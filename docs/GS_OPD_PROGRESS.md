@@ -334,3 +334,11 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - PNG 通过 Backend 已有 RGB 编码函数从 Bridge 返回的原始帧编码；没有旋转、裁剪或额外图像预处理。未指定输出目录时不保存图像，现有 `--raw-out`、请求计时及默认 VLM Smoke 路径保持可用。
 - 新增 `--capture-only`；该模式要求同时指定 `--images-out-dir`，读取一次 Bridge Reset 并保存图像/元数据后退出，不创建 VLM Backend、不调用模型或执行 Schema 校验。示例：`python -m research.gs_opd.teacher.smoke --images-out-dir /tmp/gs_opd_capture --capture-only`。
 - 本次仅计划运行 Python 语法检查与 `git diff --check`；不启动 Bridge、不运行 Smoke、不连接真实模型。图像文件的运行时生成与 RGB 像素一致性仍待后续人工运行验证。
+
+## GS-OPD Safety IR v2 Schema / Validator
+
+- 新增 `research/gs_opd/teacher/schema_v2.py`，单独定义 v2 JSON Schema 常量 `SAFETY_OUTPUT_V2_JSON_SCHEMA`、`validate_teacher_output_v2()`、`parse_teacher_output_v2()` 和 `TeacherOutputV2Error`；不导入或修改 v1 Validator，也未接入现有 Prompt、Backend、Smoke 或 Bridge。
+- v2 强制顶层 `schema_version`, `objects`, `rules`, `global_uncertainties`。Object 字段为 `id,name,role,visibility,mobility,visual_facts,inferences,uncertainties`；Rule 字段为 `id,subject_parts,target_id,predicate,decision,phase,reason`。所有层级均拒绝额外字段；Validator 检查非空文本、对象和规则 ID 各自唯一、规则目标引用、合法机器人部位、枚举、`[0,1]` 有限 confidence，以及文本中显式 MuJoCo geom/body ID。
+- v1 相机、role、visibility 和 robot-part 枚举在新模块中独立定义并保持同值。解析器拒绝重复 JSON 键和 NaN/Infinity。`unknown` 保持原值；Schema 不按 role 合成规则。
+- 新增 `research/gs_opd/teacher/test_schema_v2.py`，只依赖 Python 标准库 `unittest`。仓库 Python 执行 `python -m unittest -v research.gs_opd.teacher.test_schema_v2`：10 项通过；`python -m py_compile research/gs_opd/teacher/schema_v2.py research/gs_opd/teacher/test_schema_v2.py` 与 `git diff --check` 均通过。
+- 本次仅验证离线 Schema/Validator；没有调用 VLM、MuJoCo，也未改变 v1 行为。v2 尚未接入 Prompt 或服务端约束生成流程。
