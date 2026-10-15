@@ -19,6 +19,7 @@ from .backend import (
     create_backend_from_env,
 )
 from .schema import CAMERA_NAMES, TeacherOutputError, parse_teacher_output
+from .schema_v2 import parse_teacher_output_v2
 
 AUTHKEY = b"gs-opd-local"
 
@@ -126,6 +127,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="save the Bridge observation and exit without calling the VLM",
     )
+    parser.add_argument(
+        "--teacher-version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="Safety Teacher prompt and output schema version (default: v1)",
+    )
     args = parser.parse_args(argv)
 
     if args.capture_only and args.images_out_dir is None:
@@ -183,7 +190,15 @@ def main(argv: list[str] | None = None) -> int:
 
     request_started = time.perf_counter()
     try:
-        raw_output = backend.generate(instruction, images)
+        if args.teacher_version == "v2":
+            generate_v2 = getattr(backend, "generate_v2", None)
+            if not callable(generate_v2):
+                raise TeacherBackendError(
+                    "Configured Teacher backend does not support Safety IR v2"
+                )
+            raw_output = generate_v2(instruction, images)
+        else:
+            raw_output = backend.generate(instruction, images)
     except (TeacherBackendError, ValueError, RuntimeError) as exc:
         elapsed_s = time.perf_counter() - request_started
         print(f"VLM request elapsed: {elapsed_s:.3f}s")
@@ -202,7 +217,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Raw Teacher output saved: {args.raw_out}")
 
     try:
-        output = parse_teacher_output(raw_output)
+        if args.teacher_version == "v2":
+            output = parse_teacher_output_v2(raw_output)
+        else:
+            output = parse_teacher_output(raw_output)
     except (TeacherOutputError, ValueError) as exc:
         print(f"Teacher Smoke failed: {type(exc).__name__}: {exc}")
         return 1

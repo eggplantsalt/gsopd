@@ -349,3 +349,11 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - Prompt 要求从双相机和任务语义识别环境对象、使用本地语义 ID、区分 visual facts / inferences / uncertainties，并排除机器人本体与 MuJoCo ID。接触规则仅表达机器人部位到环境物体的 contact；目标抓取、放置关系、非目标意外碰撞分别说明；证据不足保留 `unknown`，不按非目标角色自动生成禁令。
 - 新增标准库 unittest `research/gs_opd/teacher/test_prompt_v2.py`，3 项测试通过：`python -m unittest -v research.gs_opd.teacher.test_prompt_v2`。Prompt 和测试文件语法检查、`git diff --check` 均通过。
 - 未调用真实 VLM，未修改或接入现有 v1 Prompt、Backend、Schema、Smoke 或 Bridge；v2 Prompt 的实际模型输出尚未验证。
+
+## Teacher Smoke 可选 Safety IR v2 接入（2026-10-15）
+
+- `research/gs_opd/teacher/smoke.py` 新增 `--teacher-version {v1,v2}`，默认 `v1`。v1 仍调用原 `generate()`、v1 Prompt/Parser 和现有 `json_object` 配置路径；v2 调用 Backend 的 `generate_v2()`，采用 `prompt_v2.py`，并使用 `parse_teacher_output_v2()`，不经过 v1 Parser。
+- `research/gs_opd/teacher/backend.py` 的 v2 请求在 Chat Completions `response_format.type=json_schema` 下直接传入 `SAFETY_OUTPUT_V2_JSON_SCHEMA`；不会把 Schema 模式退化成 `json_object`。Thinking 配置继续应用于两个版本。若服务以 HTTP 错误拒绝 Schema 请求，报错会明确指出 JSON Schema 模式/关键字不兼容，且说明未执行无约束回退。
+- 原有 `--raw-out`（保存后再校验）、`--images-out-dir`、`--capture-only` 和单次请求耗时统计均保留；一次 Smoke 只调用一个版本的一个 Backend 生成入口。
+- 新增 `research/gs_opd/teacher/test_smoke_versions.py`，mock Bridge 与 HTTP，不连接真实服务；验证 v1 默认 Prompt/`json_object`/Parser、v2 Prompt/Schema `response_format`/v2 Parser，以及 Schema 请求拒绝时不回退。Smoke 版本、Prompt v2、Schema v2 单测共 16 项全部通过；修改文件语法检查及 `git diff --check` 通过。
+- 未调用真实 VLM。兼容性限制：当前 v2 JSON Schema 在 `subject_parts` 使用 `uniqueItems`；[vLLM XGrammar 文档](https://docs.vllm.ai/en/stable/api/vllm/v1/structured_output/backend_xgrammar/) 将该关键字列为不支持项。使用不支持它的 vLLM 结构化输出后端时，请求会明确失败，不会剥除该约束或静默退化。JSON Schema 请求结构参考 [vLLM Structured Outputs 示例](https://docs.vllm.ai/en/stable/examples/features/structured_outputs/)。

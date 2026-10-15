@@ -18,10 +18,14 @@ import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 from .prompt import SYSTEM_PROMPT, build_user_prompt
 from .schema import CAMERA_NAMES
+from .prompt_v2 import SYSTEM_PROMPT as SYSTEM_PROMPT_V2
+from .prompt_v2 import build_user_prompt as build_user_prompt_v2
+from .schema_v2 import CAMERA_NAMES as CAMERA_NAMES_V2
+from .schema_v2 import SAFETY_OUTPUT_V2_JSON_SCHEMA
 
 
 class BackendConfigError(ValueError):
@@ -138,8 +142,34 @@ class OpenAICompatibleBackend:
         self.thinking_enabled = thinking_enabled
 
     def _messages(self, instruction: str, images: Sequence[RGBFrame]) -> list[dict]:
+        return self._messages_with_prompt(
+            instruction,
+            images,
+            camera_names=CAMERA_NAMES,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt_builder=build_user_prompt,
+        )
+
+    def _messages_v2(self, instruction: str, images: Sequence[RGBFrame]) -> list[dict]:
+        return self._messages_with_prompt(
+            instruction,
+            images,
+            camera_names=CAMERA_NAMES_V2,
+            system_prompt=SYSTEM_PROMPT_V2,
+            user_prompt_builder=build_user_prompt_v2,
+        )
+
+    def _messages_with_prompt(
+        self,
+        instruction: str,
+        images: Sequence[RGBFrame],
+        *,
+        camera_names: Sequence[str],
+        system_prompt: str,
+        user_prompt_builder: Callable[[str, Sequence[str]], str],
+    ) -> list[dict]:
         by_name = {image.camera_name: image for image in images}
-        missing = [camera for camera in CAMERA_NAMES if camera not in by_name]
+        missing = [camera for camera in camera_names if camera not in by_name]
         if missing:
             raise TeacherBackendError(f"Teacher input is missing cameras: {missing}")
         if len(by_name) != len(images):
@@ -148,10 +178,10 @@ class OpenAICompatibleBackend:
         content: list[dict] = [
             {
                 "type": "text",
-                "text": build_user_prompt(instruction, CAMERA_NAMES),
+                "text": user_prompt_builder(instruction, camera_names),
             }
         ]
-        for camera in CAMERA_NAMES:
+        for camera in camera_names:
             content.append({"type": "text", "text": f"Camera: {camera}"})
             content.append(
                 {
@@ -160,7 +190,7 @@ class OpenAICompatibleBackend:
                 }
             )
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ]
 
@@ -189,21 +219,9 @@ class OpenAICompatibleBackend:
                 return "".join(text_parts)
         raise TeacherBackendError("VLM response content is empty or not text")
 
-    def generate(self, instruction: str, images: Sequence[RGBFrame]) -> str:
-        if not instruction.strip():
-            raise ValueError("Task instruction must not be empty")
-        payload = {
-            "model": self.model,
-            "messages": self._messages(instruction, images),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        if self.json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if self.thinking_enabled is not None:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": self.thinking_enabled
-            }
+    def _post_payload(
+        self, payload: dict, *, schema_constrained: bool = False
+    ) -> str:
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -221,6 +239,13 @@ class OpenAICompatibleBackend:
                 response_body = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read(1200).decode("utf-8", errors="replace")
+            if schema_constrained:
+                raise TeacherBackendError(
+                    "VLM endpoint rejected the Safety IR v2 JSON Schema request; "
+                    "the server may not support JSON Schema mode or one or more "
+                    "schema keywords. No unconstrained or json_object fallback "
+                    f"was attempted. HTTP {exc.code}: {detail}"
+                ) from exc
             raise TeacherBackendError(
                 f"VLM endpoint returned HTTP {exc.code}: {detail}"
             ) from exc
@@ -236,6 +261,46 @@ class OpenAICompatibleBackend:
         if not isinstance(response_json, dict):
             raise TeacherBackendError("VLM endpoint response must be a JSON object")
         return self._extract_content(response_json)
+
+    def generate(self, instruction: str, images: Sequence[RGBFrame]) -> str:
+        if not instruction.strip():
+            raise ValueError("Task instruction must not be empty")
+        payload = {
+            "model": self.model,
+            "messages": self._messages(instruction, images),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if self.json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if self.thinking_enabled is not None:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self.thinking_enabled
+            }
+        return self._post_payload(payload)
+
+    def generate_v2(self, instruction: str, images: Sequence[RGBFrame]) -> str:
+        """Generate using the v2 prompt and a mandatory JSON Schema constraint."""
+        if not instruction.strip():
+            raise ValueError("Task instruction must not be empty")
+        payload = {
+            "model": self.model,
+            "messages": self._messages_v2(instruction, images),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "gs_opd_safety_teacher_v2",
+                    "schema": SAFETY_OUTPUT_V2_JSON_SCHEMA,
+                },
+            },
+        }
+        if self.thinking_enabled is not None:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self.thinking_enabled
+            }
+        return self._post_payload(payload, schema_constrained=True)
 
 
 def _read_positive_float(name: str, default: float) -> float:
