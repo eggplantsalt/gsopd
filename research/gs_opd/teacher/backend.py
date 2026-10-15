@@ -1,4 +1,9 @@
-"""Replaceable VLM backends for structured GS-OPD Teacher inference."""
+"""Replaceable VLM backends for structured GS-OPD Teacher inference.
+这个文件的作用是，负责把图片和指令发送给VLM，并且取得回复
+
+"""
+
+
 
 from __future__ import annotations
 
@@ -95,6 +100,7 @@ class OpenAICompatibleBackend:
         max_tokens: int = 1800,
         temperature: float = 0.0,
         json_mode: bool = False,
+        thinking_enabled: bool | None = None,
     ) -> None:
         parsed = urllib.parse.urlparse(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -129,6 +135,7 @@ class OpenAICompatibleBackend:
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
         self.json_mode = bool(json_mode)
+        self.thinking_enabled = thinking_enabled
 
     def _messages(self, instruction: str, images: Sequence[RGBFrame]) -> list[dict]:
         by_name = {image.camera_name: image for image in images}
@@ -193,6 +200,10 @@ class OpenAICompatibleBackend:
         }
         if self.json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if self.thinking_enabled is not None:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self.thinking_enabled
+            }
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -266,6 +277,19 @@ def _read_temperature() -> float:
     return temperature
 
 
+def _read_thinking_enabled() -> bool | None:
+    raw = os.environ.get("GS_OPD_TEACHER_ENABLE_THINKING")
+    if raw is None:
+        return None
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise BackendConfigError(
+        "GS_OPD_TEACHER_ENABLE_THINKING must be exactly '0' or '1'"
+    )
+
+
 def create_backend_from_env() -> TeacherBackend:
     """Create the configured real backend; never substitute a fake response."""
     backend_name = os.environ.get("GS_OPD_TEACHER_BACKEND", "").strip().lower()
@@ -306,6 +330,7 @@ def create_backend_from_env() -> TeacherBackend:
             max_tokens=_read_positive_int("GS_OPD_TEACHER_MAX_TOKENS", 1800),
             temperature=_read_temperature(),
             json_mode=json_mode_value in ("1", "true", "yes"),
+            thinking_enabled=_read_thinking_enabled(),
         )
     except ValueError as exc:
         if isinstance(exc, BackendConfigError):
