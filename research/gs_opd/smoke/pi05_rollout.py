@@ -31,6 +31,15 @@ def parse_args():
         type=Path,
         help="Optional NPZ path for on-policy rollout transitions.",
     )
+    parser.add_argument(
+        "--contact-safety-probe",
+        action="store_true",
+        help="Probe the first predicted Action Chunk with Bridge branching, then stop before real actions.",
+    )
+    parser.add_argument("--teacher-json", type=Path)
+    parser.add_argument("--object-id")
+    parser.add_argument("--semantic-result", type=Path)
+    parser.add_argument("--probe-out-dir", type=Path)
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
@@ -38,7 +47,134 @@ def parse_args():
         parser.error("--video-out must use the .mp4 extension")
     if args.trace_out is not None and args.trace_out.suffix != ".npz":
         parser.error("--trace-out must use the .npz extension")
+    probe_inputs = (
+        args.teacher_json,
+        args.object_id,
+        args.semantic_result,
+        args.probe_out_dir,
+    )
+    if args.contact_safety_probe:
+        if any(value is None for value in probe_inputs):
+            parser.error(
+                "--contact-safety-probe requires --teacher-json, --object-id, "
+                "--semantic-result, and --probe-out-dir"
+            )
+        if args.max_steps == 0:
+            parser.error("--contact-safety-probe requires --max-steps greater than zero")
+        if args.trace_out is not None:
+            parser.error("--trace-out cannot be combined with --contact-safety-probe")
+        if not args.teacher_json.is_file():
+            parser.error(f"Safety IR v2 file does not exist: {args.teacher_json}")
+        if not args.semantic_result.is_file():
+            parser.error(f"Semantic result file does not exist: {args.semantic_result}")
+    elif any(value is not None for value in probe_inputs):
+        parser.error(
+            "--teacher-json, --object-id, --semantic-result, and --probe-out-dir "
+            "require --contact-safety-probe"
+        )
     return args
+
+
+def run_first_chunk_contact_probe(
+    conn,
+    chunk,
+    instruction,
+    teacher_json_path,
+    object_id,
+    semantic_result_path,
+    out_dir,
+):
+    """Branch the complete first predicted chunk and compile its contact evidence."""
+    import json
+    import sys
+
+    repo_root = str(Path(__file__).resolve().parents[3])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from research.gs_opd.smoke.contact_safety_compiler_smoke import (
+        compile_forbid_contact,
+    )
+    from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
+
+    teacher = parse_teacher_output_v2(teacher_json_path.read_text(encoding="utf-8"))
+    if not any(item["id"] == object_id for item in teacher["objects"]):
+        raise ValueError(f"object_id {object_id!r} is absent from Safety IR v2")
+    semantic_result = json.loads(semantic_result_path.read_text(encoding="utf-8"))
+
+    def bridge_request(payload):
+        conn.send(payload)
+        response = conn.recv()
+        if not isinstance(response, dict):
+            return {"error": "Safety Bridge returned a non-object response"}
+        return response
+
+    actions = chunk.tolist()
+    candidates = [{"candidate_id": "pi05-first-action-chunk", "actions": actions}]
+    geometry_inventory = {"status": "unavailable"}
+    gripper_inventory = {"status": "unavailable"}
+    branch_result = {"error": "branch_rollout was not started", "main_state_restored": False}
+    snapshot_id = None
+    try:
+        geometry_inventory = bridge_request({"op": "geometry_inventory"})
+        gripper_inventory = bridge_request({"op": "gripper_geometry_inventory"})
+        snapshot = bridge_request({"op": "snapshot"})
+        snapshot_id = snapshot.get("snapshot_id")
+        if isinstance(snapshot_id, str):
+            branch_result = bridge_request(
+                {
+                    "op": "branch_rollout",
+                    "snapshot_id": snapshot_id,
+                    "candidates": candidates,
+                }
+            )
+        else:
+            branch_result = {
+                "error": snapshot.get("error", "Snapshot operation returned no ID"),
+                "main_state_restored": False,
+                "candidates": [],
+            }
+    except (OSError, EOFError) as exc:
+        branch_result = {
+            "error": f"Safety Bridge request failed: {type(exc).__name__}: {exc}",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+
+    compiled_result = compile_forbid_contact(
+        teacher,
+        object_id,
+        semantic_result,
+        branch_result,
+        geometry_inventory,
+        gripper_inventory,
+    )
+    report = {
+        "mode": "first_action_chunk_contact_safety_probe",
+        "instruction": instruction,
+        "object_id": object_id,
+        "predicted_action_chunk": actions,
+        "snapshot_id": snapshot_id,
+        "main_state_restored": branch_result.get("main_state_restored") is True,
+        "verdict": compiled_result["status"],
+        "compiled_result": compiled_result,
+        "bridge_geometry_inventory": geometry_inventory,
+        "bridge_gripper_geometry_inventory": gripper_inventory,
+        "branch_rollout_result": branch_result,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "first_chunk_contact_safety_probe.json"
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        "FIRST CHUNK CONTACT SAFETY PROBE:",
+        report["verdict"],
+        "MAIN STATE RESTORED:",
+        report["main_state_restored"],
+        flush=True,
+    )
+    print("PROBE RESULT:", report_path, flush=True)
+    return report
 
 
 def get_video_frame(data):
@@ -108,6 +244,7 @@ try:
     if video_frames is not None:
         video_frames.append(get_video_frame(data))
     print("TASK:", data["instruction"], flush=True)
+    contact_probe_result = None
 
     while steps < args.max_steps and not done and not success:
         obs = {
@@ -142,6 +279,18 @@ try:
         if trace_writer is not None:
             trace_writer.add_decision(chunk_index, steps, data, chunk)
         chunks += 1
+
+        if args.contact_safety_probe:
+            contact_probe_result = run_first_chunk_contact_probe(
+                conn=conn,
+                chunk=chunk,
+                instruction=data["instruction"],
+                teacher_json_path=args.teacher_json,
+                object_id=args.object_id,
+                semantic_result_path=args.semantic_result,
+                out_dir=args.probe_out_dir,
+            )
+            break
 
         for action_index, action in enumerate(chunk):
             conn.send({"op": "step", "action": action.tolist()})
@@ -191,6 +340,8 @@ try:
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "camera_resolution": 256,
     }
+    if contact_probe_result is not None:
+        result["contact_safety_probe"] = contact_probe_result["verdict"]
 
     with open("/tmp/gs_pi05_safety_l0t0_result.json", "w") as f:
         json.dump(result, f, indent=2)

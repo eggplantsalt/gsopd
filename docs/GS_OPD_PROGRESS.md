@@ -605,3 +605,32 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
   ```
 
 - 6 项轻量 unittest、Python 语法检查和 `git diff --check` 通过；测试包含有效的非目标物体接触（含 gripper Geom）应被忽略。仅使用 mock Bridge/联系记录验证编译逻辑，没有运行真实分支 Rollout。真实模型下的 gripper Geom 查询和 Contact 判定待按上面的命令验证。
+
+## π₀.₅ 首个 Action Chunk Contact Safety 探测（2026-10-16）
+
+- `research/gs_opd/smoke/pi05_rollout.py` 新增可选 `--contact-safety-probe` 模式，要求同时提供 `--teacher-json`、`--object-id`、`--semantic-result` 和 `--probe-out-dir`。模型按现有流程根据 Reset Observation 生成首个完整 Chunk 后，脚本不发送任何真实 `step`；它使用 Rollout 当前 Bridge 连接查询 Geom/Gripper 清单、创建 Snapshot，再将同一 Chunk 作为单个候选传给现有 `branch_rollout`。
+- 分支接触监控结果传给 `contact_safety_compiler_smoke.py` 的 `compile_forbid_contact()`，使用 Safety IR v2 和语义消歧文件计算 `safe/violation/unknown`。输出目录中的 `first_chunk_contact_safety_probe.json` 保存原始预测动作 Chunk、Bridge 清单、完整分支结果/接触证据、编译结果和 `main_state_restored`。只有 Bridge 明确报告主状态恢复时该字段才为 true。
+- 探测模式运行后立即结束，不会继续 Rollout；为避免写出没有真实执行 Transition 的轨迹，不能与 `--trace-out` 同用。未启用探测参数时，Rollout、Video、Trace 流程不变。探测时可选 `--video-out` 只包含初始观测帧，不应将其当作动作视频。
+- 轻量 Bridge Mock 测试验证 Geometry/Gripper 查询、Snapshot、完整动作 Chunk 的分支请求顺序，确认未发送 `step`，并检查动作及分支证据落盘。Python 语法检查、该测试和 `git diff --check` 通过；未运行模型或仿真。
+- 真实验证需先按下列命令启动 Safety Bridge，再运行 π₀.₅ 首 Chunk 探测。输出目录独立保存本次检查结果：
+
+  ```bash
+  # 终端 A：LIBERO-Safety 环境启动 Bridge
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/safety_bridge.py
+  ```
+
+  ```bash
+  # 终端 B：生成首个模型 Chunk、分支试执行并编译接触结果；不会执行真实动作
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/RLinf \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/pi05_rollout.py \
+    --contact-safety-probe \
+    --teacher-json /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0_raw.json \
+    --object-id object_4 \
+    --semantic-result /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4_raw_outline_ab/semantic_disambiguation.json \
+    --probe-out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/pi05_first_chunk_contact_probe_object_4
+  ```
