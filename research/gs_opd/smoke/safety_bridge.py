@@ -536,6 +536,72 @@ def _geometry_inventory():
     )
 
 
+def _render_highres():
+    """Render the existing primary camera without advancing or rebuilding sim."""
+    sim = env.sim
+    if getattr(sim, "_render_context_offscreen", None) is None:
+        raise RuntimeError(
+            "Offscreen render context is not initialized; refusing to create one "
+            "because its constructor calls sim.forward()"
+        )
+
+    render_context = sim._render_context_offscreen
+    visual_global = sim.model.vis.global_
+    old_offscreen_size = (visual_global.offwidth, visual_global.offheight)
+    old_camera_state = (render_context.cam.type, render_context.cam.fixedcamid)
+    state_before = _mujoco_integration_state(sim).copy()
+    try:
+        raw_rgb = np.ascontiguousarray(
+            sim.render(
+                width=512,
+                height=512,
+                camera_name="agentview",
+                depth=False,
+            )
+        )
+    finally:
+        # robosuite may grow the offscreen framebuffer and changes these visual
+        # settings while selecting the requested camera. Keep the prior render
+        # configuration for the normal 256x256 observation path.
+        visual_global.offwidth, visual_global.offheight = old_offscreen_size
+        render_context.cam.type, render_context.cam.fixedcamid = old_camera_state
+    state_after = _mujoco_integration_state(sim)
+    if not np.array_equal(state_before, state_after, equal_nan=True):
+        raise RuntimeError(
+            "MuJoCo integration state changed during high-resolution render; "
+            "discarding rendered image"
+        )
+    if raw_rgb.shape != (512, 512, 3) or raw_rgb.dtype != np.uint8:
+        raise RuntimeError(
+            "Unexpected high-resolution render result: "
+            f"shape={raw_rgb.shape}, dtype={raw_rgb.dtype}"
+        )
+
+    rotated_rgb = np.ascontiguousarray(np.rot90(raw_rgb, k=2))
+
+    def image_payload(image):
+        return {
+            "shape": tuple(image.shape),
+            "dtype": str(image.dtype),
+            "data": image.tobytes(),
+        }
+
+    return {
+        "camera_name": "agentview",
+        "width": 512,
+        "height": 512,
+        "color_space": "RGB",
+        "render_api": "env.sim.render",
+        "raw_orientation": "unmodified offscreen renderer row order",
+        "rotated_orientation": "raw RGB rotated 180 degrees",
+        "physical_state_unchanged": True,
+        "images": {
+            "raw_rgb": image_payload(raw_rgb),
+            "rotated_180_rgb": image_payload(rotated_rgb),
+        },
+    }
+
+
 def _new_contact_monitor():
     robot_body_ids = None
     robot_classification_error = None
@@ -1060,6 +1126,16 @@ try:
                                 "Geometry inventory failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                        }
+                elif request["op"] == "render_highres":
+                    try:
+                        result = _render_highres()
+                    except Exception as exc:
+                        result = {
+                            "error": (
+                                "High-resolution render failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
                         }
                 else:
                     result = {"error": "Unknown operation"}

@@ -435,3 +435,28 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 - `sam3_smoke.py` 新增 `--confidence-threshold`，默认 `0.5`，只接受闭区间 `[0, 1]`。参数传入 `Sam3Processor(..., confidence_threshold=...)`，并在 `sam3_results.json` 的 `confidence_threshold` 字段记录。
 - CPU mock 检查覆盖默认/自定义阈值传递、结果元数据及越界输入拒绝；语法检查通过。未运行 GPU 推理。
+
+## MuJoCo 高分辨率相机采集 Smoke（2026-10-15）
+
+- 已审计 Safety Bridge 启动的 `OffScreenRenderEnv` 与 vendored robosuite 1.4：环境初始化时会创建 offscreen render context；已有 context 下 `sim.render(width, height, camera_name)` 直接使用当前 `MjData` 和指定相机，不调用 reset、step 或 forward。若 context 不存在，新操作会报错，不尝试创建，因为 context 构造函数会调用 `sim.forward()`。
+- Safety Bridge 新增只读 `render_highres` 操作，直接从 `agentview` 渲染 512×512 RGB。返回原始 renderer 行序图像和它旋转 180° 后的图像，并在渲染前后比较 MuJoCo integration state；状态不一致就报错且不返回图像。robosuite 扩大 framebuffer 时修改的 offscreen 尺寸及临时 camera 选择会在调用后恢复。环境 camera sensor 仍按现有 256×256 配置工作。
+- 新增 `research/gs_opd/smoke/highres_capture.py`，只发送 `{"op":"render_highres"}`，把两张真实渲染图保存为 PNG，并写入 `capture_metadata.json`。客户端校验图像 shape、dtype、payload 长度和 Bridge 的物理状态未变化标记。
+- 运行命令：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/safety_bridge.py
+  ```
+
+  另开终端运行采集：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/highres_capture.py \
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/highres_capture
+  ```
+
+- Bridge 与客户端语法检查及 fake render / mocked Bridge 写图测试通过；未启动仿真或模型推理。真实 GL 渲染、图像质量及运行时 integration state 比较仍待人工执行验证。
