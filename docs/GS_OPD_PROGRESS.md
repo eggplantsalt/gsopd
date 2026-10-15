@@ -464,8 +464,9 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 ## MuJoCo Geom ID 分割图采集（2026-10-16）
 
 - Safety Bridge 新增只读 `geom_segmentation` 操作，复用启动时已经存在的 offscreen renderer，从当前 `agentview` 直接渲染 512×512 RGB 和 robosuite 的 MuJoCo object segmentation。segmentation 的每像素 `(object_type, object_id)` 仅在类型为 `mjOBJ_GEOM` 时解码为模型 Geom ID；`(-1, -1)` 是背景并写为 `-1`，其他可见非 Geom 对象写为 `-2`，不会误报成背景。可见 Geom 元数据动态包含 Geom ID/名称、所属 Body ID/名称和像素数。
-- 不创建 renderer、不调用 Reset、step 或 forward。Bridge 在渲染前后比较 MuJoCo integration state；并在 segmentation 渲染前后再次渲染 RGB，要求 512×512 RGB 数组逐像素一致，否则拒绝返回采集结果。渲染期间修改的 framebuffer 尺寸和临时相机选择会恢复。客户端另可用 `--compare-rgb` 与现有 RGB PNG 做严格逐像素比较；图像尺寸不符或像素不一致会保存诊断结果后以失败状态退出。
-- 新增 `research/gs_opd/smoke/geom_segmentation_capture.py`，输出 `agentview_512_rgb.png`、`geom_ids.npy`、`geom_segmentation_overlay.png` 和 `geom_metadata.json`。Overlay 按真实 Geom ID 着色，背景保留 RGB，非 Geom 像素用洋红提示；该工具只记录几何分割，不做对象名称匹配、IoU 或安全判断。
+- 不创建 renderer、不调用 Reset、step 或 forward。Bridge 在渲染前后比较 MuJoCo integration state；并在 segmentation 渲染前后再次渲染 RGB，要求 512×512 RGB 数组逐像素一致，否则拒绝返回采集结果。渲染期间修改的 framebuffer 尺寸和临时相机选择会恢复。
+- `research/gs_opd/smoke/geom_segmentation_capture.py` 保留 renderer 原始方向输出 `agentview_512_rgb.png`、`geom_ids.npy`、`geom_segmentation_overlay.png`，并以相同的 180° 变换输出正向 `agentview_512_rgb_rotated_180.png`、`geom_ids_rotated_180.npy`、`geom_segmentation_overlay_rotated_180.png`。正向 RGB 与 Geom ID 图使用相同旋转，逐像素坐标一致，可用于后续 SAM Mask 对齐；元数据为每个文件标注坐标方向。Overlay 按真实 Geom ID 着色，背景保留 RGB，非 Geom 像素用洋红提示；不做对象名称匹配、IoU 或安全判断。
+- `--compare-rgb` 明确比较已有的正向 RGB PNG 与本次 180° 旋转后的 RGB，执行严格逐像素比较；尺寸不符、文件不可读或像素不一致会在元数据中记录并使客户端以失败状态退出。需确保两张图来自相同场景状态和渲染条件。
 - 两个终端运行方式：
 
   ```bash
@@ -484,5 +485,5 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
     --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/geom_segmentation
   ```
 
-  可选地增加 `--compare-rgb /path/to/existing_agentview_512.png`；只有场景状态、相机和渲染条件相同才预期逐像素匹配。
-- Python 语法检查、Geom/背景/非 Geom 解码、fake renderer 状态与渲染配置恢复，以及客户端 PNG/NPY 写入和 RGB 匹配/不匹配轻量测试通过；`git diff --check` 通过。未启动真实仿真或 GPU/模型推理，真实 GL segmentation 输出仍待人工运行验证。
+  可选地增加 `--compare-rgb /path/to/existing_forward_rgb.png`；输入应是与 SAM 3 一致的 180° 正向 RGB，并且场景状态、相机和渲染条件相同才预期逐像素匹配。
+- Python 语法检查及 mock 写图/旋转一致性/正向 RGB 匹配与不匹配轻量测试通过；`git diff --check` 通过。未启动真实仿真或 GPU/模型推理，真实 GL segmentation 输出仍待人工运行验证。

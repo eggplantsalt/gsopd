@@ -124,18 +124,36 @@ def save_capture(response, output_dir, compare_rgb_path=None):
     if np.any(geom_ids >= geom_count):
         raise RuntimeError("Geom ID map contains IDs outside the current model")
 
+    # Keep the renderer-native arrays for debugging, and apply the exact same
+    # 180-degree rotation to RGB and labels for alignment with the SAM 3 input.
+    rgb_rotated_180 = np.ascontiguousarray(np.rot90(rgb, k=2))
+    geom_ids_rotated_180 = np.ascontiguousarray(np.rot90(geom_ids, k=2))
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rgb_file = "agentview_512_rgb.png"
     geom_ids_file = "geom_ids.npy"
     overlay_file = "geom_segmentation_overlay.png"
+    rgb_rotated_file = "agentview_512_rgb_rotated_180.png"
+    geom_ids_rotated_file = "geom_ids_rotated_180.npy"
+    overlay_rotated_file = "geom_segmentation_overlay_rotated_180.png"
     Image.fromarray(rgb).save(output_dir / rgb_file)
     np.save(output_dir / geom_ids_file, geom_ids, allow_pickle=False)
     overlay = _overlay_segmentation(rgb, geom_ids, visible_geoms)
     Image.fromarray(overlay).save(output_dir / overlay_file)
+    Image.fromarray(rgb_rotated_180).save(output_dir / rgb_rotated_file)
+    np.save(
+        output_dir / geom_ids_rotated_file,
+        geom_ids_rotated_180,
+        allow_pickle=False,
+    )
+    overlay_rotated_180 = _overlay_segmentation(
+        rgb_rotated_180, geom_ids_rotated_180, visible_geoms
+    )
+    Image.fromarray(overlay_rotated_180).save(output_dir / overlay_rotated_file)
 
     comparison = (
-        _compare_rgb(rgb, compare_rgb_path)
+        _compare_rgb(rgb_rotated_180, compare_rgb_path)
         if compare_rgb_path is not None
         else {"status": "not_requested"}
     )
@@ -157,6 +175,22 @@ def save_capture(response, output_dir, compare_rgb_path=None):
         "rgb_file": rgb_file,
         "geom_ids_file": geom_ids_file,
         "overlay_file": overlay_file,
+        "rgb_rotated_180_file": rgb_rotated_file,
+        "geom_ids_rotated_180_file": geom_ids_rotated_file,
+        "overlay_rotated_180_file": overlay_rotated_file,
+        "coordinate_directions": {
+            rgb_file: "MuJoCo/robosuite raw renderer row/column order",
+            geom_ids_file: "MuJoCo/robosuite raw renderer row/column order",
+            overlay_file: "MuJoCo/robosuite raw renderer row/column order",
+            rgb_rotated_file: "raw image rotated 180 degrees; SAM 3 forward orientation",
+            geom_ids_rotated_file: "raw label map rotated 180 degrees; aligned with SAM 3 forward orientation",
+            overlay_rotated_file: "raw overlay rotated 180 degrees; SAM 3 forward orientation",
+        },
+        "compare_rgb_coordinate_direction": (
+            "raw image rotated 180 degrees; SAM 3 forward orientation"
+            if compare_rgb_path is not None
+            else None
+        ),
         "comparison": comparison,
     }
     (output_dir / "geom_metadata.json").write_text(
@@ -174,7 +208,10 @@ def main(argv=None):
     parser.add_argument(
         "--compare-rgb",
         type=Path,
-        help="optional existing 512x512 RGB PNG to compare pixel-for-pixel",
+        help=(
+            "optional existing forward-oriented 512x512 RGB PNG to compare "
+            "pixel-for-pixel against the raw capture rotated 180 degrees"
+        ),
     )
     args = parser.parse_args(argv)
 
