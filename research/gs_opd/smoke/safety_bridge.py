@@ -421,6 +421,319 @@ def _collect_contacts():
     return {"status": "contact", "contacts": contacts}
 
 
+def _robot_body_ids():
+    """Resolve robot bodies from the compiled model's robot body hierarchy."""
+    sim = env.sim
+    model = sim.model._model
+    robot_body_ids = set()
+    for robot in env.robots:
+        root_name = robot.robot_model.root_body
+        root_id = int(sim.model.body_name2id(root_name))
+        for body_id in range(int(model.nbody)):
+            current_id = body_id
+            while current_id > 0:
+                if current_id == root_id:
+                    robot_body_ids.add(body_id)
+                    break
+                parent_id = int(model.body_parentid[current_id])
+                if parent_id == current_id:
+                    break
+                current_id = parent_id
+    return robot_body_ids
+
+
+def _new_contact_monitor():
+    robot_body_ids = None
+    robot_classification_error = None
+    try:
+        robot_body_ids = _robot_body_ids()
+    except Exception as exc:
+        robot_classification_error = f"{type(exc).__name__}: {exc}"
+
+    expected_substeps = None
+    expected_error = None
+    try:
+        task_env = env.env
+        control_timestep = float(task_env.control_timestep)
+        model_timestep = float(task_env.model_timestep)
+        expected_substeps = int(control_timestep / model_timestep)
+        if expected_substeps <= 0:
+            raise ValueError(f"invalid substep count {expected_substeps}")
+    except Exception as exc:
+        expected_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "expected_substeps_per_control_step": expected_substeps,
+        "expected_substeps_error": expected_error,
+        "robot_body_ids": robot_body_ids,
+        "robot_classification_status": (
+            "available" if robot_body_ids is not None else "unavailable"
+        ),
+        "robot_classification_error": robot_classification_error,
+        "captured_physics_substeps": 0,
+        "contact_substeps": 0,
+        "no_contact_substeps": 0,
+        "unavailable_contact_substeps": 0,
+        "control_steps": [],
+        "_events": {},
+    }
+
+
+def _contact_pair_classification(body1_id, body2_id, robot_body_ids):
+    if robot_body_ids is None:
+        return "unavailable", None
+    body1_robot = body1_id in robot_body_ids
+    body2_robot = body2_id in robot_body_ids
+    if body1_robot and body2_robot:
+        return "robot_robot", True
+    if body1_robot or body2_robot:
+        return "robot_scene", True
+    return "scene_scene", False
+
+
+def _record_substep_contacts(monitor, control_step_index, physics_substep_index,
+                             candidate_substep_index, contact_result):
+    status = contact_result.get("status", "unavailable")
+    if status not in ("contact", "no_contact"):
+        status = "unavailable"
+
+    # Count each geom pair once per physics substep, even when the solver
+    # reports several contact points for the same pair.
+    pairs_in_substep = {}
+    malformed_contact = False
+    for contact in contact_result.get("contacts", []):
+        try:
+            geom1 = contact["geom1"]
+            geom2 = contact["geom2"]
+            body1 = contact["body1"]
+            body2 = contact["body2"]
+            geom1_id = int(geom1["id"])
+            geom2_id = int(geom2["id"])
+            if geom1_id <= geom2_id:
+                pair_key = (geom1_id, geom2_id)
+                ordered_geoms = (geom1, geom2)
+                ordered_bodies = (body1, body2)
+            else:
+                pair_key = (geom2_id, geom1_id)
+                ordered_geoms = (geom2, geom1)
+                ordered_bodies = (body2, body1)
+            pair = pairs_in_substep.setdefault(
+                pair_key,
+                {
+                    "geoms": ordered_geoms,
+                    "bodies": ordered_bodies,
+                    "contact_point_count": 0,
+                    "force_norms": [],
+                    "force_unavailable_count": 0,
+                },
+            )
+            pair["contact_point_count"] += 1
+            if contact.get("force_status") == "available":
+                force = np.asarray(contact.get("force_and_torque"), dtype=np.float64)
+                if force.shape == (6,) and np.isfinite(force[:3]).all():
+                    pair["force_norms"].append(float(np.linalg.norm(force[:3])))
+                else:
+                    pair["force_unavailable_count"] += 1
+            else:
+                pair["force_unavailable_count"] += 1
+        except Exception:
+            # The contact reader normally returns complete records or marks the
+            # sample unavailable. Keep the coverage status conservative if a
+            # malformed item reaches this aggregation layer.
+            malformed_contact = True
+
+    if malformed_contact:
+        status = "unavailable"
+    if status == "contact":
+        monitor["contact_substeps"] += 1
+    elif status == "no_contact":
+        monitor["no_contact_substeps"] += 1
+    else:
+        monitor["unavailable_contact_substeps"] += 1
+
+    for pair_key, pair in pairs_in_substep.items():
+        event = monitor["_events"].get(pair_key)
+        if event is None:
+            body1_id = int(pair["bodies"][0]["id"])
+            body2_id = int(pair["bodies"][1]["id"])
+            classification, robot_involved = _contact_pair_classification(
+                body1_id, body2_id, monitor["robot_body_ids"]
+            )
+            event = {
+                "geom_pair": [dict(item) for item in pair["geoms"]],
+                "body_pair": [dict(item) for item in pair["bodies"]],
+                "classification": classification,
+                "robot_involved": robot_involved,
+                "first_control_step": int(control_step_index),
+                "first_physics_substep": int(physics_substep_index),
+                "first_candidate_physics_substep": int(candidate_substep_index),
+                "occurrence_count": 0,
+                "contact_point_count": 0,
+                "max_force_norm": None,
+                "force_sample_count": 0,
+                "force_unavailable_count": 0,
+            }
+            monitor["_events"][pair_key] = event
+        event["occurrence_count"] += 1
+        event["contact_point_count"] += pair["contact_point_count"]
+        event["force_unavailable_count"] += pair["force_unavailable_count"]
+        for force_norm in pair["force_norms"]:
+            event["force_sample_count"] += 1
+            if event["max_force_norm"] is None or force_norm > event["max_force_norm"]:
+                event["max_force_norm"] = force_norm
+
+    return status
+
+
+def _finish_contact_control_step(monitor, control_step):
+    expected = control_step["expected_physics_substeps"]
+    captured = control_step["captured_physics_substeps"]
+    observed = control_step["contact_samples"]
+    if control_step.get("capture_error"):
+        status = "unavailable" if captured == 0 else "incomplete"
+    elif expected is not None and captured == expected and observed["unavailable"] == 0:
+        status = "complete"
+    else:
+        status = "incomplete"
+    control_step["status"] = status
+    control_step["unobserved_expected_substeps"] = (
+        max(0, expected - captured) if expected is not None else None
+    )
+    monitor["control_steps"].append(control_step)
+    return control_step
+
+
+def _run_env_step_with_contact_monitor(action, action_index, monitor):
+    """Observe contacts after each native MjSim.step during one env.step call."""
+    sim = env.sim
+    expected = monitor["expected_substeps_per_control_step"]
+    control_step = {
+        "control_step_index": int(action_index),
+        "status": "unavailable",
+        "expected_physics_substeps": expected,
+        "captured_physics_substeps": 0,
+        "contact_samples": {"contact": 0, "no_contact": 0, "unavailable": 0},
+        "capture_error": None,
+    }
+    candidate_substep_start = monitor["captured_physics_substeps"]
+    prior_step = sim.__dict__.get("step", None)
+    had_instance_step = "step" in sim.__dict__
+    original_step = sim.step
+    physics_substep_index = 0
+    observer_installed = False
+
+    def monitored_step(*args, **kwargs):
+        nonlocal physics_substep_index
+        result = original_step(*args, **kwargs)
+        substep_index = physics_substep_index
+        physics_substep_index += 1
+        monitor["captured_physics_substeps"] += 1
+        control_step["captured_physics_substeps"] += 1
+        prior_sample_counts = (
+            monitor["contact_substeps"],
+            monitor["no_contact_substeps"],
+            monitor["unavailable_contact_substeps"],
+        )
+        try:
+            contacts = _collect_contacts()
+            sample_status = _record_substep_contacts(
+                monitor,
+                action_index,
+                substep_index,
+                candidate_substep_start + substep_index,
+                contacts,
+            )
+        except Exception as exc:
+            sample_status = "unavailable"
+            (monitor["contact_substeps"],
+             monitor["no_contact_substeps"],
+             monitor["unavailable_contact_substeps"]) = prior_sample_counts
+            monitor["unavailable_contact_substeps"] += 1
+            control_step["capture_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        control_step["contact_samples"][sample_status] += 1
+        return result
+
+    try:
+        sim.step = monitored_step
+        observer_installed = True
+    except Exception as exc:
+        control_step["capture_error"] = (
+            f"Cannot install per-instance MjSim.step observer: {type(exc).__name__}: {exc}"
+        )
+
+    try:
+        return env.step(action)
+    finally:
+        if observer_installed:
+            try:
+                if had_instance_step:
+                    sim.step = prior_step
+                else:
+                    del sim.__dict__["step"]
+            except Exception as exc:
+                control_step["capture_error"] = (
+                    f"Cannot restore MjSim.step observer: {type(exc).__name__}: {exc}"
+                )
+        else:
+            # A failed assignment should not have replaced the class method;
+            # restore the prior instance lookup state defensively.
+            if had_instance_step:
+                sim.__dict__["step"] = prior_step
+            else:
+                sim.__dict__.pop("step", None)
+        monitor["_last_control_step"] = _finish_contact_control_step(
+            monitor, control_step
+        )
+
+
+def _contact_monitor_result(monitor):
+    control_steps = monitor["control_steps"]
+    expected_counts = [
+        step["expected_physics_substeps"] for step in control_steps
+    ]
+    expected_total = (
+        sum(expected_counts)
+        if expected_counts and all(count is not None for count in expected_counts)
+        else None
+    )
+    unobserved_counts = [
+        step["unobserved_expected_substeps"] for step in control_steps
+    ]
+    unobserved_total = (
+        sum(unobserved_counts)
+        if unobserved_counts and all(count is not None for count in unobserved_counts)
+        else None
+    )
+    if control_steps and all(step["status"] == "complete" for step in control_steps):
+        status = "complete"
+    elif not control_steps or all(step["status"] == "unavailable" for step in control_steps):
+        status = "unavailable"
+    else:
+        status = "incomplete"
+    events = [monitor["_events"][key] for key in sorted(monitor["_events"])]
+    return {
+        "status": status,
+        "sampling_point": "immediately_after_each_successful_MjSim.step",
+        "expected_physics_substeps_per_control_step": monitor[
+            "expected_substeps_per_control_step"
+        ],
+        "expected_physics_substeps_total": expected_total,
+        "unobserved_expected_substeps": unobserved_total,
+        "expected_substeps_error": monitor["expected_substeps_error"],
+        "captured_physics_substeps": monitor["captured_physics_substeps"],
+        "contact_substeps": monitor["contact_substeps"],
+        "no_contact_substeps": monitor["no_contact_substeps"],
+        "unavailable_contact_substeps": monitor["unavailable_contact_substeps"],
+        "robot_classification_status": monitor["robot_classification_status"],
+        "robot_classification_error": monitor["robot_classification_error"],
+        "control_steps": control_steps,
+        "events": events,
+        "interpretation": "Observed physical contacts only; no safety verdict is assigned.",
+    }
+
+
 def _normalize_branch_candidates(raw_candidates):
     if not isinstance(raw_candidates, (list, tuple)):
         raise ValueError("candidates must be a list of candidate action sequences")
@@ -492,11 +805,14 @@ def _branch_rollout(snapshot_id, raw_candidates):
                 "executed_steps": 0,
                 "steps": [],
             }
+            contact_monitor = _new_contact_monitor()
             try:
                 _restore_snapshot(target_snapshot)
                 candidate_result["start_state"] = _snapshot_diagnostics()
                 for action_index, action in enumerate(candidate["actions"]):
-                    obs, reward, done, _info = env.step(action)
+                    obs, reward, done, _info = _run_env_step_with_contact_monitor(
+                        action, action_index, contact_monitor
+                    )
                     last_reward = reward
                     last_done = done
                     state = _snapshot_diagnostics()
@@ -509,6 +825,9 @@ def _branch_rollout(snapshot_id, raw_candidates):
                             "done": bool(done),
                             "state": state,
                             "contacts": contacts,
+                            "substep_contact_coverage": contact_monitor[
+                                "control_steps"
+                            ][-1],
                         }
                     )
                     candidate_result["executed_steps"] += 1
@@ -517,6 +836,10 @@ def _branch_rollout(snapshot_id, raw_candidates):
             except Exception as exc:
                 candidate_result["status"] = "error"
                 candidate_result["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                candidate_result["contact_monitoring"] = _contact_monitor_result(
+                    contact_monitor
+                )
             result["candidates"].append(candidate_result)
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"

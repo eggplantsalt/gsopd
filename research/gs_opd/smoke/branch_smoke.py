@@ -168,16 +168,71 @@ def print_candidate(candidate, verbose_contacts=False):
             candidate["start_state"], step["state"], "object_states"
         )
         contacts = step["contacts"]
+        coverage = step.get("substep_contact_coverage", {})
+        sample_counts = coverage.get("contact_samples", {})
+        expected_substeps = coverage.get("expected_physics_substeps")
+        expected_text = (
+            "unknown" if expected_substeps is None else str(expected_substeps)
+        )
         print(
             f"  step={step['step_index']} reward={step['reward']:.6g} "
             f"done={step['done']} integration_delta_linf={delta_linf:.3e} "
             f"robot_delta_linf={robot_delta:.3e} "
             f"object_delta_linf={object_delta:.3e} "
             f"contact_status={contacts['status']} "
-            f"contact_count={len(contacts['contacts'])}"
+            f"contact_count={len(contacts['contacts'])} "
+            f"substep_capture={coverage.get('status', 'unavailable')} "
+            f"physics_substeps={coverage.get('captured_physics_substeps', 0)}/"
+            f"{expected_text} "
+            f"contact/no_contact/unavailable="
+            f"{sample_counts.get('contact', 0)}/"
+            f"{sample_counts.get('no_contact', 0)}/"
+            f"{sample_counts.get('unavailable', 0)}"
         )
         if verbose_contacts:
             print("    contacts=" + json.dumps(contacts, sort_keys=True))
+    monitoring = candidate.get("contact_monitoring", {})
+    events = monitoring.get("events", [])
+    expected_total = monitoring.get("expected_physics_substeps_total")
+    expected_total_text = "unknown" if expected_total is None else str(expected_total)
+    print(
+        f"  substep_contact_summary: status={monitoring.get('status', 'unavailable')} "
+        f"physics_substeps={monitoring.get('captured_physics_substeps', 0)}/"
+        f"{expected_total_text} "
+        f"contact/no_contact/unavailable="
+        f"{monitoring.get('contact_substeps', 0)}/"
+        f"{monitoring.get('no_contact_substeps', 0)}/"
+        f"{monitoring.get('unavailable_contact_substeps', 0)} "
+        f"robot_classification={monitoring.get('robot_classification_status', 'unavailable')} "
+        f"event_pairs={len(events)}"
+    )
+    for event in events:
+        geom_pair = ",".join(
+            f"{geom.get('id')}:{geom.get('name') or '<unnamed>'}"
+            for geom in event["geom_pair"]
+        )
+        body_pair = ",".join(
+            f"{body.get('id')}:{body.get('name') or '<unnamed>'}"
+            for body in event["body_pair"]
+        )
+        max_force = event.get("max_force_norm")
+        force_text = "unavailable" if max_force is None else f"{max_force:.6g}"
+        print(
+            f"    event class={event.get('classification', 'unavailable')} "
+            f"robot_involved={event.get('robot_involved')} "
+            f"geom_pair=[{geom_pair}] body_pair=[{body_pair}] "
+            f"first={event['first_control_step']}/{event['first_physics_substep']} "
+            f"occurrences={event['occurrence_count']} "
+            f"contact_points={event['contact_point_count']} "
+            f"max_force_norm={force_text} "
+            f"force_samples={event['force_sample_count']} "
+            f"force_unavailable={event['force_unavailable_count']}"
+        )
+    if monitoring.get("status") != "complete":
+        print(
+            "  contact coverage is incomplete or unavailable; an empty event list "
+            "does not establish no contact."
+        )
     if candidate["status"] != "ok":
         print(f"  candidate error: {candidate.get('error')}")
 
@@ -330,11 +385,13 @@ def main():
             {
                 "start_state": candidates[0]["start_state"],
                 "steps": candidates[0]["steps"],
+                "contact_monitoring": candidates[0].get("contact_monitoring"),
                 "executed_steps": candidates[0]["executed_steps"],
             },
             {
                 "start_state": candidates[2]["start_state"],
                 "steps": candidates[2]["steps"],
+                "contact_monitoring": candidates[2].get("contact_monitoring"),
                 "executed_steps": candidates[2]["executed_steps"],
             },
         )
@@ -356,6 +413,13 @@ def main():
         max_start_error, max_start_location = max(
             candidate_start_details, key=lambda item: item[0], default=(0.0, "state")
         )
+        contact_recording_pass = all(
+            candidate.get("contact_monitoring", {}).get("status") == "complete"
+            and candidate.get("contact_monitoring", {}).get(
+                "robot_classification_status"
+            ) == "available"
+            for candidate in candidates
+        )
         passed = (
             s0_s1_delta > args.atol
             and probe_delta > args.atol
@@ -365,6 +429,7 @@ def main():
             and max_start_error <= args.atol
             and repeat_error <= args.atol
             and branch_preserve_error <= args.atol
+            and contact_recording_pass
         )
         print(f"snapshot_S0_id: {snapshot_s0_id}")
         print(f"snapshot_S1_id: {snapshot_s1_id}")
@@ -395,6 +460,7 @@ def main():
         )
         print(f"physics_and_branch_tolerance: {args.atol:.3e}")
         print(f"continuation_replay_tolerance: {args.replay_atol:.3e}")
+        print(f"substep_contact_recording_pass: {contact_recording_pass}")
         print("S1 derived-state discrepancies above are diagnostics, not pass conditions.")
         print("PASS (bounded replay)" if passed else "FAIL")
         return 0 if passed else 1
