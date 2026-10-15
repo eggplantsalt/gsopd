@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import unittest
@@ -148,15 +149,42 @@ class TeacherSmokeVersionTests(unittest.TestCase):
             payload["messages"][1]["content"][0]["text"],
             build_user_prompt_v2(TASK_INSTRUCTION, CAMERA_NAMES_V2),
         )
+        response_format = payload["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
         self.assertEqual(
-            payload["response_format"],
-            {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "gs_opd_safety_teacher_v2",
-                    "schema": SAFETY_OUTPUT_V2_JSON_SCHEMA,
-                },
-            },
+            response_format["json_schema"]["name"], "gs_opd_safety_teacher_v2"
+        )
+        generated_schema = response_format["json_schema"]["schema"]
+        expected_schema = copy.deepcopy(SAFETY_OUTPUT_V2_JSON_SCHEMA)
+        expected_subject_parts = expected_schema["properties"]["rules"]["items"]
+        expected_subject_parts = expected_subject_parts["properties"]["subject_parts"]
+        del expected_subject_parts["uniqueItems"]
+        self.assertEqual(generated_schema, expected_schema)
+
+        original_subject_parts = SAFETY_OUTPUT_V2_JSON_SCHEMA["properties"]["rules"]
+        original_subject_parts = original_subject_parts["items"]["properties"]
+        original_subject_parts = original_subject_parts["subject_parts"]
+        self.assertTrue(original_subject_parts["uniqueItems"])
+        generated_subject_parts = generated_schema["properties"]["rules"]["items"]
+        generated_subject_parts = generated_subject_parts["properties"][
+            "subject_parts"
+        ]
+        self.assertNotIn("uniqueItems", generated_subject_parts)
+        self.assertEqual(generated_subject_parts["minItems"], 1)
+        self.assertEqual(
+            generated_subject_parts["items"]["enum"],
+            original_subject_parts["items"]["enum"],
+        )
+        self.assertEqual(
+            generated_schema["properties"]["rules"]["items"]["required"],
+            SAFETY_OUTPUT_V2_JSON_SCHEMA["properties"]["rules"]["items"][
+                "required"
+            ],
+        )
+        self.assertFalse(
+            generated_schema["properties"]["rules"]["items"][
+                "additionalProperties"
+            ]
         )
 
     def test_v2_schema_rejection_is_explicit_and_has_no_fallback(self) -> None:

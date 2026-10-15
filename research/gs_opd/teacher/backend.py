@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import json
 import math
 import os
@@ -283,6 +284,10 @@ class OpenAICompatibleBackend:
         """Generate using the v2 prompt and a mandatory JSON Schema constraint."""
         if not instruction.strip():
             raise ValueError("Task instruction must not be empty")
+        generation_schema = copy.deepcopy(SAFETY_OUTPUT_V2_JSON_SCHEMA)
+        subject_parts_schema = generation_schema["properties"]["rules"]["items"]
+        subject_parts_schema = subject_parts_schema["properties"]["subject_parts"]
+        del subject_parts_schema["uniqueItems"]
         payload = {
             "model": self.model,
             "messages": self._messages_v2(instruction, images),
@@ -292,7 +297,7 @@ class OpenAICompatibleBackend:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "gs_opd_safety_teacher_v2",
-                    "schema": SAFETY_OUTPUT_V2_JSON_SCHEMA,
+                    "schema": generation_schema,
                 },
             },
         }

@@ -357,3 +357,10 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - 原有 `--raw-out`（保存后再校验）、`--images-out-dir`、`--capture-only` 和单次请求耗时统计均保留；一次 Smoke 只调用一个版本的一个 Backend 生成入口。
 - 新增 `research/gs_opd/teacher/test_smoke_versions.py`，mock Bridge 与 HTTP，不连接真实服务；验证 v1 默认 Prompt/`json_object`/Parser、v2 Prompt/Schema `response_format`/v2 Parser，以及 Schema 请求拒绝时不回退。Smoke 版本、Prompt v2、Schema v2 单测共 16 项全部通过；修改文件语法检查及 `git diff --check` 通过。
 - 未调用真实 VLM。兼容性限制：当前 v2 JSON Schema 在 `subject_parts` 使用 `uniqueItems`；[vLLM XGrammar 文档](https://docs.vllm.ai/en/stable/api/vllm/v1/structured_output/backend_xgrammar/) 将该关键字列为不支持项。使用不支持它的 vLLM 结构化输出后端时，请求会明确失败，不会剥除该约束或静默退化。JSON Schema 请求结构参考 [vLLM Structured Outputs 示例](https://docs.vllm.ai/en/stable/examples/features/structured_outputs/)。
+
+## vLLM 0.31.0 v2 `uniqueItems` 兼容性修复（2026-10-15）
+
+- `backend.py` 在构造 v2 `response_format` 时对 `SAFETY_OUTPUT_V2_JSON_SCHEMA` 执行 `copy.deepcopy()`，只从生成用副本的 `rules.items.properties.subject_parts` 删除 `uniqueItems`。`minItems`、机器人部位 `items.enum`、required、`additionalProperties` 和其他 Schema 内容保持不变；请求仍使用 JSON Schema 约束，不会退化成 `json_object`。
+- 原始 Schema 常量未修改。v2 `validate_teacher_output_v2()` 和 `parse_teacher_output_v2()` 仍拒绝重复 `subject_parts`；模型若生成重复部位，将在本地校验阶段失败。
+- 回归测试检查生成请求 Schema 仅缺少 `uniqueItems`、原始常量仍保留该约束、其余关键约束不变，并验证 Validator 与 Parser 拒绝重复部位。Teacher Smoke、Prompt v2、Schema v2 相关 unittest 共 17 项通过；Python 语法检查及 `git diff --check` 通过。
+- 未启动 VLM 或执行推理。其他 vLLM Schema 兼容错误仍按服务端错误明确报出，不会通过移除其他关键字或切换无约束输出来规避。

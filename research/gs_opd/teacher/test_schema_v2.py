@@ -116,6 +116,14 @@ class SafetyIRV2SchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(TeacherOutputV2Error, "non-empty array"):
             validate_teacher_output_v2(payload)
 
+    def test_duplicate_subject_parts_are_rejected_by_validator_and_parser(self) -> None:
+        payload = _valid_output()
+        payload["rules"][0]["subject_parts"] = ["gripper", "gripper"]
+        with self.assertRaisesRegex(TeacherOutputV2Error, "unique robot-part labels"):
+            validate_teacher_output_v2(payload)
+        with self.assertRaisesRegex(TeacherOutputV2Error, "unique robot-part labels"):
+            parse_teacher_output_v2(json.dumps(payload))
+
     def test_illegal_enums_are_rejected(self) -> None:
         invalid_values = (
             ("objects", "role", "person"),
