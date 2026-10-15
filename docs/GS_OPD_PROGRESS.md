@@ -364,3 +364,20 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - 原始 Schema 常量未修改。v2 `validate_teacher_output_v2()` 和 `parse_teacher_output_v2()` 仍拒绝重复 `subject_parts`；模型若生成重复部位，将在本地校验阶段失败。
 - 回归测试检查生成请求 Schema 仅缺少 `uniqueItems`、原始常量仍保留该约束、其余关键约束不变，并验证 Validator 与 Parser 拒绝重复部位。Teacher Smoke、Prompt v2、Schema v2 相关 unittest 共 17 项通过；Python 语法检查及 `git diff --check` 通过。
 - 未启动 VLM 或执行推理。其他 vLLM Schema 兼容错误仍按服务端错误明确报出，不会通过移除其他关键字或切换无约束输出来规避。
+
+## MuJoCo Geometry Inventory 调试工具（2026-10-15）
+
+- Safety Bridge 新增只读 `geometry_inventory` 操作。它枚举当前编译模型的每个 Geom，并返回 `geom_id`、`geom_name`、`body_id`、`body_name` 和 `category`。分类复用 `_robot_body_ids()`：由当前机器人根 Body 和 MuJoCo `body_parentid` 层级判断 `robot` / `scene`；机器人映射或某项归属 Body ID 无法确认时，分类为 `unknown` 并保留错误信息。没有场景名称或固定 Geom ID 清单。
+- 新增 `research/gs_opd/smoke/geometry_inventory_smoke.py`，通过现有本机 Bridge 协议发送 `{"op":"geometry_inventory"}`，将完整响应保存为 JSON。它不 Reset、不 step、不修改仿真状态，也不调用 Teacher。
+- 运行方式：终端 A 按现有命令启动 Safety Bridge；终端 B 执行：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/geometry_inventory_smoke.py \
+    --out /tmp/geometry_inventory.json
+  ```
+
+  服务端需处于已加载模型状态；输出包含清单状态、分类统计和文件路径。
+- 静态语法检查及轻量 fake-model 分类/失败回退验证通过；未启动真实仿真或 VLM，因此当前场景的 Geom 数量、名称及运行时分类尚待人工采集确认。

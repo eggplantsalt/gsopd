@@ -442,6 +442,100 @@ def _robot_body_ids():
     return robot_body_ids
 
 
+def _build_geometry_inventory(
+    model, geom_count, robot_body_ids, robot_classification_error=None
+):
+    """Build a read-only inventory from the active MuJoCo model wrapper."""
+    geometries = []
+    has_lookup_errors = False
+    body_count = int(model._model.nbody)
+
+    for geom_id in range(geom_count):
+        item = {
+            "geom_id": geom_id,
+            "geom_name": None,
+            "body_id": None,
+            "body_name": None,
+            "category": "unknown",
+        }
+        errors = {}
+
+        try:
+            item["geom_name"] = model.geom_id2name(geom_id)
+        except Exception as exc:
+            errors["geom_name"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            body_id = int(model.geom_bodyid[geom_id])
+            item["body_id"] = body_id
+            if 0 <= body_id < body_count:
+                try:
+                    item["body_name"] = model.body_id2name(body_id)
+                except Exception as exc:
+                    errors["body_name"] = f"{type(exc).__name__}: {exc}"
+            else:
+                errors["body_id"] = f"Body ID {body_id} is outside model range"
+
+            if 0 <= body_id < body_count and robot_body_ids is not None:
+                item["category"] = (
+                    "robot" if body_id in robot_body_ids else "scene"
+                )
+        except Exception as exc:
+            errors["body_id"] = f"{type(exc).__name__}: {exc}"
+
+        if errors:
+            item["errors"] = errors
+            has_lookup_errors = True
+        geometries.append(item)
+
+    classification_available = robot_body_ids is not None
+    status = (
+        "complete"
+        if classification_available and not has_lookup_errors
+        else "partial"
+    )
+    result = {
+        "status": status,
+        "robot_classification_status": (
+            "available" if classification_available else "unavailable"
+        ),
+        "geom_count": geom_count,
+        "geometries": geometries,
+    }
+    if robot_classification_error is not None:
+        result["robot_classification_error"] = robot_classification_error
+    return result
+
+
+def _geometry_inventory():
+    """Return current model geometry metadata without changing simulation state."""
+    sim = env.sim
+    try:
+        geom_count = int(sim.model._model.ngeom)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "robot_classification_status": "unavailable",
+            "geom_count": None,
+            "geometries": [],
+            "error": f"Cannot read MuJoCo geometry count: {type(exc).__name__}: {exc}",
+        }
+
+    robot_body_ids = None
+    robot_classification_error = None
+    try:
+        robot_body_ids = _robot_body_ids()
+    except Exception as exc:
+        robot_classification_error = f"{type(exc).__name__}: {exc}"
+
+    return _build_geometry_inventory(
+        sim.model,
+        geom_count,
+        robot_body_ids,
+        robot_classification_error=robot_classification_error,
+    )
+
+
 def _new_contact_monitor():
     robot_body_ids = None
     robot_classification_error = None
@@ -952,6 +1046,20 @@ try:
                         result = {
                             "error": f"Branch rollout failed: {type(exc).__name__}: {exc}",
                             "main_state_restored": None,
+                        }
+                elif request["op"] == "geometry_inventory":
+                    try:
+                        result = _geometry_inventory()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "robot_classification_status": "unavailable",
+                            "geom_count": None,
+                            "geometries": [],
+                            "error": (
+                                "Geometry inventory failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
                         }
                 else:
                     result = {"error": "Unknown operation"}
