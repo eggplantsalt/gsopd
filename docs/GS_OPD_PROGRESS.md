@@ -327,3 +327,10 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - 使用示例：在现有 Teacher Smoke 命令后添加 `--raw-out /tmp/teacher_raw.json`。未提供参数时，不写文件，保留原有输出行为。
 - 终端会输出单次 `generate()` 调用耗时（秒），请求异常时也会输出已耗时间；该计时不包含文件写入与 Schema 校验。
 - 本次只做 Python 语法检查，未连接 Safety Bridge、未调用真实 VLM；实际原始响应保存和耗时输出待配置服务后验证。
+
+### Teacher Smoke 双相机采集（2026-10-15）
+
+- `research/gs_opd/teacher/smoke.py` 新增 `--images-out-dir <目录>`：保存 `agentview_image.png` 与 `robot0_eye_in_hand_image.png`，并写入 `capture_metadata.json`，其中包含原始任务指令、RGB/uint8 信息及各图像的宽高和文件名。
+- PNG 通过 Backend 已有 RGB 编码函数从 Bridge 返回的原始帧编码；没有旋转、裁剪或额外图像预处理。未指定输出目录时不保存图像，现有 `--raw-out`、请求计时及默认 VLM Smoke 路径保持可用。
+- 新增 `--capture-only`；该模式要求同时指定 `--images-out-dir`，读取一次 Bridge Reset 并保存图像/元数据后退出，不创建 VLM Backend、不调用模型或执行 Schema 校验。示例：`python -m research.gs_opd.teacher.smoke --images-out-dir /tmp/gs_opd_capture --capture-only`。
+- 本次仅计划运行 Python 语法检查与 `git diff --check`；不启动 Bridge、不运行 Smoke、不连接真实模型。图像文件的运行时生成与 RGB 像素一致性仍待后续人工运行验证。

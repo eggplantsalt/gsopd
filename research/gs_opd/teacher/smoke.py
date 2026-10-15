@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import time
@@ -14,6 +15,7 @@ from .backend import (
     BackendConfigError,
     RGBFrame,
     TeacherBackendError,
+    _rgb_frame_to_data_url,
     create_backend_from_env,
 )
 from .schema import CAMERA_NAMES, TeacherOutputError, parse_teacher_output
@@ -73,6 +75,38 @@ def _decode_bridge_observation(result: dict[str, Any]) -> tuple[str, list[RGBFra
     return instruction, frames
 
 
+def _save_capture(
+    output_dir: Path, instruction: str, images: list[RGBFrame]
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_metadata = {}
+    for frame in images:
+        data_url = _rgb_frame_to_data_url(frame)
+        header, separator, encoded_png = data_url.partition(",")
+        if header != "data:image/png;base64" or not separator:
+            raise RuntimeError("Backend RGB encoder returned an invalid PNG data URL")
+        filename = f"{frame.camera_name}.png"
+        (output_dir / filename).write_bytes(base64.b64decode(encoded_png))
+        image_metadata[frame.camera_name] = {
+            "file": filename,
+            "width": frame.width,
+            "height": frame.height,
+        }
+
+    metadata = {
+        "instruction": instruction,
+        "color_space": "RGB",
+        "dtype": "uint8",
+        "encoding": "PNG",
+        "images": image_metadata,
+    }
+    (output_dir / "capture_metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="Safety Bridge host")
@@ -82,13 +116,28 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="save the raw VLM response text to this JSON-named file before validation",
     )
+    parser.add_argument(
+        "--images-out-dir",
+        type=Path,
+        help="save the raw RGB camera images and capture metadata in this directory",
+    )
+    parser.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="save the Bridge observation and exit without calling the VLM",
+    )
     args = parser.parse_args(argv)
 
-    try:
-        backend = create_backend_from_env()
-    except BackendConfigError as exc:
-        print(f"Teacher configuration error: {exc}", file=sys.stderr)
-        return 2
+    if args.capture_only and args.images_out_dir is None:
+        parser.error("--capture-only requires --images-out-dir")
+
+    backend = None
+    if not args.capture_only:
+        try:
+            backend = create_backend_from_env()
+        except BackendConfigError as exc:
+            print(f"Teacher configuration error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         connection = Client((args.host, args.port), authkey=AUTHKEY)
@@ -108,6 +157,29 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, RuntimeError) as exc:
         print(f"Teacher Smoke failed: {type(exc).__name__}: {exc}")
         return 1
+
+    if args.images_out_dir is not None:
+        try:
+            capture_metadata = _save_capture(
+                args.images_out_dir, instruction, images
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Cannot save Bridge observation: {type(exc).__name__}: {exc}")
+            return 1
+        print(f"Camera images saved under: {args.images_out_dir}")
+        for camera_name, image_info in capture_metadata["images"].items():
+            print(
+                f"  {camera_name}: {image_info['file']} "
+                f"({image_info['width']}x{image_info['height']}, RGB uint8)"
+            )
+        print(
+            "Task instruction and image sizes saved: "
+            f"{args.images_out_dir / 'capture_metadata.json'}"
+        )
+
+    if args.capture_only:
+        print("Capture-only complete; VLM was not called.")
+        return 0
 
     request_started = time.perf_counter()
     try:
