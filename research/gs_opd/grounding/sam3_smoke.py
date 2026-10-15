@@ -11,7 +11,17 @@ from typing import Any
 from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
 
 
-def _load_processor(checkpoint_path: Path) -> Any:
+def _parse_confidence_threshold(value: str) -> float:
+    try:
+        threshold = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number from 0 to 1") from exc
+    if not 0.0 <= threshold <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1, inclusive")
+    return threshold
+
+
+def _load_processor(checkpoint_path: Path, confidence_threshold: float) -> Any:
     """Load the official SAM 3 image model from a local checkpoint only."""
     import torch
     from sam3.model.sam3_image_processor import Sam3Processor
@@ -23,7 +33,11 @@ def _load_processor(checkpoint_path: Path) -> Any:
         load_from_HF=False,
         device=device,
     )
-    return Sam3Processor(model, device=device)
+    return Sam3Processor(
+        model,
+        device=device,
+        confidence_threshold=confidence_threshold,
+    )
 
 
 def _to_numpy(value: Any):
@@ -94,6 +108,7 @@ def _save_results(
     object_id: str,
     object_name: str,
     checkpoint_path: Path,
+    confidence_threshold: float,
 ) -> dict[str, Any]:
     import numpy as np
     from PIL import Image
@@ -147,6 +162,7 @@ def _save_results(
         "image_width": width,
         "image_height": height,
         "checkpoint": str(checkpoint_path.resolve()),
+        "confidence_threshold": confidence_threshold,
         "candidate_count": len(candidates),
         "selected_candidate": None,
         "candidates": candidates,
@@ -164,6 +180,7 @@ def run_smoke(
     image_path: Path,
     checkpoint_path: Path,
     output_dir: Path,
+    confidence_threshold: float = 0.5,
 ) -> dict[str, Any]:
     import torch
     from PIL import Image
@@ -184,7 +201,7 @@ def run_smoke(
     object_name = matched["name"]
     with Image.open(image_path) as source_image:
         image = source_image.convert("RGB")
-    processor = _load_processor(checkpoint_path)
+    processor = _load_processor(checkpoint_path, confidence_threshold)
     with torch.inference_mode():
         if torch.cuda.is_available():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -209,6 +226,7 @@ def run_smoke(
         object_id=object_id,
         object_name=object_name,
         checkpoint_path=checkpoint_path,
+        confidence_threshold=confidence_threshold,
     )
 
 
@@ -219,6 +237,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--confidence-threshold",
+        type=_parse_confidence_threshold,
+        default=0.5,
+        help="SAM 3 candidate confidence threshold in [0, 1] (default: 0.5)",
+    )
     args = parser.parse_args(argv)
 
     for label, path in (
@@ -236,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             image_path=args.image,
             checkpoint_path=args.checkpoint,
             output_dir=args.out_dir,
+            confidence_threshold=args.confidence_threshold,
         )
     except Exception as exc:
         print(f"SAM 3 Smoke failed: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -430,3 +430,8 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
   print("BF16 and Bool conversion regression: PASS")
   PY
   ```
+
+### SAM 3 置信度阈值参数
+
+- `sam3_smoke.py` 新增 `--confidence-threshold`，默认 `0.5`，只接受闭区间 `[0, 1]`。参数传入 `Sam3Processor(..., confidence_threshold=...)`，并在 `sam3_results.json` 的 `confidence_threshold` 字段记录。
+- CPU mock 检查覆盖默认/自定义阈值传递、结果元数据及越界输入拒绝；语法检查通过。未运行 GPU 推理。
