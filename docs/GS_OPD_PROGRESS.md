@@ -320,3 +320,10 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - 本次源码语法检查通过；没有启动 Safety Bridge、没有连接真实 VLM 服务，也没有执行模型推理 Smoke。
 - 当前环境尚缺 Backend 名称、服务 URL 和模型 ID；需提供一个已运行、可接收两张 `image_url` 图像的 OpenAI-compatible VLM endpoint，并按上表设置配置。若服务要求鉴权，还需配置 API Key。
 - 尚未验证不同 vLLM/SGLang 版本对双图输入、`response_format` 参数和该 JSON Schema Prompt 的兼容性，也未评估模型输出的语义准确率、置信度校准或接触规则质量。下一步先配置真实服务运行 Teacher Smoke，人工审核对象角色、事实/推断边界和 `unknown` 使用情况，再考虑向后续 Compiler 提供输入；当前没有实现视觉分割、物理绑定、Compiler、Repair 或训练逻辑。
+
+### Teacher Smoke 原始响应保存与请求耗时（2026-10-15）
+
+- `research/gs_opd/teacher/smoke.py` 新增可选 `--raw-out <path.json>`。Smoke 只调用一次 `backend.generate()`；成功收到响应后，先按 UTF-8 原文写入指定路径，再调用现有 `parse_teacher_output()`。因此 Schema 校验失败时仍保留完整模型文本。路径的父目录会自动创建；写入失败会明确报告并以失败状态退出。
+- 使用示例：在现有 Teacher Smoke 命令后添加 `--raw-out /tmp/teacher_raw.json`。未提供参数时，不写文件，保留原有输出行为。
+- 终端会输出单次 `generate()` 调用耗时（秒），请求异常时也会输出已耗时间；该计时不包含文件写入与 Schema 校验。
+- 本次只做 Python 语法检查，未连接 Safety Bridge、未调用真实 VLM；实际原始响应保存和耗时输出待配置服务后验证。

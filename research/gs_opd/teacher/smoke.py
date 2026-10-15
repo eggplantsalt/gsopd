@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from multiprocessing.connection import Client
+from pathlib import Path
 from typing import Any
 
 from .backend import (
@@ -14,8 +16,7 @@ from .backend import (
     TeacherBackendError,
     create_backend_from_env,
 )
-from .schema import CAMERA_NAMES, TeacherOutputError
-from .teacher import SafetyTeacher
+from .schema import CAMERA_NAMES, TeacherOutputError, parse_teacher_output
 
 AUTHKEY = b"gs-opd-local"
 
@@ -76,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="Safety Bridge host")
     parser.add_argument("--port", type=int, default=38567, help="Safety Bridge port")
+    parser.add_argument(
+        "--raw-out",
+        type=Path,
+        help="save the raw VLM response text to this JSON-named file before validation",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -99,8 +105,33 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         instruction, images = _decode_bridge_observation(bridge_result)
-        output = SafetyTeacher(backend).analyze(instruction, images)
-    except (TeacherBackendError, TeacherOutputError, ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError) as exc:
+        print(f"Teacher Smoke failed: {type(exc).__name__}: {exc}")
+        return 1
+
+    request_started = time.perf_counter()
+    try:
+        raw_output = backend.generate(instruction, images)
+    except (TeacherBackendError, ValueError, RuntimeError) as exc:
+        elapsed_s = time.perf_counter() - request_started
+        print(f"VLM request elapsed: {elapsed_s:.3f}s")
+        print(f"Teacher Smoke failed: {type(exc).__name__}: {exc}")
+        return 1
+    elapsed_s = time.perf_counter() - request_started
+    print(f"VLM request elapsed: {elapsed_s:.3f}s")
+
+    if args.raw_out is not None:
+        try:
+            args.raw_out.parent.mkdir(parents=True, exist_ok=True)
+            args.raw_out.write_text(raw_output, encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Cannot save raw Teacher output to {args.raw_out}: {exc}")
+            return 1
+        print(f"Raw Teacher output saved: {args.raw_out}")
+
+    try:
+        output = parse_teacher_output(raw_output)
+    except (TeacherOutputError, ValueError) as exc:
         print(f"Teacher Smoke failed: {type(exc).__name__}: {exc}")
         return 1
 
