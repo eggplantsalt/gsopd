@@ -487,3 +487,22 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
   可选地增加 `--compare-rgb /path/to/existing_forward_rgb.png`；输入应是与 SAM 3 一致的 180° 正向 RGB，并且场景状态、相机和渲染条件相同才预期逐像素匹配。
 - Python 语法检查及 mock 写图/旋转一致性/正向 RGB 匹配与不匹配轻量测试通过；`git diff --check` 通过。未启动真实仿真或 GPU/模型推理，真实 GL segmentation 输出仍待人工运行验证。
+
+## SAM 3 × MuJoCo 物理实例 IoU 匹配 Smoke（2026-10-16）
+
+- 新增独立 `research/gs_opd/grounding/sam3_mujoco_iou_smoke.py`。它读取 SAM 3 `sam3_results.json` 中所有候选 Mask 和原始 score、`geom_ids_rotated_180.npy` 及 `geom_metadata.json`，检查 SAM 实际输入 RGB 与元数据中的 180° 正向 RGB 尺寸相同且逐像素相同，并校验 Geom ID 方向、可见 ID 清单及像素计数。尺寸、方向或输入图像不匹配时明确失败。
+- 以 Geom 元数据中的 owning `body_id` 聚合同一 Body 下的可见 Geom，计算所有 Candidate 对每个 Body 组的 IoU 矩阵。默认 `--min-iou 0.1`，仅唯一且非零、达到阈值的最大 IoU 标为 `matched_by_iou`；零重叠、并列、空 Mask 或低于阈值保留 `unresolved`。每候选保留 SAM 原始 score、所有对象 IoU、最佳重叠对象的 Body/Geom ID 和分数，并保存 SAM Mask 与最佳物理重叠区域的并排叠加图。SAM score 不参与匹配，也不用于推断 Teacher 对象身份。
+- 当前 Geom capture metadata 没有 Body parent links，因此只合并共享同一 owning Body ID 的 Geom；不会猜测跨多个 Body 的关节连接对象属于同一个实例。输出 JSON 会明确记录此限制。该 Smoke 不做语义消歧、IoU 之外的身份判断或 Compiler。
+- 运行示例（SAM 结果中的 `image` 必须是该 Geom capture 的正向 RGB，且文件内容严格一致）：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/grounding/sam3_mujoco_iou_smoke.py \
+    --sam3-results /path/to/sam3_output/sam3_results.json \
+    --geom-ids /path/to/geom_capture/geom_ids_rotated_180.npy \
+    --geom-metadata /path/to/geom_capture/geom_metadata.json \
+    --out-dir /path/to/sam3_mujoco_iou
+  ```
+
+- 输出 `sam3_mujoco_iou_results.json`（含完整 IoU 矩阵和 unresolved 原因）及每个候选的 `candidate_NNN_iou_comparison.png`。新增标准库 `unittest` 覆盖同 Body Geom 聚合、完整矩阵、低 SAM score 仍按 IoU 匹配、高分但无重叠时 unresolved、坐标方向及像素不一致拒绝。3 项测试、语法检查和 `git diff --check` 通过；未运行 SAM 3 推理或真实 MuJoCo 环境。
