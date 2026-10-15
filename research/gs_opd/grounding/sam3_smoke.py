@@ -31,6 +31,10 @@ def _to_numpy(value: Any):
 
     if hasattr(value, "detach"):
         value = value.detach()
+        import torch
+
+        if value.dtype == torch.bfloat16:
+            value = value.to(dtype=torch.float32)
     if hasattr(value, "cpu"):
         value = value.cpu()
     if hasattr(value, "numpy"):

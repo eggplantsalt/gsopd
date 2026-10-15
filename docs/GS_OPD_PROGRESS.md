@@ -407,3 +407,26 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 - `sam3_smoke.py::run_smoke()` 将 `processor.set_image()` 和 `set_text_prompt()` 放入同一个 `torch.inference_mode()` 区域；CUDA 可用时再包入 `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`，CPU 路径仅使用 inference mode。
 - 本次已通过 Python 语法检查；未加载模型、运行 GPU 推理或修改 SAM 3 官方代码、权重及环境。
+
+### BF16 Tensor 转 NumPy 修复
+
+- `_to_numpy()` 对 PyTorch Tensor 先 detach；仅当 dtype 为 `torch.bfloat16` 时转为 `torch.float32`，然后继续转 CPU/NumPy。其他 dtype 原样处理，包括保持 Bool Mask 为 NumPy `bool`。
+- 已运行 CPU 侧轻量回归检查，覆盖 BF16 数值和 NumPy dtype，以及 Bool Mask dtype/值保持；未启动 GPU 推理。
+- 可复现检查命令：
+
+  ```bash
+  PYTHONPATH=/workspace/zy_workspace/RLinf \
+    /workspace/zy_workspace/envs/gsopd_sam3/bin/python - <<'PY'
+  import numpy as np
+  import torch
+  from research.gs_opd.grounding.sam3_smoke import _to_numpy
+
+  values = _to_numpy(torch.tensor([1.25, -2.5], dtype=torch.bfloat16))
+  assert values.dtype == np.float32
+  np.testing.assert_allclose(values, [1.25, -2.5])
+  mask = _to_numpy(torch.tensor([[True, False]], dtype=torch.bool))
+  assert mask.dtype == np.bool_
+  np.testing.assert_array_equal(mask, [[True, False]])
+  print("BF16 and Bool conversion regression: PASS")
+  PY
+  ```
