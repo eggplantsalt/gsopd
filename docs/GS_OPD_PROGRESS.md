@@ -506,3 +506,29 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
   ```
 
 - 输出 `sam3_mujoco_iou_results.json`（含完整 IoU 矩阵和 unresolved 原因）及每个候选的 `candidate_NNN_iou_comparison.png`。新增标准库 `unittest` 覆盖同 Body Geom 聚合、完整矩阵、低 SAM score 仍按 IoU 匹配、高分但无重叠时 unresolved、坐标方向及像素不一致拒绝。3 项测试、语法检查和 `git diff --check` 通过；未运行 SAM 3 推理或真实 MuJoCo 环境。
+
+## VLM 语义 Candidate 消歧 Smoke（2026-10-16）
+
+- 新增独立 `research/gs_opd/grounding/vlm_semantic_disambiguation_smoke.py`。输入为 Safety IR v2 JSON、目标 `object_id`、SAM 3 结果和对应 IoU 结果。Safety IR 由现有 v2 Parser 校验；读取 SAM 结果记录的原始 RGB 与候选 Mask，并在图像上绘出候选 Mask 及其 `candidate_index` 编号。
+- 调用现有 `create_backend_from_env()` 配置的 OpenAI-compatible Teacher Backend transport，附带真实 annotated RGB 和 Teacher 对象的名称、角色、视觉事实、推断、不确定性及相关接触规则。VLM 请求使用独立 JSON Schema，输出严格限定为 `object_id`、`candidate_index`、`reason`、`status`；`candidate_index` 只能是已有候选编号或 null。VLM 不会收到 SAM score、IoU、Body/Geom ID 或物理对象名称，也不以 SAM 最高分代替语义判断。原始 VLM 文本先保存，再进行本地严格校验。
+- VLM 只有返回 `resolved` 且引用有效候选时，Smoke 才读取该候选已有的 IoU `best_match` 并附加 Body/Geom ID。若 IoU 本身 unresolved，语义 Candidate 结果仍保留，但物理关联继续标记 unresolved；VLM 也可返回 unresolved 和 null Candidate。
+- 运行前需配置已有 Teacher Backend 环境变量：`GS_OPD_TEACHER_BACKEND=openai_compatible`、`GS_OPD_TEACHER_BASE_URL`、`GS_OPD_TEACHER_MODEL`；若服务启用鉴权，再配置 `GS_OPD_TEACHER_API_KEY`。实际运行命令（模型名和 URL 替换为当前已启动服务的配置）：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  export GS_OPD_TEACHER_BACKEND=openai_compatible
+  export GS_OPD_TEACHER_BASE_URL=http://127.0.0.1:8000/v1
+  export GS_OPD_TEACHER_MODEL=your-served-vlm-model
+  # 服务要求鉴权时，设置实际 API Key；按需设置 GS_OPD_TEACHER_ENABLE_THINKING=0 或 1。
+
+  PYTHONPATH=/workspace/zy_workspace/RLinf \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    -m research.gs_opd.grounding.vlm_semantic_disambiguation_smoke \
+    --teacher-json /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0_raw.json \
+    --object-id object_4 \
+    --sam3-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_smoke_512/sam3_results.json \
+    --iou-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_mujoco_iou/sam3_mujoco_iou_results.json \
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4
+  ```
+
+- 以上 Teacher/SAM/IoU 输入文件在本地存在，SAM 与 IoU 的 Candidate/图像坐标关联通过轻量输入审计，当前 `object_4` 名称为 `small metal bowl`。新增 3 项 mock unittest，覆盖单次 Backend 请求、结构化 Schema/非法候选拒绝、unresolved 行为、成功后 Body/Geom 关联，并验证 VLM Prompt 不含 SAM score 或 MuJoCo 名称。单元测试、语法检查和 `git diff --check` 通过；未调用真实 VLM。
