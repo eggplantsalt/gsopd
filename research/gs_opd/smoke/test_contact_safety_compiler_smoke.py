@@ -169,6 +169,38 @@ class ContactSafetyCompilerSmokeTest(unittest.TestCase):
             "other_robot_part_target_contact",
         )
 
+    def test_valid_unrelated_contact_involving_gripper_is_ignored(self):
+        teacher, semantic, branch, geometry, gripper = self._fixtures()
+        geometry["geom_count"] = 4
+        geometry["geometries"].append(
+            {
+                "geom_id": 3,
+                "geom_name": "unrelated_scene_geom",
+                "body_id": 21,
+                "body_name": "unrelated_scene_body",
+                "category": "scene",
+            }
+        )
+        monitor = branch["candidates"][0]["contact_monitoring"]
+        event = monitor["events"][0]
+        event["geom_pair"] = [
+            {"id": 0, "name": "finger_geom"},
+            {"id": 3, "name": "unrelated_scene_geom"},
+        ]
+        event["body_pair"] = [
+            {"id": 10, "name": "gripper_body"},
+            {"id": 21, "name": "unrelated_scene_body"},
+        ]
+
+        result = compile_forbid_contact(
+            teacher, "object_4", semantic, branch, geometry, gripper
+        )
+        self.assertEqual(result["status"], "safe")
+        self.assertEqual(
+            result["candidates"][0]["reason"],
+            "complete_substep_monitoring_found_no_gripper_target_contact",
+        )
+
     def test_incomplete_monitoring_or_missing_gripper_identity_is_unknown(self):
         teacher, semantic, branch, geometry, gripper = self._fixtures()
         branch["candidates"][0]["contact_monitoring"]["status"] = "incomplete"

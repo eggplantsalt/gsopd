@@ -566,7 +566,7 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 - 新增 `research/gs_opd/smoke/contact_safety_compiler_smoke.py`，目前只识别 Safety IR v2 中显式的 `predicate=contact`、`decision=forbid`、`subject_parts=["gripper"]`、`phase=any` 规则。不会从 `avoid_object` 等角色推导禁令；无规则、规则冲突/不支持、目标语义未解析或 Body/Geom 绑定不一致时输出 `unknown`。
 - 复用现有语义消歧 JSON 的 `physical_association`，并在当前 Bridge 会话查询现有 `geometry_inventory`，核对目标 Body/Geom ID 和名称确属当前 scene 模型。为了精确区分手爪与机械臂其他部分，Safety Bridge 只新增只读 `gripper_geometry_inventory`：通过当前 robosuite gripper model 的 `contact_geoms` 名称及模型 `geom_name2id()` 得到精确 Geom ID，并核实其所属 Body 在机器人层级中；不按名称前缀推断。若任一夹爪几何身份无法完整确认，规则判定为 `unknown`。
-- Smoke 在同一 Bridge 连接内获取几何清单、创建 Snapshot，并调用原有 `branch_rollout` 接口执行用户传入的候选动作序列；不重写或拆分动作执行。只有主状态恢复、机器人 Body 分类可用、每个已执行控制步的物理子步采集完整、没有 unavailable 子步且所有 Contact pair 身份可与当前模型核对时，未观察到夹爪-目标 Body 接触才判为本规则的 `safe`。精确的 gripper Geom 与绑定目标 Body 接触输出 `violation` 和首次控制步/物理子步、接触次数、Contact pair 及可用最大力证据；其他机器人部位与目标接触单独列出，不计作夹爪违规。整体结果按候选汇总：任一已证明违规即 `violation`，所有候选均完整安全才 `safe`，其余为 `unknown`。
+- Smoke 在同一 Bridge 连接内获取几何清单、创建 Snapshot，并调用原有 `branch_rollout` 接口执行用户传入的候选动作序列；不重写或拆分动作执行。只有主状态恢复、机器人 Body 分类可用、每个已执行控制步的物理子步采集完整、没有 unavailable 子步且所有 Contact pair 身份可与当前模型核对时，未观察到夹爪-目标 Body 接触才判为本规则的 `safe`。精确的 gripper Geom 与绑定目标 Body 接触输出 `violation` 和首次控制步/物理子步、接触次数、Contact pair 及可用最大力证据；其他机器人部位与目标接触单独列出，不计作夹爪违规。双方都不属于绑定目标 Body 的有效接触事件会被忽略，即使其中一方是 gripper Geom；身份不一致仍会使判定为 `unknown`。整体结果按候选汇总：任一已证明违规即 `violation`，所有候选均完整安全才 `safe`，其余为 `unknown`。
 - 结果范围仅是已编译的 `forbid contact(gripper, object_id)` 规则，不代表其他安全规则或未执行动作安全。输出包括 `contact_safety_compiler_results.json`、Bridge 当前完整 Geom 清单、夹爪 Geom 清单及所用 `branch_rollout_result.json`。测试覆盖精确夹爪接触、机械臂其他部位接触、完整无接触记录、监控缺失、夹爪身份不完整；未启动 Bridge 或执行仿真。
 - 使用 `object_4` 的当前 v2/语义结果做实际实验时，先在 LIBERO-Safety 环境启动 Bridge：
 
@@ -604,4 +604,4 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
     --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/contact_safety_compiler_object_4
   ```
 
-- 5 项轻量 unittest、Python 语法检查和 `git diff --check` 通过；仅使用 mock Bridge/联系记录验证编译逻辑，没有运行真实分支 Rollout。真实模型下的 gripper Geom 查询和 Contact 判定待按上面的命令验证。
+- 6 项轻量 unittest、Python 语法检查和 `git diff --check` 通过；测试包含有效的非目标物体接触（含 gripper Geom）应被忽略。仅使用 mock Bridge/联系记录验证编译逻辑，没有运行真实分支 Rollout。真实模型下的 gripper Geom 查询和 Contact 判定待按上面的命令验证。

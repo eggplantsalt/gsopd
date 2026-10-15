@@ -401,8 +401,6 @@ def _inspect_contact_event(
 
     target_side = next((index for index in (0, 1) if body_ids[index] == object_body_id), None)
     if target_side is None:
-        if any(geom_id in gripper_geom_to_body for geom_id in geom_ids):
-            return None, None, "gripper_contact_event_does_not_match_target_body"
         return None, None, None
     gripper_side = 1 - target_side
     gripper_geom_id = geom_ids[gripper_side]
