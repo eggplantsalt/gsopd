@@ -169,6 +169,11 @@ def _set_mujoco_integration_state(sim, state):
         )
     mujoco.mj_setState(model, data, state, state_spec)
     sim.forward()
+    # mj_forward recomputes derived quantities and can also update integration
+    # inputs such as qacc_warmstart while solving constraints. Reapply the saved
+    # integration state after forward so restoring does not silently replace
+    # state captured at the snapshot boundary.
+    mujoco.mj_setState(model, data, state, state_spec)
 
 
 def _capture_task_object_properties(task_env):
@@ -343,6 +348,189 @@ def _snapshot_diagnostics():
         "object_states": object_states,
     }
 
+
+def _collect_contacts():
+    """Return MuJoCo contacts without conflating no contact with unavailable data."""
+    sim = env.sim
+    try:
+        contact_count = int(sim.data.ncon)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "contacts": [],
+            "error": f"Cannot read MuJoCo contact count: {type(exc).__name__}: {exc}",
+        }
+
+    if contact_count == 0:
+        return {"status": "no_contact", "contacts": []}
+
+    contacts = []
+    for contact_index in range(contact_count):
+        try:
+            contact = sim.data.contact[contact_index]
+            geom1_id = int(contact.geom1)
+            geom2_id = int(contact.geom2)
+            geom1_name = sim.model.geom_id2name(geom1_id)
+            geom2_name = sim.model.geom_id2name(geom2_id)
+            body1_id = int(sim.model.geom_bodyid[geom1_id])
+            body2_id = int(sim.model.geom_bodyid[geom2_id])
+            body1_name = sim.model.body_id2name(body1_id)
+            body2_name = sim.model.body_id2name(body2_id)
+            item = {
+                "contact_index": contact_index,
+                "geom1": {"id": geom1_id, "name": geom1_name},
+                "geom2": {"id": geom2_id, "name": geom2_name},
+                "body1": {"id": body1_id, "name": body1_name},
+                "body2": {"id": body2_id, "name": body2_name},
+                "position": np.asarray(contact.pos, dtype=np.float64).tolist(),
+            }
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "contacts": contacts,
+                "error": (
+                    f"Cannot inspect MuJoCo contact {contact_index}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
+        # mj_contactForce only has a solver force when this contact has an
+        # address in the constraint system. Keep the geometric contact record
+        # even when its force cannot be queried.
+        try:
+            efc_address = int(contact.efc_address)
+            if efc_address < 0:
+                raise RuntimeError("contact has no constraint force address")
+            force = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(
+                sim.model._model,
+                sim.data._data,
+                contact_index,
+                force,
+            )
+            item["force_status"] = "available"
+            item["force_frame"] = "contact"
+            item["force_and_torque"] = force.tolist()
+        except Exception as exc:
+            item["force_status"] = "unavailable"
+            item["force_frame"] = None
+            item["force_and_torque"] = None
+            item["force_error"] = f"{type(exc).__name__}: {exc}"
+        contacts.append(item)
+
+    return {"status": "contact", "contacts": contacts}
+
+
+def _normalize_branch_candidates(raw_candidates):
+    if not isinstance(raw_candidates, (list, tuple)):
+        raise ValueError("candidates must be a list of candidate action sequences")
+
+    normalized = []
+    seen_ids = set()
+    for candidate_index, candidate in enumerate(raw_candidates):
+        if isinstance(candidate, dict):
+            candidate_id = candidate.get("candidate_id", f"candidate-{candidate_index}")
+            raw_actions = candidate.get("actions")
+        else:
+            candidate_id = f"candidate-{candidate_index}"
+            raw_actions = candidate
+
+        if isinstance(candidate_id, bool) or not isinstance(candidate_id, (str, int)):
+            raise ValueError(
+                f"candidate {candidate_index} candidate_id must be a string or integer"
+            )
+        id_key = (type(candidate_id).__name__, str(candidate_id))
+        if id_key in seen_ids:
+            raise ValueError(f"Duplicate candidate_id: {candidate_id!r}")
+        seen_ids.add(id_key)
+
+        try:
+            actions = np.asarray(raw_actions, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"candidate {candidate_id!r} actions must be a numeric array"
+            ) from exc
+        if actions.ndim != 2 or actions.shape[1:] != (7,) or actions.shape[0] == 0:
+            raise ValueError(
+                f"candidate {candidate_id!r} actions must have shape (steps, 7) "
+                "with at least one step"
+            )
+        if not np.isfinite(actions).all():
+            raise ValueError(f"candidate {candidate_id!r} contains a non-finite action")
+        normalized.append(
+            {
+                "candidate_id": candidate_id,
+                "actions": [action.copy() for action in actions],
+            }
+        )
+    return normalized
+
+
+def _branch_rollout(snapshot_id, raw_candidates):
+    global obs, last_reward, last_done
+
+    if not isinstance(snapshot_id, str) or snapshot_id not in snapshots:
+        raise ValueError(f"Unknown snapshot_id: {snapshot_id!r}")
+    candidates = _normalize_branch_candidates(raw_candidates)
+    target_snapshot = snapshots[snapshot_id]
+
+    # Capture the caller's live state before touching the simulator. Every
+    # candidate restores target_snapshot, and this finally block restores the
+    # state that was active when branch_rollout was requested.
+    main_snapshot = _capture_snapshot()
+    result = {
+        "snapshot_id": snapshot_id,
+        "candidates": [],
+        "main_state_restored": False,
+    }
+    try:
+        for candidate in candidates:
+            candidate_result = {
+                "candidate_id": candidate["candidate_id"],
+                "status": "ok",
+                "requested_steps": len(candidate["actions"]),
+                "executed_steps": 0,
+                "steps": [],
+            }
+            try:
+                _restore_snapshot(target_snapshot)
+                candidate_result["start_state"] = _snapshot_diagnostics()
+                for action_index, action in enumerate(candidate["actions"]):
+                    obs, reward, done, _info = env.step(action)
+                    last_reward = reward
+                    last_done = done
+                    state = _snapshot_diagnostics()
+                    contacts = _collect_contacts()
+                    candidate_result["steps"].append(
+                        {
+                            "step_index": action_index,
+                            "action": action.tolist(),
+                            "reward": float(reward),
+                            "done": bool(done),
+                            "state": state,
+                            "contacts": contacts,
+                        }
+                    )
+                    candidate_result["executed_steps"] += 1
+                    if done:
+                        break
+            except Exception as exc:
+                candidate_result["status"] = "error"
+                candidate_result["error"] = f"{type(exc).__name__}: {exc}"
+            result["candidates"].append(candidate_result)
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            _restore_snapshot(main_snapshot)
+            result["main_state_restored"] = True
+        except Exception as exc:
+            result["main_state_restored"] = False
+            result["main_restore_error"] = f"{type(exc).__name__}: {exc}"
+
+    return result
+
+
 def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
     images = {}
     for k in ("agentview_image", "robot0_eye_in_hand_image"):
@@ -431,6 +619,17 @@ try:
                             result["restored_snapshot_id"] = snapshot_id
                         except Exception as exc:
                             result = {"error": f"Restore failed: {type(exc).__name__}: {exc}"}
+                elif request["op"] == "branch_rollout":
+                    try:
+                        result = _branch_rollout(
+                            request.get("snapshot_id"),
+                            request.get("candidates"),
+                        )
+                    except Exception as exc:
+                        result = {
+                            "error": f"Branch rollout failed: {type(exc).__name__}: {exc}",
+                            "main_state_restored": None,
+                        }
                 else:
                     result = {"error": "Unknown operation"}
 
