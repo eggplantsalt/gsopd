@@ -1,3 +1,4 @@
+import argparse
 import os
 from pathlib import Path
 from multiprocessing.connection import Client
@@ -10,6 +11,44 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from rlinf.models import get_model
 from rlinf.envs.sim.libero.utils import get_libero_image, get_libero_wrist_image, quat2axisangle
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--video-out",
+        type=Path,
+        help="Optional MP4 path for the agentview rollout video.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=240,
+        help="Maximum number of environment actions to execute (default: 240).",
+    )
+    parser.add_argument(
+        "--trace-out",
+        type=Path,
+        help="Optional NPZ path for on-policy rollout transitions.",
+    )
+    args = parser.parse_args()
+    if args.max_steps < 0:
+        parser.error("--max-steps must be zero or greater")
+    if args.video_out is not None and args.video_out.suffix != ".mp4":
+        parser.error("--video-out must use the .mp4 extension")
+    if args.trace_out is not None and args.trace_out.suffix != ".npz":
+        parser.error("--trace-out must use the .npz extension")
+    return args
+
+
+def get_video_frame(data):
+    image = data["images"]["agentview_image"]
+    frame = np.frombuffer(image["data"], dtype=image["dtype"])
+    frame = frame.reshape(image["shape"]).copy()
+    return np.ascontiguousarray(get_libero_image({"agentview_image": frame}))
+
+
+args = parse_args()
 
 ckpt = Path("/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft")
 assert (ckpt / "model.safetensors").is_file(), f"Checkpoint missing: {ckpt}"
@@ -41,9 +80,36 @@ start = time.monotonic()
 try:
     conn.send({"op": "reset"})
     data = conn.recv()
+    trace_writer = None
+    if args.trace_out is not None:
+        import sys
+
+        repo_root = str(Path(__file__).resolve().parents[3])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from research.gs_opd.data.trajectory_writer import TrajectoryWriter
+
+        trace_writer = TrajectoryWriter(
+            args.trace_out,
+            {
+                "suite": "obstacle_avoidance",
+                "level": 0,
+                "task_id": 0,
+                "instruction": data["instruction"],
+                "checkpoint_path": str(ckpt),
+                "checkpoint_file": str(ckpt / "model.safetensors"),
+                "max_steps": args.max_steps,
+                "camera_resolution": 256,
+                "env_seed": 0,
+                "initial_state_index": 0,
+            },
+        )
+    video_frames = [] if args.video_out is not None else None
+    if video_frames is not None:
+        video_frames.append(get_video_frame(data))
     print("TASK:", data["instruction"], flush=True)
 
-    while steps < 240 and not done and not success:
+    while steps < args.max_steps and not done and not success:
         obs = {
             k: np.frombuffer(v["data"], dtype=v["dtype"]).reshape(v["shape"]).copy()
             for k, v in data["images"].items()
@@ -72,20 +138,47 @@ try:
         chunk = actions[0].detach().float().cpu().numpy()
         assert chunk.ndim == 2 and chunk.shape[1] == 7
         assert np.isfinite(chunk).all()
+        chunk_index = chunks
+        if trace_writer is not None:
+            trace_writer.add_decision(chunk_index, steps, data, chunk)
         chunks += 1
 
-        for action in chunk:
+        for action_index, action in enumerate(chunk):
             conn.send({"op": "step", "action": action.tolist()})
             data = conn.recv()
             steps += 1
+            if trace_writer is not None:
+                trace_writer.add_step(
+                    step_index=steps - 1,
+                    chunk_index=chunk_index,
+                    action_index=action_index,
+                    action=action,
+                    bridge_data=data,
+                )
+            if video_frames is not None:
+                video_frames.append(get_video_frame(data))
             success = success or data["reward"] > 0
             done = bool(data["done"])
 
             if steps % 20 == 0 or success or done:
                 print(f"STEP={steps} REWARD={data['reward']} DONE={done} SUCCESS={success}", flush=True)
 
-            if steps >= 240 or done or success:
+            if steps >= args.max_steps or done or success:
                 break
+
+    if args.video_out is not None:
+        from rlinf.envs.utils import save_rollout_video
+
+        save_rollout_video(
+            video_frames,
+            str(args.video_out.parent),
+            args.video_out.stem,
+        )
+        print("VIDEO:", args.video_out, flush=True)
+
+    if trace_writer is not None:
+        trace_writer.save(steps=steps, chunks=chunks)
+        print("TRACE:", args.trace_out, flush=True)
 
     result = {
         "suite": "obstacle_avoidance",
