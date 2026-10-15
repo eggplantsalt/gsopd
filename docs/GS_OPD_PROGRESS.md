@@ -381,3 +381,24 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
   服务端需处于已加载模型状态；输出包含清单状态、分类统计和文件路径。
 - 静态语法检查及轻量 fake-model 分类/失败回退验证通过；未启动真实仿真或 VLM，因此当前场景的 Geom 数量、名称及运行时分类尚待人工采集确认。
+
+## SAM 3 文本提示分割 Smoke（2026-10-15）
+
+- 新增 `research/gs_opd/grounding/sam3_smoke.py`。脚本使用 v2 Validator 读取 `--teacher-json`，按 `--object-id` 精确查找对象，再将其语义 `name` 传给 SAM 3 文本提示；Object ID 不传给模型。
+- 调用指定 SAM 3 安装中的官方 `build_sam3_image_model(checkpoint_path=..., load_from_HF=False)`、`Sam3Processor.set_image()` 和 `set_text_prompt()`。默认根据 PyTorch CUDA 可用性选择设备；不会下载权重。每个返回候选分别保存二值 Mask PNG、原图叠加 PNG，并在 `sam3_results.json` 记录分数、像素坐标框、掩码面积及路径。零候选时记录 `status: no_candidates` 和空列表，`selected_candidate` 始终为 `null`。
+- 实际运行命令（输出路径可按需替换）：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/RLinf \
+    /workspace/zy_workspace/envs/gsopd_sam3/bin/python \
+    research/gs_opd/grounding/sam3_smoke.py \
+    --teacher-json /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0_raw.json \
+    --object-id object_1 \
+    --image /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0/agentview_image.png \
+    --checkpoint /workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt \
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_smoke
+  ```
+
+- 上述输入文件均已在本地检查存在，Teacher JSON 通过 v2 Validator，`object_1` 当前对应 `akita black bowl`；对应图像 capture metadata 的指令是“pick up the akita black bowl on the stove and place it on the plate”。
+- 当前只进行语法和 mock 结果保存/零候选轻量测试；未加载 SAM 3、启动 GPU 推理或修改 Python 环境。真实候选数量、Mask 质量与叠加图待人工运行检查；候选是模型输出，不代表已确认的物理对象对应关系。
