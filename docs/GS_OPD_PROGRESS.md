@@ -402,3 +402,8 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 - 上述输入文件均已在本地检查存在，Teacher JSON 通过 v2 Validator，`object_1` 当前对应 `akita black bowl`；对应图像 capture metadata 的指令是“pick up the akita black bowl on the stove and place it on the plate”。
 - 当前只进行语法和 mock 结果保存/零候选轻量测试；未加载 SAM 3、启动 GPU 推理或修改 Python 环境。真实候选数量、Mask 质量与叠加图待人工运行检查；候选是模型输出，不代表已确认的物理对象对应关系。
+
+### SAM 3 CUDA BF16 推理上下文修复
+
+- `sam3_smoke.py::run_smoke()` 将 `processor.set_image()` 和 `set_text_prompt()` 放入同一个 `torch.inference_mode()` 区域；CUDA 可用时再包入 `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`，CPU 路径仅使用 inference mode。
+- 本次已通过 Python 语法检查；未加载模型、运行 GPU 推理或修改 SAM 3 官方代码、权重及环境。

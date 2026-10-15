@@ -161,6 +161,7 @@ def run_smoke(
     checkpoint_path: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
+    import torch
     from PIL import Image
 
     teacher_output = parse_teacher_output_v2(
@@ -180,9 +181,18 @@ def run_smoke(
     with Image.open(image_path) as source_image:
         image = source_image.convert("RGB")
     processor = _load_processor(checkpoint_path)
-    state = processor.set_image(image)
-    # Only the Teacher object's semantic name is sent to SAM 3 as its prompt.
-    output = processor.set_text_prompt(state=state, prompt=object_name)
+    with torch.inference_mode():
+        if torch.cuda.is_available():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                state = processor.set_image(image)
+                # Only the Teacher object's semantic name is sent to SAM 3.
+                output = processor.set_text_prompt(
+                    state=state, prompt=object_name
+                )
+        else:
+            state = processor.set_image(image)
+            # Only the Teacher object's semantic name is sent to SAM 3.
+            output = processor.set_text_prompt(state=state, prompt=object_name)
     masks, boxes, scores = _normalize_predictions(output, image.size)
     return _save_results(
         image=image,
