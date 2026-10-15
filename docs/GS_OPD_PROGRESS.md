@@ -533,3 +533,31 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
   ```
 
 - 以上 Teacher/SAM/IoU 输入文件在本地存在，SAM 与 IoU 的 Candidate/图像坐标关联通过轻量输入审计，当前 `object_4` 名称为 `small metal bowl`。mock unittest 覆盖单次 Backend 请求、双图顺序与像素内容、原图逐像素保真、候选内部不填色、标注免责声明、结构化 Schema/非法候选拒绝、unresolved 行为及成功后的 Body/Geom 关联。3 项单元测试、Python 语法检查和 `git diff --check` 通过；未调用真实 VLM。旧输出目录保持不变，可直接与 `...object_4_raw_outline_ab` 对照。
+
+## Teacher 视觉定位点 Smoke（2026-10-16）
+
+- 新增独立 `research/gs_opd/grounding/teacher_visual_point_smoke.py`。脚本读取并校验 Safety IR v2、目标 `object_id`、用户指定的 180° 正向原始 RGB、SAM 3 Mask 和 MuJoCo IoU 结果；要求传入 RGB 与 SAM 输入图像及 IoU 来源 Geom capture 的正向 RGB 逐像素一致，且尺寸/坐标方向元数据吻合。
+- 现有 Teacher Backend 只收到目标对象的名称、角色、可见事实、推断、不确定性、相关 Safety IR 规则和单张未标注原始 RGB。请求的 JSON Schema 只约束 `status,x,y,reason`，不传 Candidate 编号、Mask、分数、IoU、Body/Geom ID 或物理对象名称。`x,y` 是左上角原点、范围 `[0,1]` 的归一化坐标；`located` 必须给出两个有限坐标，`unresolved` 必须令两者均为 null。收到响应后先保存原文，再进行严格字段/坐标校验。
+- Smoke 将坐标以 `round-half-up` 映射到 `(width-1,height-1)` 像素索引；仅当该像素落在唯一一个 SAM Mask 内，且该候选 IoU 状态为 `matched_by_iou`、Body/Geom 元数据内部一致时，才返回 `resolved` 和 Candidate/Body/Geom ID。Mask 无命中、多个 Mask 重叠、物理匹配 unresolved 或 Teacher 点位 unresolved 都保留整体 `unresolved`。输出定位点原图可视化、原始 VLM 文本、结构化 JSON；可选 `--semantic-result` 将点位映射 Candidate 与既有消歧结果 Candidate/物理 ID 作一致性对照。
+- 对当前 `object_4`，已有最新轮廓辅助消歧结果为 Candidate 1（Body 26 / Geom 167）；先前填色图版本曾选择 Candidate 0。下面命令把新定位点结果与最新轮廓版本做对照；不会覆盖两份历史消歧输出。模型 URL/名称需与当前已启动 Teacher 服务一致：
+
+  ```bash
+  cd /workspace/zy_workspace/RLinf
+  export GS_OPD_TEACHER_BACKEND=openai_compatible
+  export GS_OPD_TEACHER_BASE_URL=http://127.0.0.1:8000/v1
+  export GS_OPD_TEACHER_MODEL=your-served-vlm-model
+  # 服务启用鉴权时设置 GS_OPD_TEACHER_API_KEY；Thinking 可按服务配置为 0 或 1。
+
+  PYTHONPATH=/workspace/zy_workspace/RLinf \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    -m research.gs_opd.grounding.teacher_visual_point_smoke \
+    --teacher-json /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0_raw.json \
+    --object-id object_4 \
+    --image /workspace/zy_workspace/RLinf/logs/gs_opd/highres_capture/agentview_512_rotated_180.png \
+    --sam3-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_smoke_512/sam3_results.json \
+    --iou-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_mujoco_iou/sam3_mujoco_iou_results.json \
+    --semantic-result /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4_raw_outline_ab/semantic_disambiguation.json \
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/teacher_visual_point_object_4
+  ```
+
+- 3 项轻量 unittest 覆盖严格响应解析、VLM 请求只包含语义和单张原图、唯一 Mask 命中且物理匹配成功、重叠 Mask 和物理匹配 unresolved 时不输出选择，以及与既有 Candidate/Body/Geom 对照；语法检查及 `git diff --check` 通过。对本地 `object_4` 输入做了无模型的文件/尺寸/坐标关联审计：`small metal bowl`、512×512、4 个 Mask，现有轮廓辅助消歧结果为 Candidate 1。未调用真实 VLM 或运行耗时推理。
