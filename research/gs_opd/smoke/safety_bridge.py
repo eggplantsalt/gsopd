@@ -536,6 +536,114 @@ def _geometry_inventory():
     )
 
 
+def _gripper_geometry_inventory():
+    """Resolve collision Geom IDs from robosuite's active gripper models."""
+    sim = env.sim
+    robot_body_ids = None
+    robot_body_error = None
+    try:
+        robot_body_ids = _robot_body_ids()
+    except Exception as exc:
+        robot_body_error = f"{type(exc).__name__}: {exc}"
+
+    grippers = []
+    for robot_index, robot in enumerate(env.robots):
+        gripper_value = getattr(robot, "gripper", None)
+        if isinstance(gripper_value, dict):
+            gripper_items = list(gripper_value.items())
+        else:
+            gripper_items = [(None, gripper_value)]
+
+        for arm_name, gripper in gripper_items:
+            entry = {
+                "robot_index": robot_index,
+                "arm": arm_name,
+                "model_class": (
+                    f"{type(gripper).__module__}.{type(gripper).__qualname__}"
+                    if gripper is not None
+                    else None
+                ),
+                "status": "unavailable",
+                "geometries": [],
+                "errors": [],
+            }
+            if gripper is None:
+                entry["errors"].append("robot has no gripper model")
+                grippers.append(entry)
+                continue
+
+            try:
+                geom_names = gripper.contact_geoms
+            except Exception as exc:
+                entry["errors"].append(
+                    f"Cannot read gripper contact_geoms: {type(exc).__name__}: {exc}"
+                )
+                grippers.append(entry)
+                continue
+
+            if not isinstance(geom_names, (list, tuple)) or not geom_names:
+                entry["errors"].append("gripper model has no contact geom names")
+                grippers.append(entry)
+                continue
+
+            seen_geom_ids = set()
+            for geom_name in geom_names:
+                if not isinstance(geom_name, str) or not geom_name:
+                    entry["errors"].append(f"invalid gripper contact geom name: {geom_name!r}")
+                    continue
+                try:
+                    geom_id = int(sim.model.geom_name2id(geom_name))
+                    if geom_id < 0 or geom_id >= int(sim.model._model.ngeom):
+                        raise ValueError(f"Geom ID {geom_id} is outside the active model")
+                    actual_name = sim.model.geom_id2name(geom_id)
+                    if actual_name != geom_name:
+                        raise ValueError(
+                            f"name lookup returned {actual_name!r} for {geom_name!r}"
+                        )
+                    body_id = int(sim.model.geom_bodyid[geom_id])
+                    if robot_body_ids is None or body_id not in robot_body_ids:
+                        raise ValueError(
+                            f"gripper geom {geom_name!r} does not map to a confirmed robot body"
+                        )
+                    if geom_id in seen_geom_ids:
+                        continue
+                    seen_geom_ids.add(geom_id)
+                    entry["geometries"].append(
+                        {
+                            "geom_id": geom_id,
+                            "geom_name": actual_name,
+                            "body_id": body_id,
+                            "body_name": sim.model.body_id2name(body_id),
+                        }
+                    )
+                except Exception as exc:
+                    entry["errors"].append(
+                        f"Cannot map gripper geom {geom_name!r}: {type(exc).__name__}: {exc}"
+                    )
+            if entry["geometries"] and not entry["errors"]:
+                entry["status"] = "complete"
+            elif not entry["errors"]:
+                entry["errors"].append("no gripper contact Geom IDs were resolved")
+            grippers.append(entry)
+
+    complete = bool(grippers) and robot_body_ids is not None and all(
+        item["status"] == "complete" for item in grippers
+    )
+    result = {
+        "status": "complete" if complete else "partial" if grippers else "unavailable",
+        "robot_classification_status": (
+            "available" if robot_body_ids is not None else "unavailable"
+        ),
+        "robot_body_ids": sorted(robot_body_ids) if robot_body_ids is not None else None,
+        "model_body_count": int(sim.model._model.nbody),
+        "model_geom_count": int(sim.model._model.ngeom),
+        "grippers": grippers,
+    }
+    if robot_body_error is not None:
+        result["robot_classification_error"] = robot_body_error
+    return result
+
+
 def _render_highres():
     """Render the existing primary camera without advancing or rebuilding sim."""
     sim = env.sim
@@ -1269,6 +1377,22 @@ try:
                             "geometries": [],
                             "error": (
                                 "Geometry inventory failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+                elif request["op"] == "gripper_geometry_inventory":
+                    try:
+                        result = _gripper_geometry_inventory()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "robot_classification_status": "unavailable",
+                            "robot_body_ids": None,
+                            "model_body_count": None,
+                            "model_geom_count": None,
+                            "grippers": [],
+                            "error": (
+                                "Gripper geometry inventory failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
                         }
