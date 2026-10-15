@@ -24,10 +24,15 @@ from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
 
 
 SYSTEM_PROMPT = """You perform visual semantic disambiguation for robot manipulation.
-Use the supplied Teacher object description and the actual annotated RGB image.
-The integer labels point to SAM segmentation candidates. Decide which numbered
-candidate, if any, visually depicts the requested semantic object. Do not infer
-identity from segmentation confidence, simulator names, or hidden physical IDs.
+Use the supplied Teacher object description and both supplied views of the same
+RGB frame. The first image is the unmodified original RGB and is the only source
+for judging genuine object appearance, including color and material. The second
+image adds thin candidate boundaries and integer labels only to help locate SAM
+segmentation candidates. These artificial boundaries and labels are not visual
+evidence and must never be used to judge color, material, or object appearance.
+Decide which numbered candidate, if any, visually depicts the requested
+semantic object. Do not infer identity from segmentation confidence, simulator
+names, or hidden physical IDs.
 If the image is ambiguous, occluded, or no candidate depicts the object, return
 unresolved and candidate_index=null. Never guess. Return only the required JSON.
 """
@@ -232,13 +237,7 @@ def _candidate_color(index: int) -> tuple[int, int, int]:
 
 
 def _annotate_candidates(rgb: np.ndarray, candidates: list[dict], output_path: Path) -> np.ndarray:
-    annotated = rgb.astype(np.float32).copy()
-    for candidate in candidates:
-        mask = candidate["mask"]
-        color = np.asarray(_candidate_color(candidate["candidate_index"]), dtype=np.float32)
-        annotated[mask] = 0.52 * annotated[mask] + 0.48 * color
-    annotated = np.clip(annotated, 0, 255).astype(np.uint8)
-    image = Image.fromarray(annotated)
+    image = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(image)
     for candidate in candidates:
         index = candidate["candidate_index"]
@@ -253,9 +252,13 @@ def _annotate_candidates(rgb: np.ndarray, candidates: list[dict], output_path: P
             label_x = 3
             label_y = 3 + 18 * index
         label = str(index)
-        bbox = draw.textbbox((label_x, label_y), label)
-        draw.rectangle(bbox, fill=color, outline=(255, 255, 255), width=1)
-        draw.text((label_x, label_y), label, fill=(0, 0, 0), stroke_width=0)
+        draw.text(
+            (label_x, label_y),
+            label,
+            fill=color,
+            stroke_width=2,
+            stroke_fill=(0, 0, 0),
+        )
     image.save(output_path)
     return np.asarray(image, dtype=np.uint8)
 
@@ -282,12 +285,17 @@ def _build_user_prompt(target: dict, teacher: dict, candidate_indices: list[int]
     context = _teacher_object_context(target, teacher)
     return (
         "Determine whether the Teacher object shown below corresponds to one of "
-        "the numbered colored segmentation regions in the attached original RGB image.\n"
+        "the numbered candidate regions in the two attached views of one RGB frame.\n"
         "Teacher object semantics (Safety IR v2):\n"
         f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Candidate indices shown in the image: {candidate_indices}\n"
-        "Use the visible object appearance and the supplied name/description. The "
-        "numbers only label image regions. They do not rank candidates. Return "
+        "Image 1 is the completely unmodified original RGB; use it to judge genuine "
+        "appearance, including color and material. Image 2 is the same frame with "
+        "thin candidate boundaries and numbers added only to locate regions. The "
+        "numbers and boundaries are artificial location aids, not appearance "
+        "evidence, and must not be used to judge color or material. Use the visible "
+        "appearance in Image 1 together with the supplied name/description. The "
+        "numbers do not rank candidates. Return "
         "resolved with the matching candidate index only when visual evidence is "
         "clear; otherwise return unresolved with candidate_index null. Give a short reason."
     )
@@ -390,19 +398,30 @@ def _validate_physical_match(iou_result: dict, physical_objects: dict) -> dict:
     }
 
 
-def _request_vlm(backend: Any, prompt: str, rgb: np.ndarray, object_id: str, candidate_indices: list[int]) -> str:
+def _request_vlm(
+    backend: Any,
+    prompt: str,
+    original_rgb: np.ndarray,
+    annotated_rgb: np.ndarray,
+    object_id: str,
+    candidate_indices: list[int],
+) -> str:
     required = ("model", "temperature", "max_tokens", "_post_payload")
     if any(not hasattr(backend, name) for name in required):
         raise TeacherBackendError(
             "This Smoke requires the configured OpenAI-compatible Teacher Backend"
         )
-    height, width = rgb.shape[:2]
-    frame = RGBFrame(
-        camera_name="agentview_image",
-        width=width,
-        height=height,
-        rgb_bytes=np.ascontiguousarray(rgb).tobytes(),
-    )
+    frames = []
+    for rgb in (original_rgb, annotated_rgb):
+        height, width = rgb.shape[:2]
+        frames.append(
+            RGBFrame(
+                camera_name="agentview_image",
+                width=width,
+                height=height,
+                rgb_bytes=np.ascontiguousarray(rgb).tobytes(),
+            )
+        )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -410,8 +429,20 @@ def _request_vlm(backend: Any, prompt: str, rgb: np.ndarray, object_id: str, can
             "content": [
                 {"type": "text", "text": prompt},
                 {
+                    "type": "text",
+                    "text": "Image 1: completely unmodified original RGB; use this image for color and material evidence.",
+                },
+                {
                     "type": "image_url",
-                    "image_url": {"url": _rgb_frame_to_data_url(frame)},
+                    "image_url": {"url": _rgb_frame_to_data_url(frames[0])},
+                },
+                {
+                    "type": "text",
+                    "text": "Image 2: same RGB with thin candidate boundaries and numbers added only as location aids; do not use these markings for color or material judgments.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _rgb_frame_to_data_url(frames[1])},
                 },
             ],
         },
@@ -452,6 +483,8 @@ def run_smoke(
     sam_results = loaded["sam"]
     iou_results = loaded["iou"]
     output_dir.mkdir(parents=True, exist_ok=True)
+    original_path = output_dir / "original_rgb.png"
+    Image.fromarray(rgb.copy()).save(original_path)
     annotated_path = output_dir / "numbered_candidates.png"
     annotated_rgb = _annotate_candidates(rgb, candidates, annotated_path)
     candidate_indices = [item["candidate_index"] for item in candidates]
@@ -470,7 +503,7 @@ def run_smoke(
         prompt = _build_user_prompt(target, teacher, candidate_indices)
         started = time.perf_counter()
         raw_output = _request_vlm(
-            backend, prompt, annotated_rgb, object_id, candidate_indices
+            backend, prompt, rgb, annotated_rgb, object_id, candidate_indices
         )
         elapsed_s = time.perf_counter() - started
         if not isinstance(raw_output, str):
@@ -527,7 +560,9 @@ def run_smoke(
             else None
         ),
         "physical_association": association,
+        "original_rgb_image": original_path.name,
         "annotated_image": annotated_path.name,
+        "visual_input_mode": "unmodified_original_rgb_plus_thin_candidate_boundaries_and_numbers",
         "sam3_results": str(sam3_results_path.resolve()),
         "iou_results": str(iou_results_path.resolve()),
         "teacher_json": str(teacher_json.resolve()),

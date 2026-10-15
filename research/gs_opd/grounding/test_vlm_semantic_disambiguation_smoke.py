@@ -1,5 +1,7 @@
 """Mocked tests for the VLM semantic disambiguation Smoke."""
 
+import base64
+import io
 import json
 import tempfile
 import unittest
@@ -172,8 +174,21 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
             self.assertEqual(result["physical_association"]["geom_ids"], [11, 12])
             self.assertEqual(result["status"], "resolved")
             self.assertTrue((out_dir / "numbered_candidates.png").is_file())
+            self.assertTrue((out_dir / "original_rgb.png").is_file())
             self.assertTrue((out_dir / "semantic_disambiguation_raw.txt").is_file())
             self.assertTrue((out_dir / "semantic_disambiguation.json").is_file())
+
+            with Image.open(teacher.parent / "forward_rgb.png") as image:
+                original_rgb = np.asarray(image.convert("RGB"))
+            with Image.open(out_dir / "original_rgb.png") as image:
+                saved_rgb = np.asarray(image.convert("RGB"))
+            np.testing.assert_array_equal(saved_rgb, original_rgb)
+            with Image.open(out_dir / "numbered_candidates.png") as image:
+                annotated_rgb = np.asarray(image.convert("RGB"))
+            # Away from the number glyph, the candidate interior remains the
+            # original pixel; only its thin perimeter and label are drawn.
+            np.testing.assert_array_equal(annotated_rgb[14, 4], original_rgb[14, 4])
+            self.assertFalse(np.array_equal(annotated_rgb[8, 7], original_rgb[8, 7]))
 
             payload = backend.calls[0]
             self.assertEqual(payload["response_format"]["type"], "json_schema")
@@ -182,10 +197,25 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
             prompt_text = content[0]["text"]
             self.assertIn("yellow mug", prompt_text)
             self.assertIn("Candidate indices shown in the image: [0]", prompt_text)
+            self.assertIn("completely unmodified original RGB", prompt_text)
+            self.assertIn("must not be used to judge color or material", prompt_text)
             self.assertNotIn("0.61", prompt_text)
             self.assertNotIn("0.72", prompt_text)
             self.assertNotIn("physical_body_name", prompt_text)
-            self.assertEqual(content[1]["type"], "image_url")
+            self.assertEqual(content[1]["type"], "text")
+            self.assertEqual(content[2]["type"], "image_url")
+            self.assertEqual(content[3]["type"], "text")
+            self.assertEqual(content[4]["type"], "image_url")
+            self.assertIn("Image 1", content[1]["text"])
+            self.assertIn("Image 2", content[3]["text"])
+            image_arrays = []
+            for content_index in (2, 4):
+                data_url = content[content_index]["image_url"]["url"]
+                encoded = data_url.partition(",")[2]
+                with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+                    image_arrays.append(np.asarray(image.convert("RGB")))
+            np.testing.assert_array_equal(image_arrays[0], original_rgb)
+            np.testing.assert_array_equal(image_arrays[1], annotated_rgb)
 
     def test_unresolved_decision_does_not_attach_physical_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:

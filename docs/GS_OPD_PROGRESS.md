@@ -509,10 +509,11 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 ## VLM 语义 Candidate 消歧 Smoke（2026-10-16）
 
-- 新增独立 `research/gs_opd/grounding/vlm_semantic_disambiguation_smoke.py`。输入为 Safety IR v2 JSON、目标 `object_id`、SAM 3 结果和对应 IoU 结果。Safety IR 由现有 v2 Parser 校验；读取 SAM 结果记录的原始 RGB 与候选 Mask，并在图像上绘出候选 Mask 及其 `candidate_index` 编号。
-- 调用现有 `create_backend_from_env()` 配置的 OpenAI-compatible Teacher Backend transport，附带真实 annotated RGB 和 Teacher 对象的名称、角色、视觉事实、推断、不确定性及相关接触规则。VLM 请求使用独立 JSON Schema，输出严格限定为 `object_id`、`candidate_index`、`reason`、`status`；`candidate_index` 只能是已有候选编号或 null。VLM 不会收到 SAM score、IoU、Body/Geom ID 或物理对象名称，也不以 SAM 最高分代替语义判断。原始 VLM 文本先保存，再进行本地严格校验。
+- 新增独立 `research/gs_opd/grounding/vlm_semantic_disambiguation_smoke.py`。输入为 Safety IR v2 JSON、目标 `object_id`、SAM 3 结果和对应 IoU 结果。Safety IR 由现有 v2 Parser 校验；读取 SAM 结果记录的原始 RGB 与候选 Mask，并标出 `candidate_index`。
+- 当前视觉输入为两张同尺寸图：`original_rgb.png` 是按输入 RGB 像素原样保存的原图；`numbered_candidates.png` 仅覆盖 1 像素候选轮廓和候选编号文字，不填充候选内部。两张图在同一次 VLM 请求中发送。Prompt 明确规定编号和轮廓只是定位辅助、属于人工标注，不能用于颜色、材质或外观判断；这些判断只能依据未修改原图。Teacher 对象描述、SAM 候选编号、Backend 配置、响应 Schema 和物理关联逻辑与既有实现相同。
+- 调用现有 `create_backend_from_env()` 配置的 OpenAI-compatible Teacher Backend transport，附带 Teacher 对象的名称、角色、视觉事实、推断、不确定性及相关接触规则。VLM 请求使用独立 JSON Schema，输出严格限定为 `object_id`、`candidate_index`、`reason`、`status`；`candidate_index` 只能是已有候选编号或 null。VLM 不会收到 SAM score、IoU、Body/Geom ID 或物理对象名称，也不以 SAM 最高分代替语义判断。原始 VLM 文本先保存，再进行本地严格校验。
 - VLM 只有返回 `resolved` 且引用有效候选时，Smoke 才读取该候选已有的 IoU `best_match` 并附加 Body/Geom ID。若 IoU 本身 unresolved，语义 Candidate 结果仍保留，但物理关联继续标记 unresolved；VLM 也可返回 unresolved 和 null Candidate。
-- 运行前需配置已有 Teacher Backend 环境变量：`GS_OPD_TEACHER_BACKEND=openai_compatible`、`GS_OPD_TEACHER_BASE_URL`、`GS_OPD_TEACHER_MODEL`；若服务启用鉴权，再配置 `GS_OPD_TEACHER_API_KEY`。实际运行命令（模型名和 URL 替换为当前已启动服务的配置）：
+- 为与先前错误选择 Candidate 0 的运行进行单变量对照，继续使用相同 Teacher JSON、`object_4`、SAM/IoU 文件及 VLM 服务配置；本次使用新的输出目录，保留此前结果不被覆盖。运行前需配置已有 Teacher Backend 环境变量：`GS_OPD_TEACHER_BACKEND=openai_compatible`、`GS_OPD_TEACHER_BASE_URL`、`GS_OPD_TEACHER_MODEL`；若服务启用鉴权，再配置 `GS_OPD_TEACHER_API_KEY`。实际运行命令（模型名和 URL 替换为当前已启动服务的配置）：
 
   ```bash
   cd /workspace/zy_workspace/RLinf
@@ -528,7 +529,7 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
     --object-id object_4 \
     --sam3-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_smoke_512/sam3_results.json \
     --iou-results /workspace/zy_workspace/RLinf/logs/gs_opd/sam3_mujoco_iou/sam3_mujoco_iou_results.json \
-    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4_raw_outline_ab
   ```
 
-- 以上 Teacher/SAM/IoU 输入文件在本地存在，SAM 与 IoU 的 Candidate/图像坐标关联通过轻量输入审计，当前 `object_4` 名称为 `small metal bowl`。新增 3 项 mock unittest，覆盖单次 Backend 请求、结构化 Schema/非法候选拒绝、unresolved 行为、成功后 Body/Geom 关联，并验证 VLM Prompt 不含 SAM score 或 MuJoCo 名称。单元测试、语法检查和 `git diff --check` 通过；未调用真实 VLM。
+- 以上 Teacher/SAM/IoU 输入文件在本地存在，SAM 与 IoU 的 Candidate/图像坐标关联通过轻量输入审计，当前 `object_4` 名称为 `small metal bowl`。mock unittest 覆盖单次 Backend 请求、双图顺序与像素内容、原图逐像素保真、候选内部不填色、标注免责声明、结构化 Schema/非法候选拒绝、unresolved 行为及成功后的 Body/Geom 关联。3 项单元测试、Python 语法检查和 `git diff --check` 通过；未调用真实 VLM。旧输出目录保持不变，可直接与 `...object_4_raw_outline_ab` 对照。
