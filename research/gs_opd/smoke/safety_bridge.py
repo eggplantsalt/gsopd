@@ -602,6 +602,151 @@ def _render_highres():
     }
 
 
+def _decode_geom_segmentation(object_segmentation, geom_count, geom_object_type):
+    """Convert robosuite's (MuJoCo object type, object id) image to Geom IDs."""
+    object_segmentation = np.asarray(object_segmentation)
+    if (
+        object_segmentation.ndim != 3
+        or object_segmentation.shape[2] != 2
+        or not np.issubdtype(object_segmentation.dtype, np.integer)
+    ):
+        raise RuntimeError(
+            "Unsupported robosuite segmentation result; expected integer "
+            f"HxWx2 object-type/object-id array, got "
+            f"shape={object_segmentation.shape}, dtype={object_segmentation.dtype}"
+        )
+
+    object_types = object_segmentation[:, :, 0]
+    object_ids = object_segmentation[:, :, 1]
+    geom_pixels = object_types == geom_object_type
+    invalid_geom_pixels = geom_pixels & (
+        (object_ids < 0) | (object_ids >= geom_count)
+    )
+    if np.any(invalid_geom_pixels):
+        bad_id = int(object_ids[invalid_geom_pixels][0])
+        raise RuntimeError(
+            f"Segmentation returned invalid Geom ID {bad_id}; model has "
+            f"{geom_count} Geoms"
+        )
+
+    background_pixels = (object_types == -1) & (object_ids == -1)
+    geom_ids = np.full(object_ids.shape, -2, dtype=np.int32)
+    geom_ids[background_pixels] = -1
+    geom_ids[geom_pixels] = object_ids[geom_pixels].astype(np.int32)
+    return geom_ids
+
+
+def _render_geom_segmentation():
+    """Capture same-state RGB and object segmentation from the primary camera."""
+    sim = env.sim
+    if getattr(sim, "_render_context_offscreen", None) is None:
+        raise RuntimeError(
+            "Offscreen render context is not initialized; refusing to create one "
+            "because its constructor calls sim.forward()"
+        )
+
+    render_context = sim._render_context_offscreen
+    visual_global = sim.model.vis.global_
+    old_offscreen_size = (visual_global.offwidth, visual_global.offheight)
+    old_camera_state = (render_context.cam.type, render_context.cam.fixedcamid)
+    state_before = _mujoco_integration_state(sim).copy()
+    try:
+        rgb_before = np.ascontiguousarray(
+            sim.render(
+                width=512,
+                height=512,
+                camera_name="agentview",
+                depth=False,
+                segmentation=False,
+            )
+        )
+        object_segmentation = sim.render(
+            width=512,
+            height=512,
+            camera_name="agentview",
+            depth=False,
+            segmentation=True,
+        )
+        rgb_after = np.ascontiguousarray(
+            sim.render(
+                width=512,
+                height=512,
+                camera_name="agentview",
+                depth=False,
+                segmentation=False,
+            )
+        )
+    finally:
+        visual_global.offwidth, visual_global.offheight = old_offscreen_size
+        render_context.cam.type, render_context.cam.fixedcamid = old_camera_state
+
+    state_after = _mujoco_integration_state(sim)
+    if not np.array_equal(state_before, state_after, equal_nan=True):
+        raise RuntimeError(
+            "MuJoCo integration state changed during Geom segmentation render"
+        )
+    if rgb_before.shape != (512, 512, 3) or rgb_before.dtype != np.uint8:
+        raise RuntimeError(
+            "Unexpected RGB render result: "
+            f"shape={rgb_before.shape}, dtype={rgb_before.dtype}"
+        )
+    if rgb_after.shape != rgb_before.shape or not np.array_equal(rgb_before, rgb_after):
+        raise RuntimeError(
+            "RGB output changed across the segmentation render; pixel alignment "
+            "cannot be confirmed"
+        )
+
+    geom_count = int(sim.model._model.ngeom)
+    geom_ids = _decode_geom_segmentation(
+        object_segmentation,
+        geom_count=geom_count,
+        geom_object_type=int(mujoco.mjtObj.mjOBJ_GEOM),
+    )
+    visible_geom_ids = np.unique(geom_ids[geom_ids >= 0]).tolist()
+    visible_geoms = []
+    for geom_id in visible_geom_ids:
+        body_id = int(sim.model.geom_bodyid[geom_id])
+        visible_geoms.append(
+            {
+                "geom_id": int(geom_id),
+                "geom_name": sim.model.geom_id2name(int(geom_id)),
+                "body_id": body_id,
+                "body_name": sim.model.body_id2name(body_id),
+                "pixel_count": int(np.count_nonzero(geom_ids == geom_id)),
+            }
+        )
+
+    rgb = np.ascontiguousarray(rgb_before)
+    geom_ids = np.ascontiguousarray(geom_ids, dtype=np.int32)
+
+    def image_payload(image):
+        return {
+            "shape": tuple(image.shape),
+            "dtype": str(image.dtype),
+            "data": image.tobytes(),
+        }
+
+    return {
+        "camera_name": "agentview",
+        "width": 512,
+        "height": 512,
+        "color_space": "RGB",
+        "render_api": "env.sim.render",
+        "rgb_segmentation_pixel_consistency": True,
+        "physical_state_unchanged": True,
+        "geom_id_background_value": -1,
+        "non_geom_object_value": -2,
+        "model_geom_count": geom_count,
+        "background_pixel_count": int(np.count_nonzero(geom_ids == -1)),
+        "non_geom_pixel_count": int(np.count_nonzero(geom_ids == -2)),
+        "visible_geoms": visible_geoms,
+        "images": {
+            "rgb": image_payload(rgb),
+            "geom_ids": image_payload(geom_ids),
+        },
+    }
+
+
 def _new_contact_monitor():
     robot_body_ids = None
     robot_classification_error = None
@@ -1134,6 +1279,16 @@ try:
                         result = {
                             "error": (
                                 "High-resolution render failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        }
+                elif request["op"] == "geom_segmentation":
+                    try:
+                        result = _render_geom_segmentation()
+                    except Exception as exc:
+                        result = {
+                            "error": (
+                                "Geom segmentation render failed: "
                                 f"{type(exc).__name__}: {exc}"
                             )
                         }

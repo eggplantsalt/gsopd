@@ -460,3 +460,29 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
   ```
 
 - Bridge 与客户端语法检查及 fake render / mocked Bridge 写图测试通过；未启动仿真或模型推理。真实 GL 渲染、图像质量及运行时 integration state 比较仍待人工执行验证。
+
+## MuJoCo Geom ID 分割图采集（2026-10-16）
+
+- Safety Bridge 新增只读 `geom_segmentation` 操作，复用启动时已经存在的 offscreen renderer，从当前 `agentview` 直接渲染 512×512 RGB 和 robosuite 的 MuJoCo object segmentation。segmentation 的每像素 `(object_type, object_id)` 仅在类型为 `mjOBJ_GEOM` 时解码为模型 Geom ID；`(-1, -1)` 是背景并写为 `-1`，其他可见非 Geom 对象写为 `-2`，不会误报成背景。可见 Geom 元数据动态包含 Geom ID/名称、所属 Body ID/名称和像素数。
+- 不创建 renderer、不调用 Reset、step 或 forward。Bridge 在渲染前后比较 MuJoCo integration state；并在 segmentation 渲染前后再次渲染 RGB，要求 512×512 RGB 数组逐像素一致，否则拒绝返回采集结果。渲染期间修改的 framebuffer 尺寸和临时相机选择会恢复。客户端另可用 `--compare-rgb` 与现有 RGB PNG 做严格逐像素比较；图像尺寸不符或像素不一致会保存诊断结果后以失败状态退出。
+- 新增 `research/gs_opd/smoke/geom_segmentation_capture.py`，输出 `agentview_512_rgb.png`、`geom_ids.npy`、`geom_segmentation_overlay.png` 和 `geom_metadata.json`。Overlay 按真实 Geom ID 着色，背景保留 RGB，非 Geom 像素用洋红提示；该工具只记录几何分割，不做对象名称匹配、IoU 或安全判断。
+- 两个终端运行方式：
+
+  ```bash
+  # 终端 A：启动 Safety Bridge 和已加载的 LIBERO-Safety 环境
+  cd /workspace/zy_workspace/RLinf
+  PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+    /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/safety_bridge.py
+  ```
+
+  ```bash
+  # 终端 B：采集当前 agentview 的 RGB 和 Geom ID 分割图
+  cd /workspace/zy_workspace/RLinf
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+    research/gs_opd/smoke/geom_segmentation_capture.py \
+    --out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/geom_segmentation
+  ```
+
+  可选地增加 `--compare-rgb /path/to/existing_agentview_512.png`；只有场景状态、相机和渲染条件相同才预期逐像素匹配。
+- Python 语法检查、Geom/背景/非 Geom 解码、fake renderer 状态与渲染配置恢复，以及客户端 PNG/NPY 写入和 RGB 匹配/不匹配轻量测试通过；`git diff --check` 通过。未启动真实仿真或 GPU/模型推理，真实 GL segmentation 输出仍待人工运行验证。
