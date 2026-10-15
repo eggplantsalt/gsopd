@@ -342,3 +342,10 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 - v1 相机、role、visibility 和 robot-part 枚举在新模块中独立定义并保持同值。解析器拒绝重复 JSON 键和 NaN/Infinity。`unknown` 保持原值；Schema 不按 role 合成规则。
 - 新增 `research/gs_opd/teacher/test_schema_v2.py`，只依赖 Python 标准库 `unittest`。仓库 Python 执行 `python -m unittest -v research.gs_opd.teacher.test_schema_v2`：10 项通过；`python -m py_compile research/gs_opd/teacher/schema_v2.py research/gs_opd/teacher/test_schema_v2.py` 与 `git diff --check` 均通过。
 - 本次仅验证离线 Schema/Validator；没有调用 VLM、MuJoCo，也未改变 v1 行为。v2 尚未接入 Prompt 或服务端约束生成流程。
+
+## GS-OPD Safety IR v2 Teacher Prompt
+
+- 新增 `research/gs_opd/teacher/prompt_v2.py`，提供独立 `SYSTEM_PROMPT` 和 `build_user_prompt(task_instruction, camera_names)`；从 `schema_v2.py` 读取版本及枚举，明确列出全部顶层、object、visual fact、inference 和 rule 字段，与 v2 JSON Schema 对齐。
+- Prompt 要求从双相机和任务语义识别环境对象、使用本地语义 ID、区分 visual facts / inferences / uncertainties，并排除机器人本体与 MuJoCo ID。接触规则仅表达机器人部位到环境物体的 contact；目标抓取、放置关系、非目标意外碰撞分别说明；证据不足保留 `unknown`，不按非目标角色自动生成禁令。
+- 新增标准库 unittest `research/gs_opd/teacher/test_prompt_v2.py`，3 项测试通过：`python -m unittest -v research.gs_opd.teacher.test_prompt_v2`。Prompt 和测试文件语法检查、`git diff --check` 均通过。
+- 未调用真实 VLM，未修改或接入现有 v1 Prompt、Backend、Schema、Smoke 或 Bridge；v2 Prompt 的实际模型输出尚未验证。
