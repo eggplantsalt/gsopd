@@ -634,3 +634,41 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
     --semantic-result /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4_raw_outline_ab/semantic_disambiguation.json \
     --probe-out-dir /workspace/zy_workspace/RLinf/logs/gs_opd/pi05_first_chunk_contact_probe_object_4
   ```
+
+## π₀.₅ → LIBERO-Safety 7 维动作链路审计（2026-10-16）
+
+### 动作传递与归一化
+
+1. `research/gs_opd/smoke/pi05_rollout.py:259-277` 组装 EEF state/camera/task 输入，调用 `predict_action_batch(..., mode="eval")`，取 batch 0 并断言动作形状为 `[T, 7]`。`pi05_rollout.py:295-297` 对每行直接 `.tolist()` 发给 Bridge；Rollout 不在这里再缩放、裁剪或改写动作。`T` 为 5：评测配置 `evaluations/libero/libero_spatial_openpi_pi05_smoke.yaml` 设置 `num_action_chunks: 5`；OpenPI `pi05_libero` 的网络 horizon 为 10，但运行时 output transform 按 `action_chunk=5` 截取前五行。
+2. `rlinf/models/embodiment/openpi/tasks/eval.py:77-78` 将环境 observation 送入 Pi0Eval；`rlinf/models/embodiment/openpi/env_io.py:87-100` 在 `decode_actions()` 调用输出 pipeline 并将结果作为 float32 env actions 返回。pipeline 在 `rlinf/models/embodiment/openpi/transforms/pipeline.py:102-105` 按顺序执行模型输出 transform、`Unnormalize(norm_stats)` 和数据集输出 transform。该 checkpoint 对应 `pi05_libero`：`rlinf/models/embodiment/openpi/dataconfig/__init__.py:107-116` 指定 Pi0.5、10 步 horizon、`extra_delta_transform=False`；OpenPI 创建数据配置时按非 PI0 模型启用 quantile normalization（`VLA-Arena/vla_arena/models/openpi/src/openpi/training/config.py:219-232`）。因此这里的返回动作已从模型归一化空间反变换，后续不是再对归一化模型输出做修正。
+3. LIBERO 输出 transform `rlinf/models/embodiment/openpi/policies/libero_policy.py:104-118` 只保留动作前 7 维；本配置的 `extra_delta_transform=False`，不会再对前六维套用 `AbsoluteActions`。checkpoint 的实际统计文件为 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/physical-intelligence/libero/norm_stats.json`，其 quantile 反变换使用每维 `q01/q99`。前七维 q01→q99 为：`[-0.7152, 1.0217]`、`[-0.8907, 1.0487]`、`[-2.1055, 0.7261]`、`[-3.3144, -1.4901]`、`[-2.4146, 2.7202]`、`[-0.6158, 1.1151]`、`[-1.0000, 0.9996]`。这些是统计反变换的端点，不是输出裁剪范围；OpenPI `Unnormalize` 不负责把结果限制到 robosuite 控制范围。
+4. `research/gs_opd/smoke/safety_bridge.py:1319-1326` 的 `step` 分支将请求向量转为 `np.float32` 后调用 `env.step(action)`；LIBERO `bddl_base_domain.py:1251-1261` 只有 action_dim 为 4 时才重排成 OSC_POSITION 命令，当前 7 维路径原样进入 robosuite。`robot_env.py:558-584` 按机器人 action_dim 分发，Panda `single_arm.py:236-245` 将前 6 维交给 OSC_POSE、最后一维交给 gripper。robosuite `base.py:378-393` 在一次 20 Hz 控制步内重复 25 次 2 ms 物理子步；控制器 set_goal 只在首个子步更新，期间反复运行控制器。
+
+### 7 维含义、坐标系与范围
+
+| 维度 | 当前 LIBERO/Panda 路径含义 | 坐标/单位 | 当前控制范围及后处理 |
+| --- | --- | --- | --- |
+| 0 | EEF 目标位置增量 X | MuJoCo world frame，米 | OSC 输入先 clip 到 `[-1, 1]`，再按本地 `robosuite/controllers/config/osc_pose.json:3-6` 映射到 `[-2, 2]` 米；`set_goal_position()` 将该增量加到当前 world `site_xpos`。 |
+| 1 | EEF 目标位置增量 Y | MuJoCo world frame，米 | 同维 0。 |
+| 2 | EEF 目标位置增量 Z | MuJoCo world frame，米 | 同维 0。 |
+| 3 | 旋转增量 axis-angle X 分量 | world/spatial 旋转向量，弧度 | OSC 输入 clip `[-1, 1]` 后按当前 JSON 映射到 `[-2, 2]` rad/分量；姿态目标无额外 orientation limit。 |
+| 4 | 旋转增量 axis-angle Y 分量 | world/spatial 旋转向量，弧度 | 同维 3。 |
+| 5 | 旋转增量 axis-angle Z 分量 | world/spatial 旋转向量，弧度 | 同维 3。 |
+| 6 | Panda gripper 开合方向命令 | 无量纲，输入 `[-1, 1]` | `PandaGripper.format_action()` 用符号决定开/合，幅值不是夹爪宽度；其 `current_action` 每次调用以 0.01 增减并饱和到 `[-1, 1]`，再映射到夹爪执行器控制范围。 |
+
+- 几何和坐标结论依据：`single_arm.py` 的 EEF observable 从 `sim.data.site_xpos`/world EEF orientation 取状态；`osc.py:234-237` 调用 `scale_action()`；`osc.py:202-245` 在 `control_delta=True` 时把前三维作为位置 delta、后三维作为轴角 delta；`control_utils.py:132-145` 计算 `current_position + delta`，`control_utils.py:172-177` 用 `R(delta) @ current_orientation` 更新姿态。该左乘顺序表示姿态增量按 world/spatial 轴表达。OSC 最终产生力/力矩并由 Panda 机器人 actuator torque limits 裁剪；这不是对 EEF 目标位置的保护性限幅。
+- **发现的尺度风险：** 当前被 `ControlEnv(controller="OSC_POSE")` 选中的 `osc_pose.json` 将六个 OSC 输出上下限都配置为 ±2；虽然 OSC 类构造函数默认位置 ±0.05 m、旋转 ±0.5 rad（`osc.py:114-117`），本环境传入的 JSON 会覆盖默认值。按当前配置，最终 env action 的 xyz 增量 `0.01` 对应约 `0.02 m` 的目标位置增量；对五行 Chunk 每行都加该偏置，理想目标轨迹累计偏移可达约 `0.1 m`。该数值表示控制器目标，不保证实际 EEF 每步都能完全跟踪。仿真中实际加载 controller 对象的参数尚未运行时读取，文档结论来自实际选用路径和本地配置文件。[需运行时确认 active controller 参数]
+- 方向命名限制：动作前三维是 world X/Y/Z，不是图像像素的左/右/上。要按 `agentview` 图像语义生成左/右候选，需用当前 camera extrinsics 将像素方向投影到 world/table 平面；现有 Rollout 没有提供这项变换。把 world `+Z` 称作“上”也应以当前模型重力/场景坐标约定验证后再使用。[需运行时确认 camera/world 对齐]
+
+### 首版局部修正建议
+
+- 可以直接在已经 `Unnormalize` 的 Action Chunk 前三维构造 world-axis 候选；不要在模型归一化输出上直接加相同数值，也不要改维度 3–6。首版候选建议只沿单个 world axis 产生正/负小偏置，并对控制器有效输入区间 `[-1, 1]` 做显式检查，遇到基动作已饱和或修正经 clip 后没有变化时不要把它当成有效候选。
+- 以当前 OSC JSON 的增益估算，`ε=0.0025` 对应每个被修正控制步约 5 mm 的目标位置偏移；这是小幅探测的起点，不是安全阈值。若五行都加常量，该目标路径偏移会逐步累计。首版可先只改第一个动作，或对一个很短的前缀使用有界/渐消 bias，并保留其余 action 值；在相同 Snapshot 下用 `branch_rollout` 比较原 Chunk、`+ε`、`-ε`，核查实际 EEF 轨迹、接触和目标是否恢复，再决定候选策略。
+- “左/右/上”应先落成明确的 world `±X/±Y/±Z`，或者先从真实 camera extrinsics 求出图像方向在世界坐标中的向量；仅根据图像观感任意改 X/Y/Z 会把方向标签和物理运动混淆。每次修正还需保留 chunk 时序、动作有限值、控制器 clip、环境工作空间/桌面边界、夹爪维度不变，并对全部候选执行同一 Contact Safety Compiler 检查。
+
+**检查清单（Checklist）**
+
+- [x] 跟踪模型输出、checkpoint 反归一化、Bridge、LIBERO step、OSC 和 Panda gripper。
+- [x] 标明 7 维语义、坐标、统计反变换及控制器输入/输出范围。
+- [x] 记录首版 XYZ 候选修正建议和坐标/累积偏移约束。
+- [ ] 运行时打印已加载 OSC_POSE 参数并核验当前模型相机与 world 坐标关系。
