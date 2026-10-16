@@ -333,6 +333,11 @@ def _smoothstep(value: float) -> float:
 
 
 def _window_envelope(length: int, violation_step: int, lead: int, tail: int) -> tuple[int, int, np.ndarray]:
+    """Build a contact-centered envelope that starts steering before contact.
+
+    The first action in the lead window must already have a non-zero weight;
+    otherwise early violations can leave no anticipatory action to repair.
+    """
     start = max(0, violation_step - max(0, int(lead)))
     end = min(length - 1, violation_step + max(0, int(tail)))
     envelope = np.zeros(length, dtype=np.float64)
@@ -342,7 +347,9 @@ def _window_envelope(length: int, violation_step: int, lead: int, tail: int) -> 
     for index in range(start, end + 1):
         if index <= violation_step:
             span = violation_step - start
-            progress = 1.0 if span == 0 else (index - start) / span
+            # Include the lead action in the ramp. For a one-step lead this
+            # gives weights [0.5, 1.0], rather than [0.0, 1.0].
+            progress = 1.0 if span == 0 else (index - start + 1) / (span + 1)
             envelope[index] = _smoothstep(progress)
         else:
             span = end - violation_step
@@ -446,12 +453,27 @@ def build_repair_actions(
     return repaired, diagnostics
 
 
-def _object_state_changes(branch_candidate: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _object_state_changes(
+    branch_candidate: dict[str, Any], prefix_steps: int | None = None
+) -> dict[str, dict[str, Any]]:
     start_state = branch_candidate.get("start_state", {}).get("object_states")
     steps = branch_candidate.get("steps")
-    if not isinstance(start_state, dict) or not isinstance(steps, list) or not steps:
+    if not isinstance(start_state, dict) or not isinstance(steps, list):
         return {}
-    end_state = steps[-1].get("state", {}).get("object_states")
+    if prefix_steps is None:
+        if not steps:
+            return {}
+        end_checkpoint = steps[-1]
+    else:
+        if isinstance(prefix_steps, bool) or prefix_steps < 0 or prefix_steps > len(steps):
+            return {}
+        # A prefix of N actions ends at the state after action N-1; zero
+        # actions means the initial Snapshot state.
+        end_checkpoint = branch_candidate.get("start_state") if prefix_steps == 0 else steps[prefix_steps - 1]
+    if prefix_steps == 0:
+        end_state = end_checkpoint.get("object_states")
+    else:
+        end_state = end_checkpoint.get("state", {}).get("object_states")
     if not isinstance(end_state, dict):
         return {}
     changes = {}
@@ -480,17 +502,22 @@ def _object_state_changes(branch_candidate: dict[str, Any]) -> dict[str, dict[st
 
 
 def _task_object_progress(
-    baseline: dict[str, Any], candidate: dict[str, Any], task_object_binding: Any, config: RepairConfig
+    baseline: dict[str, Any], candidate: dict[str, Any], task_object_binding: Any,
+    config: RepairConfig, prefix_steps: int,
 ) -> dict[str, Any]:
     if not isinstance(task_object_binding, dict) or not isinstance(task_object_binding.get("body_id"), int):
         return {"status": "unavailable", "reason": "task_object_physical_binding_not_supplied"}
     body_id = task_object_binding["body_id"]
-    base_changes = _object_state_changes(baseline)
-    candidate_changes = _object_state_changes(candidate)
+    base_changes = _object_state_changes(baseline, prefix_steps)
+    candidate_changes = _object_state_changes(candidate, prefix_steps)
     base = next((value for value in base_changes.values() if value["body_id"] == body_id), None)
     actual = next((value for value in candidate_changes.values() if value["body_id"] == body_id), None)
     if base is None or actual is None:
-        return {"status": "unavailable", "reason": "task_object_body_state_missing_from_branch"}
+        return {
+            "status": "unavailable",
+            "reason": "task_object_body_state_missing_from_aligned_prefix",
+            "prefix_steps_compared": prefix_steps,
+        }
     base_pos = _vector(base["root_translation_delta_world_m"], 3, "baseline task object delta")
     candidate_pos = _vector(actual["root_translation_delta_world_m"], 3, "candidate task object delta")
     baseline_distance = float(np.linalg.norm(base_pos))
@@ -515,12 +542,14 @@ def _task_object_progress(
         return {
             "status": "no_baseline_task_object_motion",
             "body_id": body_id,
+            "prefix_steps_compared": prefix_steps,
             "baseline_translation_m": baseline_distance,
             "baseline_joint_qpos_delta_norm": joint_distance,
         }
     return {
         "status": "pass" if all(comparisons) else "fail",
         "body_id": body_id,
+        "prefix_steps_compared": prefix_steps,
         "baseline_translation_m": baseline_distance,
         "candidate_translation_progress_m": position_progress,
         "baseline_joint_qpos_delta_norm": joint_distance,
@@ -538,11 +567,14 @@ def evaluate_task_progress(
     task_object_binding: Any = None,
     config: RepairConfig = RepairConfig(),
 ) -> dict[str, Any]:
-    """Require reward preservation or measurable forward/task-object progress."""
+    """Require task-specific evidence and compare motion/reward at equal prefixes."""
     baseline_steps = baseline.get("steps", [])
     candidate_steps = candidate.get("steps", [])
+    prefix_steps = max(0, min(int(violation_step), len(original_actions)))
     baseline_reward = float(sum(float(step.get("reward", 0.0)) for step in baseline_steps))
     candidate_reward = float(sum(float(step.get("reward", 0.0)) for step in candidate_steps))
+    baseline_prefix_reward = float(sum(float(step.get("reward", 0.0)) for step in baseline_steps[:prefix_steps]))
+    candidate_prefix_reward = float(sum(float(step.get("reward", 0.0)) for step in candidate_steps[:prefix_steps]))
     baseline_positive_reward = any(float(step.get("reward", 0.0)) > 0 for step in baseline_steps)
     candidate_positive_reward = any(float(step.get("reward", 0.0)) > 0 for step in candidate_steps)
     done_steps = [bool(step.get("done", False)) for step in candidate_steps]
@@ -553,43 +585,53 @@ def evaluate_task_progress(
     if positions_base and positions_candidate and controller is not None:
         lo, hi = controller["input_min"], controller["input_max"]
         gain = controller["gain_m_per_env_action"]
-        end_action = min(max(violation_step, 0), len(original_actions) - 1)
-        intent = np.clip(original_actions[: end_action + 1, :3], lo, hi) * gain
+        intent = np.clip(original_actions[:prefix_steps, :3], lo, hi) * gain
         intent_vector = intent.sum(axis=0) if len(intent) else np.zeros(3)
         intent_direction = _unit(intent_vector, "pre-violation intent")
         if intent_direction is None:
-            baseline_end_index = min(end_action, len(positions_base) - 1)
+            baseline_end_index = min(prefix_steps, len(positions_base) - 1)
             intent_direction = _unit(positions_base[baseline_end_index] - positions_base[0], "baseline EEF movement")
         if intent_direction is not None:
-            baseline_end_index = min(end_action, len(positions_base) - 1)
+            baseline_end_index = min(prefix_steps, len(positions_base) - 1)
             baseline_progress = float(
                 np.dot(positions_base[baseline_end_index] - positions_base[0], intent_direction)
             )
+            candidate_end_index = min(prefix_steps, len(positions_candidate) - 1)
             candidate_progress = float(
-                np.dot(positions_candidate[-1] - positions_candidate[0], intent_direction)
+                np.dot(positions_candidate[candidate_end_index] - positions_candidate[0], intent_direction)
             )
-            candidate_distance = float(np.linalg.norm(positions_candidate[-1] - positions_candidate[0]))
+            candidate_distance = float(np.linalg.norm(positions_candidate[candidate_end_index] - positions_candidate[0]))
             required = max(
                 config.minimum_eef_progress_m,
                 max(0.0, baseline_progress) * config.required_baseline_progress_fraction,
             )
             eef_metric = {
-                "status": "pass" if candidate_progress >= required else "fail",
+                "status": (
+                    "not_required" if baseline_progress < config.minimum_eef_progress_m
+                    else "pass" if candidate_progress >= required else "fail"
+                ),
                 "intent_direction_world": intent_direction.tolist(),
+                "prefix_steps_compared": prefix_steps,
                 "baseline_previolation_forward_progress_m": baseline_progress,
                 "candidate_forward_progress_m": candidate_progress,
                 "candidate_net_eef_displacement_m": candidate_distance,
                 "required_forward_progress_m": required,
                 "required_baseline_progress_fraction": config.required_baseline_progress_fraction,
-                "proxy_limitation": "Tracks progress along A0's pre-violation XYZ intent, not task completion semantics.",
+                "role": "local trajectory diagnostic only; never sufficient evidence of task progress",
+                "proxy_limitation": "Tracks same-prefix displacement along A0's pre-violation XYZ intent, not task completion semantics.",
             }
         else:
-            eef_metric = {"status": "unavailable", "reason": "pre_violation_xyz_intent_is_zero"}
+            eef_metric = {
+                "status": "not_required",
+                "reason": "no_previolation_eef_motion_to_preserve",
+                "prefix_steps_compared": prefix_steps,
+                "role": "local trajectory diagnostic only; never sufficient evidence of task progress",
+            }
     elif controller_error:
         eef_metric = {"status": "unavailable", "reason": controller_error}
 
     task_object_metric = _task_object_progress(
-        baseline, candidate, task_object_binding, config
+        baseline, candidate, task_object_binding, config, prefix_steps
     )
     baseline_object_changes = _object_state_changes(baseline)
     all_object_changes = _object_state_changes(candidate)
@@ -606,22 +648,39 @@ def evaluate_task_progress(
         basis = "terminal_without_success_reward"
         reason = "candidate_terminated_without_positive_success_reward"
     else:
-        eef_pass = eef_metric.get("status") == "pass"
         object_pass = task_object_metric.get("status") == "pass"
-        if task_object_binding is not None and task_object_metric.get("status") in ("fail", "unavailable"):
+        if object_pass:
+            passed = True
+            basis = "time_aligned_task_object_state_proxy"
+            reason = None
+        elif task_object_binding is not None and task_object_metric.get("status") in ("fail", "unavailable"):
             passed = False
             basis = "insufficient_task_object_progress_evidence"
-            reason = "task_object_progress_failed_or_unavailable"
+            reason = "task_object_progress_failed_or_unavailable_in_aligned_prefix"
         else:
-            passed = eef_pass or object_pass
-            basis = "eef_forward_progress_proxy" if eef_pass else "task_object_state_proxy"
-            reason = None if passed else "no_minimum_task_progress_evidence"
+            passed = False
+            basis = "no_task_specific_progress_evidence"
+            reason = "no_task_specific_progress_evidence"
+    prefix_reward_pass = (
+        baseline_prefix_reward <= 0.0
+        or candidate_prefix_reward + 1e-9 >= baseline_prefix_reward
+    )
+    # A positive reward in the A0 prefix must be preserved at the same
+    # control-step horizon; matching only the full-chunk total is insufficient.
+    if not prefix_reward_pass:
+        passed = False
+        reason = "candidate_did_not_preserve_aligned_prefix_reward"
     return {
         "status": "pass" if passed else "fail",
         "reason": reason,
         "basis": basis,
         "baseline_reward_sum": baseline_reward,
         "candidate_reward_sum": candidate_reward,
+        "aligned_prefix_steps_compared": prefix_steps,
+        "baseline_aligned_prefix_reward_sum": baseline_prefix_reward,
+        "candidate_aligned_prefix_reward_sum": candidate_prefix_reward,
+        "aligned_prefix_reward_preserved": prefix_reward_pass,
+        "reward_alignment": "A0 and candidate prefix rewards both cover actions [0, first_violation_control_step); full-chunk reward is reported separately.",
         "candidate_done_by_step": done_steps,
         "eef_forward_progress": eef_metric,
         "task_object_progress": task_object_metric,
@@ -630,8 +689,8 @@ def evaluate_task_progress(
         "task_object_binding": task_object_binding,
         "limitations": [
             "Short-chunk LIBERO reward is sparse; done is reported but is not treated alone as success.",
-            "Without a physically resolved target_object binding, EEF progress is only a local motion-intent proxy.",
-            "Object-state deltas are descriptive unless the task object is bound by a resolved semantic result.",
+            "EEF progress is only a local same-prefix motion-preservation constraint and never task-success evidence.",
+            "Object-state progress is usable only when a target_object is physically bound, and compares equal-length pre-violation prefixes.",
         ],
     }
 
@@ -854,6 +913,12 @@ def run_verifier_guided_repair(
         "status": "unknown",
         "search_attempts": [],
         "rejected_reasons": [],
+        "supervision": {
+            "requested_action_steps": int(len(actions)) if actions.ndim == 2 else None,
+            "valid_action_steps": 0,
+            "training_label_valid": False,
+            "reason": "no_fully_validated_candidate",
+        },
     }
     invalid_config = _config_error(config)
     if invalid_config is not None:
@@ -1028,6 +1093,37 @@ def run_verifier_guided_repair(
                 local.update({"verdict": "unknown", "reason": "candidate_branch_or_compiler_result_missing"})
                 report["search_attempts"].append(local)
                 continue
+            branch_steps = candidate_branch.get("steps")
+            branch_steps_len = len(branch_steps) if isinstance(branch_steps, list) else 0
+            requested_steps = candidate_branch.get("requested_steps")
+            executed_steps = candidate_branch.get("executed_steps")
+            if isinstance(requested_steps, bool) or not isinstance(requested_steps, int):
+                requested_steps = -1
+            if isinstance(executed_steps, bool) or not isinstance(executed_steps, int):
+                executed_steps = -1
+            observed_steps = min(len(actions), max(0, executed_steps), branch_steps_len)
+            local["execution_coverage"] = {
+                "requested_action_steps": int(len(actions)),
+                "bridge_requested_steps": requested_steps,
+                "bridge_executed_steps": executed_steps,
+                "branch_step_records": branch_steps_len,
+                "observed_action_steps": observed_steps,
+                "compiler_verdict": compiled_branch.get("verdict"),
+                "training_label_valid": False,
+            }
+            if (
+                requested_steps != len(actions)
+                or executed_steps != len(actions)
+                or branch_steps_len != len(actions)
+            ):
+                local.update({
+                    "verdict": "rejected_incomplete_chunk",
+                    "reason": "candidate_executed_incomplete_action_chunk",
+                    "candidate_steps_with_state_records": observed_steps,
+                    "training_label_valid": False,
+                })
+                report["search_attempts"].append(local)
+                continue
             local["safety_verdict"] = compiled_branch.get("verdict")
             if compiled_branch.get("verdict") != "safe":
                 local.update({"verdict": "rejected", "reason": "candidate_not_compiler_safe"})
@@ -1057,6 +1153,10 @@ def run_verifier_guided_repair(
                 continue
             local["verdict"] = "accepted"
             local["reason"] = "complete_contact_monitoring_safe_progress_preserved_constraints_pass"
+            local["execution_coverage"].update({
+                "validated_action_steps": len(actions),
+                "training_label_valid": True,
+            })
             report["search_attempts"].append(local)
             accepted_records.append(local)
         return accepted_records
@@ -1092,9 +1192,12 @@ def run_verifier_guided_repair(
     active = configurations[:]
     expansion_round = 0
     while active and candidate_evaluations < config.max_candidate_evaluations:
-        scale = initial * (config.amplitude_growth ** expansion_round)
-        if scale > config.maximum_amplitude_m_per_step + 1e-9:
-            break
+        # Clamp the geometric schedule to the legal maximum so a sequence
+        # such as 0.012, 0.024, 0.048 still evaluates the 0.040 upper bound.
+        scale = min(
+            initial * (config.amplitude_growth ** expansion_round),
+            config.maximum_amplitude_m_per_step,
+        )
         report["search"]["amplitude_rounds"].append(scale)
         specs = create_specs(active, lambda _item: scale)
         accepted = evaluate_specs(specs)
@@ -1112,7 +1215,7 @@ def run_verifier_guided_repair(
                 item["expansion_round"] = expansion_round
             else:
                 item["last_unsafe_amplitude"] = scale
-                if scale * config.amplitude_growth <= config.maximum_amplitude_m_per_step + 1e-9:
+                if scale < config.maximum_amplitude_m_per_step - 1e-9:
                     next_active.append(item)
         active = next_active
         expansion_round += 1
@@ -1187,6 +1290,13 @@ def run_verifier_guided_repair(
         "selected_candidate": chosen,
         "selection_objective": "minimum L2 world-XYZ action correction among safety-, progress-, and constraint-passing branches",
         "candidate_evaluations": candidate_evaluations,
+        "supervision": {
+            "requested_action_steps": len(actions),
+            "valid_action_steps": len(actions),
+            "training_label_valid": True,
+            "candidate_id": chosen["candidate_id"],
+            "reason": "complete_chunk_safety_task_progress_and_action_constraints_validated",
+        },
     })
     return report
 

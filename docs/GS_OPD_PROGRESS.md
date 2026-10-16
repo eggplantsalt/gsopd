@@ -639,7 +639,7 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 
 - 新增 `research/gs_opd/repair/verifier_guided_repair.py`，提供无模型/环境副作用的可复用搜索接口 `run_verifier_guided_repair()`。`pi05_rollout.py` 增加可选 `--verifier-guided-repair` 入口，使用 π₀.₅ 正常预测的首个、已反归一化 `[T,7]` Action Chunk 作为 A0；对 A0 与后续每个候选都调用同一 `snapshot_id` 下的 `branch_rollout`，并复用 `compile_forbid_contact()`。该入口在探测后立即结束，不对主环境发送 `step`，不改变未启用该参数时的 Rollout、Video、Trace 路径。
 - Safety Bridge 新增只读 `repair_context`，返回当前加载 OSC 的输入/输出范围、有效 `use_delta`、位置限幅、MuJoCo gravity/world-up、控制 timestep 和 Panda 关节范围。分支状态的对象诊断增加 `body_id/body_name`。子步 Contact event 新增首个世界坐标接触位置、MuJoCo contact frame 第一轴法向、法向原始 Geom 顺序及可用状态；物理 step、动作缩放、Snapshot/Restore、分支和 Contact 采集时序未改。contact normal 的 `geom1→geom2` 方向用本地 MuJoCo 双球接触模型做了轻量确认，真实 LIBERO-Safety 环境还未运行验证。
-- 搜索仅在 A0 的 Compiler 结果为明确 `violation` 时启动；A0 为 `safe` 时报告 `skipped_original_safe`，`unknown`、不完整监控或无法将违规 Contact 与完整位置/法向关联时报告 `skipped_unknown`，不构造 A+。Repair direction 由首个违规步、违规 Geom 对、接触法向、接触点与该控制步结束后 EEF 位置的相对向量、违规前观测到的 EEF 运动方向构造：障碍法向外侧、接触切平面两侧方向和按真实 MuJoCo 重力确定的上方方向。接触位置/法向有物理子步时间精度，Bridge 目前只在控制步结束时保存 EEF pose，所以 EEF 相对向量是时间近似值，字段会明确标注。每个候选执行完整 Chunk；环境若已进入 done 终态则按 Bridge 现有语义提前停止，并将 reward/done 纳入验收。
+- 搜索仅在 A0 的 Compiler 结果为明确 `violation` 时启动；A0 为 `safe` 时报告 `skipped_original_safe`，`unknown`、不完整监控或无法将违规 Contact 与完整位置/法向关联时报告 `skipped_unknown`，不构造 A+。Repair direction 由首个违规步、违规 Geom 对、接触法向、接触点与该控制步结束后 EEF 位置的相对向量、违规前观测到的 EEF 运动方向构造：障碍法向外侧、接触切平面两侧方向和按真实 MuJoCo 重力确定的上方方向。接触位置/法向有物理子步时间精度，Bridge 目前只在控制步结束时保存 EEF pose，所以 EEF 相对向量是时间近似值，字段会明确标注。候选若因 `done` 提前结束，将记录实际检查步数并拒绝作为完整 Chunk 标签；不会把未执行动作输出为 A+。
 - 修正是在已反归一化的 world XYZ 控制量上添加控制步位移 bias；以 Bridge 实际 `input_min/max`、`output_min/max` 计算 OSC 增益，按输入裁剪后的有效基动作构造候选，动作维度 3–6（姿态和夹爪）保持逐元素相同。每个候选使用接触步前后连续动作上的平滑包络，至少修正两个动作；如果修正会越过 OSC 输入范围、被裁剪抹掉、窗口太短、控制器目标限位或机器人关节限位检查失败，则拒绝该候选。配置的 Cartesian `position_limits` 若存在会检查每步目标；若未配置，则用 Bridge 返回的模型关节范围和分支实际 EEF 状态作约束。当前控制配置中的 Cartesian 位置限幅可能为 `null`，因此实际任务工作空间边界仍需真实运行核验，不能将本约束解释为通用工作空间安全证明。
 
 ### 搜索参数与任务进度门槛
@@ -649,16 +649,17 @@ Smoke 只 Reset 并读取 `agentview_image`、`robot0_eye_in_hand_image` 和 `in
 | 初始每步幅度 | `clip(0.5 × 违规前观测 EEF 单步位移中位数, 0.002, 0.012) m` | 如果没有可用实际 EEF 位移，则用活动 OSC 尺度换算的基动作幅度；不是固定 action-space epsilon。 |
 | 每步最大幅度 | `0.04 m` | 单个控制步的世界 XYZ 修正上限。 |
 | 累计修正路程 | `0.08 m` | 各修正控制步向量模长之和上限。 |
-| 时间窗口 | 前/后各 `1、2、3` 步 | 以首个违规控制步为中心，超出 Chunk 的部分截断，平滑扩张和回落。 |
-| 搜索扩张 | `×2`，最多 `96` 次候选 | 未通过时增大幅度；达到上限仍无合格候选则不输出 A+。 |
+| 时间窗口 | 前/后各 `1、2、3` 步 | 以首个违规控制步为中心，超出 Chunk 的部分截断；lead 区间首个动作有非零权重。第 0 步违规时只能从该步开始避让。 |
+| 搜索扩张 | `×2`，最多 `96` 次候选 | 指数扩张超过上限时将最后一级截到 `0.04 m` 并实际构造/评估该幅度；达到上限仍无合格候选则不输出 A+。 |
 | 安全后收缩 | 二分最多 `3` 轮，直到区间 `≤0.001 m` | 在发现可行候选后缩小不必要偏移；最终在合格候选中按相对 A0 的 world-XYZ 修正 L2 范数选择。 |
 | 动作平滑 | 相邻修正控制量变化 `≤0.025 m` | 限制 bias 的突变；基动作原有变化不由 Repair 重写。 |
-| EEF 进度代理 | 至少 `5 mm`，且达到 A0 违规前正向位移的 `70%` | 用 EEF 实际位移投影到 A0 违规前 XYZ 意图方向，避免把停住当作成功。 |
-| 已绑定任务物体进度 | 保留基线可观测位移/关节变化的 `70%` | 仅在额外提供语义为 `target_object` 且物理 Body 已解析的任务物体绑定时启用。 |
+| EEF 轨迹诊断 | 至少 `5 mm`，且达到 A0 违规前正向位移的 `70%` 时标记为保留 | 只比较相同的违规前动作前缀，用于描述局部轨迹是否保持；不作为独立任务成功/进度证据。 |
+| 已绑定任务物体进度 | 保留基线可观测位移/关节变化的 `70%` | 仅在额外提供语义为 `target_object` 且物理 Body 已解析时启用，并比较 A0 与候选等长违规前缀的状态变化。 |
 
-- 稀疏 Reward 情况下，默认使用并在 JSON 中记录 EEF 违规前意图方向进度、基线/候选奖励和 done 序列，以及各分支中 MuJoCo `objects_dict/fixtures_dict` 的位移与关节变化。只要 EEF 进度代理达到阈值即可作为局部任务进展证据；它不能证明完整任务成功。若提供 `--task-object-id` 与对应 `--task-object-semantic-result`，程序校验 Teacher `target_object` 角色、resolved 语义绑定、当前模型 Body 身份，再检查该物体状态变化；绑定不一致/状态缺失时不接受候选。基线奖励为正时，候选累计奖励不得低于基线；候选以 done 终止但无正奖励时拒绝。done 单独不当作成功信号。
+- 进度比较以首个违规控制步 `k` 为界：基线 A0 与候选的 EEF、目标物体状态、前缀 reward 都比较动作 `[0,k)` 执行后的状态/奖励；完整 Chunk reward 另行记录，用于保留已获得的正向 LIBERO 成功奖励。候选 EEF 位移只保留为同前缀轨迹诊断，绝不单独证明任务进度。任务证据必须来自候选正向环境 reward、保留 A0 的正向 reward，或已物理绑定 `target_object` 在同长度违规前缀中的可观测进展；证据不足时不生成 A+。若提供 `--task-object-id` 与对应 `--task-object-semantic-result`，程序校验 Teacher `target_object` 角色、resolved 语义绑定、当前模型 Body 身份，再检查该物体状态变化；绑定不一致/状态缺失时不接受该对象代理。done 单独不当作成功信号。
 - 若 Snapshot/分支报告主状态恢复失败，立即停止搜索并输出 `aborted_main_state_restore_failed`。其它情况没有合格 A+ 时 `repaired_action_chunk_A_plus=null`，JSON 保留失败原因。结果 `verifier_guided_repair.json` 包括 A0、首违例控制步/物理子步、Geom/Body、接触位置/法向与机器人运动、方向基、控制器参数、每次候选动作、时间窗口、幅度、分支接触与 reward/done、Compiler verdict、任务进度指标、动作/工作空间检查、拒绝原因和最终 A+。
-- `RepairConfig` 可由后续 On-Policy 调用方注入以调整搜索边界；默认实现不改模型、Bridge 动作协议或主环境，不包含学习逻辑。轻量标准库 unittest 覆盖 A0 安全跳过、unknown、Contact 证据到方向/连续多步窗口、多尺度扩张与收缩、搜索失败、静止但无进度候选拒绝、任务物体状态进度、缺少法向，以及 baseline/candidate 主状态恢复失败；同时测试首 Chunk Probe 的 Bridge 请求顺序且确认不发送 `step`。10 项 Repair 核心测试、1 项 Repair Probe 集成 Mock、6 项现有 Contact Compiler 测试及 1 项既有 Contact Probe 回归测试，共 18 项通过；语法检查和 `git diff --check` 通过。以上均不是真实 Safety Bridge/π₀.₅ 环境有效性验证，不能宣称 Repair 已在真实场景成功。
+- 本次定点修复增加 Chunk 首步/第 1 步/末步违规的窗口权重测试；lead 首个动作现在会提前产生非零修正。幅度指数序列超过 `0.04 m` 时截到并实际测试合法上界。A0 与候选的进度比较统一到违规步前缀 `[0,k)`，候选完整 Chunk 的 EEF 位移不能再与 A0 的违规前缀对比；EEF 仅是轨迹诊断，不能独立作为任务进度。Bridge 实际执行步数、step 记录数或请求步数任一短于 Chunk 时，候选记为 `rejected_incomplete_chunk`，报告 requested/executed/recorded 步数和 `training_label_valid=false`，且不输出部分或完整 A+ 标签。只有完整且通过全部门槛的候选才记录 `validated_action_steps` 并输出有效 A+。
+- `RepairConfig` 可由后续 On-Policy 调用方注入以调整搜索边界；默认实现不改模型、Bridge 动作协议或主环境，不包含学习逻辑。轻量标准库 unittest 覆盖 A0 安全跳过、unknown、Contact 证据到方向/连续多步窗口、Chunk 边界窗口、多尺度扩张与收缩及最大幅度评估、搜索失败、EEF 单独不构成任务进度、对齐前缀的任务物体进度、缺少法向、候选提前终止拒绝，以及 baseline/candidate 主状态恢复失败；同时测试首 Chunk Probe 的 Bridge 请求顺序且确认不发送 `step`。15 项 Repair 核心测试、1 项 Repair Probe 集成 Mock、6 项现有 Contact Compiler 测试及 1 项既有 Contact Probe 回归测试，共 23 项通过；语法检查和 `git diff --check` 通过。以上均不是真实 Safety Bridge/π₀.₅ 环境有效性验证，不能宣称 Repair 已在真实场景成功。
 
 ### 真实首 Chunk Repair 探测命令
 
@@ -671,7 +672,7 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
   research/gs_opd/smoke/safety_bridge.py
 ```
 
-另开终端运行 π₀.₅ Repair 探测。没有独立任务物体语义绑定时，候选仅按明确记录的 EEF 局部进度代理验收：
+另开终端运行 π₀.₅ Repair 探测。没有正向环境 reward 或已物理绑定的任务物体进展证据时，Repair 会拒绝候选并将 A+ 留空；EEF 局部位移只记录为同前缀轨迹诊断：
 
 ```bash
 cd /workspace/zy_workspace/RLinf
@@ -691,9 +692,9 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 
 - [x] 实现首 Chunk A0 分支验证、明确违规门控和基于接触几何的局部方向生成。
 - [x] 实现依赖活动 OSC 参数的平滑多动作窗口、幅度扩张及安全后幅度收缩。
-- [x] 仅接受完整 Compiler 安全、进度门槛和动作/关节约束均通过的候选；失败不伪造 A+。
+- [x] 仅接受完整 Chunk、Compiler 安全、任务特定进度证据和动作/关节约束均通过的候选；部分执行候选不产生训练标签。
 - [x] 保存 A0、违规位置、方向、参数、候选证据、进度指标、恢复状态和最终 Repair JSON。
-- [x] 完成 17 项轻量单测、语法检查及 `git diff --check`。
+- [x] 完成 23 项相关轻量单测、语法检查及 `git diff --check`。
 - [ ] 在真实 LIBERO-Safety Bridge 与 π₀.₅ 环境验证 contact normal、控制器尺度、Restore 和候选有效性。
 
 ## π₀.₅ → LIBERO-Safety 7 维动作链路审计（2026-10-16）
