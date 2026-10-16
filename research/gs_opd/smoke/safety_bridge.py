@@ -11,6 +11,120 @@ import mujoco
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
+
+# This checkpoint was trained and is normally evaluated with the upstream
+# robosuite v1.4.0 OSC_POSE ranges. The vendored LIBERO-Safety copy has a
+# modified osc_pose.json (all six outputs are +/-2), so apply the upstream
+# runtime values to this Bridge environment only.
+_PI05_LIBERO_OSC_POS_OUTPUT = 0.05
+_PI05_LIBERO_OSC_ROT_OUTPUT = 0.5
+_PI05_LIBERO_OSC_KP = 150.0
+
+
+def _configure_pi05_libero_osc_pose(controller):
+    """Apply and verify the LIBERO / Pi0.5 OSC_POSE runtime convention."""
+    controller_name = getattr(controller, "name", type(controller).__name__)
+    if controller_name != "OSC_POSE":
+        raise RuntimeError(
+            "Pi0.5 LIBERO requires OSC_POSE, got " f"{controller_name!r}"
+        )
+    if int(getattr(controller, "control_dim", -1)) != 6:
+        raise RuntimeError("OSC_POSE must expose six arm control dimensions")
+    if getattr(controller, "use_delta", None) is not True:
+        raise RuntimeError("OSC_POSE must use delta commands for Pi0.5 LIBERO")
+    if getattr(controller, "use_ori", None) is not True:
+        raise RuntimeError("OSC_POSE must control position and orientation")
+    if getattr(controller, "impedance_mode", None) != "fixed":
+        raise RuntimeError("Pi0.5 LIBERO expects fixed-impedance OSC_POSE")
+
+    input_min = np.asarray(getattr(controller, "input_min", []), dtype=np.float64)
+    input_max = np.asarray(getattr(controller, "input_max", []), dtype=np.float64)
+    expected_input_min = np.full(6, -1.0, dtype=np.float64)
+    expected_input_max = np.full(6, 1.0, dtype=np.float64)
+    if not (
+        input_min.shape == (6,)
+        and input_max.shape == (6,)
+        and np.allclose(input_min, expected_input_min)
+        and np.allclose(input_max, expected_input_max)
+    ):
+        raise RuntimeError(
+            "Unexpected OSC_POSE normalized input bounds: "
+            f"min={input_min.tolist()}, max={input_max.tolist()}"
+        )
+
+    # robosuite v1.4 OSC deltas are world-frame: set_goal_position adds the
+    # scaled delta to world-coordinate ee_pos, and orientation deltas are
+    # pre-multiplied onto ee_ori_mat. Newer controllers may expose the frame.
+    input_ref_frame = getattr(controller, "input_ref_frame", None)
+    if input_ref_frame not in (None, "world"):
+        raise RuntimeError(
+            "Expected world-frame OSC_POSE deltas, got " f"{input_ref_frame!r}"
+        )
+
+    output_min = np.asarray(
+        [-_PI05_LIBERO_OSC_POS_OUTPUT] * 3 + [-_PI05_LIBERO_OSC_ROT_OUTPUT] * 3,
+        dtype=np.float64,
+    )
+    output_max = -output_min
+    controller.output_min = output_min.copy()
+    controller.output_max = output_max.copy()
+
+    # Match the fixed OSC gains in the upstream v1.4.0 controller config too.
+    controller.kp = np.full(6, _PI05_LIBERO_OSC_KP, dtype=np.float64)
+    controller.kd = 2.0 * np.sqrt(controller.kp)
+    controller.kp_min = np.zeros(6, dtype=np.float64)
+    controller.kp_max = np.full(6, 300.0, dtype=np.float64)
+    controller.damping_ratio_min = np.zeros(6, dtype=np.float64)
+    controller.damping_ratio_max = np.full(6, 10.0, dtype=np.float64)
+    controller.position_limits = None
+    controller.orientation_limits = None
+    controller.uncoupling = True
+
+    # The controller caches the affine input-to-output scale on first use.
+    # Invalidate it before probing the actual scaling implementation.
+    controller.action_scale = None
+    controller.action_input_transform = None
+    controller.action_output_transform = None
+    probe = np.full(6, 0.5, dtype=np.float64)
+    scaled_probe = np.asarray(controller.scale_action(probe), dtype=np.float64)
+    expected_probe = np.asarray(
+        [_PI05_LIBERO_OSC_POS_OUTPUT * 0.5] * 3
+        + [_PI05_LIBERO_OSC_ROT_OUTPUT * 0.5] * 3,
+        dtype=np.float64,
+    )
+    if scaled_probe.shape != (6,) or not np.allclose(scaled_probe, expected_probe):
+        raise RuntimeError(
+            "OSC_POSE runtime scaling validation failed: "
+            f"expected {expected_probe.tolist()}, got {scaled_probe.tolist()}"
+        )
+
+    return {
+        "controller": controller_name,
+        "input_min": input_min.tolist(),
+        "input_max": input_max.tolist(),
+        "output_min": output_min.tolist(),
+        "output_max": output_max.tolist(),
+        "position_output_range_m": [-_PI05_LIBERO_OSC_POS_OUTPUT, _PI05_LIBERO_OSC_POS_OUTPUT],
+        "rotation_output_range_rad": [-_PI05_LIBERO_OSC_ROT_OUTPUT, _PI05_LIBERO_OSC_ROT_OUTPUT],
+        "position_gain_m_per_input": _PI05_LIBERO_OSC_POS_OUTPUT,
+        "rotation_gain_rad_per_input": _PI05_LIBERO_OSC_ROT_OUTPUT,
+        "control_frame": "world",
+        "control_delta": True,
+        "kp": controller.kp.tolist(),
+        "kd": controller.kd.tolist(),
+        "damping_ratio": 1.0,
+        "kp_limits": [controller.kp_min.tolist(), controller.kp_max.tolist()],
+        "damping_ratio_limits": [
+            controller.damping_ratio_min.tolist(),
+            controller.damping_ratio_max.tolist(),
+        ],
+        "impedance_mode": controller.impedance_mode,
+        "uncouple_pos_ori": bool(controller.uncoupling),
+        "scaled_half_input_probe": scaled_probe.tolist(),
+        "source": "upstream robosuite v1.4.0 OSC_POSE defaults",
+    }
+
+
 suite = get_benchmark("obstacle_avoidance")()
 task = suite.get_task_by_level_id(0, 0)
 bddl = suite.get_task_bddl_file_path_by_level_id(0, 0)
@@ -25,6 +139,8 @@ env.seed(0)
 env.reset()
 states = suite.get_task_init_states_by_level_id(0, 0)
 obs = env.set_init_state(states[0])
+controller_runtime_config = _configure_pi05_libero_osc_pose(env.env.robots[0].controller)
+print("PI05 LIBERO OSC_POSE RUNTIME CONFIG:", controller_runtime_config, flush=True)
 last_reward = 0.0
 last_done = False
 
@@ -354,7 +470,14 @@ def _repair_context():
             "output_max",
             "control_delta",
             "use_delta",
+            "use_ori",
+            "kp",
+            "kd",
+            "impedance_mode",
+            "uncoupling",
             "position_limits",
+            "orientation_limits",
+            "input_ref_frame",
             "eef_name",
         )
         controller_fields = {key: _json_value(getattr(controller, key, None)) for key in fields}
@@ -1447,6 +1570,14 @@ try:
                     snapshots.clear()
                     env.reset()
                     obs = env.set_init_state(states[0])
+                    controller_runtime_config = _configure_pi05_libero_osc_pose(
+                        env.env.robots[0].controller
+                    )
+                    print(
+                        "PI05 LIBERO OSC_POSE RUNTIME CONFIG:",
+                        controller_runtime_config,
+                        flush=True,
+                    )
                     last_reward = 0.0
                     last_done = False
                     result = pack(obs)

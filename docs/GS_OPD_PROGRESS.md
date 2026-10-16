@@ -753,16 +753,16 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 
 | 维度 | 当前 LIBERO/Panda 路径含义 | 坐标/单位 | 当前控制范围及后处理 |
 | --- | --- | --- | --- |
-| 0 | EEF 目标位置增量 X | MuJoCo world frame，米 | OSC 输入先 clip 到 `[-1, 1]`，再按本地 `robosuite/controllers/config/osc_pose.json:3-6` 映射到 `[-2, 2]` 米；`set_goal_position()` 将该增量加到当前 world `site_xpos`。 |
+| 0 | EEF 目标位置增量 X | MuJoCo world frame，米 | Safety Bridge 初始化时校正为 OSC 输入 `[-1, 1]` → 目标增量 `[-0.05, 0.05]` m；`set_goal_position()` 将该增量加到当前 world `site_xpos`。 |
 | 1 | EEF 目标位置增量 Y | MuJoCo world frame，米 | 同维 0。 |
 | 2 | EEF 目标位置增量 Z | MuJoCo world frame，米 | 同维 0。 |
-| 3 | 旋转增量 axis-angle X 分量 | world/spatial 旋转向量，弧度 | OSC 输入 clip `[-1, 1]` 后按当前 JSON 映射到 `[-2, 2]` rad/分量；姿态目标无额外 orientation limit。 |
+| 3 | 旋转增量 axis-angle X 分量 | world/spatial 旋转向量，弧度 | Safety Bridge 初始化时校正为 OSC 输入 `[-1, 1]` → 旋转增量 `[-0.5, 0.5]` rad/分量；姿态目标无额外 orientation limit。 |
 | 4 | 旋转增量 axis-angle Y 分量 | world/spatial 旋转向量，弧度 | 同维 3。 |
 | 5 | 旋转增量 axis-angle Z 分量 | world/spatial 旋转向量，弧度 | 同维 3。 |
 | 6 | Panda gripper 开合方向命令 | 无量纲，输入 `[-1, 1]` | `PandaGripper.format_action()` 用符号决定开/合，幅值不是夹爪宽度；其 `current_action` 每次调用以 0.01 增减并饱和到 `[-1, 1]`，再映射到夹爪执行器控制范围。 |
 
 - 几何和坐标结论依据：`single_arm.py` 的 EEF observable 从 `sim.data.site_xpos`/world EEF orientation 取状态；`osc.py:234-237` 调用 `scale_action()`；`osc.py:202-245` 在 `control_delta=True` 时把前三维作为位置 delta、后三维作为轴角 delta；`control_utils.py:132-145` 计算 `current_position + delta`，`control_utils.py:172-177` 用 `R(delta) @ current_orientation` 更新姿态。该左乘顺序表示姿态增量按 world/spatial 轴表达。OSC 最终产生力/力矩并由 Panda 机器人 actuator torque limits 裁剪；这不是对 EEF 目标位置的保护性限幅。
-- **发现的尺度风险：** 当前被 `ControlEnv(controller="OSC_POSE")` 选中的 `osc_pose.json` 将六个 OSC 输出上下限都配置为 ±2；虽然 OSC 类构造函数默认位置 ±0.05 m、旋转 ±0.5 rad（`osc.py:114-117`），本环境传入的 JSON 会覆盖默认值。按当前配置，最终 env action 的 xyz 增量 `0.01` 对应约 `0.02 m` 的目标位置增量；对五行 Chunk 每行都加该偏置，理想目标轨迹累计偏移可达约 `0.1 m`。该数值表示控制器目标，不保证实际 EEF 每步都能完全跟踪。仿真中实际加载 controller 对象的参数尚未运行时读取，文档结论来自实际选用路径和本地配置文件。[需运行时确认 active controller 参数]
+- **修复前的尺度风险：** LIBERO-Safety vendored `osc_pose.json` 曾把六个 OSC 输出上下限都配置为 ±2，覆盖控制器构造函数默认值。Bridge 当前已在每次环境 Reset/硬重建后将运行时参数校正到 checkpoint 对应的标准 LIBERO 值，具体证据和换算见下方修复记录。
 - 方向命名限制：动作前三维是 world X/Y/Z，不是图像像素的左/右/上。要按 `agentview` 图像语义生成左/右候选，需用当前 camera extrinsics 将像素方向投影到 world/table 平面；现有 Rollout 没有提供这项变换。把 world `+Z` 称作“上”也应以当前模型重力/场景坐标约定验证后再使用。[需运行时确认 camera/world 对齐]
 
 ### 首版局部修正建议
@@ -776,4 +776,60 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 跟踪模型输出、checkpoint 反归一化、Bridge、LIBERO step、OSC 和 Panda gripper。
 - [x] 标明 7 维语义、坐标、统计反变换及控制器输入/输出范围。
 - [x] 记录首版 XYZ 候选修正建议和坐标/累积偏移约束。
-- [ ] 运行时打印已加载 OSC_POSE 参数并核验当前模型相机与 world 坐标关系。
+- [x] Bridge 启动及 Reset 后打印并验证 active OSC_POSE 参数和输入到物理目标的实际缩放。
+- [ ] 在真实 LIBERO-Safety rollout 中确认 EEF 位移与任务表现改善，并核验 camera/world 方向关系。
+
+## π₀.₅ OSC_POSE 尺度异常排查与 Bridge 修复（2026-10-16）
+
+### 根因与配置证据
+
+- 失败日志和本次测量显示：未校正时 active OSC_POSE 的 6 维 `output_min/max` 均为 `[-2, 2]`，7 维 Rollout 不做额外缩放，240 步实际 EEF 累计运动为 `12.889 m`。在 controller 的仿射缩放后，xyz 动作 `0.1–0.5` 形成 `0.2–1.0 m` 的单步 world-frame 位置目标增量，足以解释观测到的过大位移。
+- 训练约定可由本地 Pi0.5 配置和上游默认评测链路交叉核对：`rlinf/models/embodiment/openpi/dataconfig/__init__.py` 的 `pi05_libero` 使用 `extra_delta_transform=False`，Rollout 的 `Unnormalize(norm_stats)` 后将 LIBERO 7 维 delta action 原样送入环境；官方 LIBERO `ControlEnv` 默认使用 `OSC_POSE` 并调用 `load_controller_config(default_controller=controller)`，OpenPI 官方 LIBERO evaluator 创建 `OffScreenRenderEnv` 时也不覆盖控制器配置。robosuite **v1.4.0** 官方 `osc_pose.json` 定义 xyz 输出 `±0.05 m`、旋转输出 `±0.5 rad`、`kp=150`、`damping_ratio=1`、固定阻抗与 `control_delta=true`。本地 LIBERO-Safety vendored 的同名配置相较该官方文件被改为全部输出 `±2`，并将 `kp` 从 `150` 提高到 `750`、`kp_limits` 从 `[0,300]` 提高到 `[0,1000]`。
+- 控制坐标约定来自 robosuite 1.4 的实际实现：位置 delta 加到 world 坐标 `ee_pos`；姿态轴角增量先转成旋转矩阵并左乘当前 EEF 姿态，即 world/spatial 增量。每维输入仍裁剪在 `[-1,1]`，夹爪第 7 维走 Panda gripper，不受以下 OSC 修复影响。
+
+### 最小修复与尺度对比
+
+仅修改 GS-OPD Safety Bridge 初始化路径，不改 π₀.₅ 输出、不改 LIBERO-Safety/robosuite 文件、不改 Repair 算法。Bridge 在首次 Reset 和客户端每次 `reset`（该环境启用 hard reset，可能重建 controller）后，对活动 OSC_POSE 应用并检查上游配置：`output_min/max=[-0.05,-0.05,-0.05,-0.5,-0.5,-0.5] / [0.05,0.05,0.05,0.5,0.5,0.5]`、`kp=150`、`kd=2√150`、`kp_limits=[0,300]`、固定阻抗、delta 命令和解耦控制。输入范围、控制维数、控制器类型或 delta 约定不符时启动/Reset 报错，不静默继续。还会调用控制器真实 `scale_action(0.5)` 验证输出 `[0.025,0.025,0.025,0.25,0.25,0.25]`；`repair_context` 返回 active gains、ranges 和限制供后续 Repair 正确读取。
+
+| 分量 | 修复前 | 修复后 | 尺度差异 | π₀.₅ 典型输入 `0.1–0.5` 对应目标增量 |
+| --- | --- | --- | --- | --- |
+| XYZ 位置 | `±2 m / 输入单位` | `±0.05 m / 输入单位` | 输出斜率降低 `40×` | `0.2–1.0 m` → `0.005–0.025 m` |
+| 轴角旋转 | `±2 rad / 输入单位` | `±0.5 rad / 输入单位` | 输出斜率降低 `4×` | `0.2–1.0 rad` → `0.05–0.25 rad` |
+| OSC 固定刚度 `kp` | `750` | `150` | 降为 `1/5` | 作用于闭环跟踪刚度；不是动作缩放因子 |
+
+官方配置证据：[robosuite v1.4.0 OSC_POSE config](https://raw.githubusercontent.com/ARISE-Initiative/robosuite/v1.4.0/robosuite/controllers/config/osc_pose.json)、[OpenPI Pi0.5 LIBERO training config](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/training/config.py)、[OpenPI LIBERO evaluator](https://github.com/Physical-Intelligence/openpi/blob/main/examples/libero/main.py)。Bridge 会将实际 active 参数打印到服务端终端；无需修改或覆盖 vendored 文件。
+
+### 验证与重新评测
+
+- 新增 `test_safety_bridge_controller.py`，用轻量假控制器验证旧 `±2/kp=750` 参数会被设置为目标值、实际仿射 `scale_action()` 输出正确、非 OSC_POSE 或非 delta controller 会拒绝启动，并静态确认每次 hard reset 后都会重应用配置。3 项测试通过；Bridge 和测试文件 Python 语法检查、`git diff --check` 通过。
+- 已用 LIBERO-Safety 环境启动新 Bridge 到环境初始化阶段；真实 `OSC_POSE` runtime 输出验证为位置 `±0.05 m`、旋转 `±0.5 rad`、`kp=150`，实际 `scale_action(0.5)` 输出 `[0.025,0.025,0.025,0.25,0.25,0.25]`。新进程随后因端口 `38567` 已被占用而退出。对当前占用端口的服务只读调用 `repair_context`，确认它仍报告旧的 `±2` 配置；没有对该服务执行 Reset 或动作。因此重跑前必须正常停止旧 Bridge、再用更新后的脚本启动新 Bridge。π₀.₅ rollout 未运行，修复后的真实 EEF 位移、累计运动和成功率仍待重新验证；之前的 `12.889 m` 是修复前测量，不能当作修复后的结果。
+
+先正常停止仍占用 `127.0.0.1:38567` 的旧 Safety Bridge，再启动新版 Bridge，确认服务端日志出现 `output_min/max`、`kp=150` 和 `scaled_half_input_probe`：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+另开终端用同一 π₀.₅ checkpoint 重跑 240 步固定 LIBERO-Safety 任务，保留视频和 Trace 便于核对 EEF 路径：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/RLinf/.venv/bin/python \
+  research/gs_opd/smoke/pi05_rollout.py \
+  --max-steps 240 \
+  --trace-out /workspace/zy_workspace/RLinf/logs/gs_opd/pi05_l0t0_osc_scale_fix.npz \
+  --video-out /workspace/zy_workspace/RLinf/logs/gs_opd/pi05_l0t0_osc_scale_fix.mp4
+```
+
+复测时重点比较动作量级、`robot0_eef_pos` 累计路径、成功/结束标志和视频；若尺度已正确但任务仍失败，再依据新 Trace 分析策略/坐标对齐，不对模型输出做手工缩放。
+
+**检查清单（Checklist）**
+
+- [x] 对照 Pi0.5 LIBERO 数据配置、OpenPI 正常 evaluator、LIBERO 控制器加载路径和 robosuite v1.4.0 官方 OSC 配置。
+- [x] 在 Bridge 初始化与每次硬 Reset 后应用局部运行时配置，并验证 controller 实际缩放函数的结果。
+- [x] 增加控制参数轻量回归测试；语法检查和 diff 检查通过。
+- [ ] 人工重启 Bridge 并运行同一任务，确认 EEF 位移、任务成功率和新日志表现。
