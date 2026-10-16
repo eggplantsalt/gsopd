@@ -34,12 +34,55 @@ NPZ 通过 `numpy.savez_compressed` 写入，不使用 object 数组或 pickle�
 | `step_indices`、`step_chunk_indices`、`step_action_indices` | 每个真实执行 step 的全局零起始索引、所属预测 chunk 和 chunk 内动作下标。 |
 | `executed_actions`、`step_rewards`、`step_dones` | 实际发给 Bridge 的动作及其 step reward/done。 |
 | `post_agentview_image`、`post_robot0_eye_in_hand_image`、`post_robot0_eef_pos`、`post_robot0_eef_quat`、`post_robot0_gripper_qpos` | 每个动作执行后的 raw Bridge 观测。 |
+| `decision_safety_json`（仅 Safety Collection） | 与各决策索引对齐的 JSON 字符串，包含 A0/Teacher 规则/当前绑定/Compiler 结果/Repair 搜索状态/A+ 和训练标签有效性。 |
 
 ## 验证情况
 
 - 已运行 `PYTHONPYCACHEPREFIX=/tmp/rlinf-pycache .venv/bin/python -m py_compile research/gs_opd/data/trajectory_writer.py research/gs_opd/smoke/pi05_rollout.py`，两个文件语法检查通过。
 - 本次没有启动 Safety Bridge、没有运行 rollout，也没有生成 trace NPZ 或新 MP4；NPZ 字段布局已在源码定义，实际落盘读取和帧/状态对齐待人工短程验证。
 - Safety Bridge 使用 `research/gs_opd/smoke/safety_bridge.py`，监听本机 `127.0.0.1:38567`；Rollout 返回的初始和 step 观测都包含 `agentview_image`。
+
+## Continuous On-Policy Safety Collection
+
+`pi05_rollout.py` 新增可选 `--on-policy-safety-collection --on-policy-safety-out <episode.npz>`。该模式仅面向仓库当前 Bridge 源码固定的 `obstacle_avoidance / level 0 / task 0`。启动前解析 Safety IR v2 和语义消歧结果，并把目标 Body/Geom 名称、Geom ID、gripper 分类及 forbid-contact 规则与活动 Bridge Geometry Inventory 核对；不把 `object_4` 或任何物理绑定默认套用到其他场景。`--object-id` 必须由调用者明确提供。
+
+每个 π₀.₅ 决策后，Rollout 在当前状态创建 Snapshot，完整分支评估 A0，并调用 Contact Compiler。明确 `violation` 时调用既有 `run_verifier_guided_repair()`，候选从同一 Snapshot 独立分支检查；`safe` 或 `unknown` 时跳过 Repair。分支结束后主进程继续执行 Student 原始 A0，绝不把 A+ 发给主环境。安全完整的 A0 可作为有效安全标签；只有 Repair 完整 Chunk、Compiler、安全监控、任务进度证据和动作约束全部通过时，A+ 才是有效标签。未知、无有效 Repair、短执行 Chunk 均不产生训练标签。Snapshot/Branch Rollout 无法确认主状态恢复时，立即停止 Episode，决策已记录但不执行主环境动作。
+
+NPZ 继续包含 Trace 的原始双相机图像、状态、完整 A0 和实际主环境动作/后置 Observation。新增 `decision_safety_json` 保存每个决策的完整 Teacher IR、任务指令和对象绑定、A0 Compiler 输出、Repair 状态、候选搜索摘要、A+（若有效）、`training_action_chunk`、`training_label_valid`、失败原因和分支恢复标志。为控制体积，Repair 摘要保留每个搜索候选的动作、幅度/窗口、Safety/进度/约束结论与失败原因，不重复嵌入候选分支的完整物理状态；A0 Contact Compiler 证据及其完整 Contact Monitoring 仍保留。NPZ 外同时生成同名 `.summary.json`，记录 Episode 内 `safe/violation/unknown` 数量、Repair 调用次数、有效 A+ 数量、有效训练标签数、Repair 状态分布、失败原因和候选拒绝原因。
+
+### 固定任务运行命令
+
+先启动仓库内固定场景的 Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+另一个终端运行完整 On-Policy Episode。下面的 `object_4` 和 JSON 路径是同一已有 Teacher/语义绑定组合；程序仍会对活动物理模型重新核验：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/RLinf/.venv/bin/python \
+  research/gs_opd/smoke/pi05_rollout.py \
+  --on-policy-safety-collection \
+  --max-steps 240 \
+  --teacher-json /workspace/zy_workspace/RLinf/logs/gs_opd/teacher/v2_l0t0_raw.json \
+  --object-id object_4 \
+  --semantic-result /workspace/zy_workspace/RLinf/logs/gs_opd/vlm_semantic_disambiguation_object_4_raw_outline_ab/semantic_disambiguation.json \
+  --on-policy-safety-out /workspace/zy_workspace/RLinf/logs/gs_opd/on_policy_safety_l0t0_episode.npz
+```
+
+若当前 IR 中另有已消歧且 Body 已解析的 `target_object`，可增加成对的 `--task-object-id <id> --task-object-semantic-result <json>`，以等长违规前缀的目标物体状态变化提供 Repair 任务进度证据。未提供时，Repair 仍要求可用的正向环境 Reward；仅 EEF 位移不足以生成 A+。`--trace-out` 与该模式互斥，视频可通过既有 `--video-out` 同时保存。运行会真正执行 π₀.₅ 和主环境 Student A0，不要把该命令当作无动作 Smoke。
+
+### 验证与结果统计
+
+- 每个 Episode 的终端统计和 `.summary.json` 包含 `a0_verdict_counts.safe/violation/unknown`、`repair_attempts`、`valid_a_plus_count`、`valid_training_label_count`、`failure_reason_counts` 与 `candidate_rejection_reason_counts`；NPZ 的 `metadata_json` 内也保存相同汇总。
+- 新增轻量测试覆盖 safe/unknown 跳过 Repair、violation 复用 Snapshot 并记录 A+、主状态恢复失败时标记必须终止、Episode 计数，以及可选 NPZ 标签落盘和普通 Trace 兼容性。完成测试/语法检查不代表真实 LIBERO-Safety 场景已成功采集；首次实际运行需人工检查 summary、`decision_safety_json` 和 `training_label_valid`。
+- 本次未启动 Safety Bridge、未执行模型推理或真实 Episode；只做轻量测试与文件检查。
 
 ## MuJoCo Snapshot / Restore 第一版
 

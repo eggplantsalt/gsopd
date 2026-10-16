@@ -56,6 +56,7 @@ class TrajectoryWriter:
         step_index: int,
         bridge_data: dict,
         predicted_actions: np.ndarray,
+        safety_record: dict | None = None,
     ) -> None:
         """Record the raw observation and complete predicted action chunk."""
         decision = {
@@ -68,6 +69,8 @@ class TrajectoryWriter:
             decision[key] = _decode_image(bridge_data, key)
         for key in _STATE_KEYS:
             decision[key] = _copy_state(bridge_data, key)
+        if safety_record is not None:
+            decision["safety_record"] = dict(safety_record)
         self.decisions.append(decision)
 
     def add_step(
@@ -153,6 +156,23 @@ class TrajectoryWriter:
                 [item["done"] for item in self.steps], dtype=np.bool_
             ),
         }
+        if any("safety_record" in item for item in self.decisions):
+            arrays["decision_safety_json"] = np.asarray(
+                [
+                    json.dumps(
+                        item.get("safety_record", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    for item in self.decisions
+                ],
+                dtype=np.str_,
+            )
+            metadata["safety_decision_schema_version"] = 1
+            arrays["metadata_json"] = np.asarray(
+                json.dumps(metadata, sort_keys=True)
+            )
 
         for key in _CAMERA_KEYS:
             arrays[f"decision_{key}"] = _stack(
