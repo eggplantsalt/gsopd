@@ -304,6 +304,88 @@ def _restore_snapshot(snapshot):
     random.setstate(snapshot["python_rng_state"])
 
 
+def _json_value(value):
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value)
+    except Exception:
+        return None
+    if array.ndim == 0:
+        scalar = array.item()
+        if isinstance(scalar, (bool, int, float, str)):
+            return scalar
+        return None
+    try:
+        return array.tolist()
+    except Exception:
+        return None
+
+
+def _repair_context():
+    """Read the active controller scaling and robot limits without changing state."""
+    sim = env.sim
+    model = sim.model._model
+    gravity = np.asarray(model.opt.gravity, dtype=np.float64)
+    gravity_norm = float(np.linalg.norm(gravity))
+    world_up = (-gravity / gravity_norm).tolist() if gravity_norm > 1e-12 else None
+    robots = []
+    for index, robot in enumerate(env.robots):
+        controller = getattr(robot, "controller", None)
+        if controller is None:
+            robots.append({"robot_index": index, "status": "unavailable"})
+            continue
+        joint_ids = np.asarray(getattr(robot, "_ref_joint_indexes", []), dtype=np.int64)
+        joint_ranges = None
+        joint_limited = None
+        joint_names = []
+        try:
+            joint_ranges = np.asarray(model.jnt_range[joint_ids], dtype=np.float64).tolist()
+            joint_limited = np.asarray(model.jnt_limited[joint_ids], dtype=bool).tolist()
+            joint_names = [sim.model.joint_id2name(int(joint_id)) for joint_id in joint_ids]
+        except Exception:
+            joint_ranges = None
+            joint_limited = None
+        fields = (
+            "control_dim",
+            "input_min",
+            "input_max",
+            "output_min",
+            "output_max",
+            "control_delta",
+            "use_delta",
+            "position_limits",
+            "eef_name",
+        )
+        controller_fields = {key: _json_value(getattr(controller, key, None)) for key in fields}
+        # robosuite OSC stores the constructor's ``control_delta`` flag as
+        # ``use_delta``; expose the effective runtime value under both labels.
+        if controller_fields["control_delta"] is None:
+            controller_fields["control_delta"] = _json_value(getattr(controller, "use_delta", None))
+        robots.append(
+            {
+                "robot_index": index,
+                "status": "available",
+                "controller_name": getattr(controller, "name", type(controller).__name__),
+                "robot_name": getattr(getattr(robot, "robot_model", None), "name", None),
+                "action_dim": int(getattr(robot, "action_dim", 0)),
+                "has_gripper": bool(getattr(robot, "has_gripper", False)),
+                "fields": controller_fields,
+                "joint_names": joint_names,
+                "joint_ranges": joint_ranges,
+                "joint_limited": joint_limited,
+            }
+        )
+    return {
+        "status": "available" if robots and all(r.get("status") == "available" for r in robots) else "incomplete",
+        "source": "active robosuite controller and compiled MuJoCo model",
+        "world_up": world_up,
+        "gravity": gravity.tolist(),
+        "model_timestep": float(sim.model.opt.timestep),
+        "robots": robots,
+    }
+
+
 def _snapshot_diagnostics():
     sim = env.sim
     task_env = env.env
@@ -337,6 +419,8 @@ def _snapshot_diagnostics():
                     joint_qpos = sim.data.qpos[address]
                 joints.extend(np.asarray(joint_qpos).reshape(-1).tolist())
             object_states[f"{mapping_name}:{object_name}"] = {
+                "body_id": int(body_id),
+                "body_name": str(root_body),
                 "root_pos": np.asarray(sim.data.body_xpos[body_id]).tolist(),
                 "root_quat": np.asarray(sim.data.body_xquat[body_id]).tolist(),
                 "joint_qpos": joints,
@@ -384,6 +468,18 @@ def _collect_contacts():
                 "body2": {"id": body2_id, "name": body2_name},
                 "position": np.asarray(contact.pos, dtype=np.float64).tolist(),
             }
+            try:
+                contact_frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+                normal = contact_frame[0].copy()
+                normal_norm = float(np.linalg.norm(normal))
+                if not np.isfinite(normal).all() or normal_norm <= 1e-12:
+                    raise ValueError("contact normal is non-finite or degenerate")
+                item["normal_status"] = "available"
+                item["normal_geom1_to_geom2"] = (normal / normal_norm).tolist()
+            except Exception as exc:
+                item["normal_status"] = "unavailable"
+                item["normal_geom1_to_geom2"] = None
+                item["normal_error"] = f"{type(exc).__name__}: {exc}"
         except Exception as exc:
             return {
                 "status": "unavailable",
@@ -938,9 +1034,33 @@ def _record_substep_contacts(monitor, control_step_index, physics_substep_index,
                     "contact_point_count": 0,
                     "force_norms": [],
                     "force_unavailable_count": 0,
+                    "first_contact_sample": None,
                 },
             )
             pair["contact_point_count"] += 1
+            if pair["first_contact_sample"] is None:
+                position = contact.get("position")
+                normal = contact.get("normal_geom1_to_geom2")
+                normal_status = contact.get("normal_status", "unavailable")
+                try:
+                    position_array = np.asarray(position, dtype=np.float64)
+                    if position_array.shape != (3,) or not np.isfinite(position_array).all():
+                        raise ValueError("contact position is malformed")
+                    pair["first_contact_sample"] = {
+                        "position": position_array.tolist(),
+                        "position_status": "available",
+                        "normal": normal,
+                        "normal_status": normal_status,
+                        "normal_geom1_to_geom2": [geom1_id, geom2_id],
+                    }
+                except Exception:
+                    pair["first_contact_sample"] = {
+                        "position": None,
+                        "position_status": "unavailable",
+                        "normal": normal,
+                        "normal_status": normal_status,
+                        "normal_geom1_to_geom2": [geom1_id, geom2_id],
+                    }
             if contact.get("force_status") == "available":
                 force = np.asarray(contact.get("force_and_torque"), dtype=np.float64)
                 if force.shape == (6,) and np.isfinite(force[:3]).all():
@@ -985,8 +1105,22 @@ def _record_substep_contacts(monitor, control_step_index, physics_substep_index,
                 "max_force_norm": None,
                 "force_sample_count": 0,
                 "force_unavailable_count": 0,
+                "first_contact_position_world": None,
+                "contact_position_status": "unavailable",
+                "first_contact_normal_geom1_to_geom2_world": None,
+                "contact_normal_status": "unavailable",
+                "contact_normal_geom_ids": None,
+                "first_contact_sample_recorded": False,
             }
             monitor["_events"][pair_key] = event
+        if not event["first_contact_sample_recorded"] and pair["first_contact_sample"] is not None:
+            sample = pair["first_contact_sample"]
+            event["first_contact_position_world"] = sample["position"]
+            event["contact_position_status"] = sample["position_status"]
+            event["first_contact_normal_geom1_to_geom2_world"] = sample["normal"]
+            event["contact_normal_status"] = sample["normal_status"]
+            event["contact_normal_geom_ids"] = sample["normal_geom1_to_geom2"]
+            event["first_contact_sample_recorded"] = True
         event["occurrence_count"] += 1
         event["contact_point_count"] += pair["contact_point_count"]
         event["force_unavailable_count"] += pair["force_unavailable_count"]
@@ -1395,6 +1529,15 @@ try:
                                 "Gripper geometry inventory failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                        }
+                elif request["op"] == "repair_context":
+                    try:
+                        result = _repair_context()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "robots": [],
+                            "error": f"Repair context failed: {type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "render_highres":
                     try:

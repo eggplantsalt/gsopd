@@ -36,10 +36,18 @@ def parse_args():
         action="store_true",
         help="Probe the first predicted Action Chunk with Bridge branching, then stop before real actions.",
     )
+    parser.add_argument(
+        "--verifier-guided-repair",
+        action="store_true",
+        help="Search Snapshot-verified local XYZ repairs for the first predicted Action Chunk, then stop.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
     parser.add_argument("--probe-out-dir", type=Path)
+    parser.add_argument("--repair-out-dir", type=Path)
+    parser.add_argument("--task-object-id")
+    parser.add_argument("--task-object-semantic-result", type=Path)
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
@@ -51,26 +59,48 @@ def parse_args():
         args.teacher_json,
         args.object_id,
         args.semantic_result,
-        args.probe_out_dir,
     )
-    if args.contact_safety_probe:
+    if args.contact_safety_probe and args.verifier_guided_repair:
+        parser.error("--contact-safety-probe and --verifier-guided-repair are mutually exclusive")
+    probe_enabled = args.contact_safety_probe or args.verifier_guided_repair
+    if probe_enabled:
         if any(value is None for value in probe_inputs):
             parser.error(
-                "--contact-safety-probe requires --teacher-json, --object-id, "
-                "--semantic-result, and --probe-out-dir"
+                "a probe mode requires --teacher-json, --object-id, "
+                "and --semantic-result"
             )
+        if args.verifier_guided_repair and args.repair_out_dir is None:
+            parser.error("--verifier-guided-repair requires --repair-out-dir")
+        if args.contact_safety_probe and args.probe_out_dir is None:
+            parser.error("--contact-safety-probe requires --probe-out-dir")
+        if args.verifier_guided_repair and args.probe_out_dir is not None:
+            parser.error("--probe-out-dir is only used by --contact-safety-probe")
+        if args.contact_safety_probe and args.repair_out_dir is not None:
+            parser.error("--repair-out-dir requires --verifier-guided-repair")
         if args.max_steps == 0:
-            parser.error("--contact-safety-probe requires --max-steps greater than zero")
+            parser.error("a probe mode requires --max-steps greater than zero")
         if args.trace_out is not None:
-            parser.error("--trace-out cannot be combined with --contact-safety-probe")
+            parser.error("--trace-out cannot be combined with a branch probe mode")
         if not args.teacher_json.is_file():
             parser.error(f"Safety IR v2 file does not exist: {args.teacher_json}")
         if not args.semantic_result.is_file():
             parser.error(f"Semantic result file does not exist: {args.semantic_result}")
-    elif any(value is not None for value in probe_inputs):
+        if (args.task_object_id is None) != (args.task_object_semantic_result is None):
+            parser.error("--task-object-id and --task-object-semantic-result must be supplied together")
+        if args.task_object_id is not None and not args.verifier_guided_repair:
+            parser.error("task-object binding options require --verifier-guided-repair")
+        if args.task_object_semantic_result is not None and not args.task_object_semantic_result.is_file():
+            parser.error(f"Task object semantic result does not exist: {args.task_object_semantic_result}")
+    elif any(value is not None for value in probe_inputs) or any(
+        value is not None for value in (
+            args.probe_out_dir,
+            args.repair_out_dir,
+            args.task_object_id,
+            args.task_object_semantic_result,
+        )
+    ):
         parser.error(
-            "--teacher-json, --object-id, --semantic-result, and --probe-out-dir "
-            "require --contact-safety-probe"
+            "Teacher, binding, and output arguments require a probe mode"
         )
     return args
 
@@ -174,6 +204,229 @@ def run_first_chunk_contact_probe(
         flush=True,
     )
     print("PROBE RESULT:", report_path, flush=True)
+    return report
+
+
+def _resolve_task_object_binding(teacher, object_id, semantic_result, geometry_inventory):
+    """Require explicit target_object semantics and a model-verified Body binding."""
+    teacher_object = next((item for item in teacher["objects"] if item["id"] == object_id), None)
+    if teacher_object is None or teacher_object.get("role") != "target_object":
+        raise ValueError("task progress object must have Safety IR role target_object")
+    if not isinstance(semantic_result, dict):
+        raise ValueError("task object semantic result is not a JSON object")
+    decision = semantic_result.get("semantic_decision")
+    semantic_object = semantic_result.get("teacher_object")
+    association = semantic_result.get("physical_association")
+    if (
+        not isinstance(decision, dict)
+        or decision.get("object_id") != object_id
+        or decision.get("status") != "resolved"
+        or not isinstance(semantic_object, dict)
+        or semantic_object.get("object_id") != object_id
+        or not isinstance(association, dict)
+        or association.get("status") != "matched_by_iou"
+    ):
+        raise ValueError("task object semantic result is unresolved or lacks a physical association")
+    body_id = association.get("body_id")
+    body_name = association.get("body_name")
+    if isinstance(body_id, bool) or not isinstance(body_id, int) or body_id < 0:
+        raise ValueError("task object semantic binding has an invalid Body ID")
+    if not isinstance(geometry_inventory, dict) or geometry_inventory.get("status") != "complete":
+        raise ValueError("active Bridge geometry inventory is incomplete")
+    body_entries = {
+        item.get("body_id"): item
+        for item in geometry_inventory.get("geometries", [])
+        if isinstance(item, dict) and item.get("body_id") == body_id
+    }
+    if not body_entries or any(item.get("category") != "scene" for item in body_entries.values()):
+        raise ValueError("task object Body ID is absent from the active scene model")
+    active_names = {item.get("body_name") for item in body_entries.values()}
+    if not isinstance(body_name, str) or active_names != {body_name}:
+        raise ValueError("task object Body name disagrees with the active model")
+    return {
+        "status": "matched_by_iou",
+        "object_id": object_id,
+        "role": "target_object",
+        "body_id": body_id,
+        "body_name": body_name,
+        "physical_object_id": association.get("physical_object_id"),
+    }
+
+
+def run_first_chunk_verifier_guided_repair(
+    conn,
+    chunk,
+    instruction,
+    teacher_json_path,
+    object_id,
+    semantic_result_path,
+    out_dir,
+    task_object_id=None,
+    task_object_semantic_result_path=None,
+):
+    """Branch A0 and adaptively search verified repairs; never step the main env."""
+    import json
+    import sys
+
+    repo_root = str(Path(__file__).resolve().parents[3])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from research.gs_opd.repair.verifier_guided_repair import run_verifier_guided_repair
+    from research.gs_opd.smoke.contact_safety_compiler_smoke import compile_forbid_contact
+    from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
+
+    def bridge_request(payload):
+        conn.send(payload)
+        response = conn.recv()
+        if not isinstance(response, dict):
+            return {"error": "Safety Bridge returned a non-object response"}
+        return response
+
+    actions = np.asarray(chunk, dtype=np.float32)
+    report = {
+        "mode": "first_chunk_verifier_guided_action_repair_probe",
+        "instruction": instruction,
+        "object_id": object_id,
+        "task_object_id": task_object_id,
+        "original_action_chunk_A0": actions.tolist(),
+        "snapshot_id": None,
+        "main_state_restored": None,
+        "status": "unknown",
+        "repaired_action_chunk_A_plus": None,
+        "bridge_geometry_inventory": {"status": "unavailable"},
+        "bridge_gripper_geometry_inventory": {"status": "unavailable"},
+        "bridge_repair_context": {"status": "unavailable"},
+        "baseline_branch_result": None,
+        "baseline_compiled_result": None,
+        "repair_search": None,
+    }
+    try:
+        teacher = parse_teacher_output_v2(teacher_json_path.read_text(encoding="utf-8"))
+        if not any(item["id"] == object_id for item in teacher["objects"]):
+            raise ValueError(f"object_id {object_id!r} is absent from Safety IR v2")
+        semantic_result = json.loads(semantic_result_path.read_text(encoding="utf-8"))
+        task_semantic_result = (
+            json.loads(task_object_semantic_result_path.read_text(encoding="utf-8"))
+            if task_object_semantic_result_path is not None
+            else None
+        )
+        report["bridge_geometry_inventory"] = bridge_request({"op": "geometry_inventory"})
+        report["bridge_gripper_geometry_inventory"] = bridge_request({"op": "gripper_geometry_inventory"})
+        report["bridge_repair_context"] = bridge_request({"op": "repair_context"})
+        if report["bridge_repair_context"].get("status") != "available":
+            raise RuntimeError("Safety Bridge did not provide active controller repair context")
+        snapshot = bridge_request({"op": "snapshot"})
+        report["snapshot_id"] = snapshot.get("snapshot_id")
+        if not isinstance(report["snapshot_id"], str):
+            raise RuntimeError(snapshot.get("error", "Safety Bridge Snapshot returned no ID"))
+        if task_object_id is not None:
+            report["task_object_binding"] = _resolve_task_object_binding(
+                teacher,
+                task_object_id,
+                task_semantic_result,
+                report["bridge_geometry_inventory"],
+            )
+        else:
+            report["task_object_binding"] = None
+
+        baseline_candidate_id = "repair-A0"
+        baseline_branch = bridge_request({
+            "op": "branch_rollout",
+            "snapshot_id": report["snapshot_id"],
+            "candidates": [{"candidate_id": baseline_candidate_id, "actions": actions.tolist()}],
+        })
+        report["baseline_branch_result"] = baseline_branch
+        report["main_state_restored"] = baseline_branch.get("main_state_restored") is True
+        baseline_compiled = compile_forbid_contact(
+            teacher,
+            object_id,
+            semantic_result,
+            baseline_branch,
+            report["bridge_geometry_inventory"],
+            report["bridge_gripper_geometry_inventory"],
+        )
+        report["baseline_compiled_result"] = baseline_compiled
+        if not report["main_state_restored"]:
+            report["status"] = "aborted_main_state_restore_failed"
+            report["failure_reason"] = "baseline_branch_did_not_restore_the_preprobe_main_state"
+        else:
+            def evaluate_candidates(specifications):
+                # One branch request per adaptive round; the Bridge restores the
+                # same supplied Snapshot before each candidate and restores its
+                # call-entry state in a finally block.
+                report["main_state_restored"] = False
+                branch = bridge_request({
+                    "op": "branch_rollout",
+                    "snapshot_id": report["snapshot_id"],
+                    "candidates": [
+                        {"candidate_id": item["candidate_id"], "actions": item["actions"]}
+                        for item in specifications
+                    ],
+                })
+                report["main_state_restored"] = branch.get("main_state_restored") is True
+                compiled = compile_forbid_contact(
+                    teacher,
+                    object_id,
+                    semantic_result,
+                    branch,
+                    report["bridge_geometry_inventory"],
+                    report["bridge_gripper_geometry_inventory"],
+                )
+                branch_by_id = {
+                    item.get("candidate_id"): item
+                    for item in branch.get("candidates", [])
+                    if isinstance(item, dict)
+                }
+                compiled_by_id = {
+                    item.get("candidate_id"): item
+                    for item in compiled.get("candidates", [])
+                    if isinstance(item, dict)
+                }
+                results = []
+                for item in specifications:
+                    candidate_id = item["candidate_id"]
+                    candidate_branch = branch_by_id.get(candidate_id)
+                    candidate_compiled = compiled_by_id.get(candidate_id)
+                    results.append({
+                        "candidate_id": candidate_id,
+                        "branch_result": {
+                            **branch,
+                            "candidates": [candidate_branch] if candidate_branch is not None else [],
+                        },
+                        "compiled_result": {
+                            **compiled,
+                            "candidates": [candidate_compiled] if candidate_compiled is not None else [],
+                        },
+                    })
+                return results
+
+            repair = run_verifier_guided_repair(
+                actions,
+                baseline_branch,
+                baseline_compiled,
+                report["bridge_repair_context"],
+                evaluate_candidates,
+                task_object_binding=report["task_object_binding"],
+            )
+            report["repair_search"] = repair
+            report["status"] = repair.get("status", "unknown")
+            report["repaired_action_chunk_A_plus"] = repair.get("repaired_action_chunk_A_plus")
+            report["failure_reason"] = repair.get("failure_reason")
+            report["main_state_restored"] = report["main_state_restored"] and repair.get("status") != "aborted_main_state_restore_failed"
+    except Exception as exc:
+        report["status"] = "aborted_unknown"
+        report["failure_reason"] = f"{type(exc).__name__}: {exc}"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "verifier_guided_repair.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(
+        "VERIFIER-GUIDED REPAIR:", report["status"],
+        "MAIN STATE RESTORED:", report["main_state_restored"],
+        "HAS A+:", report["repaired_action_chunk_A_plus"] is not None,
+        flush=True,
+    )
+    print("REPAIR RESULT:", report_path, flush=True)
     return report
 
 
@@ -292,6 +545,20 @@ try:
             )
             break
 
+        if args.verifier_guided_repair:
+            contact_probe_result = run_first_chunk_verifier_guided_repair(
+                conn=conn,
+                chunk=chunk,
+                instruction=data["instruction"],
+                teacher_json_path=args.teacher_json,
+                object_id=args.object_id,
+                semantic_result_path=args.semantic_result,
+                out_dir=args.repair_out_dir,
+                task_object_id=args.task_object_id,
+                task_object_semantic_result_path=args.task_object_semantic_result,
+            )
+            break
+
         for action_index, action in enumerate(chunk):
             conn.send({"op": "step", "action": action.tolist()})
             data = conn.recv()
@@ -341,7 +608,10 @@ try:
         "camera_resolution": 256,
     }
     if contact_probe_result is not None:
-        result["contact_safety_probe"] = contact_probe_result["verdict"]
+        if args.contact_safety_probe:
+            result["contact_safety_probe"] = contact_probe_result["verdict"]
+        elif args.verifier_guided_repair:
+            result["verifier_guided_repair"] = contact_probe_result["status"]
 
     with open("/tmp/gs_pi05_safety_l0t0_result.json", "w") as f:
         json.dump(result, f, indent=2)
