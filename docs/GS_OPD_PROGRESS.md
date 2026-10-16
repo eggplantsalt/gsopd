@@ -833,3 +833,54 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 在 Bridge 初始化与每次硬 Reset 后应用局部运行时配置，并验证 controller 实际缩放函数的结果。
 - [x] 增加控制参数轻量回归测试；语法检查和 diff 检查通过。
 - [ ] 人工重启 Bridge 并运行同一任务，确认 EEF 位移、任务成功率和新日志表现。
+
+## Safety IR v2 搬运物体避障规则与离线漏检修复（2026-10-16）
+
+### 审计与真实视觉检查
+
+- 原 Safety IR v2 只有机器人部位到环境物体的 `rules`，没有表达“被搬运物体不能碰撞另一个物体”的字段；Contact Compiler 因此只检查 `gripper ↔ object_4` 等已编译的手部接触规则，`scene_scene` 物体对接触不会触发这条规则。
+- 已用本地 Qwen3.8-27B vLLM 对归档中 Step 74 的原始 256×256 双相机 RGB 和任务指令运行 v2 Teacher。原方向与旋转 180° 的结果都没有识别中央小物体，也未输出 payload-object 禁止接触规则；这一输入路径仍会漏掉该遮挡物。
+- 随后用同一固定场景的原始高分辨率双相机图像和未标注中央区域裁剪图做真实 VLM 检查。聚焦提示下，Qwen 输出了可校验的 `object_contact_rules`：将搬运碗和“small ridged cylinder”分为不同语义对象，并生成 payload→障碍物 `forbid contact`。VLM 没有把该物体命名为 perfume bottle；它只依据视觉描述识别为小型有棱纹圆柱。此输出保存于 `logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt`。因此高分辨率聚焦输入能够表达视觉风险，但不能声称标准 Step 74 输入已解决识别漏检，也不能声称 VLM 识别了瓶子的精确类别。
+- SAM 3 在 VLM 给出的“small ridged cylinder”语义及视觉事实提示下产生候选；IoU 后处理把语义消歧候选绑定到当前仿真模型里的一个场景 Body/Geom。针对搬运碗，加入任务指令消歧后，VLM 选中 stove 上的 bowl 候选（IoU `0.9793`）；中央小物体候选 IoU 为 `0.1427`。VLM 只看原始 RGB、候选轮廓/编号、Teacher 语义和可选指令，不接收 MuJoCo ID/名称；物理 ID 只由本地 SAM Mask、Geom 分割和 IoU 后处理关联。关联记录为 `logs/gs_opd/semantic_bindings_l0t0.json`。低 IoU 结果与 SAM 候选不确定性仍是限制，不能视作普遍可靠的 Grounding。
+
+### 最小实现
+
+- `teacher/schema_v2.py` 和 `teacher/prompt_v2.py` 增加可选顶层 `object_contact_rules`，字段为 `id, subject_id, target_id, predicate, decision, phase, reason`。Validator 校验对象引用、不同 subject/target、ID 唯一和枚举；旧 v2 JSON 缺少该字段时仍可读取。Prompt 要求区分任务 payload 与可见路径障碍，不能仅因非目标角色而禁止接触；保留正常支撑面和目标放置接触，证据不足时输出 `unknown` 或记录不确定性。
+- `smoke/contact_safety_compiler_smoke.py` 只从明确的语义消歧结果编译 object-object 规则，并对照 Bridge 几何清单校验当前模型身份。完整子步 Contact Recording 若发现绑定的 payload 与障碍 Body 接触，则返回 `violation` 并附控制步/物理子步、Geom/Body、接触位置/法向/力证据；身份冲突、缺失绑定或采集不完整返回 `unknown`。无关场景接触、夹爪抓取及正常支撑/放置接触不触发障碍规则。没有将 VLM 名称直接匹配到 Geom，也没有硬编码场景对象名或 ID。
+- `grounding/vlm_semantic_disambiguation_smoke.py` 可选接收任务指令与当前 Geom Inventory；在发给 VLM 前排除机器人候选和无可靠 IoU 物理绑定的候选，且不把物理 ID/名称传给 VLM。`grounding/sam3_smoke.py` 可选把 Teacher 的 agentview 可见事实加入 SAM 文本提示，默认行为不变。
+- 新增 `smoke/recompile_archive_contact_safety.py`，仅离线复用 NPZ 中已有的逐物理子步接触记录重编译，不启动仿真、Teacher 或完整 Rollout。
+
+### 离线结果与限制
+
+- 输入 `logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz` 的 27 个已归档决策，经新规则与真实 VLM/SAM/IoU 语义绑定重编译，结果为 `safe=24, violation=3, unknown=0`。旧记录在决策 Step 70 将原始 chunk 标为 safe；新编译在首个 chunk 的控制步偏移 4（Step 74）检出 `object_1` 搬运碗与 `object_4` 视觉识别障碍绑定 Body 的接触：两组接触发生于物理子步 8/9，记录到 17/16 次接触点，最大可用接触力约 `5.55/4.30`。Step 75 与 80 的后续分支也检出持续接触。证据来自归档 MuJoCo Contact 记录；Teacher 视觉语义来自上面单独保存的真实 VLM 原始响应，二者没有互相冒充。
+- 本归档中的正常 gripper-target 抓取、搬运物体与当前支撑物/放置区域接触没有被这条 payload-obstacle 规则误报；其余 24 个决策保持 safe。该离线复核只验证已有轨迹，不代表实时 Rollout 的 Teacher、SAM 和 Compiler 已在每个状态在线运行。
+- Schema、Prompt、Compiler、VLM 候选消歧和 SAM 提示的相关 unittest 共 39 项通过；修改的 Python 文件通过 `py_compile`，`git diff --check` 通过。未运行仿真或完整 Rollout。
+- 当前 Rollout 调用链没有被改动。若实时调用方没有为规则涉及的每个语义对象传入已解析的 SAM/IoU 绑定，Compiler 应返回 unknown，不能据此继续声称安全。下一步需在同一固定任务中接通完整绑定和规则输入，先做短程分支验证；同时改进 Step 74 视角/分辨率或复核提示，避免依赖初始高分辨率识别来覆盖搬运期间的遮挡变化。
+
+### 验证命令
+
+离线复现上述 27 个决策重编译结果（不运行仿真或模型）：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/envs/gsopd_teacher/bin/python \
+  research/gs_opd/smoke/recompile_archive_contact_safety.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --object-id object_1 \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --geometry-inventory logs/gs_opd/contact_safety_compiler_object_4/bridge_geometry_inventory.json \
+  --gripper-inventory logs/gs_opd/contact_safety_compiler_object_4/bridge_gripper_geometry_inventory.json \
+  --out logs/gs_opd/offline_object_contact_recompile.json
+```
+
+后续真实验证应先用 Safety Bridge 对固定 L0T0 场景提供所有 Teacher 对象的 SAM/IoU 语义绑定，再从同一 Snapshot 对短 Action Chunk 执行 `branch_rollout` 并调用 Contact Compiler；确认 Step 74 的对象对接触返回 violation、正常抓放/支撑对不触发后，再考虑接入 Rollout。当前没有新增会直接启动完整 Rollout 的命令。
+
+**检查清单（Checklist）**
+
+- [x] 审计 Teacher Prompt、Safety IR v2、SAM 3 候选绑定及 Compiler 的原有对象接触覆盖缺口。
+- [x] 用真实 vLLM 对原始 Step 74 观测检查并保存结果；如实记录 256×256 路径的漏检，以及高分辨率聚焦输入的有限识别结果。
+- [x] 增加向后兼容的 object-object 规则、严格字段/引用校验及语义绑定驱动的 Compiler 检查。
+- [x] 用已有 NPZ 离线重编译，检出 Step 74 及后续两段接触；完成抓取和支撑接触回归覆盖。
+- [ ] 在短程真实 Bridge 分支中验证在线对象绑定、Teacher 规则输入与正常抓放误报率；标准分辨率下的障碍视觉识别仍需改进。

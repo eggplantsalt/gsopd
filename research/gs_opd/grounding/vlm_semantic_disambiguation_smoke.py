@@ -68,6 +68,7 @@ def _load_case(
     object_id: str,
     sam3_results_path: Path,
     iou_results_path: Path,
+    geometry_inventory_path: Path | None = None,
 ) -> tuple[dict, dict, np.ndarray, list[dict]]:
     teacher = parse_teacher_output_v2(teacher_json.read_text(encoding="utf-8"))
     target = next((item for item in teacher["objects"] if item["id"] == object_id), None)
@@ -154,6 +155,41 @@ def _load_case(
 
     candidates = []
     seen_indices = set()
+    robot_candidates_filtered: list[int] = []
+    unresolved_iou_candidates_filtered: list[int] = []
+    body_categories: dict[int, str] = {}
+    geom_identities: dict[int, tuple[int, str, str]] = {}
+    if geometry_inventory_path is not None:
+        inventory = _load_json(geometry_inventory_path, "Bridge geometry inventory")
+        if (
+            inventory.get("status") != "complete"
+            or inventory.get("robot_classification_status") != "available"
+            or not isinstance(inventory.get("geometries"), list)
+        ):
+            raise RuntimeError("Bridge geometry inventory is not complete for candidate filtering")
+        for geometry in inventory["geometries"]:
+            if not isinstance(geometry, dict):
+                raise RuntimeError("Bridge geometry inventory contains an invalid geometry entry")
+            geom_id = geometry.get("geom_id")
+            body_id = geometry.get("body_id")
+            category = geometry.get("category")
+            geom_name = geometry.get("geom_name")
+            body_name = geometry.get("body_name")
+            if (
+                isinstance(geom_id, bool)
+                or not isinstance(geom_id, int)
+                or isinstance(body_id, bool)
+                or not isinstance(body_id, int)
+                or category not in ("robot", "scene")
+                or not isinstance(geom_name, str)
+                or not isinstance(body_name, str)
+                or geom_id in geom_identities
+            ):
+                raise RuntimeError("Bridge geometry inventory has invalid body/category data")
+            geom_identities[geom_id] = (body_id, geom_name, category)
+            previous = body_categories.setdefault(body_id, category)
+            if previous != category:
+                raise RuntimeError("Bridge geometry inventory has inconsistent body categories")
     for item in raw_candidates:
         if not isinstance(item, dict):
             raise RuntimeError("SAM 3 candidate entries must be objects")
@@ -202,6 +238,44 @@ def _load_case(
             raise RuntimeError(
                 f"Unsupported IoU status for candidate {index}: {iou_entry.get('status')!r}"
             )
+        best_match = iou_entry.get("best_match")
+        matched_body_id = best_match.get("body_id") if isinstance(best_match, dict) else None
+        if geometry_inventory_path is not None and iou_entry.get("status") == "matched_by_iou":
+            if not isinstance(best_match, dict):
+                raise RuntimeError(f"IoU matched candidate {index} has no best_match")
+            match_geom_ids = best_match.get("geom_ids")
+            match_geom_names = best_match.get("geom_names")
+            if (
+                not isinstance(match_geom_ids, list)
+                or not match_geom_ids
+                or not isinstance(match_geom_names, list)
+                or len(match_geom_names) != len(match_geom_ids)
+            ):
+                raise RuntimeError(f"IoU candidate {index} has malformed physical geometry identity")
+            for geom_id, geom_name in zip(match_geom_ids, match_geom_names):
+                identity = geom_identities.get(geom_id) if isinstance(geom_id, int) else None
+                if (
+                    identity is None
+                    or identity[0] != matched_body_id
+                    or identity[1] != geom_name
+                ):
+                    raise RuntimeError(
+                        f"IoU candidate {index} disagrees with the active Bridge geometry inventory"
+                    )
+        physical_category = (
+            body_categories.get(matched_body_id)
+            if isinstance(matched_body_id, int) and not isinstance(matched_body_id, bool)
+            else None
+        )
+        if geometry_inventory_path is not None:
+            if iou_entry.get("status") != "matched_by_iou":
+                unresolved_iou_candidates_filtered.append(index)
+                continue
+            if physical_category == "robot":
+                # The active model hierarchy, not a geom-name prefix or SAM
+                # score, establishes robot membership.
+                robot_candidates_filtered.append(index)
+                continue
         candidates.append(
             {
                 "candidate_index": index,
@@ -209,11 +283,19 @@ def _load_case(
                 "mask": mask,
                 "mask_file": str(mask_path.resolve()),
                 "iou_result": iou_entry,
+                "physical_category": physical_category,
             }
         )
     if set(iou_by_index) != seen_indices:
         raise RuntimeError("SAM 3 and IoU candidate index sets do not match")
-    return target, {"teacher": teacher, "sam": sam_results, "iou": iou_results}, rgb, candidates
+    return target, {
+        "teacher": teacher,
+        "sam": sam_results,
+        "iou": iou_results,
+        "geometry_inventory_path": str(geometry_inventory_path.resolve()) if geometry_inventory_path else None,
+        "robot_candidates_filtered": robot_candidates_filtered,
+        "unresolved_iou_candidates_filtered": unresolved_iou_candidates_filtered,
+    }, rgb, candidates
 
 
 def _edge_mask(mask: np.ndarray) -> np.ndarray:
@@ -281,11 +363,22 @@ def _teacher_object_context(target: dict, teacher: dict) -> dict:
     }
 
 
-def _build_user_prompt(target: dict, teacher: dict, candidate_indices: list[int]) -> str:
+def _build_user_prompt(
+    target: dict,
+    teacher: dict,
+    candidate_indices: list[int],
+    task_instruction: str | None = None,
+) -> str:
     context = _teacher_object_context(target, teacher)
+    instruction = (
+        f"Task instruction: {task_instruction.strip()}\n"
+        if isinstance(task_instruction, str) and task_instruction.strip()
+        else ""
+    )
     return (
         "Determine whether the Teacher object shown below corresponds to one of "
         "the numbered candidate regions in the two attached views of one RGB frame.\n"
+        f"{instruction}"
         "Teacher object semantics (Safety IR v2):\n"
         f"{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Candidate indices shown in the image: {candidate_indices}\n"
@@ -475,9 +568,15 @@ def run_smoke(
     iou_results_path: Path,
     output_dir: Path,
     backend: Any | None = None,
+    geometry_inventory_path: Path | None = None,
+    task_instruction: str | None = None,
 ) -> dict:
     target, loaded, rgb, candidates = _load_case(
-        teacher_json, object_id, sam3_results_path, iou_results_path
+        teacher_json,
+        object_id,
+        sam3_results_path,
+        iou_results_path,
+        geometry_inventory_path=geometry_inventory_path,
     )
     teacher = loaded["teacher"]
     sam_results = loaded["sam"]
@@ -500,7 +599,7 @@ def run_smoke(
     else:
         if backend is None:
             backend = create_backend_from_env()
-        prompt = _build_user_prompt(target, teacher, candidate_indices)
+        prompt = _build_user_prompt(target, teacher, candidate_indices, task_instruction)
         started = time.perf_counter()
         raw_output = _request_vlm(
             backend, prompt, rgb, annotated_rgb, object_id, candidate_indices
@@ -563,6 +662,10 @@ def run_smoke(
         "original_rgb_image": original_path.name,
         "annotated_image": annotated_path.name,
         "visual_input_mode": "unmodified_original_rgb_plus_thin_candidate_boundaries_and_numbers",
+        "robot_candidates_filtered": loaded["robot_candidates_filtered"],
+        "unresolved_iou_candidates_filtered": loaded["unresolved_iou_candidates_filtered"],
+        "geometry_inventory": loaded["geometry_inventory_path"],
+        "task_instruction": task_instruction,
         "sam3_results": str(sam3_results_path.resolve()),
         "iou_results": str(iou_results_path.resolve()),
         "teacher_json": str(teacher_json.resolve()),
@@ -582,13 +685,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--object-id", required=True)
     parser.add_argument("--sam3-results", type=Path, required=True)
     parser.add_argument("--iou-results", type=Path, required=True)
+    parser.add_argument(
+        "--geometry-inventory",
+        type=Path,
+        help="optional active Bridge inventory used only to remove robot-part masks before VLM selection",
+    )
+    parser.add_argument(
+        "--instruction",
+        help="optional task instruction used with the Teacher semantics during visual candidate disambiguation",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    for label, path in (
+    required_files = [
         ("Teacher v2 JSON", args.teacher_json),
         ("SAM 3 results", args.sam3_results),
         ("MuJoCo IoU results", args.iou_results),
-    ):
+    ]
+    if args.geometry_inventory is not None:
+        required_files.append(("Bridge geometry inventory", args.geometry_inventory))
+    for label, path in required_files:
         if not path.is_file():
             parser.error(f"{label} file does not exist: {path}")
     try:
@@ -598,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
             args.sam3_results,
             args.iou_results,
             args.out_dir,
+            geometry_inventory_path=args.geometry_inventory,
+            task_instruction=args.instruction,
         )
     except (BackendConfigError, TeacherBackendError, OSError, ValueError, RuntimeError) as exc:
         print(f"VLM semantic disambiguation failed: {type(exc).__name__}: {exc}", file=sys.stderr)

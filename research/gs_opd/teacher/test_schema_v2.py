@@ -80,6 +80,70 @@ class SafetyIRV2SchemaTests(unittest.TestCase):
         payload["rules"] = []
         self.assertEqual(validate_teacher_output_v2(payload)["rules"], [])
 
+    def test_legacy_v2_without_object_contact_rules_remains_valid(self) -> None:
+        payload = _valid_output()
+        self.assertNotIn("object_contact_rules", payload)
+        self.assertEqual(parse_teacher_output_v2(json.dumps(payload)), payload)
+        self.assertIn(
+            "object_contact_rules",
+            SAFETY_OUTPUT_V2_JSON_SCHEMA["required"],
+        )
+
+    def test_object_contact_rule_is_validated_and_unknown_is_preserved(self) -> None:
+        payload = _valid_output()
+        second = copy.deepcopy(payload["objects"][0])
+        second["id"] = "object-2"
+        second["name"] = "small bottle"
+        payload["objects"].append(second)
+        payload["rules"] = []
+        payload["object_contact_rules"] = [
+            {
+                "id": "object-rule-1",
+                "subject_id": "object-1",
+                "target_id": "object-2",
+                "predicate": "contact",
+                "decision": "unknown",
+                "phase": "any",
+                "reason": "The route relation is visually unclear.",
+            }
+        ]
+        parsed = parse_teacher_output_v2(json.dumps(payload))
+        self.assertEqual(parsed["object_contact_rules"][0]["decision"], "unknown")
+        self.assertEqual(parsed["object_contact_rules"], payload["object_contact_rules"])
+
+    def test_object_contact_rule_references_and_ids_are_strict(self) -> None:
+        payload = _valid_output()
+        second = copy.deepcopy(payload["objects"][0])
+        second["id"] = "object-2"
+        payload["objects"].append(second)
+        payload["object_contact_rules"] = [
+            {
+                "id": "rule-1",
+                "subject_id": "object-1",
+                "target_id": "object-2",
+                "predicate": "contact",
+                "decision": "forbid",
+                "phase": "any",
+                "reason": "The carried object should clear this obstacle.",
+            }
+        ]
+        with self.assertRaisesRegex(TeacherOutputV2Error, "duplicate rule id"):
+            validate_teacher_output_v2(payload)
+
+        payload["rules"] = []
+        payload["object_contact_rules"][0]["target_id"] = "missing"
+        with self.assertRaisesRegex(TeacherOutputV2Error, "no object with id"):
+            validate_teacher_output_v2(payload)
+
+        payload["object_contact_rules"][0]["target_id"] = "object-1"
+        with self.assertRaisesRegex(TeacherOutputV2Error, "different object id"):
+            validate_teacher_output_v2(payload)
+
+        payload["object_contact_rules"][0]["target_id"] = "object-2"
+        payload["object_contact_rules"][0]["decision"] = "safe"
+        with self.assertRaises(TeacherOutputV2Error):
+            validate_teacher_output_v2(payload)
+
     def test_extra_or_missing_fields_are_rejected(self) -> None:
         payload = _valid_output()
         payload["objects"][0]["unexpected"] = "value"

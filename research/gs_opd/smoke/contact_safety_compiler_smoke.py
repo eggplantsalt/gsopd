@@ -50,7 +50,7 @@ def _resolve_forbid_rule(teacher: dict[str, Any], object_id: str) -> tuple[dict 
     if len(related) != 1:
         return None, "multiple_or_conflicting_gripper_contact_rules"
     rule = related[0]
-    if rule["decision"] != "forbid":
+    if rule["decision"] not in ("allow", "forbid", "unknown"):
         return None, f"unsupported_contact_decision:{rule['decision']}"
     if rule["subject_parts"] != ["gripper"]:
         return None, "rule_includes_subject_parts_outside_minimal_gripper_compiler"
@@ -434,6 +434,169 @@ def _inspect_contact_event(
     return None, None, None
 
 
+def _compile_object_contact_checks(
+    teacher: dict[str, Any],
+    object_semantic_results: Any,
+    candidate: Any,
+    geometry_inventory: Any,
+    gripper_inventory: Any,
+    *,
+    branch_error: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compile explicit object-object forbid rules from semantic Body bindings."""
+    raw_rules = teacher.get("object_contact_rules", [])
+    if not isinstance(raw_rules, list):
+        return [], [{"verdict": "unknown", "reason": "object_contact_rules_are_malformed"}]
+    rules = [
+        rule
+        for rule in raw_rules
+        if isinstance(rule, dict) and rule.get("decision") in ("forbid", "unknown")
+    ]
+    if not rules:
+        return [], []
+
+    if not isinstance(object_semantic_results, dict):
+        object_semantic_results = {}
+    needed_ids = {
+        object_id
+        for rule in rules
+        for object_id in (rule.get("subject_id"), rule.get("target_id"))
+        if isinstance(object_id, str)
+    }
+    bindings: dict[str, dict | None] = {}
+    binding_errors: dict[str, str] = {}
+    geom_by_id: dict[int, dict] = {}
+    body_by_id: dict[int, dict] = {}
+    for object_id in needed_ids:
+        semantic_result = object_semantic_results.get(object_id)
+        binding, current_geoms, current_bodies, error = _resolve_target_binding(
+            semantic_result, object_id, geometry_inventory
+        )
+        bindings[object_id] = binding
+        if error is not None:
+            binding_errors[object_id] = error
+        else:
+            geom_by_id = current_geoms
+            body_by_id = current_bodies
+
+    gripper_geom_to_body, robot_body_ids, gripper_error = _resolve_gripper_geometries(
+        gripper_inventory, geom_by_id, body_by_id
+    ) if geom_by_id and body_by_id else (None, None, "active_model_identity_is_unavailable")
+    monitor, coverage_error = _complete_monitoring(candidate)
+    if branch_error is not None:
+        coverage_error = branch_error
+    elif coverage_error is None and (gripper_error is not None or gripper_geom_to_body is None or robot_body_ids is None):
+        coverage_error = gripper_error or "active_robot_contact_classification_is_unavailable"
+
+    compiled: list[dict[str, Any]] = []
+    checks: list[dict[str, Any]] = []
+    for rule in rules:
+        rule_id = rule.get("id")
+        subject_id = rule.get("subject_id")
+        target_id = rule.get("target_id")
+        compiled_rule: dict[str, Any] = {
+            "rule_id": rule_id,
+            "predicate": "contact",
+            "decision": rule.get("decision"),
+            "subject_object_id": subject_id,
+            "target_object_id": target_id,
+        }
+        subject_binding = bindings.get(subject_id) if isinstance(subject_id, str) else None
+        target_binding = bindings.get(target_id) if isinstance(target_id, str) else None
+        if subject_binding is not None:
+            compiled_rule["subject_body_id"] = subject_binding["body_id"]
+            compiled_rule["subject_geom_ids"] = subject_binding["geom_ids"]
+        if target_binding is not None:
+            compiled_rule["target_body_id"] = target_binding["body_id"]
+            compiled_rule["target_geom_ids"] = target_binding["geom_ids"]
+        compiled.append(compiled_rule)
+
+        base = {"rule_id": rule_id, "subject_id": subject_id, "target_id": target_id, "evidence": []}
+        if rule.get("decision") == "unknown":
+            checks.append({**base, "verdict": "unknown", "reason": "teacher_rule_decision_is_unknown"})
+            continue
+        if not isinstance(subject_id, str) or not isinstance(target_id, str) or subject_id == target_id:
+            checks.append({**base, "verdict": "unknown", "reason": "object_contact_rule_references_are_invalid"})
+            continue
+        if subject_id in binding_errors or target_id in binding_errors:
+            errors = [binding_errors[key] for key in (subject_id, target_id) if key in binding_errors]
+            checks.append({**base, "verdict": "unknown", "reason": "object_semantic_binding_unavailable", "binding_errors": errors})
+            continue
+        if (
+            subject_binding is not None
+            and target_binding is not None
+            and subject_binding["body_id"] == target_binding["body_id"]
+        ):
+            checks.append(
+                {
+                    **base,
+                    "verdict": "unknown",
+                    "reason": "distinct_teacher_objects_share_one_physical_body",
+                }
+            )
+            continue
+        if coverage_error is not None or monitor is None:
+            checks.append({**base, "verdict": "unknown", "reason": coverage_error or "contact_monitoring_unavailable"})
+            continue
+        assert subject_binding is not None and target_binding is not None
+        assert geom_by_id and body_by_id and gripper_geom_to_body is not None and robot_body_ids is not None
+        violations = []
+        event_error = None
+        for event in monitor["events"]:
+            _gripper_hit, _robot_hit, current_error = _inspect_contact_event(
+                event,
+                object_body_id=subject_binding["body_id"],
+                object_geom_ids=set(subject_binding["geom_ids"]),
+                gripper_geom_to_body=gripper_geom_to_body,
+                robot_body_ids=robot_body_ids,
+                geom_by_id=geom_by_id,
+                body_by_id=body_by_id,
+            )
+            if current_error is not None:
+                event_error = current_error
+                break
+            if not isinstance(event, dict):
+                event_error = "contact_event_is_not_an_object"
+                break
+            body_pair = event.get("body_pair")
+            bodies = [_int_pair_entry(body_pair, index) for index in (0, 1)]
+            if any(item is None for item in bodies):
+                event_error = "contact_event_pair_identity_is_malformed"
+                break
+            body_ids = [item[0] for item in bodies]
+            if set(body_ids) == {subject_binding["body_id"], target_binding["body_id"]}:
+                if event.get("classification") != "scene_scene" or event.get("robot_involved") is not False:
+                    event_error = "bound_object_pair_is_not_classified_as_scene_scene"
+                    break
+                violations.append(
+                    {
+                        "classification": "forbidden_object_object_contact",
+                        "subject_object_id": subject_id,
+                        "target_object_id": target_id,
+                        "subject_body_id": subject_binding["body_id"],
+                        "target_body_id": target_binding["body_id"],
+                        "geom_pair": event["geom_pair"],
+                        "body_pair": event["body_pair"],
+                        "first_control_step": event["first_control_step"],
+                        "first_physics_substep": event["first_physics_substep"],
+                        "occurrence_count": event["occurrence_count"],
+                        "contact_point_count": event["contact_point_count"],
+                        "first_contact_position_world": event.get("first_contact_position_world"),
+                        "first_contact_normal_geom1_to_geom2_world": event.get(
+                            "first_contact_normal_geom1_to_geom2_world"
+                        ),
+                        "max_force_norm": event["max_force_norm"],
+                    }
+                )
+        if event_error is not None:
+            checks.append({**base, "verdict": "unknown", "reason": event_error})
+        elif violations:
+            checks.append({**base, "verdict": "violation", "reason": "forbidden_object_object_contact_observed", "evidence": violations})
+        else:
+            checks.append({**base, "verdict": "safe", "reason": "complete_substep_monitoring_found_no_contact_for_bound_object_pair"})
+    return compiled, checks
+
+
 def compile_forbid_contact(
     teacher: dict[str, Any],
     object_id: str,
@@ -441,8 +604,16 @@ def compile_forbid_contact(
     branch_result: Any,
     geometry_inventory: Any,
     gripper_inventory: Any,
+    object_semantic_results: Any = None,
 ) -> dict[str, Any]:
     rule, rule_error = _resolve_forbid_rule(teacher, object_id)
+    has_object_contact_rules = bool(
+        isinstance(teacher, dict) and teacher.get("object_contact_rules")
+    )
+    if has_object_contact_rules and rule is None and rule_error == "no_contact_rule_for_gripper_and_target":
+        # This API also compiles object-only v2 policies. Keep old missing-rule
+        # behavior unchanged when the object-contact extension is absent.
+        rule_error = None
     binding, geom_by_id, body_by_id, binding_error = _resolve_target_binding(
         semantic_result, object_id, geometry_inventory
     )
@@ -460,7 +631,7 @@ def compile_forbid_contact(
         branch_error = "branch_rollout_has_no_candidate_results"
 
     compiled_rule = None
-    if rule is not None and binding is not None:
+    if rule is not None and rule["decision"] == "forbid" and binding is not None:
         compiled_rule = {
             "rule_id": rule["id"],
             "predicate": "contact",
@@ -484,6 +655,28 @@ def compile_forbid_contact(
             base = {"candidate_id": candidate_id, "verdict": "unknown", "evidence": []}
             if common_error is not None:
                 base["reason"] = common_error
+                candidate_results.append(base)
+                continue
+            if rule is not None and rule["decision"] == "unknown":
+                base["reason"] = "teacher_gripper_contact_decision_is_unknown"
+                candidate_results.append(base)
+                continue
+            if rule is not None and rule["decision"] == "allow":
+                monitor, coverage_error = _complete_monitoring(candidate)
+                if coverage_error is not None:
+                    base["reason"] = coverage_error
+                else:
+                    base["verdict"] = "safe"
+                    base["reason"] = "teacher_explicitly_allows_gripper_target_contact"
+                    base["evidence"] = {
+                        "allowed_rule_id": rule["id"],
+                        "complete_contact_substeps": monitor["captured_physics_substeps"],
+                    }
+                candidate_results.append(base)
+                continue
+            if rule is None and has_object_contact_rules:
+                base["verdict"] = "safe"
+                base["reason"] = "no_robot_forbid_rule_to_check"
                 candidate_results.append(base)
                 continue
             monitor, coverage_error = _complete_monitoring(candidate)
@@ -539,6 +732,32 @@ def compile_forbid_contact(
                 }
                 candidate_results.append(base)
 
+    object_rules = teacher.get("object_contact_rules", []) if isinstance(teacher, dict) else []
+    object_compiled_rules = []
+    if isinstance(candidates, list) and isinstance(object_rules, list) and object_rules:
+        semantic_results = dict(object_semantic_results) if isinstance(object_semantic_results, dict) else {}
+        semantic_results.setdefault(object_id, semantic_result)
+        for candidate_result, candidate in zip(candidate_results, candidates):
+            compiled_objects, object_checks = _compile_object_contact_checks(
+                teacher,
+                semantic_results,
+                candidate,
+                geometry_inventory,
+                gripper_inventory,
+                branch_error=branch_error,
+            )
+            object_compiled_rules = compiled_objects
+            candidate_result["object_contact_checks"] = object_checks
+            object_verdicts = [item["verdict"] for item in object_checks]
+            if "violation" in object_verdicts:
+                candidate_result["verdict"] = "violation"
+                candidate_result["reason"] = "forbidden_object_object_contact_observed"
+            elif "unknown" in object_verdicts and candidate_result["verdict"] == "safe":
+                candidate_result["verdict"] = "unknown"
+                candidate_result["reason"] = "object_contact_rule_could_not_be_verified"
+            elif object_verdicts and all(verdict == "safe" for verdict in object_verdicts):
+                candidate_result["object_contact_verdict"] = "safe"
+
     verdicts = [item["verdict"] for item in candidate_results]
     if "violation" in verdicts:
         overall = "violation"
@@ -546,11 +765,17 @@ def compile_forbid_contact(
         overall = "safe"
     else:
         overall = "unknown"
+    object_rules_active = bool(object_rules)
     return {
         "status": overall,
-        "scope": "only the compiled forbid contact(gripper, target_object) rule",
+        "scope": (
+            "compiled explicit forbid robot-part/object and object/object contact rules"
+            if object_rules_active
+            else "only the compiled forbid contact(gripper, target_object) rule"
+        ),
         "object_id": object_id,
         "compiled_rule": compiled_rule,
+        "compiled_object_contact_rules": object_compiled_rules,
         "target_binding": binding,
         "gripper_geom_ids": sorted(gripper_geom_to_body) if gripper_geom_to_body else None,
         "main_state_restored": main_restored,
@@ -595,6 +820,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--object-id", required=True)
     parser.add_argument("--semantic-result", type=Path, required=True)
     parser.add_argument(
+        "--object-semantic-results-json",
+        type=Path,
+        help=(
+            "optional JSON object mapping semantic object IDs to their resolved "
+            "SAM/IoU/VLM semantic result objects"
+        ),
+    )
+    parser.add_argument(
         "--candidates-json",
         type=Path,
         required=True,
@@ -616,6 +849,14 @@ def main(argv: list[str] | None = None) -> int:
         if not any(item["id"] == args.object_id for item in teacher["objects"]):
             parser.error(f"object_id {args.object_id!r} is absent from Safety IR v2")
         semantic_result = _load_json(args.semantic_result, "semantic result")
+        object_semantic_results = {}
+        if args.object_semantic_results_json is not None:
+            object_semantic_results = _load_json(
+                args.object_semantic_results_json,
+                "object semantic results",
+            )
+            if not isinstance(object_semantic_results, dict):
+                parser.error("object semantic results JSON must be an object keyed by object ID")
         candidates = _load_json(args.candidates_json, "branch candidates")
         if not isinstance(candidates, list) or not candidates:
             parser.error("branch candidates JSON must be a non-empty list")
@@ -636,12 +877,18 @@ def main(argv: list[str] | None = None) -> int:
             branch_result,
             geometry_inventory,
             gripper_inventory,
+            object_semantic_results=object_semantic_results,
         )
         result.update(
             {
                 "snapshot_id": snapshot_id,
                 "teacher_json": str(args.teacher_json.resolve()),
                 "semantic_result": str(args.semantic_result.resolve()),
+                "object_semantic_results_json": (
+                    str(args.object_semantic_results_json.resolve())
+                    if args.object_semantic_results_json is not None
+                    else None
+                ),
                 "candidates_json": str(args.candidates_json.resolve()),
                 "bridge_host": args.host,
                 "bridge_port": args.port,

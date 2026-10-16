@@ -6,6 +6,7 @@ import unittest
 
 from research.gs_opd.teacher.prompt_v2 import (
     INFERENCE_FIELDS,
+    OBJECT_CONTACT_RULE_FIELDS,
     OBJECT_FIELDS,
     RULE_FIELDS,
     SYSTEM_PROMPT,
@@ -42,8 +43,12 @@ class SafetyIRV2PromptTests(unittest.TestCase):
             set(RULE_FIELDS),
             set(properties["rules"]["items"]["properties"]),
         )
+        self.assertEqual(
+            set(OBJECT_CONTACT_RULE_FIELDS),
+            set(properties["object_contact_rules"]["items"]["properties"]),
+        )
         for field in (*TOP_LEVEL_FIELDS, *OBJECT_FIELDS, *VISUAL_FACT_FIELDS,
-                      *INFERENCE_FIELDS, *RULE_FIELDS):
+                      *INFERENCE_FIELDS, *RULE_FIELDS, *OBJECT_CONTACT_RULE_FIELDS):
             with self.subTest(field=field):
                 self.assertIn(field, SYSTEM_PROMPT)
 
@@ -59,6 +64,11 @@ class SafetyIRV2PromptTests(unittest.TestCase):
             "do not infer a prohibition from role alone",
             "non-target status alone is not evidence of danger",
             "A placement goal does not by itself authorize",
+            "object-to-object collision rules",
+            "object_contact_rules",
+            "carried payload",
+            "Do not treat every non-target object as an obstacle",
+            "Do not forbid normal support contact",
             "MuJoCo",
         ):
             with self.subTest(phrase=phrase):

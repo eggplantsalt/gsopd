@@ -56,6 +56,23 @@ def _to_numpy(value: Any):
     return np.asarray(value)
 
 
+def _teacher_text_prompt(teacher_object: dict[str, Any], include_visual_facts: bool) -> str:
+    """Build an optional SAM phrase from the Teacher name and its visible facts."""
+    name = teacher_object["name"]
+    if not include_visual_facts:
+        return name
+    facts = teacher_object.get("visual_facts", [])
+    statements = [
+        item["statement"]
+        for item in facts
+        if isinstance(item, dict)
+        and item.get("camera") == "agentview_image"
+        and isinstance(item.get("statement"), str)
+        and item["statement"].strip()
+    ]
+    return "; ".join([name, *statements])
+
+
 def _normalize_predictions(output: dict[str, Any], image_size: tuple[int, int]):
     """Return masks [N,H,W], boxes [N,4], and scores [N] as NumPy arrays."""
     import numpy as np
@@ -107,6 +124,7 @@ def _save_results(
     image_path: Path,
     object_id: str,
     object_name: str,
+    text_prompt: str,
     checkpoint_path: Path,
     confidence_threshold: float,
 ) -> dict[str, Any]:
@@ -157,7 +175,7 @@ def _save_results(
         "teacher_json": str(teacher_json.resolve()),
         "object_id": object_id,
         "object_name": object_name,
-        "text_prompt": object_name,
+        "text_prompt": text_prompt,
         "image": str(image_path.resolve()),
         "image_width": width,
         "image_height": height,
@@ -181,6 +199,7 @@ def run_smoke(
     checkpoint_path: Path,
     output_dir: Path,
     confidence_threshold: float = 0.5,
+    include_visual_facts: bool = False,
 ) -> dict[str, Any]:
     import torch
     from PIL import Image
@@ -199,6 +218,7 @@ def run_smoke(
         )
 
     object_name = matched["name"]
+    text_prompt = _teacher_text_prompt(matched, include_visual_facts)
     with Image.open(image_path) as source_image:
         image = source_image.convert("RGB")
     processor = _load_processor(checkpoint_path, confidence_threshold)
@@ -208,12 +228,12 @@ def run_smoke(
                 state = processor.set_image(image)
                 # Only the Teacher object's semantic name is sent to SAM 3.
                 output = processor.set_text_prompt(
-                    state=state, prompt=object_name
+                    state=state, prompt=text_prompt
                 )
         else:
             state = processor.set_image(image)
             # Only the Teacher object's semantic name is sent to SAM 3.
-            output = processor.set_text_prompt(state=state, prompt=object_name)
+            output = processor.set_text_prompt(state=state, prompt=text_prompt)
     masks, boxes, scores = _normalize_predictions(output, image.size)
     return _save_results(
         image=image,
@@ -225,6 +245,7 @@ def run_smoke(
         image_path=image_path,
         object_id=object_id,
         object_name=object_name,
+        text_prompt=text_prompt,
         checkpoint_path=checkpoint_path,
         confidence_threshold=confidence_threshold,
     )
@@ -242,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
         type=_parse_confidence_threshold,
         default=0.5,
         help="SAM 3 candidate confidence threshold in [0, 1] (default: 0.5)",
+    )
+    parser.add_argument(
+        "--include-visual-facts",
+        action="store_true",
+        help="append Teacher agentview visual facts to its object name for SAM 3 text prompting",
     )
     args = parser.parse_args(argv)
 
@@ -261,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_path=args.checkpoint,
             output_dir=args.out_dir,
             confidence_threshold=args.confidence_threshold,
+            include_visual_facts=args.include_visual_facts,
         )
     except Exception as exc:
         print(f"SAM 3 Smoke failed: {type(exc).__name__}: {exc}", file=sys.stderr)

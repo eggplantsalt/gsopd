@@ -60,6 +60,10 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
         mask[:, :8] = 255
         mask_path = root / "candidate_000_mask.png"
         Image.fromarray(mask).save(mask_path)
+        robot_mask = np.zeros((16, 16), dtype=np.uint8)
+        robot_mask[:, 8:] = 255
+        robot_mask_path = root / "candidate_001_mask.png"
+        Image.fromarray(robot_mask).save(robot_mask_path)
 
         teacher = {
             "schema_version": "gs_opd.safety_teacher.v2",
@@ -97,14 +101,20 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
                     "image": str(image_path.resolve()),
                     "image_width": 16,
                     "image_height": 16,
-                    "candidate_count": 1,
+                    "candidate_count": 2,
                     "candidates": [
                         {
                             "candidate_index": 0,
                             "score": 0.61,
                             "mask_file": str(mask_path.resolve()),
                             "mask_area_pixels": 128,
-                        }
+                        },
+                        {
+                            "candidate_index": 1,
+                            "score": 0.58,
+                            "mask_file": str(robot_mask_path.resolve()),
+                            "mask_area_pixels": 128,
+                        },
                     ],
                 }
             ),
@@ -143,18 +153,47 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
                                 "geom_names": ["geom_a", "geom_b"],
                                 "iou": 0.72,
                             },
-                        }
+                        },
+                        {
+                            "candidate_index": 1,
+                            "sam_score": 0.58,
+                            "mask_file": str(robot_mask_path.resolve()),
+                            "status": "matched_by_iou",
+                            "best_match": {
+                                "physical_object_id": "body_8",
+                                "body_id": 8,
+                                "body_name": "robot_link_body",
+                                "geom_ids": [13],
+                                "geom_names": ["robot_geom"],
+                                "iou": 0.9,
+                            },
+                        },
                     ],
                 }
             ),
             encoding="utf-8",
         )
-        return teacher_path, sam_path, iou_path
+        geometry_inventory_path = root / "bridge_geometry_inventory.json"
+        geometry_inventory_path.write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "robot_classification_status": "available",
+                    "geometries": [
+                        {"geom_id": 11, "geom_name": "geom_a", "body_id": 7, "body_name": "physical_body_name", "category": "scene"},
+                        {"geom_id": 12, "geom_name": "geom_b", "body_id": 7, "body_name": "physical_body_name", "category": "scene"},
+                        {"geom_id": 13, "geom_name": "robot_geom", "body_id": 8, "body_name": "robot_link_body", "category": "robot"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return teacher_path, sam_path, iou_path, geometry_inventory_path
 
     def test_resolved_decision_attaches_physical_ids_after_vlm(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            teacher, sam, iou = self._fixture(root)
+            teacher, sam, iou, _geometry = self._fixture(root)
             backend = FakeBackend(
                 json.dumps(
                     {
@@ -196,7 +235,7 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
             content = payload["messages"][1]["content"]
             prompt_text = content[0]["text"]
             self.assertIn("yellow mug", prompt_text)
-            self.assertIn("Candidate indices shown in the image: [0]", prompt_text)
+            self.assertIn("Candidate indices shown in the image: [0, 1]", prompt_text)
             self.assertIn("completely unmodified original RGB", prompt_text)
             self.assertIn("must not be used to judge color or material", prompt_text)
             self.assertNotIn("0.61", prompt_text)
@@ -220,7 +259,7 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
     def test_unresolved_decision_does_not_attach_physical_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            teacher, sam, iou = self._fixture(root)
+            teacher, sam, iou, _geometry = self._fixture(root)
             backend = FakeBackend(
                 json.dumps(
                     {
@@ -236,6 +275,60 @@ class VlmSemanticDisambiguationSmokeTest(unittest.TestCase):
             self.assertIsNone(result["selected_candidate"])
             self.assertEqual(result["physical_association"]["status"], "unresolved")
             self.assertEqual(len(backend.calls), 1)
+
+    def test_active_robot_geometry_is_filtered_before_vlm_candidate_selection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher, sam, iou, geometry = self._fixture(root)
+            backend = FakeBackend(
+                json.dumps(
+                    {
+                        "object_id": "object_1",
+                        "candidate_index": 0,
+                        "reason": "The visual region depicts the described cup.",
+                        "status": "resolved",
+                    }
+                )
+            )
+            result = run_smoke(
+                teacher,
+                "object_1",
+                sam,
+                iou,
+                root / "filtered_out",
+                backend,
+                geometry_inventory_path=geometry,
+            )
+            content = backend.calls[0]["messages"][1]["content"]
+            self.assertIn("Candidate indices shown in the image: [0]", content[0]["text"])
+            self.assertEqual(result["robot_candidates_filtered"], [1])
+            self.assertEqual(result["physical_association"]["status"], "matched_by_iou")
+
+    def test_task_instruction_is_optional_disambiguation_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher, sam, iou, _geometry = self._fixture(root)
+            backend = FakeBackend(
+                json.dumps(
+                    {
+                        "object_id": "object_1",
+                        "candidate_index": 0,
+                        "reason": "The candidate matches the described object.",
+                        "status": "resolved",
+                    }
+                )
+            )
+            run_smoke(
+                teacher,
+                "object_1",
+                sam,
+                iou,
+                root / "instruction_out",
+                backend,
+                task_instruction="pick up the mug from the stove",
+            )
+            prompt_text = backend.calls[0]["messages"][1]["content"][0]["text"]
+            self.assertIn("Task instruction: pick up the mug from the stove", prompt_text)
 
     def test_structured_result_rejects_unknown_candidate_and_extra_fields(self):
         with self.assertRaisesRegex(ValueError, "available candidate_index"):

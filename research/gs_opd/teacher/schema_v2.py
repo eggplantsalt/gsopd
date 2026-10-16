@@ -63,7 +63,13 @@ SAFETY_OUTPUT_V2_JSON_SCHEMA: dict[str, Any] = {
     "title": "GS-OPD Safety IR v2",
     "type": "object",
     "additionalProperties": False,
-    "required": ["schema_version", "objects", "rules", "global_uncertainties"],
+    "required": [
+        "schema_version",
+        "objects",
+        "rules",
+        "object_contact_rules",
+        "global_uncertainties",
+    ],
     "properties": {
         "schema_version": {"const": SCHEMA_VERSION},
         "objects": {
@@ -129,6 +135,36 @@ SAFETY_OUTPUT_V2_JSON_SCHEMA: dict[str, Any] = {
                         "uniqueItems": True,
                         "items": {"enum": list(ROBOT_PARTS)},
                     },
+                    "target_id": _STRING_SCHEMA,
+                    "predicate": {"enum": list(PREDICATES)},
+                    "decision": {"enum": list(DECISIONS)},
+                    "phase": {"enum": list(PHASES)},
+                    "reason": _STRING_SCHEMA,
+                },
+            },
+        },
+        "object_contact_rules": {
+            "type": "array",
+            "description": (
+                "Optional for backward compatibility when parsing earlier v2 outputs; "
+                "newly generated v2 outputs include this field. Rule ids are unique "
+                "across robot and object contact rules."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "id",
+                    "subject_id",
+                    "target_id",
+                    "predicate",
+                    "decision",
+                    "phase",
+                    "reason",
+                ],
+                "properties": {
+                    "id": _STRING_SCHEMA,
+                    "subject_id": _STRING_SCHEMA,
                     "target_id": _STRING_SCHEMA,
                     "predicate": {"enum": list(PREDICATES)},
                     "decision": {"enum": list(DECISIONS)},
@@ -208,8 +244,21 @@ def _walk_strings(value: Any, path: str = "$output"):
 
 def validate_teacher_output_v2(value: Any) -> dict[str, Any]:
     """Validate v2 fields, unique identifiers, references, and text constraints."""
-    top_fields = {"schema_version", "objects", "rules", "global_uncertainties"}
-    _check_keys(value, top_fields, "$")
+    legacy_top_fields = {"schema_version", "objects", "rules", "global_uncertainties"}
+    top_fields = legacy_top_fields | {"object_contact_rules"}
+    if not isinstance(value, dict):
+        _fail("$", "an object")
+    if any(not isinstance(key, str) for key in value):
+        _fail("$", "an object with string field names")
+    missing = sorted(legacy_top_fields - set(value))
+    extra = sorted(set(value) - top_fields)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing fields {missing}")
+        if extra:
+            details.append(f"unexpected fields {extra}")
+        raise TeacherOutputV2Error("$: " + "; ".join(details))
     if value["schema_version"] != SCHEMA_VERSION:
         _fail("$.schema_version", repr(SCHEMA_VERSION))
 
@@ -302,6 +351,42 @@ def validate_teacher_output_v2(value: Any) -> dict[str, Any]:
             raise TeacherOutputV2Error(
                 f"{path}.target_id: no object with id {target_id!r}"
             )
+        _check_enum(rule["predicate"], PREDICATES, f"{path}.predicate")
+        _check_enum(rule["decision"], DECISIONS, f"{path}.decision")
+        _check_enum(rule["phase"], PHASES, f"{path}.phase")
+        _check_text(rule["reason"], f"{path}.reason")
+
+    object_contact_rules = value.get("object_contact_rules", [])
+    if not isinstance(object_contact_rules, list):
+        _fail("$.object_contact_rules", "an array")
+    object_rule_fields = {
+        "id",
+        "subject_id",
+        "target_id",
+        "predicate",
+        "decision",
+        "phase",
+        "reason",
+    }
+    for rule_index, rule in enumerate(object_contact_rules):
+        path = f"$.object_contact_rules[{rule_index}]"
+        _check_keys(rule, object_rule_fields, path)
+        rule_id = _check_text(rule["id"], f"{path}.id")
+        if rule_id in rule_ids:
+            raise TeacherOutputV2Error(f"{path}.id: duplicate rule id {rule_id!r}")
+        rule_ids.add(rule_id)
+        subject_id = _check_text(rule["subject_id"], f"{path}.subject_id")
+        target_id = _check_text(rule["target_id"], f"{path}.target_id")
+        if subject_id not in object_ids:
+            raise TeacherOutputV2Error(
+                f"{path}.subject_id: no object with id {subject_id!r}"
+            )
+        if target_id not in object_ids:
+            raise TeacherOutputV2Error(
+                f"{path}.target_id: no object with id {target_id!r}"
+            )
+        if subject_id == target_id:
+            _fail(f"{path}.target_id", "a different object id from subject_id")
         _check_enum(rule["predicate"], PREDICATES, f"{path}.predicate")
         _check_enum(rule["decision"], DECISIONS, f"{path}.decision")
         _check_enum(rule["phase"], PHASES, f"{path}.phase")
