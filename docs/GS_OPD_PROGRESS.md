@@ -999,3 +999,36 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 新增独立归档重放 Repair Smoke；A0 violation、全 Chunk、完整 Contact Monitoring、任务进度、动作约束和主环境恢复均为必要条件。
 - [x] 增加定点单测；相关 50 项 unittest 通过，Python 语法检查及 `git diff --check` 通过。
 - [ ] 人工启动 Safety Bridge，运行 Step 70 Smoke 并审查是否存在安全且保持任务进度的 A+。
+
+## On-Policy Collection 接入 Object-to-Object IR v2（2026-10-17）
+
+- `pi05_rollout.py` 的 On-Policy preflight 新增 `--semantic-results-json`，读取 Teacher Object ID 到语义消歧结果的映射。含 `object_contact_rules` 的 IR 会复用归档 Smoke 的 `_validate_current_bindings()`，逐个核对规则 subject/target 的 Teacher 名称与角色、当前 Geometry Inventory 中的 Body/Geom 身份，并把完整映射传给 preflight、A0 和每轮 Repair 候选的 `compile_forbid_contact()`。
+- 纯 Object-to-Object IR 可通过 preflight，不再要求不存在的 Gripper `compiled_rule`；若 IR 同时含旧 Gripper-to-Object 规则，仍要求对应规则成功编译。旧 `--semantic-result` 入口保留，原有 G2O 绑定和可选独立任务对象文件仍兼容。对象间规则的绑定缺失或与当前模型冲突时，Episode 在采集前失败关闭。
+- 使用映射文件时，默认从 Safety IR 唯一的 `target_object` 找出 Repair 任务进度绑定，并从同一映射解析其当前物理 Body；多个目标时需要显式 `--task-object-id`，且该对象仍须在映射中。逐次决策记录完整绑定映射与校验结果。RGB、机器人状态、指令和 A0/A+ 标签仍由同一次当前 Bridge 观测写入，不读取归档历史图像。只有完整验证的安全 A0 或 A+ 标为有效；Restore 未确认则立即终止 Episode。
+- 新增轻量测试覆盖纯 Object-to-Object preflight、两对象映射校验和传递、由同一映射解析任务进度 Body、映射不一致时 fail-closed、旧 G2O A0/候选均收到语义映射，以及 80 步 CLI 参数解析。尚未启动仿真或 Rollout，因此没有新的真实采集结论。
+
+### 人工 80 步以内采集命令
+
+先按前文命令启动 LIBERO-Safety Bridge。随后在 π₀.₅ 推理环境中运行固定 L0T0 的短程 On-Policy 采集；`object_1` 是当前 Safety IR 的搬运对象，同时从语义映射解析为任务进度目标：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+.venv/bin/python research/gs_opd/smoke/pi05_rollout.py \
+  --on-policy-safety-collection \
+  --max-steps 80 \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --object-id object_1 \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --on-policy-safety-out logs/gs_opd/on_policy_safety_l0t0_object_v2_80step.npz
+```
+
+检查输出 NPZ 的 `decision_safety_json`、`training_label_valid` 和同名 `.summary.json`。本次完成代码与轻量测试；此命令会启动真实 π₀.₅ Student，并执行至多 80 个主环境动作，需人工启动。
+
+**检查清单（Checklist）**
+
+- [x] 新增映射型语义绑定 CLI，保留旧单对象语义文件参数。
+- [x] 复用当前 Geometry Inventory 绑定校验，校验 Object-to-Object 规则引用的两侧 Body/Geom。
+- [x] 纯 Object-to-Object IR 不再依赖 Gripper `compiled_rule`；旧 Gripper-to-Object preflight 保持编译要求。
+- [x] A0 与 Repair 候选 Compiler 调用接收完整语义映射，任务进度绑定从该映射解析。
+- [x] 轻量 On-Policy Collection 测试、Python 语法检查和 `git diff --check` 通过；没有启动仿真、模型或 Rollout。
+- [ ] 人工运行短程采集并检查 NPZ 标签、绑定及 Episode 汇总。

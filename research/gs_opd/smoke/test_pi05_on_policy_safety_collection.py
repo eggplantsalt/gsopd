@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
+import json
 import sys
 import tempfile
 import unittest
@@ -21,6 +23,9 @@ if str(REPO_ROOT) not in sys.path:
 def _load_helpers():
     names = {
         "_compact_repair_report",
+        "parse_args",
+        "_resolve_task_object_binding",
+        "prepare_on_policy_safety_collection",
         "run_on_policy_safety_collection_decision",
         "_new_safety_episode_summary",
         "_update_safety_episode_summary",
@@ -32,7 +37,7 @@ def _load_helpers():
         if isinstance(item, ast.FunctionDef) and item.name in names
     ]
     module = ast.Module(body=body, type_ignores=[])
-    namespace = {"Path": Path, "np": np, "__file__": str(ROLLOUT_PATH)}
+    namespace = {"Path": Path, "np": np, "argparse": argparse, "__file__": str(ROLLOUT_PATH)}
     exec(compile(module, str(ROLLOUT_PATH), "exec"), namespace)
     return namespace
 
@@ -50,6 +55,11 @@ class FakeConnection:
 
 
 def _context():
+    object_binding = {
+        "semantic_decision": {"status": "resolved", "object_id": "object_4"},
+        "teacher_object": {"object_id": "object_4"},
+        "physical_association": {"status": "matched_by_iou", "body_id": 12},
+    }
     return {
         "object_id": "object_4",
         "teacher": {
@@ -58,12 +68,72 @@ def _context():
             "rules": [{"id": "rule_1", "target_id": "object_4", "decision": "forbid"}],
             "global_uncertainties": [],
         },
-        "semantic_result": {"semantic_decision": {"status": "resolved", "object_id": "object_4"}},
+        "semantic_result": object_binding,
+        "semantic_results": {
+            "object_4": object_binding,
+            "object_9": {"semantic_decision": {"status": "resolved", "object_id": "object_9"}},
+        },
         "safety_target_binding": {"object_id": "object_4", "body_id": 12},
         "geometry_inventory": {"status": "complete"},
         "gripper_inventory": {"status": "complete"},
         "repair_context": {"status": "available"},
         "task_object_binding": None,
+    }
+
+
+def _teacher_v2_object_only():
+    def teacher_object(object_id, name, role):
+        return {
+            "id": object_id,
+            "name": name,
+            "role": role,
+            "visibility": "visible",
+            "mobility": "likely_movable" if role == "target_object" else "likely_fixed",
+            "visual_facts": [],
+            "inferences": [],
+            "uncertainties": [],
+        }
+
+    return {
+        "schema_version": "gs_opd.safety_teacher.v2",
+        "objects": [
+            teacher_object("object_1", "bowl", "target_object"),
+            teacher_object("object_2", "blocker", "obstacle"),
+        ],
+        "rules": [],
+        "object_contact_rules": [{
+            "id": "object_rule_1",
+            "subject_id": "object_1",
+            "target_id": "object_2",
+            "predicate": "contact",
+            "decision": "forbid",
+            "phase": "any",
+            "reason": "The carried object should avoid the obstacle.",
+        }],
+        "global_uncertainties": [],
+    }
+
+
+def _semantic_binding(object_id, body_id, body_name, geom_id):
+    return {
+        "semantic_decision": {
+            "status": "resolved",
+            "object_id": object_id,
+            "candidate_index": 0,
+        },
+        "teacher_object": {
+            "object_id": object_id,
+            "name": "bowl" if object_id == "object_1" else "blocker",
+            "role": "target_object" if object_id == "object_1" else "obstacle",
+        },
+        "selected_candidate": {"candidate_index": 0, "body_id": body_id, "geom_ids": [geom_id]},
+        "physical_association": {
+            "status": "matched_by_iou",
+            "physical_object_id": f"physical-{body_id}",
+            "body_id": body_id,
+            "body_name": body_name,
+            "geom_ids": [geom_id],
+        },
     }
 
 
@@ -98,7 +168,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         with patch(
             "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
             return_value=compiled,
-        ), patch(
+        ) as compiler, patch(
             "research.gs_opd.repair.verifier_guided_repair.run_verifier_guided_repair",
         ) as repair:
             result = self.call(conn, self.chunk, "move the bowl", 0, 0, _context())
@@ -108,6 +178,8 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertTrue(result["training_label_valid"])
         np.testing.assert_array_equal(result["training_action_chunk"], self.chunk.tolist())
         self.assertFalse(result["repair_attempted"])
+        self.assertEqual(result["semantic_binding_results"], _context()["semantic_results"])
+        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], _context()["semantic_results"])
         repair.assert_not_called()
         self.assertEqual([request["op"] for request in conn.requests], ["snapshot", "branch_rollout"])
 
@@ -189,7 +261,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         with patch(
             "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
             side_effect=[baseline_compiled, candidate_compiled],
-        ), patch(
+        ) as compiler, patch(
             "research.gs_opd.repair.verifier_guided_repair.run_verifier_guided_repair",
             side_effect=invoke_core,
         ) as repair:
@@ -204,6 +276,9 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertFalse(self.helpers["_must_abort_safety_episode"](result))
         self.assertEqual(result["label_source"], "compiler_verified_repaired_A_plus")
         self.assertEqual(result["training_action_chunk"], repaired)
+        self.assertEqual(len(compiler.call_args_list), 2)
+        for call in compiler.call_args_list:
+            self.assertEqual(call.kwargs["object_semantic_results"], _context()["semantic_results"])
         self.assertNotIn("branch_result", result["repair_search"]["search_attempts"][0])
         self.assertFalse(any(request["op"] == "step" for request in conn.requests))
         repair.assert_called_once()
@@ -273,6 +348,170 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertEqual(summary["valid_a_plus_count"], 0)
         self.assertEqual(summary["failure_reason_counts"], {"no_safe_candidate": 1})
         self.assertEqual(summary["candidate_rejection_reason_counts"], {"candidate_not_compiler_safe": 1})
+
+    def test_object_only_preflight_uses_full_mapping_and_target_progress_binding(self):
+        teacher = _teacher_v2_object_only()
+        semantic_results = {
+            "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
+            "object_2": _semantic_binding("object_2", 22, "blocker_body", 32),
+        }
+        geometry = {
+            "status": "complete",
+            "geometries": [
+                {"geom_id": 31, "geom_name": "bowl_geom", "body_id": 21, "body_name": "bowl_body", "category": "scene"},
+                {"geom_id": 32, "geom_name": "blocker_geom", "body_id": 22, "body_name": "blocker_body", "category": "scene"},
+            ],
+        }
+        preflight = {
+            "compiled_rule": None,
+            "target_binding": {"object_id": "object_1", "body_id": 21, "geom_ids": [31]},
+            "gripper_geom_ids": [3, 4],
+            "unknown_reasons": ["branch_rollout_has_no_candidate_results"],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic_results.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_results), encoding="utf-8")
+            conn = FakeConnection([
+                geometry,
+                {"status": "complete", "gripper_geom_ids": [3, 4]},
+                {"status": "available"},
+            ])
+            with patch(
+                "research.gs_opd.smoke.replay_archive_contact_smoke._validate_current_bindings",
+                return_value={"valid": True, "objects": {"object_1": {}, "object_2": {}}, "errors": []},
+            ) as validate_bindings, patch(
+                "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+                return_value=preflight,
+            ) as compiler:
+                context = self.helpers["prepare_on_policy_safety_collection"](
+                    conn,
+                    teacher_path,
+                    "object_1",
+                    semantic_results_path=semantic_path,
+                )
+
+        self.assertEqual(set(context["semantic_results"]), {"object_1", "object_2"})
+        self.assertTrue(context["semantic_binding_validation"]["valid"])
+        self.assertEqual(context["task_object_binding"]["object_id"], "object_1")
+        self.assertEqual(context["task_object_id"], "object_1")
+        self.assertEqual(context["task_object_binding"]["body_id"], 21)
+        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], semantic_results)
+        self.assertEqual(validate_bindings.call_args.args[1], semantic_results)
+
+    def test_object_only_preflight_rejects_inconsistent_object_binding_map(self):
+        teacher = _teacher_v2_object_only()
+        semantic_results = {
+            "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic_results.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_results), encoding="utf-8")
+            conn = FakeConnection([
+                {"status": "complete"},
+                {"status": "complete"},
+                {"status": "available"},
+            ])
+            with patch(
+                "research.gs_opd.smoke.replay_archive_contact_smoke._validate_current_bindings",
+                return_value={"valid": False, "errors": ["semantic_binding_missing:object_2"]},
+            ), patch(
+                "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            ) as compiler:
+                with self.assertRaisesRegex(ValueError, "semantic_binding_missing:object_2"):
+                    self.helpers["prepare_on_policy_safety_collection"](
+                        conn,
+                        teacher_path,
+                        "object_1",
+                        semantic_results_path=semantic_path,
+                    )
+        compiler.assert_not_called()
+
+    def test_legacy_gripper_rule_preflight_still_requires_and_accepts_compiled_rule(self):
+        teacher = _teacher_v2_object_only()
+        teacher["objects"] = [
+            {
+                "id": "object_4",
+                "name": "bowl",
+                "role": "avoid_object",
+                "visibility": "visible",
+                "mobility": "likely_movable",
+                "visual_facts": [],
+                "inferences": [],
+                "uncertainties": [],
+            }
+        ]
+        teacher["rules"] = [{
+            "id": "rule_gripper_1",
+            "subject_parts": ["gripper"],
+            "target_id": "object_4",
+            "predicate": "contact",
+            "decision": "forbid",
+            "phase": "any",
+            "reason": "Avoid forbidden contact.",
+        }]
+        teacher.pop("object_contact_rules")
+        semantic_result = {"semantic_decision": {"status": "resolved", "object_id": "object_4"}}
+        preflight = {
+            "compiled_rule": {"target_object_id": "object_4"},
+            "target_binding": {"object_id": "object_4", "body_id": 9},
+            "gripper_geom_ids": [3, 4],
+            "unknown_reasons": ["branch_rollout_has_no_candidate_results"],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_result), encoding="utf-8")
+            conn = FakeConnection([
+                {"status": "complete"},
+                {"status": "complete"},
+                {"status": "available"},
+            ])
+            with patch(
+                "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+                return_value=preflight,
+            ) as compiler:
+                context = self.helpers["prepare_on_policy_safety_collection"](
+                    conn,
+                    teacher_path,
+                    "object_4",
+                    semantic_path,
+                )
+
+        self.assertEqual(context["semantic_results"], {"object_4": semantic_result})
+        self.assertEqual(context["task_object_binding"], None)
+        self.assertIsNotNone(context["preflight_result"]["compiled_rule"])
+        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], {"object_4": semantic_result})
+
+    def test_collection_cli_accepts_semantic_results_map_within_80_step_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher = root / "teacher.json"
+            semantic_results = root / "semantic_results.json"
+            output = root / "collection.npz"
+            teacher.write_text("{}", encoding="utf-8")
+            semantic_results.write_text("{}", encoding="utf-8")
+            argv = [
+                "pi05_rollout.py",
+                "--on-policy-safety-collection",
+                "--max-steps", "80",
+                "--teacher-json", str(teacher),
+                "--object-id", "object_1",
+                "--semantic-results-json", str(semantic_results),
+                "--on-policy-safety-out", str(output),
+            ]
+            with patch.object(sys, "argv", argv):
+                args = self.helpers["parse_args"]()
+        self.assertEqual(args.max_steps, 80)
+        self.assertEqual(args.semantic_results_json, semantic_results)
+        self.assertIsNone(args.semantic_result)
 
 
 if __name__ == "__main__":

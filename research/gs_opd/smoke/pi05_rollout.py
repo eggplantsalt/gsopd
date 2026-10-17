@@ -49,6 +49,11 @@ def parse_args():
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
+    parser.add_argument(
+        "--semantic-results-json",
+        type=Path,
+        help="Optional mapping from Teacher object IDs to current SAM/IoU semantic bindings for On-Policy collection.",
+    )
     parser.add_argument("--probe-out-dir", type=Path)
     parser.add_argument("--repair-out-dir", type=Path)
     parser.add_argument("--on-policy-safety-out", type=Path)
@@ -73,10 +78,15 @@ def parse_args():
     if probe_enabled and collection_enabled:
         parser.error("branch probe modes cannot be combined with --on-policy-safety-collection")
     if collection_enabled:
-        if any(value is None for value in probe_inputs):
+        if args.teacher_json is None or args.object_id is None:
             parser.error(
-                "--on-policy-safety-collection requires --teacher-json, --object-id, "
-                "and --semantic-result"
+                "--on-policy-safety-collection requires --teacher-json and --object-id"
+            )
+        if args.semantic_result is not None and args.semantic_results_json is not None:
+            parser.error("choose either --semantic-result or --semantic-results-json")
+        if args.semantic_result is None and args.semantic_results_json is None:
+            parser.error(
+                "--on-policy-safety-collection requires --semantic-result or --semantic-results-json"
             )
         if args.on_policy_safety_out is None:
             parser.error("--on-policy-safety-collection requires --on-policy-safety-out")
@@ -88,15 +98,23 @@ def parse_args():
             parser.error("--trace-out cannot be combined with --on-policy-safety-collection")
         if args.max_steps == 0:
             parser.error("--on-policy-safety-collection requires --max-steps greater than zero")
-        if (args.task_object_id is None) != (args.task_object_semantic_result is None):
+        if args.semantic_results_json is None and (
+            (args.task_object_id is None) != (args.task_object_semantic_result is None)
+        ):
             parser.error("--task-object-id and --task-object-semantic-result must be supplied together")
+        if args.semantic_results_json is not None and args.task_object_semantic_result is not None:
+            parser.error("--semantic-results-json already supplies the task-object binding; omit --task-object-semantic-result")
         if not args.teacher_json.is_file():
             parser.error(f"Safety IR v2 file does not exist: {args.teacher_json}")
-        if not args.semantic_result.is_file():
+        if args.semantic_result is not None and not args.semantic_result.is_file():
             parser.error(f"Semantic result file does not exist: {args.semantic_result}")
+        if args.semantic_results_json is not None and not args.semantic_results_json.is_file():
+            parser.error(f"Semantic results mapping does not exist: {args.semantic_results_json}")
         if args.task_object_semantic_result is not None and not args.task_object_semantic_result.is_file():
             parser.error(f"Task object semantic result does not exist: {args.task_object_semantic_result}")
     elif probe_enabled:
+        if args.semantic_results_json is not None:
+            parser.error("--semantic-results-json is currently supported only by --on-policy-safety-collection")
         if any(value is None for value in probe_inputs):
             parser.error(
                 "a probe mode requires --teacher-json, --object-id, "
@@ -131,6 +149,7 @@ def parse_args():
             args.probe_out_dir,
             args.repair_out_dir,
             args.on_policy_safety_out,
+            args.semantic_results_json,
             args.task_object_id,
             args.task_object_semantic_result,
         )
@@ -492,11 +511,12 @@ def prepare_on_policy_safety_collection(
     conn,
     teacher_json_path,
     object_id,
-    semantic_result_path,
+    semantic_result_path=None,
     task_object_id=None,
     task_object_semantic_result_path=None,
+    semantic_results_path=None,
 ):
-    """Load one fixed-task Teacher binding and verify it against the live model."""
+    """Load fixed-task Teacher bindings and verify every referenced body/geom."""
     import json
     import sys
 
@@ -504,6 +524,9 @@ def prepare_on_policy_safety_collection(
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     from research.gs_opd.smoke.contact_safety_compiler_smoke import compile_forbid_contact
+    from research.gs_opd.smoke.replay_archive_contact_smoke import (
+        _validate_current_bindings,
+    )
     from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
 
     def bridge_request(payload):
@@ -516,10 +539,44 @@ def prepare_on_policy_safety_collection(
     teacher = parse_teacher_output_v2(teacher_json_path.read_text(encoding="utf-8"))
     if not any(item["id"] == object_id for item in teacher["objects"]):
         raise ValueError(f"object_id {object_id!r} is absent from Safety IR v2")
-    semantic_result = json.loads(semantic_result_path.read_text(encoding="utf-8"))
+    if semantic_results_path is not None:
+        loaded_results = json.loads(semantic_results_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded_results, dict) or any(
+            not isinstance(key, str) or not isinstance(value, dict)
+            for key, value in loaded_results.items()
+        ):
+            raise ValueError("semantic results JSON must map Teacher object IDs to result objects")
+        semantic_results = loaded_results
+        if object_id not in semantic_results:
+            raise ValueError(f"semantic results mapping has no binding for {object_id!r}")
+    else:
+        if semantic_result_path is None:
+            raise ValueError("a semantic result file or semantic results mapping is required")
+        semantic_results = {
+            object_id: json.loads(semantic_result_path.read_text(encoding="utf-8"))
+        }
+
+    semantic_result = semantic_results[object_id]
     geometry_inventory = bridge_request({"op": "geometry_inventory"})
     gripper_inventory = bridge_request({"op": "gripper_geometry_inventory"})
     repair_context = bridge_request({"op": "repair_context"})
+
+    object_contact_rules = teacher.get("object_contact_rules", [])
+    binding_validation = None
+    if object_contact_rules:
+        binding_validation = _validate_current_bindings(
+            teacher,
+            semantic_results,
+            geometry_inventory,
+        )
+        if binding_validation.get("valid") is not True:
+            errors = binding_validation.get("errors") or [
+                "object_semantic_bindings_are_unverified"
+            ]
+            raise ValueError(
+                "Object-to-Object semantic Body/Geom bindings do not match the active "
+                f"Geometry Inventory: {errors}"
+            )
 
     # A branch error is expected in this read-only preflight. All other compiler
     # prerequisites must resolve before collecting from the fixed task.
@@ -530,15 +587,26 @@ def prepare_on_policy_safety_collection(
         {"main_state_restored": True, "candidates": []},
         geometry_inventory,
         gripper_inventory,
+        object_semantic_results=semantic_results,
     )
     preflight_errors = [
         reason
         for reason in preflight.get("unknown_reasons", [])
         if reason != "branch_rollout_has_no_candidate_results"
     ]
+    has_gripper_rule = any(
+        isinstance(rule, dict)
+        and rule.get("target_id") == object_id
+        and rule.get("predicate") == "contact"
+        and "gripper" in rule.get("subject_parts", [])
+        for rule in teacher.get("rules", [])
+    )
+    if not has_gripper_rule and not object_contact_rules:
+        preflight_errors.append("teacher_has_no_supported_contact_rules_for_collection")
+    if has_gripper_rule and preflight.get("compiled_rule") is None:
+        preflight_errors.append("gripper_contact_rule_did_not_compile")
     if (
-        preflight.get("compiled_rule") is None
-        or preflight.get("target_binding") is None
+        preflight.get("target_binding") is None
         or not preflight.get("gripper_geom_ids")
         or preflight_errors
     ):
@@ -548,10 +616,36 @@ def prepare_on_policy_safety_collection(
         )
 
     task_object_binding = None
+    if semantic_results_path is not None and task_object_id is None:
+        inferred_targets = [
+            item["id"] for item in teacher["objects"]
+            if item.get("role") == "target_object"
+        ]
+        if object_contact_rules:
+            if len(inferred_targets) != 1:
+                raise ValueError(
+                    "Object-to-Object collection requires exactly one target_object role "
+                    "or an explicit --task-object-id"
+                )
+            task_object_id = inferred_targets[0]
+        elif len(inferred_targets) == 1 and inferred_targets[0] in semantic_results:
+            task_object_id = inferred_targets[0]
+
     if task_object_id is not None:
-        task_semantic_result = json.loads(
-            task_object_semantic_result_path.read_text(encoding="utf-8")
-        )
+        if semantic_results_path is not None:
+            task_semantic_result = semantic_results.get(task_object_id)
+            if not isinstance(task_semantic_result, dict):
+                raise ValueError(
+                    "semantic results mapping has no task-progress binding for "
+                    f"{task_object_id!r}"
+                )
+        else:
+            if task_object_semantic_result_path is None:
+                raise ValueError("task-object ID requires a semantic result binding")
+            task_semantic_result = json.loads(
+                task_object_semantic_result_path.read_text(encoding="utf-8")
+            )
+            semantic_results[task_object_id] = task_semantic_result
         task_object_binding = _resolve_task_object_binding(
             teacher,
             task_object_id,
@@ -569,6 +663,10 @@ def prepare_on_policy_safety_collection(
         "teacher": teacher,
         "object_id": object_id,
         "semantic_result": semantic_result,
+        "semantic_results": semantic_results,
+        "semantic_binding_validation": binding_validation,
+        "object_contact_rules": object_contact_rules,
+        "task_object_id": task_object_id,
         "safety_target_binding": preflight["target_binding"],
         "geometry_inventory": geometry_inventory,
         "gripper_inventory": gripper_inventory,
@@ -599,6 +697,7 @@ def run_on_policy_safety_collection_decision(
     object_id = collection_context["object_id"]
     teacher = collection_context["teacher"]
     semantic_result = collection_context["semantic_result"]
+    semantic_results = collection_context.get("semantic_results") or {object_id: semantic_result}
     geometry_inventory = collection_context["geometry_inventory"]
     gripper_inventory = collection_context["gripper_inventory"]
     report = {
@@ -608,8 +707,11 @@ def run_on_policy_safety_collection_decision(
         "teacher_context": teacher,
         "object_id": object_id,
         "rules": [rule for rule in teacher["rules"] if rule["target_id"] == object_id],
+        "object_contact_rules": collection_context.get("object_contact_rules", []),
         "safety_target_binding": collection_context["safety_target_binding"],
         "semantic_binding_result": semantic_result,
+        "semantic_binding_results": semantic_results,
+        "semantic_binding_validation": collection_context.get("semantic_binding_validation"),
         "original_action_chunk_A0": actions.tolist(),
         "snapshot_id": None,
         "a0_verdict": "unknown",
@@ -701,6 +803,7 @@ def run_on_policy_safety_collection_decision(
             baseline_branch,
             geometry_inventory,
             gripper_inventory,
+            object_semantic_results=semantic_results,
         )
         report["a0_compiled_result"] = compiled
         report["a0_compiler_verdict"] = compiled.get("status", "unknown")
@@ -764,6 +867,7 @@ def run_on_policy_safety_collection_decision(
                 branch,
                 geometry_inventory,
                 gripper_inventory,
+                object_semantic_results=semantic_results,
             )
             branch_by_id = {
                 item.get("candidate_id"): item
@@ -985,7 +1089,14 @@ try:
                 "collection_mode": "continuous_on_policy_safety",
                 "teacher_json_path": str(args.teacher_json),
                 "safety_object_id": args.object_id,
-                "semantic_result_path": str(args.semantic_result),
+                "semantic_result_path": (
+                    str(args.semantic_result) if args.semantic_result is not None else None
+                ),
+                "semantic_results_json_path": (
+                    str(args.semantic_results_json)
+                    if args.semantic_results_json is not None
+                    else None
+                ),
                 "task_object_id": args.task_object_id,
                 "task_object_semantic_result_path": (
                     str(args.task_object_semantic_result)
@@ -1011,7 +1122,13 @@ try:
                 args.semantic_result,
                 task_object_id=args.task_object_id,
                 task_object_semantic_result_path=args.task_object_semantic_result,
+                semantic_results_path=args.semantic_results_json,
             )
+            if trace_writer is not None:
+                trace_writer.metadata["task_object_id"] = collection_context.get("task_object_id")
+                trace_writer.metadata["semantic_binding_validation"] = collection_context.get(
+                    "semantic_binding_validation"
+                )
         except Exception as exc:
             collection_preflight_failure = f"{type(exc).__name__}:{exc}"
             safety_episode_summary["failure_reason_counts"][collection_preflight_failure] = 1
