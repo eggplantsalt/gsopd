@@ -783,6 +783,178 @@ def _geometry_inventory():
     )
 
 
+def _validated_geom_id_list(raw_ids, label, geom_count):
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return None, f"{label} must be a non-empty array of Geom IDs"
+    geom_ids = []
+    for index, value in enumerate(raw_ids):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None, f"{label}[{index}] must be an integer Geom ID"
+        if value < 0 or value >= geom_count:
+            return None, f"{label}[{index}]={value} is outside [0, {geom_count})"
+        geom_ids.append(value)
+    if len(set(geom_ids)) != len(geom_ids):
+        return None, f"{label} contains duplicate Geom IDs"
+    return geom_ids, None
+
+
+def _geom_set_min_distance(geom_ids_a, geom_ids_b, distmax_m=10.0):
+    """Query pairwise signed distances on forwarded scratch data only."""
+    sim = env.sim
+    model = sim.model._model
+    model_wrapper = sim.model
+    geom_count = int(model.ngeom)
+    result = {
+        "operation": "geom_set_min_distance",
+        "status": "unavailable",
+        "query_complete": False,
+        "distance_reliable": False,
+        "minimum_distance_m": None,
+        "minimum_pair": None,
+        "geom_ids_a": geom_ids_a if isinstance(geom_ids_a, list) else None,
+        "geom_ids_b": geom_ids_b if isinstance(geom_ids_b, list) else None,
+        "distmax_m": distmax_m,
+        "pair_count_requested": None,
+        "pair_count_attempted": 0,
+        "pair_count_censored_at_distmax": 0,
+        "pair_error_count": 0,
+        "pair_errors": [],
+        "mesh_approximation": False,
+        "warnings": [],
+        "scratch_forward_used": False,
+        "active_integration_state_unchanged": None,
+    }
+    ids_a, error_a = _validated_geom_id_list(geom_ids_a, "geom_ids_a", geom_count)
+    ids_b, error_b = _validated_geom_id_list(geom_ids_b, "geom_ids_b", geom_count)
+    if error_a or error_b:
+        result["errors"] = [error for error in (error_a, error_b) if error]
+        return result
+    if set(ids_a) & set(ids_b):
+        result["errors"] = ["The two Geom sets must be disjoint"]
+        return result
+    try:
+        distmax = float(distmax_m)
+    except (TypeError, ValueError, OverflowError):
+        result["errors"] = ["distmax_m must be a finite positive number"]
+        return result
+    if not np.isfinite(distmax) or distmax <= 0.0:
+        result["errors"] = ["distmax_m must be a finite positive number"]
+        return result
+    distance_fn = getattr(mujoco, "mj_geomDistance", None)
+    if not callable(distance_fn):
+        result["errors"] = ["This MuJoCo build does not expose mj_geomDistance"]
+        return result
+
+    result["geom_ids_a"] = ids_a
+    result["geom_ids_b"] = ids_b
+    result["distmax_m"] = distmax
+    result["pair_count_requested"] = len(ids_a) * len(ids_b)
+    mesh_type = int(mujoco.mjtGeom.mjGEOM_MESH)
+    try:
+        live_state_before = _mujoco_integration_state(sim)
+        scratch_data = _diagnostic_data_from_integration_state(sim)
+        result["scratch_forward_used"] = True
+    except Exception as exc:
+        result["errors"] = [f"Cannot construct forwarded scratch data: {type(exc).__name__}: {exc}"]
+        return result
+
+    best_distance = None
+    best_pair = None
+    for geom_a in ids_a:
+        for geom_b in ids_b:
+            result["pair_count_attempted"] += 1
+            geom_pair = {"geom_id_a": geom_a, "geom_id_b": geom_b}
+            try:
+                fromto = np.zeros(6, dtype=np.float64)
+                distance = float(distance_fn(model, scratch_data, geom_a, geom_b, distmax, fromto))
+                if not np.isfinite(distance):
+                    raise ValueError(f"mj_geomDistance returned non-finite distance {distance!r}")
+                if distance >= distmax:
+                    result["pair_count_censored_at_distmax"] += 1
+                    continue
+                if not np.isfinite(fromto).all():
+                    raise ValueError("mj_geomDistance returned non-finite closest-point coordinates")
+
+                body_a = int(model.geom_bodyid[geom_a])
+                body_b = int(model.geom_bodyid[geom_b])
+                type_a = int(model.geom_type[geom_a])
+                type_b = int(model.geom_type[geom_b])
+                mesh_pair = type_a == mesh_type or type_b == mesh_type
+                result["mesh_approximation"] = result["mesh_approximation"] or mesh_pair
+                geom_pair.update(
+                    {
+                        "distance_m": distance,
+                        "geom_a": {
+                            "id": geom_a,
+                            "name": model_wrapper.geom_id2name(geom_a),
+                            "body_id": body_a,
+                            "body_name": model_wrapper.body_id2name(body_a),
+                            "type_id": type_a,
+                        },
+                        "geom_b": {
+                            "id": geom_b,
+                            "name": model_wrapper.geom_id2name(geom_b),
+                            "body_id": body_b,
+                            "body_name": model_wrapper.body_id2name(body_b),
+                            "type_id": type_b,
+                        },
+                        "closest_segment_world": fromto.tolist(),
+                        "mesh_approximation": mesh_pair,
+                    }
+                )
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_pair = geom_pair
+            except Exception as exc:
+                result["pair_error_count"] += 1
+                if len(result["pair_errors"]) < 10:
+                    result["pair_errors"].append(
+                        {
+                            **geom_pair,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+
+    try:
+        live_state_after = _mujoco_integration_state(sim)
+        state_unchanged = np.array_equal(live_state_before, live_state_after)
+        result["active_integration_state_unchanged"] = bool(state_unchanged)
+    except Exception as exc:
+        state_unchanged = False
+        result["active_state_check_error"] = f"{type(exc).__name__}: {exc}"
+
+    result["minimum_distance_m"] = best_distance
+    result["minimum_pair"] = best_pair
+    complete = bool(
+        state_unchanged
+        and result["pair_count_attempted"] == result["pair_count_requested"]
+        and result["pair_error_count"] == 0
+        and result["pair_count_censored_at_distmax"] == 0
+        and best_pair is not None
+    )
+    result["query_complete"] = complete
+    result["distance_reliable"] = complete
+    result["status"] = "complete" if complete else "partial"
+    result["distance_sign_convention"] = "negative=overlap, zero=touching, positive=separation"
+    result["distance_method"] = "mujoco.mj_geomDistance on scratch MjData from current integration state"
+    if result["pair_count_censored_at_distmax"]:
+        result["warnings"].append(
+            "One or more Geom pairs reached distmax_m; the reported minimum may be censored"
+        )
+    if result["pair_error_count"]:
+        result["warnings"].append(
+            f"{result['pair_error_count']} Geom pair distance queries failed; at most 10 are listed"
+        )
+    if not state_unchanged:
+        result["warnings"].append("The active MuJoCo integration state changed during the query")
+    if result["mesh_approximation"]:
+        result["warnings"].append(
+            "Mesh distance can be approximate; this estimate is exploratory and is not a collision-safety proof"
+        )
+    result["not_a_safety_proof"] = True
+    return result
+
+
 def _gripper_geometry_inventory():
     """Resolve collision Geom IDs from robosuite's active gripper models."""
     sim = env.sim
@@ -1672,6 +1844,24 @@ try:
                                 "Geometry inventory failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                        }
+                elif request["op"] == "geom_set_min_distance":
+                    try:
+                        result = _geom_set_min_distance(
+                            request.get("geom_ids_a"),
+                            request.get("geom_ids_b"),
+                            request.get("distmax_m", 10.0),
+                        )
+                    except Exception as exc:
+                        result = {
+                            "operation": "geom_set_min_distance",
+                            "status": "unavailable",
+                            "query_complete": False,
+                            "distance_reliable": False,
+                            "minimum_distance_m": None,
+                            "minimum_pair": None,
+                            "error": f"Geom distance query failed: {type(exc).__name__}: {exc}",
+                            "not_a_safety_proof": True,
                         }
                 elif request["op"] == "gripper_geometry_inventory":
                     try:

@@ -1106,3 +1106,42 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 增加 Restore→普通 step 五步→比较→最终 Restore 路径，最终 Restore 在比较失败时仍执行。
 - [x] 新增来源元数据、同源状态匹配/不匹配和最终恢复失败测试；本次仅做静态测试，不启动 Bridge 或仿真。
 - [ ] 人工运行下方原 S70→S75 Smoke 命令，检查新的同源比较与最终 S70 恢复结果。
+
+## Near–Far 跨 Chunk 间距预警 Smoke（2026-10-17）
+
+- `safety_bridge.py` 新增只读 `geom_set_min_distance` 操作。调用方传入当前模型中的两组 Geom ID，Bridge 将 MuJoCo `mjSTATE_INTEGRATION` 复制到新建的 scratch `MjData`，执行 `mj_forward`，再对 Geom 笛卡尔积调用 `mujoco.mj_geomDistance`；不会在真实 `env.sim.data` 上执行 forward 或改写仿真状态。结果包含最小有符号距离、对应 Geom/Body、最近点线段、查询覆盖、`distmax_m` 截断、异常和活动积分状态往返检查。
+- 每组 Geom 必须非空、组内 ID 唯一、两组互不相交且在当前模型范围内。任一组合达到距离上界、查询出错、距离/最近点非有限或活动积分状态发生变化时，结果不完整，Smoke 将距离标为 unavailable。Mesh 组合会设置近似标记并附说明；`mj_geomDistance` 结果只用于间距趋势探索，不是碰撞安全证明。
+- 新增 `research/gs_opd/smoke/near_far_gap_smoke.py`。它使用既有归档加载器校验并提取 S65/S70 决策前缀与 S70 的五步预测 Chunk，Reset 后重放实际历史动作，在 S65、S70、S71–S75 查询由当前 Geometry Inventory 和 `semantic_bindings_l0t0.json` 解析出的 `object_1` / `object_4` 当前 Body 全部 Geom 组合。Teacher 需恰有一条这两个对象间的 `forbid contact` 规则；两侧绑定身份必须与当前库存一致，程序不硬编码 Geom ID。
+- S70 风险预测仅用 S70 间距及 S70 的 A⁰ 五步分支轨迹；不会提取或使用 A⁰₇₅ 生成预测。`decision_safety_json` 中 S75 的历史违规只在 S70 预测冻结后作为事后真值单独校验，并要求其完整 Chunk、全部物理子步覆盖、规则、Body/Geom ID 与当前库存一致。5、10、20 mm 三个阈值固定写入程序；报告各阈值 S70→S75 触发情况、首次可知触发步、相邻间距变化、持续接近定义及到历史首碰撞的控制步/物理子步提前量。RGB 只作差异诊断；S65、S70、S75 指令与机器人状态仍以 `1e-6` 严格核验。
+- 增加 9 项轻量测试：固定阈值与事后提前量、距离不可用 fail-closed、RGB 仅诊断、S75 物理绑定及历史接触覆盖校验，以及真实 MuJoCo 小球模型的 scratch 距离、状态不变、`distmax` 截断、非法 Geom、非有限结果和 API 缺失。语法检查和 `git diff --check` 通过。没有连接 Safety Bridge、重放归档动作或启动模型；尚无实际 LIBERO 场景的距离、趋势或提前预警结论。
+
+### 手动运行命令
+
+终端一启动 LIBERO-Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二重放 S65→S70，再仅用 A⁰₇₀ 查询至 S75，并将 JSON 保存至指定路径：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/near_far_gap_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_object_v2_80step.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --out logs/gs_opd/near_far_gap_s65_s75.json
+```
+
+**检查清单（Checklist）**
+
+- [x] Bridge 距离查询在 scratch `MjData` 上计算；无效、截断和 Mesh 近似显式标注，不输出安全证明。
+- [x] Smoke 使用归档 A⁰₇₀ 和当前 Geometry Inventory 校验双对象绑定；5/10/20 mm 阈值固定，S75 历史违规与 S70 预测隔离。
+- [x] 9 项 unittest、Python 语法检查和 `git diff --check` 通过；没有启动仿真或模型。
+- [ ] 人工运行 Bridge Smoke，核对 S65/S70/S75 状态一致性、间距查询覆盖和真实阈值触发结果。
