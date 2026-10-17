@@ -1089,3 +1089,20 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 检查前五步分支一致性、S75 可用状态字段及分支后主环境恢复；图像豁免不放宽物理状态、绑定、动作、覆盖或 Restore 检查。
 - [x] Fake Bridge + 真实 Compiler 的 7 项单测及 Python 语法检查通过；未启动 Bridge、仿真、Student 或 VLM。
 - [ ] 人工运行真实 Bridge Smoke，审查 A/B 的实际完整性、Safety verdict 和首次碰撞证据；不得将 B 的结果当成 Repair 成功证明。
+
+## 跨 Chunk 状态一致性诊断修复（2026-10-17）
+
+- 用户提供的真实实验观察为：5 步分支 safe，10 步分支在 control step 5 / physics substep 8 出现 Object-to-Object violation，前五步分支一致且原分支主环境恢复误差为零。本次没有重新运行该仿真，也没有把这些观察写成程序判定条件。
+- 在当前 80 步 NPZ 上独立读取 Step 74 的 post-observation 与 Step 75 的 decision-observation：EEF position、EEF quaternion、夹爪位置最大绝对误差均为 `0`；agentview 与 eye-in-hand 图像均逐像素一致（差异像素 `0`）。Smoke 启动 Bridge 前先执行同一离线检查；字段缺失或不一致会停止。
+- Snapshot、候选起点、分支后主环境及最后恢复检查现在将 `kinematics_source` 字符串单独列为诊断元数据。仅当两侧该值都是字符串时才从物理状态比较中剥离；数值数组、其他字段和结构仍逐项比较，绝对容差保持 `1e-6`，非有限数值也判为失败。来源字符串不同会记录 `matched=false` 元数据，但不会单独导致物理状态失败。
+- 原 Branch 第五步诊断与 NPZ S75 decision observation 是跨接口来源比较。该结果继续完整记录可比较数值及缺失字段（例如 Branch 不提供 EEF quaternion），明确标记为非同源诊断、不作为最终 S75 一致性门槛，也不把它隐藏成成功。真正的严格比较在分支完成并检查主状态后，从原 S70 Snapshot 执行 Restore，再通过普通 `step` 接口执行归档 `A⁰₇₀` 五步：Bridge 环境返回的双相机、EEF position/quaternion、夹爪状态和指令与 NPZ S75 decision 逐项比较；图像必须像素完全相同，状态仍用 `1e-6`，`--allow-image-mismatch` 不作用于这项比较。
+- 第五个普通 `step` 同时请求 `include_snapshot_state`；该 MuJoCo/机器人/物体物理诊断与 Branch A 第五步诊断按 `1e-6` 比较，并单独报告运动学来源字符串。无论同源观测、Branch 诊断或其他比较是否失败，清理路径都会再次 Restore S70，并严格核验恢复状态；最终恢复失败会使 Smoke 失败。
+- Fake Bridge 回归覆盖来源字符串单独不同、数值差异超出 `1e-6`、S74/S75 归档不吻合、同源环境观测吻合/不吻合，以及最后 Restore 失败；保留真实 Contact Compiler 的 5/10 步检查、跨 Chunk 首次违规证据、物理子步监测覆盖和分支恢复检查。当前相关测试共 11 项，未连接 Bridge、启动仿真或模型。
+
+**检查清单（Checklist）**
+
+- [x] 离线核对归档 Step 74 post 与 Step 75 decision 的三项机器人状态和两路 RGB；当前文件五项均精确一致。
+- [x] 仅把字符串型 `kinematics_source` 从物理值比较中分离；其他差异仍受 `1e-6` 严格门控。
+- [x] 增加 Restore→普通 step 五步→比较→最终 Restore 路径，最终 Restore 在比较失败时仍执行。
+- [x] 新增来源元数据、同源状态匹配/不匹配和最终恢复失败测试；本次仅做静态测试，不启动 Bridge 或仿真。
+- [ ] 人工运行下方原 S70→S75 Smoke 命令，检查新的同源比较与最终 S70 恢复结果。

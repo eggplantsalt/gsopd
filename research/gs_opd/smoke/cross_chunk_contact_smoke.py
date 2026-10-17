@@ -89,6 +89,9 @@ def load_cross_chunk_archive(archive_path: Path) -> dict[str, Any]:
         raise CrossChunkArchiveError("S75 is not the decision immediately after the S70 chunk")
     if step_70["instruction"] != step_75["instruction"]:
         raise CrossChunkArchiveError("Archived S70 and S75 task instructions differ")
+    boundary_observation = compare_archive_step74_post_to_step75_decision(
+        archive_path, step_75
+    )
     return {
         "archive": str(archive_path.resolve()),
         "instruction": step_70["instruction"],
@@ -97,6 +100,7 @@ def load_cross_chunk_archive(archive_path: Path) -> dict[str, Any]:
         "action_70": action_70,
         "action_75": action_75,
         "action_10": np.concatenate((action_70, action_75), axis=0),
+        "archive_step74_to_step75_observation": boundary_observation,
         "archive_action_checks": {
             "step_70_prediction_matches_executed_actions": True,
             "step_75_prediction_matches_executed_actions": True,
@@ -107,6 +111,168 @@ def load_cross_chunk_archive(archive_path: Path) -> dict[str, Any]:
             "source": "decision_step_indices + predicted_action_offsets; verified against step_indices/executed_actions",
         },
     }
+
+
+def _compare_numeric_arrays(expected: Any, actual: Any, atol: float) -> dict[str, Any]:
+    try:
+        left = np.asarray(expected, dtype=np.float64)
+        right = np.asarray(actual, dtype=np.float64)
+        same_shape = left.shape == right.shape
+        finite = bool(np.isfinite(left).all() and np.isfinite(right).all())
+        max_abs_error = (
+            float(np.max(np.abs(left - right)))
+            if same_shape and left.size and right.size
+            else (0.0 if same_shape else None)
+        )
+        matched = (
+            same_shape
+            and finite
+            and bool(np.allclose(left, right, rtol=0.0, atol=atol))
+        )
+        return {
+            "matched": bool(matched),
+            "expected_shape": list(left.shape),
+            "actual_shape": list(right.shape),
+            "max_abs_error": max_abs_error,
+            "atol": atol,
+        }
+    except Exception as exc:
+        return {"matched": False, "error": f"{type(exc).__name__}: {exc}", "atol": atol}
+
+
+def _compare_rgb_arrays(expected: Any, actual: Any) -> dict[str, Any]:
+    try:
+        left = np.asarray(expected)
+        right = np.asarray(actual)
+        same_shape = left.shape == right.shape
+        same_dtype = left.dtype == right.dtype == np.uint8
+        if same_shape and same_dtype and left.ndim == 3 and left.shape[-1] == 3:
+            delta = np.abs(left.astype(np.int16) - right.astype(np.int16))
+            differing_pixels = int(np.count_nonzero(np.any(delta != 0, axis=-1)))
+            max_channel_delta = int(delta.max(initial=0))
+            matched = differing_pixels == 0
+        else:
+            differing_pixels = None
+            max_channel_delta = None
+            matched = False
+        return {
+            "matched_pixel_exactly": bool(matched),
+            "expected_shape": list(left.shape),
+            "actual_shape": list(right.shape),
+            "same_dtype": bool(same_dtype),
+            "differing_pixels": differing_pixels,
+            "max_channel_delta": max_channel_delta,
+        }
+    except Exception as exc:
+        return {"matched_pixel_exactly": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def compare_archive_step74_post_to_step75_decision(
+    archive_path: Path, step_75: dict[str, Any]
+) -> dict[str, Any]:
+    """Check the stored post-observation after action 74 against decision S75."""
+    state_keys = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
+    camera_keys = ("agentview_image", "robot0_eye_in_hand_image")
+    fields: dict[str, Any] = {"state": {}, "images": {}}
+    try:
+        with np.load(archive_path, allow_pickle=False) as archive:
+            step_indices = np.asarray(archive["step_indices"], dtype=np.int64)
+            rows = np.flatnonzero(step_indices == STEP_75 - 1)
+            if len(rows) != 1:
+                raise ValueError(f"Expected one archived post step {STEP_75 - 1}, found {len(rows)}")
+            post_row = int(rows[0])
+            decision_index = int(step_75["decision_index"])
+            for key in state_keys:
+                fields["state"][key] = _compare_numeric_arrays(
+                    archive[f"post_{key}"][post_row],
+                    archive[f"decision_{key}"][decision_index],
+                    STATE_ATOL,
+                )
+            for key in camera_keys:
+                fields["images"][key] = _compare_rgb_arrays(
+                    archive[f"post_{key}"][post_row],
+                    archive[f"decision_{key}"][decision_index],
+                )
+    except Exception as exc:
+        return {
+            "matched": False,
+            "available": False,
+            "post_step_index": STEP_75 - 1,
+            "decision_step_index": STEP_75,
+            "error": f"{type(exc).__name__}: {exc}",
+            "fields": fields,
+        }
+
+    decision_instruction_matches_metadata = (
+        step_75["instruction"] == step_75["metadata"].get("instruction")
+    )
+    field_matches = [
+        item.get("matched") is True for item in fields["state"].values()
+    ] + [
+        item.get("matched_pixel_exactly") is True for item in fields["images"].values()
+    ]
+    return {
+        "matched": bool(all(field_matches) and decision_instruction_matches_metadata),
+        "available": True,
+        "post_step_index": STEP_75 - 1,
+        "decision_step_index": STEP_75,
+        "state_atol": STATE_ATOL,
+        "instruction_matches_archive_metadata": bool(decision_instruction_matches_metadata),
+        "post_observation_instruction": "not stored per transition in the current NPZ schema",
+        "comparison_source": "TrajectoryWriter post-step arrays vs next decision arrays",
+        "fields": fields,
+    }
+
+
+def compare_snapshot_diagnostics(
+    expected: Any, actual: Any, atol: float = STATE_ATOL
+) -> dict[str, Any]:
+    """Compare all state fields numerically; report kinematics_source as metadata."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return {
+            "matched": False,
+            "physical_values": {"matched": False, "error": "diagnostics must be objects"},
+            "diagnostic_metadata": {"field": "kinematics_source", "matched": None},
+        }
+    expected_metadata = expected.get("kinematics_source")
+    actual_metadata = actual.get("kinematics_source")
+    metadata_is_source_string = (
+        isinstance(expected_metadata, str) and isinstance(actual_metadata, str)
+    )
+    expected_values = dict(expected)
+    actual_values = dict(actual)
+    if metadata_is_source_string:
+        expected_values.pop("kinematics_source", None)
+        actual_values.pop("kinematics_source", None)
+    physical = _compare_nested(expected_values, actual_values, atol)
+    if _has_non_finite_number(expected_values) or _has_non_finite_number(actual_values):
+        physical["matched"] = False
+        physical["mismatch_count"] = int(physical.get("mismatch_count", 0)) + 1
+        physical["mismatch_paths_sample"] = list(physical.get("mismatch_paths_sample", [])) + [
+            "$snapshot_state:non_finite_number"
+        ]
+    return {
+        "matched": physical["matched"],
+        "physical_values": physical,
+        "diagnostic_metadata": {
+            "field": "kinematics_source",
+            "expected": expected_metadata,
+            "actual": actual_metadata,
+            "matched": expected_metadata == actual_metadata,
+            "informational_only": True,
+            "both_are_source_strings": metadata_is_source_string,
+        },
+    }
+
+
+def _has_non_finite_number(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_has_non_finite_number(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_non_finite_number(item) for item in value)
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, (bool, np.bool_)):
+        return not bool(np.isfinite(value))
+    return False
 
 
 def _read_json(path: Path, label: str) -> Any:
@@ -422,6 +588,151 @@ def _stop(report: dict[str, Any], status: str, reason: str) -> dict[str, Any]:
     return report
 
 
+def restore_step_chunk_and_restore(
+    connection: Any,
+    snapshot_id: str,
+    snapshot_state: Any,
+    actions: np.ndarray,
+    expected_step75: dict[str, Any],
+    branch_candidate_a: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Replay A0_70 through normal step observations, always restoring S70 afterward."""
+    result: dict[str, Any] = {
+        "status": "incomplete",
+        "strict_same_source_comparison": True,
+        "image_mismatch_flag_applies": False,
+        "requested_steps": int(len(actions)),
+        "executed_steps": 0,
+        "step_records": [],
+        "final_restore_attempted": False,
+    }
+    last_response = None
+    try:
+        pre_restore = _bridge_request(
+            connection, {"op": "restore", "snapshot_id": snapshot_id}
+        )
+        if pre_restore.get("error"):
+            result["pre_step_restore"] = {"matched": False, "error": pre_restore["error"]}
+        elif pre_restore.get("restored_snapshot_id") != snapshot_id:
+            result["pre_step_restore"] = {
+                "matched": False,
+                "error": "Bridge restored a different Snapshot ID before sequential step replay",
+            }
+        elif not isinstance(snapshot_state, dict) or not isinstance(pre_restore.get("snapshot_state"), dict):
+            result["pre_step_restore"] = {
+                "matched": False,
+                "error": "S70 Snapshot or pre-step Restore omitted diagnostics",
+            }
+        else:
+            result["pre_step_restore"] = compare_snapshot_diagnostics(
+                snapshot_state, pre_restore["snapshot_state"], STATE_ATOL
+            )
+
+        if result.get("pre_step_restore", {}).get("matched") is True:
+            for index, action in enumerate(actions):
+                last_response = _bridge_request(
+                    connection,
+                    {
+                        "op": "step",
+                        "action": action.tolist(),
+                        "include_snapshot_state": True,
+                    },
+                )
+                if last_response.get("error"):
+                    result["step_records"].append(
+                        {"step_index": index, "error": last_response["error"]}
+                    )
+                    break
+                result["executed_steps"] += 1
+                record = {
+                    "step_index": index,
+                    "reward": last_response.get("reward"),
+                    "done": last_response.get("done"),
+                    "snapshot_state_available": isinstance(last_response.get("snapshot_state"), dict),
+                }
+                result["step_records"].append(record)
+                if last_response.get("done") is True and index + 1 < len(actions):
+                    result["early_done_step"] = index
+                    break
+
+            if result["executed_steps"] == len(actions) and last_response is not None:
+                result["same_source_environment_observation_vs_step75"] = compare_observation(
+                    expected_step75["expected_observation"], last_response, STATE_ATOL
+                )
+                result["same_source_environment_observation_vs_step75"]["comparison_source"] = (
+                    "Safety Bridge env.step observation vs NPZ Step75 decision observation"
+                )
+                result["same_source_environment_observation_vs_step75"]["strict_gate"] = True
+
+                branch_steps = branch_candidate_a.get("steps") if isinstance(branch_candidate_a, dict) else None
+                branch_state = (
+                    branch_steps[CHUNK_LENGTH - 1].get("state")
+                    if isinstance(branch_steps, list) and len(branch_steps) >= CHUNK_LENGTH
+                    else None
+                )
+                step_snapshot_state = last_response.get("snapshot_state")
+                result["same_physical_diagnostic_branch_vs_step"] = compare_snapshot_diagnostics(
+                    branch_state, step_snapshot_state, STATE_ATOL
+                )
+                result["same_physical_diagnostic_branch_vs_step"]["comparison_source"] = (
+                    "Branch fifth-step diagnostics vs env.step(include_snapshot_state=True) diagnostics"
+                )
+                result["same_physical_diagnostic_branch_vs_step"]["strict_numeric_gate"] = True
+                result["same_physical_diagnostic_branch_vs_step"]["expected_kinematics_source"] = (
+                    branch_state.get("kinematics_source") if isinstance(branch_state, dict) else None
+                )
+                result["same_physical_diagnostic_branch_vs_step"]["actual_kinematics_source"] = (
+                    step_snapshot_state.get("kinematics_source")
+                    if isinstance(step_snapshot_state, dict)
+                    else None
+                )
+            else:
+                result["step_chunk_complete"] = False
+                if result.get("early_done_step") is None and last_response is None:
+                    result["error"] = "No sequential step response was received"
+        if result.get("executed_steps") == len(actions):
+            result["step_chunk_complete"] = True
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        result["final_restore_attempted"] = True
+        try:
+            final_restore = _bridge_request(
+                connection, {"op": "restore", "snapshot_id": snapshot_id}
+            )
+            if final_restore.get("error"):
+                final_check = {"matched": False, "error": final_restore["error"]}
+            elif final_restore.get("restored_snapshot_id") != snapshot_id:
+                final_check = {"matched": False, "error": "Bridge restored a different Snapshot ID after step replay"}
+            elif not isinstance(snapshot_state, dict) or not isinstance(final_restore.get("snapshot_state"), dict):
+                final_check = {"matched": False, "error": "Final Restore omitted S70 state diagnostics"}
+            else:
+                final_check = compare_snapshot_diagnostics(
+                    snapshot_state, final_restore["snapshot_state"], STATE_ATOL
+                )
+            result["final_main_state_restoration"] = final_check
+        except Exception as exc:
+            result["final_main_state_restoration"] = {
+                "matched": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    same_observation = result.get("same_source_environment_observation_vs_step75", {})
+    same_physics = result.get("same_physical_diagnostic_branch_vs_step", {})
+    result["matched"] = bool(
+        result.get("pre_step_restore", {}).get("matched") is True
+        and result.get("step_chunk_complete") is True
+        and same_observation.get("matched") is True
+        and same_physics.get("matched") is True
+        and result.get("final_main_state_restoration", {}).get("matched") is True
+    )
+    if result["matched"]:
+        result["status"] = "matched"
+    else:
+        result["status"] = "mismatch_or_unavailable"
+    return result
+
+
 def run_experiment(
     connection: Any,
     archive_pair: dict[str, Any],
@@ -446,6 +757,9 @@ def run_experiment(
         "step_70": STEP_70,
         "step_75": STEP_75,
         "instruction": archive_pair["instruction"],
+        "archive_step74_to_step75_observation": archive_pair.get(
+            "archive_step74_to_step75_observation"
+        ),
         "archive_action_checks": archive_pair["archive_action_checks"],
         "action_a_step_70": action_70.tolist(),
         "action_b_step_70_to_79": action_10.tolist(),
@@ -455,6 +769,14 @@ def run_experiment(
         "branch_called": False,
         "current_visual_reidentification_performed": False,
     }
+    if not isinstance(report["archive_step74_to_step75_observation"], dict) or report[
+        "archive_step74_to_step75_observation"
+    ].get("matched") is not True:
+        return _stop(
+            report,
+            "archive_boundary_observation_mismatch",
+            "NPZ Step74 post-observation and Step75 decision-observation are missing or differ",
+        )
     try:
         object_id = _choose_compiler_object_id(teacher, compiler_object_id)
         report["compiler_object_id"] = object_id
@@ -526,7 +848,9 @@ def run_experiment(
         elif not isinstance(snapshot_state, dict) or not isinstance(roundtrip.get("snapshot_state"), dict):
             report["snapshot_restore_roundtrip"] = {"matched": False, "error": "Snapshot/Restore omitted state diagnostics"}
         else:
-            report["snapshot_restore_roundtrip"] = _compare_nested(snapshot_state, roundtrip["snapshot_state"], STATE_ATOL)
+            report["snapshot_restore_roundtrip"] = compare_snapshot_diagnostics(
+                snapshot_state, roundtrip["snapshot_state"], STATE_ATOL
+            )
         if not report["snapshot_restore_roundtrip"].get("matched"):
             return _stop(report, "snapshot_restore_roundtrip_failed", "Immediate Snapshot→Restore did not reproduce S70")
 
@@ -550,6 +874,72 @@ def run_experiment(
         branch_b = _find_candidate(branch_candidates, candidate_b_id)
         report["branch_candidate_count"] = len(branch_candidates) if isinstance(branch_candidates, list) else None
         report["branch_error"] = branch.get("error")
+
+        # Branch diagnostics and normal env.step observations are different sources.
+        # Preserve the former comparison for analysis, but gate S75 against an actual
+        # sequential Bridge step observation below.
+        report["step_75_cross_source_branch_vs_archive_diagnostic"] = (
+            compare_endpoint_to_step75(branch_a, step_75)
+            if branch_a is not None
+            else {"matched_available_fields": False, "complete": False, "error": "branch A is missing"}
+        )
+        report["step_75_cross_source_branch_vs_archive_diagnostic"].update(
+            {
+                "comparison_source": "branch state diagnostics vs archived environment observation",
+                "classification": "cross-source diagnostic; representation differences are not same-source mismatches",
+                "integrity_gate": False,
+            }
+        )
+
+        try:
+            post_branch_snapshot = _bridge_request(connection, {"op": "snapshot"})
+            if post_branch_snapshot.get("error") or not isinstance(post_branch_snapshot.get("snapshot_state"), dict):
+                restore_comparison = {
+                    "matched": False,
+                    "error": post_branch_snapshot.get("error", "Post-branch Snapshot omitted diagnostics"),
+                }
+            elif not isinstance(snapshot_state, dict):
+                restore_comparison = {"matched": False, "error": "Pre-branch Snapshot omitted diagnostics"}
+            else:
+                restore_comparison = compare_snapshot_diagnostics(
+                    snapshot_state, post_branch_snapshot["snapshot_state"], STATE_ATOL
+                )
+        except Exception as exc:
+            # Do not let a diagnostic Snapshot read prevent the mandatory
+            # restore→step→restore consistency probe below.
+            restore_comparison = {
+                "matched": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        report["branch_main_state_restoration"] = {
+            "bridge_reported_restored": report["bridge_main_state_restored"],
+            "snapshot_diagnostics_match": restore_comparison.get("matched") is True,
+            "comparison": restore_comparison,
+        }
+
+        # Always attempt the sequential A0_70 replay and final S70 restore after a
+        # branch response, even if other diagnostics already show a mismatch.
+        report["sequential_step_replay"] = restore_step_chunk_and_restore(
+            connection,
+            snapshot_id,
+            snapshot_state,
+            action_70,
+            step_75,
+            branch_a,
+        )
+        report["main_state_restoration"] = {
+            "bridge_reported_restored": report["bridge_main_state_restored"],
+            "branch_snapshot_diagnostics_match": restore_comparison.get("matched") is True,
+            "sequential_final_restore_attempted": report["sequential_step_replay"].get(
+                "final_restore_attempted"
+            ) is True,
+            "snapshot_diagnostics_match": report["sequential_step_replay"]
+            .get("final_main_state_restoration", {})
+            .get("matched")
+            is True,
+            "comparison": report["sequential_step_replay"].get("final_main_state_restoration"),
+        }
+
         if branch_a is None or branch_b is None:
             report["candidates"] = [
                 _candidate_report(candidate_a_id, CHUNK_LENGTH, branch_a, None),
@@ -563,7 +953,7 @@ def run_experiment(
         for candidate_id, candidate in ((candidate_a_id, branch_a), (candidate_b_id, branch_b)):
             candidate_start = candidate.get("start_state")
             start_state_checks[candidate_id] = (
-                _compare_nested(snapshot_state, candidate_start, STATE_ATOL)
+                compare_snapshot_diagnostics(snapshot_state, candidate_start, STATE_ATOL)
                 if isinstance(snapshot_state, dict) and isinstance(candidate_start, dict)
                 else {"matched": False, "error": "Snapshot or candidate start diagnostics are missing"}
             )
@@ -578,7 +968,9 @@ def run_experiment(
         report["fifth_step_end_state_comparison"] = report["shared_first_five_comparison"].get(
             "fifth_step_end_state_comparison"
         )
-        report["step_75_decision_observation_comparison"] = compare_endpoint_to_step75(branch_a, step_75)
+        report["step_75_decision_observation_comparison"] = report[
+            "step_75_cross_source_branch_vs_archive_diagnostic"
+        ]
 
         compiler = compile_forbid_contact(
             teacher,
@@ -598,19 +990,6 @@ def run_experiment(
         ]
         report["raw_branch_candidates"] = [branch_a, branch_b]
 
-        post_branch_snapshot = _bridge_request(connection, {"op": "snapshot"})
-        if post_branch_snapshot.get("error") or not isinstance(post_branch_snapshot.get("snapshot_state"), dict):
-            restore_comparison = {"matched": False, "error": post_branch_snapshot.get("error", "Post-branch Snapshot omitted diagnostics")}
-        elif not isinstance(snapshot_state, dict):
-            restore_comparison = {"matched": False, "error": "Pre-branch Snapshot omitted diagnostics"}
-        else:
-            restore_comparison = _compare_nested(snapshot_state, post_branch_snapshot["snapshot_state"], STATE_ATOL)
-        report["main_state_restoration"] = {
-            "bridge_reported_restored": report["bridge_main_state_restored"],
-            "snapshot_diagnostics_match": restore_comparison.get("matched") is True,
-            "comparison": restore_comparison,
-        }
-
         integrity_errors = []
         if not coverage_a["full_chunk_executed"] or not coverage_b["full_chunk_executed"]:
             integrity_errors.append("one_or_both_candidates_did_not_execute_the_complete_chunk")
@@ -624,10 +1003,14 @@ def run_experiment(
             integrity_errors.append("branch_action_echo_differs_from_archived_actions")
         if not report["shared_first_five_comparison"].get("matched"):
             integrity_errors.append("first_five_branch_prefix_state_action_or_contact_results_differ")
-        if not report["step_75_decision_observation_comparison"].get("matched_available_fields"):
-            integrity_errors.append("branch_endpoint_robot_state_differs_from_archived_step75")
+        if not report["sequential_step_replay"].get("same_source_environment_observation_vs_step75", {}).get("matched"):
+            integrity_errors.append("same_source_env_step_observation_differs_from_archived_step75")
+        if not report["sequential_step_replay"].get("same_physical_diagnostic_branch_vs_step", {}).get("matched"):
+            integrity_errors.append("branch_fifth_step_physical_diagnostics_differ_from_sequential_step")
         if not report["bridge_main_state_restored"] or not restore_comparison.get("matched"):
             integrity_errors.append("main_environment_was_not_confirmed_at_s70_after_branch")
+        if not report["sequential_step_replay"].get("final_main_state_restoration", {}).get("matched"):
+            integrity_errors.append("main_environment_was_not_confirmed_at_s70_after_sequential_step_replay")
         if compiler.get("main_state_restored") is not True:
             integrity_errors.append("Compiler_did_not_confirm_branch_main_state_restore")
         if integrity_errors:
@@ -673,6 +1056,12 @@ def print_summary(report: dict[str, Any]) -> None:
             f"{report.get('step_70_historical_robot_state_matches')} "
             f"RGB_pixel_exact={report.get('step_70_historical_images_pixel_exact')}"
         )
+    archive_boundary = report.get("archive_step74_to_step75_observation")
+    if isinstance(archive_boundary, dict):
+        print(
+            "  archive S74 post → S75 decision: "
+            f"matched={archive_boundary.get('matched')} available={archive_boundary.get('available')}"
+        )
     shared = report.get("shared_first_five_comparison", {})
     if shared:
         print(
@@ -711,6 +1100,16 @@ def print_summary(report: dict[str, Any]) -> None:
             "  main state restored: "
             f"bridge={restoration.get('bridge_reported_restored')} "
             f"diagnostics={restoration.get('snapshot_diagnostics_match')}"
+        )
+    sequential = report.get("sequential_step_replay")
+    if isinstance(sequential, dict):
+        observation_check = sequential.get("same_source_environment_observation_vs_step75", {})
+        physical_check = sequential.get("same_physical_diagnostic_branch_vs_step", {})
+        print(
+            "  sequential A0_70 env.step vs S75: "
+            f"matched={observation_check.get('matched')} "
+            f"branch/step physical diagnostics={physical_check.get('matched')} "
+            f"final_restore={sequential.get('final_main_state_restoration', {}).get('matched')}"
         )
     if report.get("failure_reason"):
         print(f"  failure: {report['failure_reason']}")

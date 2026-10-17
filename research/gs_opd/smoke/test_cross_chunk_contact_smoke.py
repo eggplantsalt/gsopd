@@ -49,6 +49,17 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         eef_pos = np.asarray(
             [[step * 0.01, 0.2, 0.3] for step in decisions], dtype=np.float64
         )
+        post_images_a = np.zeros((len(steps), 3, 4, 3), dtype=np.uint8)
+        post_images_b = np.zeros_like(post_images_a)
+        post_eef_pos = np.zeros((len(steps), 3), dtype=np.float64)
+        post_eef_quat = np.zeros((len(steps), 4), dtype=np.float64)
+        post_gripper = np.zeros((len(steps), 2), dtype=np.float64)
+        post_row = 74
+        post_images_a[post_row] = images_a[15]
+        post_images_b[post_row] = images_b[15]
+        post_eef_pos[post_row] = eef_pos[15]
+        post_eef_quat[post_row] = [0.0, 0.0, 0.0, 1.0]
+        post_gripper[post_row] = [0.01, -0.01]
         path = directory / "on_policy.npz"
         np.savez_compressed(
             path,
@@ -65,6 +76,11 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
             decision_robot0_eef_pos=eef_pos,
             decision_robot0_eef_quat=np.tile([0.0, 0.0, 0.0, 1.0], (len(decisions), 1)),
             decision_robot0_gripper_qpos=np.tile([0.01, -0.01], (len(decisions), 1)),
+            post_agentview_image=post_images_a,
+            post_robot0_eye_in_hand_image=post_images_b,
+            post_robot0_eef_pos=post_eef_pos,
+            post_robot0_eef_quat=post_eef_quat,
+            post_robot0_gripper_qpos=post_gripper,
         )
         return path, {"instruction": instruction, "actions": actions, "images_a": images_a, "images_b": images_b}
 
@@ -176,7 +192,7 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         return geometry, gripper
 
     @staticmethod
-    def _snapshot_state(x=0.7):
+    def _snapshot_state(x=0.7, kinematics_source="forwarded_copy_of_mujoco_integration_state"):
         return {
             "mujoco_integration_state": [x],
             "robot_states": [
@@ -189,7 +205,7 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
                 }
             ],
             "object_states": {},
-            "kinematics_source": "forwarded_copy_of_mujoco_integration_state",
+            "kinematics_source": kinematics_source,
         }
 
     def _branch_candidate(self, candidate_id, actions, contact_step=None):
@@ -206,7 +222,9 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
                 "contact_samples": {"contact": int(contact_here), "no_contact": int(not contact_here), "unavailable": 0},
             }
             controls.append(coverage)
-            state = self._snapshot_state(0.7 + 0.01 * (index + 1))
+            state = self._snapshot_state(
+                0.7 + 0.01 * (index + 1), "branch_diagnostic_cache"
+            )
             contacts = {
                 "status": "contact" if contact_here else "no_contact",
                 "contacts": [],
@@ -276,7 +294,7 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
             "status": "ok",
             "requested_steps": len(actions),
             "executed_steps": len(actions),
-            "start_state": self._snapshot_state(),
+            "start_state": self._snapshot_state(kinematics_source="branch_diagnostic_cache"),
             "steps": steps,
             "contact_monitoring": monitor,
         }
@@ -288,6 +306,8 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         image_mismatch=False,
         state_mismatch=False,
         incomplete_monitor=False,
+        same_source_state_mismatch=False,
+        final_restore_error=False,
     ):
         geometry, gripper = self._inventories()
         snapshot = self._snapshot_state()
@@ -305,11 +325,32 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         if state_mismatch:
             state["robot0_eef_pos"][0] += 1e-3
         packed = {"images": images, "state": state, "instruction": archive_pair["instruction"]}
+        restore_count = 0
+        sequential_step_count = 0
+
+        step75_observation = archive_pair["step_75"]["expected_observation"]
+        step75_packed = {
+            "images": {key: _packed_image(value) for key, value in step75_observation["images"].items()},
+            "state": {key: value.tolist() for key, value in step75_observation["state"].items()},
+            "instruction": archive_pair["instruction"],
+        }
 
         def handler(request):
             operation = request["op"]
-            if operation in ("reset", "step"):
+            if operation == "reset":
                 return dict(packed)
+            if operation == "step":
+                if request.get("include_snapshot_state") is not True:
+                    return dict(packed)
+                nonlocal sequential_step_count
+                sequential_step_count += 1
+                response = copy.deepcopy(step75_packed)
+                if same_source_state_mismatch and sequential_step_count == 5:
+                    response["state"]["robot0_eef_pos"][0] += 2e-6
+                response["snapshot_state"] = self._snapshot_state(
+                    0.7 + 0.01 * sequential_step_count
+                )
+                return response
             if operation == "geometry_inventory":
                 return geometry
             if operation == "gripper_geometry_inventory":
@@ -317,6 +358,10 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
             if operation == "snapshot":
                 return {"snapshot_id": "snapshot-s70", "snapshot_state": snapshot}
             if operation == "restore":
+                nonlocal restore_count
+                restore_count += 1
+                if final_restore_error and restore_count == 3:
+                    return {"error": "synthetic final restore failure"}
                 return {"restored_snapshot_id": request["snapshot_id"], "snapshot_state": snapshot}
             if operation == "branch_rollout":
                 self.assertEqual(request["snapshot_id"], "snapshot-s70")
@@ -350,6 +395,20 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         np.testing.assert_array_equal(episode["action_10"], values["actions"][70:80])
         self.assertEqual(episode["archive_action_checks"]["step_70_decision_index"], 14)
         self.assertEqual(episode["archive_action_checks"]["step_75_decision_index"], 15)
+        self.assertTrue(episode["archive_step74_to_step75_observation"]["matched"])
+
+    def test_snapshot_kinematics_source_is_metadata_but_physical_values_remain_strict(self):
+        expected = self._snapshot_state()
+        actual = self._snapshot_state(kinematics_source="branch_diagnostic_cache")
+        comparison = smoke.compare_snapshot_diagnostics(expected, actual)
+        self.assertTrue(comparison["matched"])
+        self.assertFalse(comparison["diagnostic_metadata"]["matched"])
+        self.assertTrue(comparison["diagnostic_metadata"]["informational_only"])
+
+        actual["robot_states"][0]["eef_pos"][0] += 2e-6
+        comparison = smoke.compare_snapshot_diagnostics(expected, actual)
+        self.assertFalse(comparison["matched"])
+        self.assertGreater(comparison["physical_values"]["max_abs_delta"], 1e-6)
 
     def test_archive_loader_rejects_action_chunk_that_disagrees_with_executed_actions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -361,6 +420,21 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
             with self.assertRaisesRegex(smoke.CrossChunkArchiveError, "differs from its archived executed actions"):
                 smoke.load_cross_chunk_archive(path)
 
+    def test_archive_s74_to_s75_observation_mismatch_stops_before_bridge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path, _values = self._write_archive(Path(temp_dir))
+            with np.load(path, allow_pickle=False) as saved:
+                arrays = {key: saved[key].copy() for key in saved.files}
+            arrays["post_robot0_eef_pos"][74, 0] += 2e-6
+            np.savez_compressed(path, **arrays)
+            archive_pair = smoke.load_cross_chunk_archive(path)
+        teacher, bindings = self._teacher_and_bindings()
+        connection = FakeConnection(lambda _request: self.fail("Bridge must not be contacted"))
+        report = smoke.run_experiment(connection, archive_pair, teacher, bindings)
+        self.assertEqual(report["status"], "archive_boundary_observation_mismatch")
+        self.assertFalse(report["archive_step74_to_step75_observation"]["matched"])
+        self.assertEqual(connection.requests, [])
+
     def test_real_compiler_checks_both_branches_and_reports_computed_tail_violation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path, _values = self._write_archive(Path(temp_dir))
@@ -370,6 +444,10 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         report = smoke.run_experiment(connection, archive_pair, teacher, bindings)
         self.assertEqual(report["status"], "diagnostic_complete", report.get("failure_reason"))
         self.assertTrue(report["main_state_restoration"]["snapshot_diagnostics_match"])
+        self.assertTrue(report["sequential_step_replay"]["same_source_environment_observation_vs_step75"]["matched"])
+        self.assertTrue(report["sequential_step_replay"]["same_physical_diagnostic_branch_vs_step"]["matched"])
+        self.assertTrue(report["sequential_step_replay"]["final_restore_attempted"])
+        self.assertEqual(report["sequential_step_replay"]["executed_steps"], 5)
         self.assertTrue(report["snapshot_restore_roundtrip"]["matched"])
         self.assertTrue(report["shared_first_five_comparison"]["matched"])
         self.assertTrue(report["step_75_decision_observation_comparison"]["matched_available_fields"])
@@ -392,6 +470,40 @@ class CrossChunkContactSmokeTest(unittest.TestCase):
         self.assertEqual(
             [request["op"] for request in connection.requests].count("branch_rollout"), 1
         )
+
+    def test_same_source_step_observation_mismatch_fails_and_still_restores_s70(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path, _values = self._write_archive(Path(temp_dir))
+            archive_pair = smoke.load_cross_chunk_archive(path)
+        teacher, bindings = self._teacher_and_bindings()
+        connection = self._bridge(archive_pair, same_source_state_mismatch=True)
+        report = smoke.run_experiment(connection, archive_pair, teacher, bindings)
+        self.assertEqual(report["status"], "diagnostic_integrity_failed")
+        comparison = report["sequential_step_replay"]["same_source_environment_observation_vs_step75"]
+        self.assertFalse(comparison["matched"])
+        self.assertGreater(
+            comparison["state"]["robot0_eef_pos"]["max_abs_error"], 1e-6
+        )
+        self.assertTrue(report["sequential_step_replay"]["final_restore_attempted"])
+        self.assertTrue(report["sequential_step_replay"]["final_main_state_restoration"]["matched"])
+        self.assertEqual([r["op"] for r in connection.requests].count("restore"), 3)
+
+    def test_final_restore_failure_is_reported_after_same_source_comparison(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path, _values = self._write_archive(Path(temp_dir))
+            archive_pair = smoke.load_cross_chunk_archive(path)
+        teacher, bindings = self._teacher_and_bindings()
+        connection = self._bridge(archive_pair, final_restore_error=True)
+        report = smoke.run_experiment(connection, archive_pair, teacher, bindings)
+        self.assertEqual(report["status"], "diagnostic_integrity_failed")
+        sequential = report["sequential_step_replay"]
+        self.assertTrue(sequential["final_restore_attempted"])
+        self.assertFalse(sequential["final_main_state_restoration"]["matched"])
+        self.assertEqual(
+            sequential["final_main_state_restoration"]["error"],
+            "synthetic final restore failure",
+        )
+        self.assertTrue(sequential["same_source_environment_observation_vs_step75"]["matched"])
 
     def test_allow_image_mismatch_does_not_relax_robot_state_gate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
