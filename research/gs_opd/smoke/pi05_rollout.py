@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 17009)
+Total output lines: 1553
+
 import argparse
 import os
 from pathlib import Path
@@ -525,449 +528,7 @@ def prepare_on_policy_safety_collection(
         sys.path.insert(0, repo_root)
     from research.gs_opd.smoke.contact_safety_compiler_smoke import compile_forbid_contact
     from research.gs_opd.smoke.replay_archive_contact_smoke import (
-        _validate_current_bindings,
-    )
-    from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
-
-    def bridge_request(payload):
-        conn.send(payload)
-        response = conn.recv()
-        if not isinstance(response, dict):
-            raise RuntimeError("Safety Bridge returned a non-object response")
-        return response
-
-    teacher = parse_teacher_output_v2(teacher_json_path.read_text(encoding="utf-8"))
-    if not any(item["id"] == object_id for item in teacher["objects"]):
-        raise ValueError(f"object_id {object_id!r} is absent from Safety IR v2")
-    if semantic_results_path is not None:
-        loaded_results = json.loads(semantic_results_path.read_text(encoding="utf-8"))
-        if not isinstance(loaded_results, dict) or any(
-            not isinstance(key, str) or not isinstance(value, dict)
-            for key, value in loaded_results.items()
-        ):
-            raise ValueError("semantic results JSON must map Teacher object IDs to result objects")
-        semantic_results = loaded_results
-        if object_id not in semantic_results:
-            raise ValueError(f"semantic results mapping has no binding for {object_id!r}")
-    else:
-        if semantic_result_path is None:
-            raise ValueError("a semantic result file or semantic results mapping is required")
-        semantic_results = {
-            object_id: json.loads(semantic_result_path.read_text(encoding="utf-8"))
-        }
-
-    semantic_result = semantic_results[object_id]
-    geometry_inventory = bridge_request({"op": "geometry_inventory"})
-    gripper_inventory = bridge_request({"op": "gripper_geometry_inventory"})
-    repair_context = bridge_request({"op": "repair_context"})
-
-    object_contact_rules = teacher.get("object_contact_rules", [])
-    binding_validation = None
-    if object_contact_rules:
-        binding_validation = _validate_current_bindings(
-            teacher,
-            semantic_results,
-            geometry_inventory,
-        )
-        if binding_validation.get("valid") is not True:
-            errors = binding_validation.get("errors") or [
-                "object_semantic_bindings_are_unverified"
-            ]
-            raise ValueError(
-                "Object-to-Object semantic Body/Geom bindings do not match the active "
-                f"Geometry Inventory: {errors}"
-            )
-
-    # A branch error is expected in this read-only preflight. All other compiler
-    # prerequisites must resolve before collecting from the fixed task.
-    preflight = compile_forbid_contact(
-        teacher,
-        object_id,
-        semantic_result,
-        {"main_state_restored": True, "candidates": []},
-        geometry_inventory,
-        gripper_inventory,
-        object_semantic_results=semantic_results,
-    )
-    preflight_errors = [
-        reason
-        for reason in preflight.get("unknown_reasons", [])
-        if reason != "branch_rollout_has_no_candidate_results"
-    ]
-    selected_contact_rules = [
-        rule
-        for rule in teacher.get("rules", [])
-        if isinstance(rule, dict)
-        and rule.get("target_id") == object_id
-        and rule.get("predicate") == "contact"
-    ]
-    if not selected_contact_rules and not object_contact_rules:
-        preflight_errors.append("teacher_has_no_supported_contact_rules_for_collection")
-    if selected_contact_rules:
-        # The current robot-part compiler accepts exactly one gripper rule for
-        # this target. An explicit allow is valid without the forbid-only
-        # compiled_rule field; all other shapes remain fail-closed.
-        if len(selected_contact_rules) != 1:
-            preflight_errors.append("multiple_or_conflicting_gripper_contact_rules")
-        else:
-            selected_rule = selected_contact_rules[0]
-            supported_gripper_rule = (
-                selected_rule.get("subject_parts") == ["gripper"]
-                and selected_rule.get("phase") == "any"
-                and selected_rule.get("decision") in ("allow", "forbid")
-            )
-            if not supported_gripper_rule:
-                preflight_errors.append("unsupported_or_unknown_gripper_contact_rule")
-            elif (
-                selected_rule["decision"] == "forbid"
-                and preflight.get("compiled_rule") is None
-            ):
-                preflight_errors.append("gripper_contact_rule_did_not_compile")
-    if (
-        preflight.get("target_binding") is None
-        or not preflight.get("gripper_geom_ids")
-        or preflight_errors
-    ):
-        raise ValueError(
-            "Safety IR rule or semantic physical binding is not valid for the active "
-            f"LIBERO-Safety task: {preflight_errors or preflight.get('unknown_reasons')}"
-        )
-
-    task_object_binding = None
-    if semantic_results_path is not None and task_object_id is None:
-        inferred_targets = [
-            item["id"] for item in teacher["objects"]
-            if item.get("role") == "target_object"
-        ]
-        if object_contact_rules:
-            if len(inferred_targets) != 1:
-                raise ValueError(
-                    "Object-to-Object collection requires exactly one target_object role "
-                    "or an explicit --task-object-id"
-                )
-            task_object_id = inferred_targets[0]
-        elif len(inferred_targets) == 1 and inferred_targets[0] in semantic_results:
-            task_object_id = inferred_targets[0]
-
-    if task_object_id is not None:
-        if semantic_results_path is not None:
-            task_semantic_result = semantic_results.get(task_object_id)
-            if not isinstance(task_semantic_result, dict):
-                raise ValueError(
-                    "semantic results mapping has no task-progress binding for "
-                    f"{task_object_id!r}"
-                )
-        else:
-            if task_object_semantic_result_path is None:
-                raise ValueError("task-object ID requires a semantic result binding")
-            task_semantic_result = json.loads(
-                task_object_semantic_result_path.read_text(encoding="utf-8")
-            )
-            semantic_results[task_object_id] = task_semantic_result
-        task_object_binding = _resolve_task_object_binding(
-            teacher,
-            task_object_id,
-            task_semantic_result,
-            geometry_inventory,
-        )
-    return {
-        "scope": {
-            "suite": "obstacle_avoidance",
-            "level": 0,
-            "task_id": 0,
-            "bridge_source": "research/gs_opd/smoke/safety_bridge.py",
-            "binding_scope": "validated against the active fixed-task MuJoCo geometry inventory",
-        },
-        "teacher": teacher,
-        "object_id": object_id,
-        "semantic_result": semantic_result,
-        "semantic_results": semantic_results,
-        "semantic_binding_validation": binding_validation,
-        "object_contact_rules": object_contact_rules,
-        "task_object_id": task_object_id,
-        "safety_target_binding": preflight["target_binding"],
-        "geometry_inventory": geometry_inventory,
-        "gripper_inventory": gripper_inventory,
-        "repair_context": repair_context,
-        "task_object_binding": task_object_binding,
-        "preflight_result": preflight,
-    }
-
-
-def run_on_policy_safety_collection_decision(
-    conn,
-    chunk,
-    instruction,
-    chunk_index,
-    decision_step,
-    collection_context,
-):
-    """Verify A0 from a fresh Snapshot and optionally search for a safe A+."""
-    import sys
-
-    repo_root = str(Path(__file__).resolve().parents[3])
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-    from research.gs_opd.repair.verifier_guided_repair import run_verifier_guided_repair
-    from research.gs_opd.smoke.contact_safety_compiler_smoke import compile_forbid_contact
-
-    actions = np.asarray(chunk, dtype=np.float32)
-    object_id = collection_context["object_id"]
-    teacher = collection_context["teacher"]
-    semantic_result = collection_context["semantic_result"]
-    semantic_results = collection_context.get("semantic_results") or {object_id: semantic_result}
-    geometry_inventory = collection_context["geometry_inventory"]
-    gripper_inventory = collection_context["gripper_inventory"]
-    report = {
-        "chunk_index": int(chunk_index),
-        "decision_step": int(decision_step),
-        "instruction": str(instruction),
-        "teacher_context": teacher,
-        "object_id": object_id,
-        "rules": [rule for rule in teacher["rules"] if rule["target_id"] == object_id],
-        "object_contact_rules": collection_context.get("object_contact_rules", []),
-        "safety_target_binding": collection_context["safety_target_binding"],
-        "semantic_binding_result": semantic_result,
-        "semantic_binding_results": semantic_results,
-        "semantic_binding_validation": collection_context.get("semantic_binding_validation"),
-        "original_action_chunk_A0": actions.tolist(),
-        "snapshot_id": None,
-        "a0_verdict": "unknown",
-        "a0_compiler_verdict": "unknown",
-        "a0_compiled_result": None,
-        "a0_branch_summary": None,
-        "repair_attempted": False,
-        "repair_status": None,
-        "repair_failure_reason": None,
-        "repair_search": None,
-        "repaired_action_chunk_A_plus": None,
-        "training_action_chunk": None,
-        "training_label_valid": False,
-        "label_source": None,
-        "main_state_restored": None,
-        "must_abort_episode": False,
-        "failure_reasons": [],
-    }
-
-    def add_failure(reason):
-        if reason is not None and str(reason) not in report["failure_reasons"]:
-            report["failure_reasons"].append(str(reason))
-
-    def bridge_request(payload):
-        try:
-            conn.send(payload)
-            response = conn.recv()
-        except (OSError, EOFError) as exc:
-            raise ConnectionError(
-                f"Safety Bridge connection failed: {type(exc).__name__}: {exc}"
-            ) from exc
-        if not isinstance(response, dict):
-            raise RuntimeError("Safety Bridge returned a non-object response")
-        return response
-
-    a0_candidate_id = f"on-policy-A0-{int(chunk_index):06d}"
-    try:
-        snapshot = bridge_request({"op": "snapshot"})
-        report["snapshot_id"] = snapshot.get("snapshot_id")
-        if not isinstance(report["snapshot_id"], str):
-            # Snapshot creation is read-only; continue Student A0 as an
-            # explicitly unknown sample because no branch changed the state.
-            report["main_state_restored"] = True
-            report["status"] = "unknown_snapshot_unavailable"
-            add_failure(snapshot.get("error", "snapshot_operation_returned_no_id"))
-            add_failure("original_action_chunk_not_branch_verified")
-            return report
-
-        baseline_branch = bridge_request({
-            "op": "branch_rollout",
-            "snapshot_id": report["snapshot_id"],
-            "candidates": [{"candidate_id": a0_candidate_id, "actions": actions.tolist()}],
-        })
-        report["main_state_restored"] = baseline_branch.get("main_state_restored") is True
-        baseline_candidate = next(
-            (
-                item for item in baseline_branch.get("candidates", [])
-                if isinstance(item, dict) and item.get("candidate_id") == a0_candidate_id
-            ),
-            None,
-        )
-        if baseline_candidate is not None:
-            branch_steps = baseline_candidate.get("steps")
-            branch_step_count = len(branch_steps) if isinstance(branch_steps, list) else 0
-            requested_steps = baseline_candidate.get("requested_steps")
-            executed_steps = baseline_candidate.get("executed_steps")
-            report["a0_branch_summary"] = {
-                "status": baseline_candidate.get("status"),
-                "requested_steps": requested_steps,
-                "executed_steps": executed_steps,
-                "step_record_count": branch_step_count,
-                "full_action_chunk_executed": (
-                    isinstance(requested_steps, int)
-                    and not isinstance(requested_steps, bool)
-                    and isinstance(executed_steps, int)
-                    and not isinstance(executed_steps, bool)
-                    and requested_steps == len(actions)
-                    and executed_steps == len(actions)
-                    and branch_step_count == len(actions)
-                ),
-                "step_rewards": [step.get("reward") for step in branch_steps or []],
-                "step_dones": [step.get("done") for step in branch_steps or []],
-                "contact_monitoring": baseline_candidate.get("contact_monitoring"),
-            }
-        compiled = compile_forbid_contact(
-            teacher,
-            object_id,
-            semantic_result,
-            baseline_branch,
-            geometry_inventory,
-            gripper_inventory,
-            object_semantic_results=semantic_results,
-        )
-        report["a0_compiled_result"] = compiled
-        report["a0_compiler_verdict"] = compiled.get("status", "unknown")
-        report["a0_verdict"] = report["a0_compiler_verdict"]
-
-        if report["main_state_restored"] is not True:
-            report["status"] = "aborted_main_state_restore_failed"
-            report["must_abort_episode"] = True
-            add_failure("baseline_branch_did_not_restore_the_decision_state")
-            return report
-
-        a0_full_chunk = (
-            isinstance(report["a0_branch_summary"], dict)
-            and report["a0_branch_summary"].get("full_action_chunk_executed") is True
-        )
-        if report["a0_verdict"] == "safe" and not a0_full_chunk:
-            report["a0_verdict"] = "unknown"
-            report.update({"status": "a0_unknown", "repair_status": "skipped_a0_unknown"})
-            add_failure("A0_safe_verdict_did_not_cover_the_requested_full_chunk")
-            return report
-
-        if report["a0_verdict"] == "safe":
-            report.update({
-                "status": "a0_safe",
-                "repair_status": "skipped_a0_safe",
-                "training_action_chunk": actions.tolist(),
-                "training_label_valid": True,
-                "label_source": "compiler_verified_safe_A0",
-            })
-            return report
-
-        if report["a0_verdict"] != "violation":
-            report.update({"status": "a0_unknown", "repair_status": "skipped_a0_unknown"})
-            for reason in compiled.get("unknown_reasons", []):
-                add_failure(reason)
-            for item in compiled.get("candidates", []):
-                if isinstance(item, dict):
-                    add_failure(item.get("reason"))
-            if not report["failure_reasons"]:
-                add_failure("A0_compiler_verdict_is_unknown")
-            return report
-
-        report["repair_attempted"] = True
-        last_restore_state = {"restored": True}
-
-        def evaluate_candidates(specifications):
-            last_restore_state["restored"] = False
-            branch = bridge_request({
-                "op": "branch_rollout",
-                "snapshot_id": report["snapshot_id"],
-                "candidates": [
-                    {"candidate_id": item["candidate_id"], "actions": item["actions"]}
-                    for item in specifications
-                ],
-            })
-            last_restore_state["restored"] = branch.get("main_state_restored") is True
-            compiled_candidates = compile_forbid_contact(
-                teacher,
-                object_id,
-                semantic_result,
-                branch,
-                geometry_inventory,
-                gripper_inventory,
-                object_semantic_results=semantic_results,
-            )
-            branch_by_id = {
-                item.get("candidate_id"): item
-                for item in branch.get("candidates", [])
-                if isinstance(item, dict)
-            }
-            compiled_by_id = {
-                item.get("candidate_id"): item
-                for item in compiled_candidates.get("candidates", [])
-                if isinstance(item, dict)
-            }
-            results = []
-            for item in specifications:
-                candidate_id = item["candidate_id"]
-                candidate_branch = branch_by_id.get(candidate_id)
-                candidate_compiled = compiled_by_id.get(candidate_id)
-                results.append({
-                    "candidate_id": candidate_id,
-                    "branch_result": {
-                        **branch,
-                        "candidates": [candidate_branch] if candidate_branch is not None else [],
-                    },
-                    "compiled_result": {
-                        **compiled_candidates,
-                        "candidates": [candidate_compiled] if candidate_compiled is not None else [],
-                    },
-                })
-            return results
-
-        try:
-            repair = run_verifier_guided_repair(
-                actions,
-                baseline_branch,
-                compiled,
-                collection_context["repair_context"],
-                evaluate_candidates,
-                task_object_binding=collection_context.get("task_object_binding"),
-            )
-        except Exception as exc:
-            repair = {
-                "status": "repair_exception",
-                "failure_reason": f"{type(exc).__name__}: {exc}",
-                "repaired_action_chunk_A_plus": None,
-                "supervision": {"training_label_valid": False},
-            }
-        report["main_state_restored"] = last_restore_state["restored"]
-        report["repair_search"] = _compact_repair_report(repair)
-        report["repair_status"] = repair.get("status", "unknown")
-        report["repair_failure_reason"] = repair.get("failure_reason")
-        report["repaired_action_chunk_A_plus"] = repair.get("repaired_action_chunk_A_plus")
-        plus = report["repaired_action_chunk_A_plus"]
-        try:
-            plus_array = np.asarray(plus, dtype=np.float32)
-        except (TypeError, ValueError):
-            plus_array = np.empty((0, 0), dtype=np.float32)
-        valid_repair_label = (
-            report["repair_status"] == "repaired_candidate_found"
-            and repair.get("supervision", {}).get("training_label_valid") is True
-            and isinstance(plus, list)
-            and plus_array.shape == actions.shape
-            and np.isfinite(plus_array).all()
-        )
-        if valid_repair_label:
-            report["training_action_chunk"] = plus
-            report["training_label_valid"] = True
-            report["label_source"] = "compiler_verified_repaired_A_plus"
-            report["status"] = "violation_repaired"
-        else:
-            report["status"] = (
-                "aborted_main_state_restore_failed"
-                if report["main_state_restored"] is not True
-                else "violation_unrepaired"
-            )
-            add_failure(report["repair_failure_reason"])
-            for reason in repair.get("rejected_reasons", []):
-                add_failure(reason)
-            if not report["failure_reasons"]:
-                add_failure(report["repair_status"])
-        if report["main_state_restored"] is not True:
-            report["status"] = "aborted_main_state_restore_failed"
-            report["must_abort_episode"] = True
-            report["training_action_chunk"] = None
+ …5009 tokens truncated…rt["training_action_chunk"] = None
             report["training_label_valid"] = False
             report["label_source"] = None
             add_failure("repair_branch_did_not_restore_the_decision_state")
@@ -993,6 +554,145 @@ def run_on_policy_safety_collection_decision(
         return report
 
 
+def select_verified_execution_chunk(decision, predicted_actions):
+    """Return the only full Chunk that this decision has proved executable."""
+    result = {
+        "valid": False,
+        "actions": None,
+        "source": None,
+        "candidate_id": None,
+        "reason": None,
+    }
+
+    def reject(reason):
+        result["reason"] = str(reason)
+        return result
+
+    try:
+        predicted = np.asarray(predicted_actions, dtype=np.float32)
+    except (TypeError, ValueError):
+        return reject("student_A0_is_not_numeric")
+    if predicted.ndim != 2 or predicted.shape[1:] != (7,) or not len(predicted):
+        return reject("student_A0_must_have_shape_(T,7)")
+    if not np.isfinite(predicted).all():
+        return reject("student_A0_contains_non_finite_values")
+    if not isinstance(decision, dict):
+        return reject("safety_decision_is_not_an_object")
+    if decision.get("main_state_restored") is not True:
+        return reject("snapshot_restore_was_not_confirmed")
+
+    branch_summary = decision.get("a0_branch_summary")
+    if (
+        not isinstance(branch_summary, dict)
+        or branch_summary.get("full_action_chunk_executed") is not True
+    ):
+        return reject("A0_did_not_receive_full_chunk_validation")
+    try:
+        recorded_a0 = np.asarray(decision.get("original_action_chunk_A0"), dtype=np.float32)
+    except (TypeError, ValueError):
+        return reject("safety_record_A0_is_not_numeric")
+    if recorded_a0.shape != predicted.shape or not np.isfinite(recorded_a0).all():
+        return reject("safety_record_A0_shape_or_values_do_not_match_student_prediction")
+    if not np.array_equal(recorded_a0, predicted):
+        return reject("safety_record_A0_does_not_match_student_prediction")
+    verdict = decision.get("a0_verdict")
+    if verdict not in ("safe", "violation"):
+        reasons = decision.get("failure_reasons")
+        reason = (
+            reasons[0]
+            if isinstance(reasons, list) and reasons
+            else "A0_verdict_is_not_safe_or_violation"
+        )
+        return reject(reason)
+    if verdict == "violation" and (
+        decision.get("status") != "violation_repaired"
+        or decision.get("repair_attempted") is not True
+        or decision.get("repair_status") != "repaired_candidate_found"
+    ):
+        return reject(
+            decision.get("repair_failure_reason")
+            or decision.get("repair_status")
+            or "A0_violation_has_no_validated_repair"
+        )
+    if decision.get("training_label_valid") is not True:
+        return reject("decision_has_no_validated_training_action")
+
+    if verdict == "safe":
+        if decision.get("status") != "a0_safe":
+            return reject("safe_A0_decision_status_is_inconsistent")
+        chosen = predicted
+        try:
+            labeled_a0 = np.asarray(decision.get("training_action_chunk"), dtype=np.float32)
+        except (TypeError, ValueError):
+            return reject("validated_safe_A0_label_is_not_numeric")
+        if (
+            labeled_a0.shape != predicted.shape
+            or not np.isfinite(labeled_a0).all()
+            or not np.array_equal(labeled_a0, predicted)
+        ):
+            return reject("validated_safe_A0_label_does_not_match_student_prediction")
+        source = "compiler_verified_safe_A0"
+    elif verdict == "violation":
+        search = decision.get("repair_search")
+        selected = search.get("selected_candidate") if isinstance(search, dict) else None
+        candidate_id = (
+            search.get("selected_candidate_id") if isinstance(search, dict) else None
+        )
+        supervision = search.get("supervision") if isinstance(search, dict) else None
+        coverage = selected.get("execution_coverage") if isinstance(selected, dict) else None
+        constraints = selected.get("action_constraints") if isinstance(selected, dict) else None
+        progress = selected.get("task_progress") if isinstance(selected, dict) else None
+        if (
+            not isinstance(selected, dict)
+            or selected.get("verdict") != "accepted"
+            or selected.get("safety_verdict") != "safe"
+            or not isinstance(candidate_id, str)
+            or selected.get("candidate_id") != candidate_id
+            or not isinstance(supervision, dict)
+            or supervision.get("training_label_valid") is not True
+            or supervision.get("valid_action_steps") != len(predicted)
+            or not isinstance(coverage, dict)
+            or coverage.get("training_label_valid") is not True
+            or coverage.get("validated_action_steps") != len(predicted)
+            or not isinstance(constraints, dict)
+            or constraints.get("status") != "pass"
+            or not isinstance(progress, dict)
+            or progress.get("status") != "pass"
+        ):
+            return reject("selected_A_plus_lacks_full_safety_progress_or_constraint_validation")
+        try:
+            plus = np.asarray(decision.get("repaired_action_chunk_A_plus"), dtype=np.float32)
+            labeled = np.asarray(decision.get("training_action_chunk"), dtype=np.float32)
+            selected_actions = np.asarray(selected.get("actions"), dtype=np.float32)
+        except (TypeError, ValueError):
+            return reject("validated_A_plus_is_not_numeric")
+        if any(
+            values.shape != predicted.shape or not np.isfinite(values).all()
+            for values in (plus, labeled, selected_actions)
+        ):
+            return reject("validated_A_plus_shape_or_values_are_invalid")
+        if not (
+            np.array_equal(plus, labeled)
+            and np.array_equal(plus, selected_actions)
+        ):
+            return reject("A_plus_does_not_match_the_selected_validated_candidate")
+        chosen = plus
+        source = "compiler_verified_repaired_A_plus"
+        result["candidate_id"] = candidate_id
+    else:
+        return reject("A0_verdict_is_not_safe_or_violation")
+
+    if chosen.shape != predicted.shape or not np.isfinite(chosen).all():
+        return reject("selected_action_chunk_shape_or_values_are_invalid")
+    result.update({
+        "valid": True,
+        "actions": chosen.copy(),
+        "source": source,
+        "reason": None,
+    })
+    return result
+
+
 def _new_safety_episode_summary():
     return {
         "a0_verdict_counts": {"safe": 0, "violation": 0, "unknown": 0},
@@ -1009,6 +709,7 @@ def _must_abort_safety_episode(decision):
     return (
         decision.get("must_abort_episode") is True
         or decision.get("main_state_restored") is not True
+        or decision.get("execution_selection_valid") is False
     )
 
 
@@ -1190,8 +891,9 @@ try:
             actions, _ = model.predict_action_batch(env_obs, mode="eval")
 
         chunk = actions[0].detach().float().cpu().numpy()
-        assert chunk.ndim == 2 and chunk.shape[1] == 7
-        assert np.isfinite(chunk).all()
+        if not collection_enabled:
+            assert chunk.ndim == 2 and chunk.shape[1] == 7
+            assert np.isfinite(chunk).all()
         chunk_index = chunks
         if trace_writer is not None and not collection_enabled:
             trace_writer.add_decision(chunk_index, steps, data, chunk)
@@ -1247,24 +949,49 @@ try:
                     "training_label_valid": False,
                     "failure_reasons": [f"collection_decision_exception:{type(exc).__name__}:{exc}"],
                 }
-            trace_writer.add_decision(
-                chunk_index,
-                steps,
-                data,
-                chunk,
-                safety_record=safety_decision,
+            execution_selection = select_verified_execution_chunk(safety_decision, chunk)
+            safety_decision["execution_selection_valid"] = execution_selection["valid"]
+            safety_decision["selected_action_source"] = execution_selection["source"]
+            safety_decision["selected_candidate_id"] = execution_selection["candidate_id"]
+            safety_decision["selected_action_chunk"] = (
+                execution_selection["actions"].tolist()
+                if execution_selection["valid"]
+                else None
             )
+            safety_decision["execution_selection_failure_reason"] = execution_selection["reason"]
+            if not execution_selection["valid"]:
+                safety_decision["must_abort_episode"] = True
+                safety_decision["status"] = "aborted_before_unverified_action"
+                failure_reason = execution_selection["reason"] or "no_verified_action_chunk"
+                safety_decision.setdefault("failure_reasons", []).append(failure_reason)
+                collection_abort_reason = failure_reason
+            else:
+                execution_chunk = execution_selection["actions"]
+            if chunk.ndim == 2:
+                trace_writer.add_decision(
+                    chunk_index,
+                    steps,
+                    data,
+                    chunk,
+                    safety_record=safety_decision,
+                )
             _update_safety_episode_summary(safety_episode_summary, safety_decision)
             if _must_abort_safety_episode(safety_decision):
-                collection_abort_reason = safety_decision.get("status") or "branch_restore_unconfirmed"
+                collection_abort_reason = (
+                    collection_abort_reason
+                    or safety_decision.get("status")
+                    or "branch_restore_unconfirmed"
+                )
                 print(
                     "SAFETY COLLECTION ABORTED BEFORE MAIN ACTION:",
                     collection_abort_reason,
                     flush=True,
                 )
                 break
+        else:
+            execution_chunk = chunk
 
-        for action_index, action in enumerate(chunk):
+        for action_index, action in enumerate(execution_chunk):
             conn.send({"op": "step", "action": action.tolist()})
             data = conn.recv()
             steps += 1

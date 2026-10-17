@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from research.gs_opd.data.trajectory_writer import TrajectoryWriter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -27,6 +28,7 @@ def _load_helpers():
         "_resolve_task_object_binding",
         "prepare_on_policy_safety_collection",
         "run_on_policy_safety_collection_decision",
+        "select_verified_execution_chunk",
         "_new_safety_episode_summary",
         "_update_safety_episode_summary",
         "_must_abort_safety_episode",
@@ -310,11 +312,28 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             "candidates": [{"candidate_id": "repair-0001", "verdict": "safe"}],
         }
         repaired = (self.chunk + 0.01).tolist()
+        selected_candidate = {
+            "candidate_id": "repair-0001",
+            "actions": repaired,
+            "verdict": "accepted",
+            "safety_verdict": "safe",
+            "execution_coverage": {
+                "training_label_valid": True,
+                "validated_action_steps": len(self.chunk),
+            },
+            "action_constraints": {"status": "pass"},
+            "task_progress": {"status": "pass"},
+        }
         repair_result = {
             "status": "repaired_candidate_found",
             "failure_reason": None,
             "repaired_action_chunk_A_plus": repaired,
-            "supervision": {"training_label_valid": True},
+            "supervision": {
+                "training_label_valid": True,
+                "valid_action_steps": len(self.chunk),
+            },
+            "selected_candidate_id": "repair-0001",
+            "selected_candidate": selected_candidate,
             "search_attempts": [{"candidate_id": "repair-0001", "verdict": "accepted"}],
         }
 
@@ -341,6 +360,12 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertFalse(self.helpers["_must_abort_safety_episode"](result))
         self.assertEqual(result["label_source"], "compiler_verified_repaired_A_plus")
         self.assertEqual(result["training_action_chunk"], repaired)
+        selected = self.helpers["select_verified_execution_chunk"](result, self.chunk)
+        self.assertTrue(selected["valid"])
+        self.assertEqual(selected["source"], "compiler_verified_repaired_A_plus")
+        self.assertEqual(selected["candidate_id"], "repair-0001")
+        np.testing.assert_array_equal(selected["actions"], np.asarray(repaired, dtype=np.float32))
+        self.assertFalse(np.array_equal(selected["actions"], self.chunk))
         self.assertEqual(len(compiler.call_args_list), 2)
         for call in compiler.call_args_list:
             self.assertEqual(call.kwargs["object_semantic_results"], _context()["semantic_results"])
@@ -366,6 +391,109 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertFalse(result["training_label_valid"])
         self.assertTrue(self.helpers["_must_abort_safety_episode"](result))
 
+    def test_verified_safe_a0_is_selected_for_execution(self):
+        decision = {
+            "main_state_restored": True,
+            "a0_branch_summary": {"full_action_chunk_executed": True},
+            "original_action_chunk_A0": self.chunk.tolist(),
+            "a0_verdict": "safe",
+            "status": "a0_safe",
+            "training_label_valid": True,
+            "training_action_chunk": self.chunk.tolist(),
+        }
+        selected = self.helpers["select_verified_execution_chunk"](decision, self.chunk)
+        self.assertTrue(selected["valid"])
+        self.assertEqual(selected["source"], "compiler_verified_safe_A0")
+        np.testing.assert_array_equal(selected["actions"], self.chunk)
+
+    def test_unknown_or_unrepaired_decision_has_no_executable_actions(self):
+        decision = {
+            "main_state_restored": True,
+            "a0_branch_summary": {"full_action_chunk_executed": True},
+            "original_action_chunk_A0": self.chunk.tolist(),
+            "a0_verdict": "unknown",
+            "status": "a0_unknown",
+            "training_label_valid": False,
+            "failure_reasons": ["contact_monitoring_unavailable"],
+        }
+        selected = self.helpers["select_verified_execution_chunk"](decision, self.chunk)
+        self.assertFalse(selected["valid"])
+        self.assertIsNone(selected["actions"])
+        self.assertEqual(selected["reason"], "contact_monitoring_unavailable")
+        decision["execution_selection_valid"] = selected["valid"]
+        self.assertTrue(self.helpers["_must_abort_safety_episode"](decision))
+
+    def test_invalid_student_actions_stop_before_snapshot_or_step(self):
+        invalid = self.chunk.copy()
+        invalid[1, 0] = np.nan
+        connection = FakeConnection([])
+        decision = self.call(connection, invalid, "move the bowl", 0, 0, _context())
+        self.assertEqual(decision["status"], "invalid_A0_action_values")
+        self.assertEqual(decision["failure_reasons"], ["student_A0_contains_non_finite_values"])
+        self.assertTrue(decision["must_abort_episode"])
+        self.assertEqual(connection.requests, [])
+
+    def test_action_shape_and_safety_state_must_match_before_execution(self):
+        decision = {
+            "main_state_restored": True,
+            "a0_branch_summary": {"full_action_chunk_executed": True},
+            "original_action_chunk_A0": self.chunk.tolist(),
+            "a0_verdict": "safe",
+            "status": "a0_safe",
+            "training_label_valid": True,
+            "training_action_chunk": self.chunk.tolist(),
+        }
+        invalid_shape = self.helpers["select_verified_execution_chunk"](
+            decision, np.zeros((2, 7), dtype=np.float32)
+        )
+        self.assertFalse(invalid_shape["valid"])
+        self.assertEqual(invalid_shape["reason"], "safety_record_A0_shape_or_values_do_not_match_student_prediction")
+        decision["main_state_restored"] = False
+        no_restore = self.helpers["select_verified_execution_chunk"](decision, self.chunk)
+        self.assertFalse(no_restore["valid"])
+        self.assertEqual(no_restore["reason"], "snapshot_restore_was_not_confirmed")
+
+    def test_trace_keeps_predicted_a0_separate_from_executed_a_plus(self):
+        plus = self.chunk + np.float32(0.01)
+        safety_record = {
+            "selected_action_source": "compiler_verified_repaired_A_plus",
+            "selected_candidate_id": "repair-0001",
+            "selected_action_chunk": plus.tolist(),
+            "execution_selection_valid": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "selected.npz"
+            writer = TrajectoryWriter(path, {})
+            observation = {
+                "instruction": "move the object",
+                "images": {
+                    "agentview_image": {
+                        "data": np.zeros((2, 2, 3), dtype=np.uint8).tobytes(),
+                        "dtype": "uint8", "shape": (2, 2, 3),
+                    },
+                    "robot0_eye_in_hand_image": {
+                        "data": np.ones((2, 2, 3), dtype=np.uint8).tobytes(),
+                        "dtype": "uint8", "shape": (2, 2, 3),
+                    },
+                },
+                "state": {
+                    "robot0_eef_pos": [0.0, 0.0, 0.0],
+                    "robot0_eef_quat": [0.0, 0.0, 0.0, 1.0],
+                    "robot0_gripper_qpos": [0.0, 0.0],
+                },
+                "reward": 0.0,
+                "done": False,
+            }
+            writer.add_decision(0, 0, observation, self.chunk, safety_record=safety_record)
+            writer.add_step(0, 0, 0, plus[0], observation)
+            writer.save(steps=1, chunks=1)
+            with np.load(path, allow_pickle=False) as saved:
+                np.testing.assert_array_equal(saved["predicted_actions"], self.chunk)
+                np.testing.assert_array_equal(saved["executed_actions"][0], plus[0])
+                record = json.loads(saved["decision_safety_json"][0])
+                self.assertEqual(record["selected_action_source"], "compiler_verified_repaired_A_plus")
+                self.assertEqual(record["selected_candidate_id"], "repair-0001")
+
     def test_rollout_checks_restore_gate_before_any_main_step(self):
         tree = ast.parse(ROLLOUT_PATH.read_text(encoding="utf-8"))
         rollout_loop = next(
@@ -390,9 +518,10 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             and isinstance(node.iter.func, ast.Name)
             and node.iter.func.id == "enumerate"
             and isinstance(node.iter.args[0], ast.Name)
-            and node.iter.args[0].id == "chunk"
+            and node.iter.args[0].id in ("chunk", "execution_chunk")
         )
         self.assertLess(abort_gate.lineno, main_step_loop.lineno)
+        self.assertEqual(main_step_loop.iter.args[0].id, "execution_chunk")
         self.assertTrue(any(isinstance(node, ast.Break) for statement in abort_gate.body for node in ast.walk(statement)))
 
     def test_episode_summary_counts_verdicts_attempts_labels_and_failures(self):
