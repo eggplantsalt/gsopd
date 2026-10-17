@@ -884,3 +884,53 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 增加向后兼容的 object-object 规则、严格字段/引用校验及语义绑定驱动的 Compiler 检查。
 - [x] 用已有 NPZ 离线重编译，检出 Step 74 及后续两段接触；完成抓取和支撑接触回归覆盖。
 - [ ] 在短程真实 Bridge 分支中验证在线对象绑定、Teacher 规则输入与正常抓放误报率；标准分辨率下的障碍视觉识别仍需改进。
+
+## 归档 Step 70 状态重放与真实 Bridge Contact Compiler Smoke（2026-10-17）
+
+### Smoke 流程
+
+- 新增 `research/gs_opd/smoke/replay_archive_contact_smoke.py`。脚本从归档的 `step_indices` 逐项提取已执行 Step 0 到目标决策步前一动作，要求索引连续、未提前 done；再从对应决策的预测动作偏移读取完整 Action Chunk，并核对它与归档 Step 70～74 已执行动作逐元素一致。该核对只保证数据来源与完整性，不把 Step 74 写进安全判定。
+- 通过现有 Bridge `reset` 重置固定任务，再逐个发送历史 `step` 动作。到目标决策点后，比较 Bridge 返回的 EEF 位置、四元数、夹爪关节位置（`state_atol=1e-6`）、指令，以及 `agentview_image` 和 `robot0_eye_in_hand_image` 两张原始 RGB（逐像素完全相同）。任一不符都会在 Snapshot 和分支动作之前停止，并写 `initial_state_mismatch`。
+- 只有重放观测匹配后才查询 Geometry/Gripper Inventory 并创建 Snapshot。随后将归档预测 Chunk 原样提交一次 `branch_rollout`，并调用既有 `compile_forbid_contact()`，输入 Safety IR v2 和全对象语义绑定。结果要求候选完整执行、逐控制步子步 Contact 覆盖完整、当前几何身份校验通过；任一缺失时输出 `unknown` 或明确失败，不能将未完整分支当成 Safe。
+- 分支前后各用现有 Snapshot 操作读取 MuJoCo integration、机器人和场景对象诊断；同时要求 Bridge 的 `main_state_restored=true` 且两次诊断在 `1e-6` 容差内一致。输出 JSON 保存状态/图像比较、完整动作 Chunk、逐步 reward/done、接触覆盖、Compiler 判定、接触双方和可用位置/法向/力证据、恢复结果。Bridge 分支报告 violation 但主状态恢复检查失败时，最终 Smoke 仍报告恢复失败。
+
+### 静态预检与测试状态
+
+- 只读预检真实 `logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz` 成功：目标决策索引为 14，前缀含 70 个 `[7]` 动作，Step 70 预测 Chunk 为 5×7 且与归档对应的 Step 70～74 执行动作逐元素相同；两路归档图像均为 256×256 RGB，机器人状态包含 EEF 位置/四元数和夹爪关节位置。本次没有连接真实 Bridge、执行物理仿真或运行 Rollout，因此还没有真实状态匹配/碰撞复现结论。
+- 新增的 unittest 使用 Fake Bridge 覆盖：从 NPZ 选择连续前缀和原始 Chunk、图像/状态不匹配时禁止 Snapshot/Branch、匹配时按序调用 Snapshot/Branch/现有 Compiler 并核验 object-object violation、短 Chunk 不得通过完整性检查。测试不是 MuJoCo 有效性证据。
+
+### 手动真实验证
+
+终端一：在 LIBERO-Safety Python 环境启动固定 L0T0 Safety Bridge。
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二：重放 70 个归档动作，核验观测后最多运行一个分支 Chunk；此命令不调用 π₀.₅，且不会将 Step 70～74 动作执行到主 Rollout。
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/replay_archive_contact_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --object-id object_1 \
+  --decision-step 70 \
+  --out logs/gs_opd/replay_archive_step70_contact_smoke.json
+```
+
+若状态、双相机图像、当前 Geometry Inventory、完整子步接触覆盖或 Restore 校验未通过，结果不会标为复现成功。真实 Bridge 命令需要人工运行；Smoke 单测不替代该验证。
+
+**检查清单（Checklist）**
+
+- [x] 新增独立 Bridge 客户端 Smoke，复用现有 Reset/Step/Snapshot/Branch/Compiler 接口。
+- [x] 状态/双相机观测一致后才创建 Snapshot；不一致时不发送 Snapshot/Branch。
+- [x] 检查原始 Action Chunk 的归档执行一致性、分支完整步数、物理子步覆盖和分支后主状态恢复。
+- [x] 只读预检真实 NPZ；完成 Fake Bridge unittest、Python 语法检查和 `git diff --check`。
+- [ ] 在固定 L0T0 的真实 Safety Bridge 环境运行 Smoke，确认重放观测匹配并由当前绑定/Geometry Inventory 将接触编译为 violation。
