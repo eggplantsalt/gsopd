@@ -1156,6 +1156,12 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - JSON 逐候选记录动作、几何方向、幅度/窗口、完整接触监测摘要、Compiler verdict、同五步任务进度、动作/Workspace 约束、S75 间隙和拒绝原因；另分别统计 5/10/20 mm 余量的已测候选数与安全且保留进度候选数。几何余量是探索指标，不证明碰撞安全或未来 Chunk 安全。
 - 新增 12 项纯离线单测，覆盖最近点顺序/反向、平滑候选数量上限、控制范围、姿态与夹爪不变、同五步进度及其失败、要求候选间隙实际增加、间隙计数、安全/监测 fail-closed、所有探测门槛通过但不生成训练标签，以及 step 失败时仍执行 Snapshot Restore。已运行测试和语法检查；没有启动 Bridge、仿真或模型，尚未得出 S70 实际修正可行性结果。
 
+### 端点物理状态比较门槛修复
+
+- `replay_and_measure_endpoint()` 仍完整保存 Branch 与顺序 `step(include_snapshot_state=True)` 的全部诊断比较结果；其中 EEF/物体派生运动学缓存差异现在明确标为诊断信息，不再阻断终点距离查询。
+- 是否允许查询距离改为严格比较双方完整 `mujoco_integration_state` 向量：必须均存在、均为一维数值数组、形状一致、值均有限，且 `rtol=0`、`atol=1e-6`。任何缺失、形状错误、非有限值或积分状态超差仍拒绝查询；完整诊断 JSON 和主环境 Snapshot 恢复核验保留。
+- 新增 2 项回归测试：积分状态完全一致而 EEF 缓存相差 `0.331 mm` 时仍查询端点距离；积分状态差 `2e-6` 时拒绝查询并仍完成最终 Snapshot 恢复。未放宽动作、Compiler、任务进度、间隙提升或恢复验收。
+
 ### 手动运行命令
 
 终端一启动 LIBERO-Safety Bridge：

@@ -393,6 +393,64 @@ def _restore_and_compare(connection: Any, snapshot_id: str, snapshot_state: dict
     return compare_snapshot_diagnostics(snapshot_state, actual, STATE_ATOL)
 
 
+def _compare_mujoco_integration_state(
+    expected_diagnostics: Any,
+    actual_diagnostics: Any,
+    atol: float = STATE_ATOL,
+) -> dict[str, Any]:
+    """Strictly compare the complete MuJoCo integration-state vectors."""
+    field = "mujoco_integration_state"
+    if not isinstance(expected_diagnostics, dict) or not isinstance(actual_diagnostics, dict):
+        return {
+            "matched": False,
+            "field": field,
+            "error": "diagnostics must be objects",
+            "atol": atol,
+        }
+    if field not in expected_diagnostics or field not in actual_diagnostics:
+        return {
+            "matched": False,
+            "field": field,
+            "error": "MuJoCo integration state is missing from one or both diagnostics",
+            "atol": atol,
+        }
+    try:
+        expected = np.asarray(expected_diagnostics[field], dtype=np.float64)
+        actual = np.asarray(actual_diagnostics[field], dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        return {
+            "matched": False,
+            "field": field,
+            "error": f"integration state is not numeric: {type(exc).__name__}: {exc}",
+            "atol": atol,
+        }
+    same_shape = expected.shape == actual.shape
+    finite = bool(np.isfinite(expected).all() and np.isfinite(actual).all())
+    max_abs_error = (
+        float(np.max(np.abs(expected - actual)))
+        if same_shape and expected.size
+        else (0.0 if same_shape else None)
+    )
+    matched = (
+        expected.ndim == 1
+        and actual.ndim == 1
+        and same_shape
+        and finite
+        and bool(np.allclose(expected, actual, rtol=0.0, atol=atol))
+    )
+    return {
+        "matched": bool(matched),
+        "field": field,
+        "expected_shape": list(expected.shape),
+        "actual_shape": list(actual.shape),
+        "same_shape": bool(same_shape),
+        "finite": finite,
+        "max_abs_error": max_abs_error,
+        "atol": atol,
+        "rtol": 0.0,
+    }
+
+
 def _distance_response_summary(response: dict[str, Any]) -> dict[str, Any]:
     value = response.get("minimum_distance_m")
     available = bool(
@@ -437,6 +495,7 @@ def replay_and_measure_endpoint(
         "endpoint_distance": None,
         "restore_before_replay": None,
         "branch_vs_sequential_endpoint": None,
+        "branch_vs_sequential_integration_state": None,
         "restore_after_replay": None,
     }
     final_restore_attempted = False
@@ -469,7 +528,14 @@ def replay_and_measure_endpoint(
             result["branch_vs_sequential_endpoint"] = compare_snapshot_diagnostics(
                 branch_state, live_state, STATE_ATOL
             )
-            if result["branch_vs_sequential_endpoint"].get("matched") is True:
+            result["branch_vs_sequential_endpoint"]["use_for_endpoint_distance_gate"] = False
+            result["branch_vs_sequential_endpoint"]["interpretation"] = (
+                "full diagnostics retained; derived kinematics cache differences are informational"
+            )
+            result["branch_vs_sequential_integration_state"] = _compare_mujoco_integration_state(
+                branch_state, live_state, STATE_ATOL
+            )
+            if result["branch_vs_sequential_integration_state"].get("matched") is True:
                 response = _request(
                     connection,
                     {
@@ -482,7 +548,7 @@ def replay_and_measure_endpoint(
                 result["endpoint_distance"] = _distance_response_summary(response)
                 result["status"] = "complete" if result["endpoint_distance"].get("distance_available") else "distance_unavailable"
             else:
-                result["reason"] = "branch_and_sequential_endpoint_states_differ_at_1e-6"
+                result["reason"] = "branch_and_sequential_mujoco_integration_states_differ_at_1e-6"
     except Exception as exc:
         result["reason"] = f"{type(exc).__name__}: {exc}"
     finally:

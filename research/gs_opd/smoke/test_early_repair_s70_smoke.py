@@ -354,6 +354,92 @@ class EarlyRepairProgressTests(unittest.TestCase):
         self.assertEqual(sum(request["op"] == "restore" for request in connection.requests), 2)
         self.assertIn("injected step error", result["reason"])
 
+    @staticmethod
+    def _endpoint_diagnostics(integration_state, eef_x, source):
+        return {
+            "mujoco_integration_state": integration_state,
+            "robot_states": [{"eef_pos": [eef_x, 0.0, 0.0]}],
+            "object_states": {"bowl": {"root_pos": [0.2, 0.1, 0.3]}},
+            "kinematics_source": source,
+        }
+
+    def _run_endpoint_replay(self, branch_integration, sequential_integration, cache_delta):
+        snapshot_state = self._endpoint_diagnostics([0.0, 1.0, 2.0], 0.1, "snapshot")
+        branch_state = self._endpoint_diagnostics(
+            branch_integration, 0.4, "live_mujoco_data_cache"
+        )
+        sequential_state = self._endpoint_diagnostics(
+            sequential_integration,
+            0.4 + cache_delta,
+            "forwarded_copy_of_mujoco_integration_state",
+        )
+
+        class FakeConnection:
+            def __init__(self):
+                self.request = None
+                self.requests = []
+
+            def send(self, payload):
+                self.request = payload
+                self.requests.append(payload)
+
+            def recv(self):
+                operation = self.request["op"]
+                if operation == "restore":
+                    return {"restored_snapshot_id": "s70", "snapshot_state": snapshot_state}
+                if operation == "step":
+                    return {"done": False, "snapshot_state": sequential_state}
+                if operation == "geom_set_min_distance":
+                    return {
+                        "status": "complete",
+                        "query_complete": True,
+                        "distance_reliable": True,
+                        "minimum_distance_m": 0.012,
+                    }
+                raise AssertionError(self.request)
+
+        connection = FakeConnection()
+        candidate = {"steps": [{"state": branch_state} for _ in range(smoke.CHUNK_LENGTH)]}
+        result = smoke.replay_and_measure_endpoint(
+            connection,
+            "s70",
+            snapshot_state,
+            np.zeros((smoke.CHUNK_LENGTH, 7)),
+            candidate,
+            [10],
+            [20],
+        )
+        return result, connection
+
+    def test_endpoint_distance_uses_integration_state_not_kinematics_cache(self):
+        result, connection = self._run_endpoint_replay(
+            [0.0, 1.0, 2.0], [0.0, 1.0, 2.0], 0.000331
+        )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["branch_vs_sequential_integration_state"]["matched"])
+        self.assertFalse(result["branch_vs_sequential_endpoint"]["matched"])
+        self.assertFalse(result["branch_vs_sequential_endpoint"]["use_for_endpoint_distance_gate"])
+        self.assertEqual(result["endpoint_distance"]["minimum_distance_m"], 0.012)
+        self.assertEqual(
+            sum(request["op"] == "geom_set_min_distance" for request in connection.requests), 1
+        )
+        self.assertTrue(result["main_state_restored"])
+
+    def test_endpoint_distance_rejects_inconsistent_integration_state(self):
+        result, connection = self._run_endpoint_replay(
+            [0.0, 1.0, 2.0], [0.0, 1.000002, 2.0], 0.0
+        )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertFalse(result["branch_vs_sequential_integration_state"]["matched"])
+        self.assertIn("mujoco_integration_states_differ", result["reason"])
+        self.assertIsNone(result["endpoint_distance"])
+        self.assertEqual(
+            sum(request["op"] == "geom_set_min_distance" for request in connection.requests), 0
+        )
+        self.assertTrue(result["main_state_restored"])
+
 
 if __name__ == "__main__":
     unittest.main()
