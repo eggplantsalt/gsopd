@@ -1,0 +1,359 @@
+"""Offline tests for bounded S70 clearance probes; no Bridge or MuJoCo env."""
+
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+
+from research.gs_opd.repair.verifier_guided_repair import RepairConfig
+from research.gs_opd.smoke import early_repair_s70_smoke as smoke
+from research.gs_opd.smoke.contact_safety_compiler_smoke import SAMPLING_POINT
+
+
+def _controller_context():
+    return {
+        "status": "available",
+        "world_up": [0.0, 0.0, 1.0],
+        "robots": [
+            {
+                "status": "available",
+                "joint_ranges": [[-2.0, 2.0], [-2.0, 2.0]],
+                "joint_limited": [True, True],
+                "fields": {
+                    "control_dim": 6,
+                    "input_min": [-1.0] * 6,
+                    "input_max": [1.0] * 6,
+                    "output_min": [-0.05] * 3 + [-0.5] * 3,
+                    "output_max": [0.05] * 3 + [0.5] * 3,
+                    "control_delta": True,
+                    "use_delta": True,
+                    "position_limits": [[-2.0, -2.0, -2.0], [2.0, 2.0, 2.0]],
+                },
+            }
+        ],
+    }
+
+
+def _candidate(identifier: str, object_end_x: float, eef_end_x: float, steps=5):
+    start = {
+        "robot_states": [{"eef_pos": [0.0, 0.0, 0.0], "joint_qpos": [0.0, 0.0]}],
+        "object_states": {
+            "bowl": {"body_id": 23, "root_pos": [0.0, 0.0, 0.0], "joint_qpos": []}
+        },
+    }
+    records = []
+    for index in range(steps):
+        fraction = (index + 1) / steps
+        records.append({
+            "step_index": index,
+            "reward": 0.0,
+            "done": False,
+            "state": {
+                "robot_states": [{"eef_pos": [eef_end_x * fraction, 0.0, 0.0], "joint_qpos": [0.0, 0.0]}],
+                "object_states": {
+                    "bowl": {"body_id": 23, "root_pos": [object_end_x * fraction, 0.0, 0.0], "joint_qpos": []}
+                },
+            },
+        })
+    return {
+        "candidate_id": identifier,
+        "status": "ok",
+        "requested_steps": 5,
+        "executed_steps": steps,
+        "start_state": start,
+        "steps": records,
+    }
+
+
+def _complete_monitor(candidate):
+    control_steps = []
+    for index, step in enumerate(candidate["steps"]):
+        control_steps.append({
+            "control_step_index": index,
+            "status": "complete",
+            "expected_physics_substeps": 25,
+            "captured_physics_substeps": 25,
+            "unobserved_expected_substeps": 0,
+            "contact_samples": {"contact": 0, "no_contact": 25, "unavailable": 0},
+            "step_index": step["step_index"],
+        })
+    candidate["contact_monitoring"] = {
+        "status": "complete",
+        "sampling_point": SAMPLING_POINT,
+        "robot_classification_status": "available",
+        "expected_physics_substeps_total": 125,
+        "captured_physics_substeps": 125,
+        "unobserved_expected_substeps": 0,
+        "unavailable_contact_substeps": 0,
+        "contact_substeps": 0,
+        "no_contact_substeps": 125,
+        "control_steps": control_steps,
+        "events": [],
+    }
+    return candidate
+
+
+class EarlyRepairGeometryTests(unittest.TestCase):
+    def test_away_and_lateral_directions_use_bound_nearest_pair_orientation(self):
+        distance = {
+            "query_complete": True,
+            "distance_reliable": True,
+            "minimum_distance_m": 0.03,
+            "mesh_approximation": False,
+            "minimum_pair": {
+                "geom_a": {"id": 10, "body_id": 23, "name": "moving"},
+                "geom_b": {"id": 20, "body_id": 27, "name": "obstacle"},
+                # mj_geomDistance returns the first witness on geom_a, then geom_b.
+                "closest_segment_world": [0.0, 0.0, 0.0, 0.03, 0.0, 0.0],
+            },
+        }
+        directions, basis = smoke.derive_clearance_directions(distance, 23, 27, [0, 0, 1])
+        self.assertEqual([item["name"] for item in directions], [
+            "nearest_geom_away", "nearest_geom_lateral_positive", "nearest_geom_lateral_negative"
+        ])
+        np.testing.assert_allclose(directions[0]["direction_world"], [-1, 0, 0])
+        for direction in directions[1:]:
+            self.assertAlmostEqual(np.dot(directions[0]["direction_world"], direction["direction_world"]), 0.0)
+        self.assertTrue(basis["collision_evidence_used"] is False)
+
+    def test_candidate_grid_is_bounded_and_preserves_rotation_and_gripper(self):
+        context = _controller_context()
+        actions = np.zeros((5, 7), dtype=np.float64)
+        actions[:, 3:6] = 0.1
+        actions[:, 6] = -0.5
+        directions = [
+            {"name": f"d{index}", "direction_world": vector, "basis_source": "test"}
+            for index, vector in enumerate(([1, 0, 0], [0, 1, 0], [0, -1, 0]))
+        ]
+        specs, rejected = smoke.generate_clearance_candidates(actions, directions, context)
+        self.assertEqual(len(specs), 24)
+        self.assertLessEqual(len(specs), smoke.MAX_CANDIDATES)
+        self.assertEqual(rejected, [])
+        for spec in specs:
+            np.testing.assert_array_equal(spec["actions"][:, 3:], actions[:, 3:])
+            self.assertEqual(spec["action_diagnostics"]["window"]["window_anchor_step"], spec["window"]["window_anchor_step"])
+            self.assertNotIn("violation_step", spec["action_diagnostics"]["window"])
+            self.assertTrue(spec["input_bounds_check"]["status"] == "pass")
+
+    def test_candidate_limit_and_out_of_range_a0_are_fail_closed(self):
+        context = _controller_context()
+        actions = np.zeros((5, 7), dtype=np.float64)
+        directions = [{"name": "away", "direction_world": [1, 0, 0]}]
+        specs, _ = smoke.generate_clearance_candidates(actions, directions, context, max_candidates=5)
+        self.assertEqual(len(specs), 5)
+        self.assertLessEqual(len(specs), 36)
+        actions[0, 0] = 1.01
+        with self.assertRaisesRegex(ValueError, "active OSC input bounds"):
+            smoke.generate_clearance_candidates(actions, directions, context)
+
+    def test_reverse_geom_order_is_normalized_using_body_identity(self):
+        distance = {
+            "query_complete": True,
+            "distance_reliable": True,
+            "minimum_distance_m": 0.03,
+            "minimum_pair": {
+                "geom_a": {"id": 20, "body_id": 27, "name": "obstacle"},
+                "geom_b": {"id": 10, "body_id": 23, "name": "moving"},
+                "closest_segment_world": [0.03, 0, 0, 0, 0, 0],
+            },
+        }
+        directions, basis = smoke.derive_clearance_directions(distance, 23, 27, [0, 0, 1])
+        np.testing.assert_allclose(directions[0]["direction_world"], [-1, 0, 0])
+        self.assertEqual(basis["nearest_pair"]["geom_a"]["body_id"], 23)
+        self.assertEqual(basis["nearest_pair"]["geom_b"]["body_id"], 27)
+
+
+class EarlyRepairProgressTests(unittest.TestCase):
+    def test_progress_compares_full_five_action_horizon(self):
+        actions = np.zeros((5, 7), dtype=np.float64)
+        actions[:, 0] = 0.1
+        baseline = _candidate("baseline", 0.01, 0.01)
+        candidate = _candidate("candidate", 0.008, 0.008)
+        result = smoke.evaluate_same_horizon_progress(
+            baseline,
+            candidate,
+            actions,
+            _controller_context(),
+            {"body_id": 23},
+            RepairConfig(minimum_object_motion_m=0.002, required_object_progress_fraction=0.7),
+        )
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["aligned_prefix_steps_compared"], 5)
+        self.assertEqual(result["comparison_horizon_steps"], 5)
+        self.assertEqual(result["basis"], "time_aligned_task_object_state_proxy")
+        self.assertTrue(result["eef_displacement_is_not_task_success"])
+
+    def test_incomplete_candidate_is_not_compared_using_empty_prefix(self):
+        actions = np.zeros((5, 7), dtype=np.float64)
+        result = smoke.evaluate_same_horizon_progress(
+            _candidate("baseline", 0.01, 0.01),
+            _candidate("short", 0.008, 0.008, steps=4),
+            actions,
+            _controller_context(),
+            {"body_id": 23},
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["aligned_prefix_steps_compared"], None)
+        self.assertEqual(result["comparison_horizon_steps"], 5)
+
+    def test_progress_failure_when_target_object_motion_is_reversed(self):
+        actions = np.zeros((5, 7), dtype=np.float64)
+        actions[:, 0] = 0.1
+        result = smoke.evaluate_same_horizon_progress(
+            _candidate("baseline", 0.01, 0.01),
+            _candidate("backwards", -0.01, 0.008),
+            actions,
+            _controller_context(),
+            {"body_id": 23},
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["task_object_progress"]["status"], "fail")
+
+    def test_clearance_counts_are_separate_from_safe_progress_candidates(self):
+        candidates = [
+            {"endpoint_gap_m": 0.021, "accepted_for_probe": True},
+            {"endpoint_gap_m": 0.012, "accepted_for_probe": False},
+            {"endpoint_gap_m": 0.006, "accepted_for_probe": True},
+            {"endpoint_gap_m": None, "accepted_for_probe": False},
+        ]
+        counts = smoke.clearance_margin_counts(candidates)
+        self.assertEqual(counts["counts_by_margin"]["5mm"], {
+            "all_measured_candidates": 3,
+            "safe_progress_preserving_probe_candidates": 2,
+        })
+        self.assertEqual(counts["counts_by_margin"]["10mm"], {
+            "all_measured_candidates": 2,
+            "safe_progress_preserving_probe_candidates": 1,
+        })
+        self.assertEqual(counts["counts_by_margin"]["20mm"], {
+            "all_measured_candidates": 1,
+            "safe_progress_preserving_probe_candidates": 1,
+        })
+        self.assertTrue(counts["margin_is_exploratory_not_a_safety_proof"])
+
+    def test_safety_unknown_or_incomplete_contact_monitoring_cannot_be_accepted(self):
+        actions = np.zeros((5, 7), dtype=np.float64)
+        spec = smoke.generate_clearance_candidates(
+            actions,
+            [{"name": "away", "direction_world": [1, 0, 0]}],
+            _controller_context(),
+            max_candidates=1,
+        )[0][0]
+        spec["original_actions"] = actions
+        baseline = _candidate("baseline", 0.01, 0.01)
+        candidate = _complete_monitor(_candidate(spec["candidate_id"], 0.008, 0.008))
+        incomplete = {**candidate, "contact_monitoring": {"status": "incomplete"}}
+        endpoint = {"status": "complete", "main_state_restored": True, "endpoint_distance": {"minimum_distance_m": 0.02, "distance_available": True}}
+        report = smoke.assess_candidate(
+            spec, incomplete, {"verdict": "unknown"}, baseline, _controller_context(),
+            {"body_id": 23}, smoke.PROBE_CONFIG, 0.01, endpoint,
+        )
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["physical_safety_verdict"], "unknown")
+        self.assertFalse(report["training_label_valid"])
+        self.assertFalse(report["final_a_plus"])
+        self.assertIn("contact_compiler_did_not_return_safe", report["rejection_reasons"])
+        self.assertTrue(any("monitoring" in item for item in report["rejection_reasons"]))
+
+    def test_all_probe_gates_can_pass_without_creating_an_a_plus_training_label(self):
+        context = _controller_context()
+        actions = np.zeros((5, 7), dtype=np.float64)
+        specs, _ = smoke.generate_clearance_candidates(
+            actions,
+            [{"name": "away", "direction_world": [1, 0, 0]}],
+            context,
+            max_candidates=1,
+        )
+        spec = {**specs[0], "original_actions": actions}
+        baseline = _complete_monitor(_candidate("baseline", 0.01, 0.01))
+        candidate = _complete_monitor(_candidate(spec["candidate_id"], 0.008, 0.008))
+        endpoint = {
+            "status": "complete",
+            "main_state_restored": True,
+            "endpoint_distance": {"minimum_distance_m": 0.02, "distance_available": True},
+        }
+        report = smoke.assess_candidate(
+            spec,
+            candidate,
+            {"verdict": "safe", "reason": "complete monitor found no forbidden contact", "object_contact_checks": []},
+            baseline,
+            context,
+            {"body_id": 23},
+            smoke.PROBE_CONFIG,
+            0.01,
+            endpoint,
+        )
+        self.assertTrue(report["accepted_for_probe"], report["rejection_reasons"])
+        self.assertGreater(report["endpoint_gap_change_vs_a0_m"], smoke.MIN_GAP_IMPROVEMENT_M)
+        self.assertEqual(report["task_progress"]["aligned_prefix_steps_compared"], 5)
+        self.assertEqual(report["physical_safety_verdict"], "safe")
+        self.assertFalse(report["training_label_valid"])
+        self.assertFalse(report["final_a_plus"])
+
+    def test_no_endpoint_gap_increase_is_not_a_successful_early_repair_probe(self):
+        context = _controller_context()
+        actions = np.zeros((5, 7), dtype=np.float64)
+        specs, _ = smoke.generate_clearance_candidates(
+            actions,
+            [{"name": "away", "direction_world": [1, 0, 0]}],
+            context,
+            max_candidates=1,
+        )
+        spec = {**specs[0], "original_actions": actions}
+        baseline = _complete_monitor(_candidate("baseline", 0.01, 0.01))
+        candidate = _complete_monitor(_candidate(spec["candidate_id"], 0.008, 0.008))
+        endpoint = {
+            "status": "complete",
+            "main_state_restored": True,
+            "endpoint_distance": {"minimum_distance_m": 0.01, "distance_available": True},
+        }
+        report = smoke.assess_candidate(
+            spec,
+            candidate,
+            {"verdict": "safe"},
+            baseline,
+            context,
+            {"body_id": 23},
+            smoke.PROBE_CONFIG,
+            0.01,
+            endpoint,
+        )
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertIn("candidate_did_not_increase_endpoint_gap_over_a0", report["rejection_reasons"])
+
+    def test_endpoint_replay_always_attempts_restore_after_step_failure(self):
+        class FakeConnection:
+            def __init__(self):
+                self.request = None
+                self.requests = []
+
+            def send(self, payload):
+                self.request = payload
+                self.requests.append(payload)
+
+            def recv(self):
+                if self.request["op"] == "restore":
+                    return {"restored_snapshot_id": "s70", "snapshot_state": {"state": [1.0]}}
+                if self.request["op"] == "step":
+                    return {"error": "injected step error"}
+                raise AssertionError(self.request)
+
+        connection = FakeConnection()
+        result = smoke.replay_and_measure_endpoint(
+            connection,
+            "s70",
+            {"state": [1.0]},
+            np.zeros((5, 7)),
+            {"steps": []},
+            [1],
+            [2],
+        )
+        self.assertTrue(result["final_restore_attempted"])
+        self.assertTrue(result["main_state_restored"])
+        self.assertEqual(sum(request["op"] == "restore" for request in connection.requests), 2)
+        self.assertIn("injected step error", result["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

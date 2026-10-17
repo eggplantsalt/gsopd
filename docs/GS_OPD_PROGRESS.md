@@ -1145,3 +1145,45 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] Smoke 使用归档 A⁰₇₀ 和当前 Geometry Inventory 校验双对象绑定；5/10/20 mm 阈值固定，S75 历史违规与 S70 预测隔离。
 - [x] 9 项 unittest、Python 语法检查和 `git diff --check` 通过；没有启动仿真或模型。
 - [ ] 人工运行 Bridge Smoke，核对 S65/S70/S75 状态一致性、间距查询覆盖和真实阈值触发结果。
+
+## S70 端点几何引导的提前局部修正可行性 Smoke（2026-10-17）
+
+- 新增 `research/gs_opd/smoke/early_repair_s70_smoke.py`。Smoke 只用归档加载器读取 S70 决策、此前 70 个真实执行动作及 A⁰₇₀ 五步 Chunk；不提取 A⁰₇₅，也不调用 Student、Teacher 推理或 `run_verifier_guided_repair()`。先重置并重放到 S70，严格核验 instruction/机器人状态，再创建同一 S70 Snapshot。
+- 先通过真实 `compile_forbid_contact()` 和完整 5 步 Contact Monitoring 确认 A⁰₇₀ 为 safe。随后从 Snapshot 顺序执行 A⁰₇₀，仅为获取 S75 端点的最近 Geom witness；用已验证 Body 身份确定 witness 方向（移动物体最近点减障碍物最近点）及两侧横向方向。不会伪造违规/碰撞事件。最近点或方向缺失、距离查询不完整时直接 fail closed。
+- 候选生成复用 `build_repair_actions()`、`_candidate_constraints()` 和 OSC `repair_context`。首版使用 3 个几何方向、2 个平滑窗口和 4 个小幅度组合，最多 24 条；CLI `--max-candidates` 上限为 36。候选只改已反归一化控制器尺度上的 XYZ 输入，姿态/夹爪保持 A⁰ 原值；检查 OSC 6 维输入范围、平滑修正、输出动作、活跃 Workspace 和关节限制。
+- 所有可执行候选通过单次 `branch_rollout` 从相同 S70 Snapshot 独立执行完整五步；Contact Compiler 必须判 safe，物理子步监测必须 complete。对分支端点再从 S70 Snapshot 经普通 `step` 重放，要求与 Branch 端点诊断在 `1e-6` 内一致后才查询间隙；每次重放及整个 Smoke 结束都执行 Restore 并核验 S70 主状态。
+- 任务进度复用 `evaluate_task_progress()`，比较 A⁰ 与候选相同的完整 5 步，不使用空前缀，也不把 EEF 位移单独当任务成功。首版依赖已验证 `target_object` Body 的沿 A⁰ 搬运方向位移代理；无可比物体运动、短 Chunk、Reward/物体证据不足均拒绝候选，并保留代理局限。候选 S75 最小间隙还必须比 A⁰ 增加超过 `1e-6 m`；余量阈值计数只用于探索统计。只有物理安全、完整覆盖、任务进度、动作约束、间隙提升与 Restore 全部通过时，候选才计为 `accepted_for_probe`；它仍不是最终 A⁺，`training_label_valid` 固定为 false。
+- JSON 逐候选记录动作、几何方向、幅度/窗口、完整接触监测摘要、Compiler verdict、同五步任务进度、动作/Workspace 约束、S75 间隙和拒绝原因；另分别统计 5/10/20 mm 余量的已测候选数与安全且保留进度候选数。几何余量是探索指标，不证明碰撞安全或未来 Chunk 安全。
+- 新增 12 项纯离线单测，覆盖最近点顺序/反向、平滑候选数量上限、控制范围、姿态与夹爪不变、同五步进度及其失败、要求候选间隙实际增加、间隙计数、安全/监测 fail-closed、所有探测门槛通过但不生成训练标签，以及 step 失败时仍执行 Snapshot Restore。已运行测试和语法检查；没有启动 Bridge、仿真或模型，尚未得出 S70 实际修正可行性结果。
+
+### 手动运行命令
+
+终端一启动 LIBERO-Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二运行最多 24 条（不超过 36 条）S70 几何引导探测；报告默认写入指定 JSON：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/early_repair_s70_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_object_v2_80step.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --max-candidates 36 \
+  --out logs/gs_opd/early_repair_s70.json
+```
+
+**检查清单（Checklist）**
+
+- [x] S70 A⁰ 必须经真实 Compiler 判 safe；候选方向来自 A⁰₇₀ 实际五步端点的最近 Geom 位置，不构造虚假碰撞证据。
+- [x] 所有候选都受 36 条硬上限、同一 Snapshot Branch、完整 Contact Monitoring、Compiler、同五步搬运进度、OSC/Workspace/关节和间隙 Restore 检查约束。
+- [x] 12 项轻量单测、Python 语法检查和 `git diff --check` 通过；不产生 A⁺ 训练标签，未启动仿真或模型。
+- [ ] 人工运行 Bridge Smoke 并审查逐候选 JSON；不把几何余量或五步探测通过外推为未来安全。
