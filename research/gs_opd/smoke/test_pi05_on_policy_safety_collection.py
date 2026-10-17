@@ -31,6 +31,7 @@ def _load_helpers():
         "select_verified_execution_chunk",
         "_new_safety_episode_summary",
         "_update_safety_episode_summary",
+        "_classify_safety_abort",
         "_must_abort_safety_episode",
     }
     tree = ast.parse(ROLLOUT_PATH.read_text(encoding="utf-8"))
@@ -418,7 +419,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         }
         selected = self.helpers["select_verified_execution_chunk"](decision, self.chunk)
         self.assertFalse(selected["valid"])
-        self.assertIsNone(selected["actions"])
+        self.assertIsNone(selected.get("actions"))
         self.assertEqual(selected["reason"], "contact_monitoring_unavailable")
         decision["execution_selection_valid"] = selected["valid"]
         self.assertTrue(self.helpers["_must_abort_safety_episode"](decision))
@@ -447,11 +448,27 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             decision, np.zeros((2, 7), dtype=np.float32)
         )
         self.assertFalse(invalid_shape["valid"])
-        self.assertEqual(invalid_shape["reason"], "safety_record_A0_shape_or_values_do_not_match_student_prediction")
+        self.assertEqual(invalid_shape["reason"], "safety_record_A0_does_not_match_student_prediction")
         decision["main_state_restored"] = False
         no_restore = self.helpers["select_verified_execution_chunk"](decision, self.chunk)
         self.assertFalse(no_restore["valid"])
         self.assertEqual(no_restore["reason"], "snapshot_restore_was_not_confirmed")
+
+    def test_episode_abort_summary_status_tracks_failure_cause(self):
+        classify = self.helpers["_classify_safety_abort"]
+        self.assertEqual(classify({"main_state_restored": False}), "main_state_restore_failed")
+        self.assertEqual(
+            classify({"main_state_restored": True, "status": "a0_unknown", "a0_verdict": "unknown"}),
+            "safety_verification_unknown",
+        )
+        self.assertEqual(
+            classify({"main_state_restored": True, "status": "violation_unrepaired", "a0_verdict": "violation"}),
+            "repair_failed",
+        )
+        self.assertEqual(
+            classify({"main_state_restored": True, "status": "invalid_A0_action_values", "a0_verdict": "unknown"}),
+            "invalid_action",
+        )
 
     def test_trace_keeps_predicted_a0_separate_from_executed_a_plus(self):
         plus = self.chunk + np.float32(0.01)
