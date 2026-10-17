@@ -284,12 +284,24 @@ def _set_mujoco_integration_state(sim, state):
             f"MuJoCo integration state has shape {state.shape}; expected {(expected_size,)}"
         )
     mujoco.mj_setState(model, data, state, state_spec)
+    # mj_forward refreshes derived kinematics from qpos, but the constraint
+    # solver may replace qacc_warmstart. Preserve that integration component
+    # directly: reapplying the complete state after forward can leave derived
+    # xpos / xquat / site_xpos caches inconsistent with the restored qpos.
+    qacc_warmstart = data.qacc_warmstart.copy()
     sim.forward()
-    # mj_forward recomputes derived quantities and can also update integration
-    # inputs such as qacc_warmstart while solving constraints. Reapply the saved
-    # integration state after forward so restoring does not silently replace
-    # state captured at the snapshot boundary.
+    data.qacc_warmstart[:] = qacc_warmstart
+
+
+def _diagnostic_data_from_integration_state(sim):
+    """Compute canonical kinematics on scratch data without mutating live state."""
+    model = sim.model._model
+    data = mujoco.MjData(model)
+    state = _mujoco_integration_state(sim)
+    state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
     mujoco.mj_setState(model, data, state, state_spec)
+    mujoco.mj_forward(model, data)
+    return data
 
 
 def _capture_task_object_properties(task_env):
@@ -509,16 +521,27 @@ def _repair_context():
     }
 
 
-def _snapshot_diagnostics():
+def _snapshot_diagnostics(canonicalize_kinematics=False):
     sim = env.sim
     task_env = env.env
+    diagnostic_data = (
+        _diagnostic_data_from_integration_state(sim)
+        if canonicalize_kinematics
+        else sim.data._data
+    )
+    diagnostic_body_xpos = getattr(diagnostic_data, "xpos", None)
+    if diagnostic_body_xpos is None:
+        diagnostic_body_xpos = diagnostic_data.body_xpos
+    diagnostic_body_xquat = getattr(diagnostic_data, "xquat", None)
+    if diagnostic_body_xquat is None:
+        diagnostic_body_xquat = diagnostic_data.body_xquat
     robot_states = []
     for index, robot in enumerate(env.robots):
         robot_state = {
             "robot_index": index,
             "joint_qpos": np.asarray(sim.data.qpos[robot._ref_joint_pos_indexes]).tolist(),
             "joint_qvel": np.asarray(sim.data.qvel[robot._ref_joint_vel_indexes]).tolist(),
-            "eef_pos": np.asarray(sim.data.site_xpos[robot.eef_site_id]).tolist(),
+            "eef_pos": np.asarray(diagnostic_data.site_xpos[robot.eef_site_id]).tolist(),
         }
         if getattr(robot, "has_gripper", False):
             robot_state["gripper_qpos"] = np.asarray(
@@ -544,8 +567,8 @@ def _snapshot_diagnostics():
             object_states[f"{mapping_name}:{object_name}"] = {
                 "body_id": int(body_id),
                 "body_name": str(root_body),
-                "root_pos": np.asarray(sim.data.body_xpos[body_id]).tolist(),
-                "root_quat": np.asarray(sim.data.body_xquat[body_id]).tolist(),
+                "root_pos": np.asarray(diagnostic_body_xpos[body_id]).tolist(),
+                "root_quat": np.asarray(diagnostic_body_xquat[body_id]).tolist(),
                 "joint_qpos": joints,
             }
 
@@ -553,6 +576,11 @@ def _snapshot_diagnostics():
         "mujoco_integration_state": _mujoco_integration_state(sim).tolist(),
         "robot_states": robot_states,
         "object_states": object_states,
+        "kinematics_source": (
+            "forwarded_copy_of_mujoco_integration_state"
+            if canonicalize_kinematics
+            else "live_mujoco_data_cache"
+        ),
     }
 
 
@@ -1546,7 +1574,7 @@ def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
         "instruction": task.language,
     }
     if include_snapshot_state:
-        result["snapshot_state"] = _snapshot_diagnostics()
+        result["snapshot_state"] = _snapshot_diagnostics(canonicalize_kinematics=True)
     return result
 
 listener = Listener(("127.0.0.1", 38567), authkey=b"gs-opd-local")
@@ -1600,7 +1628,7 @@ try:
                         next_snapshot_id += 1
                         result = {
                             "snapshot_id": snapshot_id,
-                            "snapshot_state": _snapshot_diagnostics(),
+                            "snapshot_state": _snapshot_diagnostics(canonicalize_kinematics=True),
                         }
                     except Exception as exc:
                         result = {"error": f"Snapshot failed: {type(exc).__name__}: {exc}"}

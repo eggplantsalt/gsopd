@@ -94,6 +94,14 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - Python 侧同时保存并恢复 robosuite `OSC_POSE` 控制器字段及位置/姿态插值器状态、机器人历史缓冲、Panda 夹爪累计 `current_action`、task 的 `cur_time/timestep/done`、LIBERO 动态物体 motion generator 的内部字段、可变物体显示属性、Observable 的采样状态和 `_obs_cache`，Bridge 最近一次观测/reward/done，以及进程级 `numpy.random` 和 `random` 状态。当前实现针对运行中的同一 Bridge 环境和同一编译模型，通过进程内 Snapshot ID 引用，不写磁盘；再次 Reset 会使现有 Snapshot ID 失效。
 - Bridge 原有 `reset` 和 `step` 请求/响应字段保持原样；只有 Smoke 请求显式传 `include_snapshot_state=true` 时，step 响应才额外包含 MuJoCo、机器人关节/末端和场景对象诊断状态。Snapshot/Restore 为新增操作；Restore 返回保存时的 Bridge 观测，并附上状态诊断。
 
+### Snapshot/Restore 派生缓存一致性修复
+
+- 真实 Step 70 检查中，integration state 和机器人关节状态在 `1e-6` 内一致；差异仅落在 `eef_pos` 与黑碗的 `root_pos/root_quat`。审计 vendored robosuite v1.4 `BaseEnv.step()` 确认每个内部物理步先 `sim.forward()` 再 `sim.step()`，且最后一次 `mj_step` 后直接更新 observable 并返回，没有再做一次 forward。因此控制步边界的 `qpos` 已是积分后的值，而 `site_xpos/body_xpos/body_xquat` 可能仍来自最后一次 `mj_forward`；Restore 的 forward 把缓存同步到当前 qpos，于是旧诊断把陈旧缓存与同步后的缓存相比较。它不能单独证明物理状态恢复错误。
+- `_set_mujoco_integration_state()` 保留 `mj_setState → sim.forward` 顺序，随后只直接恢复 `qacc_warmstart`，不再整段重写 integration state。这样保留 forward 求解前快照中的 warm-start，同时避免 forward 后重写位置状态的风险。Safety 环境的小型接触模型测试确认 forward 需要恢复的 integration 量是 warm-start，并检查恢复后完整 integration state 仍逐项相同。
+- `_snapshot_diagnostics(canonicalize_kinematics=True)` 在临时 `MjData` 上从当前 integration state 执行 forward，再读取 EEF 和物体刚体派生位姿；活动仿真数据不被改写。Bridge Snapshot/Restore 响应及显式 `include_snapshot_state` 诊断使用这一路径。分支内部逐步状态诊断仍读取仿真数据，不插入额外 forward，也不改变动作执行顺序。
+- Step 70 Smoke 现在先执行同一 Snapshot 的原地 `Snapshot → Restore`，按原 `1e-6` 阈值比较诊断；通过后再从该 Snapshot 执行两次完全相同的归档 Action Chunk。Smoke 比较两候选的起点、逐步物理状态、动作/reward/done、Contact 事件和监测汇总；要求两个候选均完整执行且子步接触监测完整，并独立核验分支结束后的主状态恢复。任何往返差异、候选差异或恢复失败均不会报告为通过。
+- 静态验证通过：`gsopd_teacher` 环境下相关 Teacher/Compiler/Grounding/Replay unittest 50 项通过；LIBERO-Safety 环境下 Snapshot/Restore MuJoCo 小模型和 OSC Bridge unittest 5 项通过；Bridge、Replay Smoke 和测试文件 `py_compile`、`git diff --check` 通过。测试没有连接真实 Safety Bridge。MuJoCo 小模型验证状态设置、派生量同步，以及相同 Snapshot 上相同物理步序列的 state/contact 确定性；归档 Step 70 的 7 维 Action Chunk 双候选一致性和真实场景碰撞仍待手动 Bridge Smoke 验证，不能据此声称真实 LIBERO-Safety Chunk 已一致重放。
+
 ### Smoke 与限制
 
 - 新增 `research/gs_opd/smoke/snapshot_smoke.py`：通过现有 `multiprocessing.connection` Bridge 协议执行 Reset → Snapshot S → 固定 4 个 7 维小幅动作 → Restore S → 重放相同动作。逐步比较 MuJoCo integration state、机器人状态和物体/fixture 状态；默认绝对误差阈值 `1e-6`，输出 PASS/FAIL。
@@ -135,7 +143,7 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
   research/gs_opd/smoke/snapshot_smoke.py --atol 1e-6
 ```
 
-测试会在控制台输出每步 MuJoCo、机器人和物体状态最大绝对误差，最后给出 `PASS` 或 `FAIL`；不会生成轨迹文件。
+该 Smoke 保留 Reset 后的短动作 Restore/续跑检查，并报告状态误差；Step 70 的实时归档重放 Smoke 另执行 Snapshot 原地往返和重复分支验证。二者都不是完整 Rollout。
 
 ## 10 步 Trace 采集命令
 
@@ -894,12 +902,12 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - 可选 `--allow-image-mismatch` 只将两张已成功解码的相机图像差异视为诊断信息；它不放宽任务指令、机器人状态、归档完整 Action Chunk 或语义绑定门槛。此模式仍要求两路当前 RGB 可读取。输出会保存当前相机 PNG、逐像素绝对差异 PNG（图像尺寸不一致时记录尺寸并跳过差异 PNG），并在 JSON 中记录不同像素数、最大通道差、尺寸和 dtype。没有执行当前 RGB 的 VLM/SAM 重识别；旧语义绑定只是拿来与活动模型 Geometry Inventory 核对，绝不代表本次视觉识别成功。
 - 只有指令和机器人状态通过后才查询 Geometry/Gripper Inventory。Smoke 对 Safety IR v2 的每条 object-contact rule 涉及的 subject/target 语义对象逐一校验：语义结果必须存在、对应 Teacher 对象名称/角色必须一致、历史 Body/Geom 身份必须由当前完整 Geometry Inventory 解析并匹配，且不同语义对象不能冲突绑定到同一 Body。缺失、冲突或 Inventory 不完整都会在 Snapshot 前终止。该核验只证明历史物理绑定与当前模型清单一致，不提供当前图像语义重新识别证据。
 - 绑定核验通过后才创建 Snapshot。随后将归档预测 Chunk 原样提交一次 `branch_rollout`，并调用既有 `compile_forbid_contact()`，输入 Safety IR v2 和全对象语义绑定。结果要求候选完整执行、逐控制步物理子步 Contact 覆盖完整；任一缺失时输出 `unknown` 或明确失败，不能将未完整分支当成 Safe。
-- 分支前后各用现有 Snapshot 操作读取 MuJoCo integration、机器人和场景对象诊断；同时要求 Bridge 的 `main_state_restored=true` 且两次诊断在 `1e-6` 容差内一致。输出 JSON 保存状态/图像比较、绑定核验、完整动作 Chunk、逐步 reward/done、接触覆盖、Compiler 判定、接触双方和可用位置/法向/力证据、恢复结果。`current_scene_physical_collision` 与历史回放诊断分开记录：`historical_decision_state_matches`、`historical_decision_images_pixel_exact`、`historical_decision_observation_matches` 分别描述指令/机器人状态（按 `state_atol`）、图像和完整决策观测是否匹配；分支判定状态只报告当前场景分支检出的物理结果，不将图像不一致的分支称为历史精确复现。Bridge 分支报告 violation 但主状态恢复检查失败时，最终 Smoke 仍报告恢复失败。
+- Snapshot 创建后先立即 Restore 同一个 ID，并按 `state_atol` 比较 canonical integration/robot/object diagnostics；未通过时不运行候选。随后一次 `branch_rollout` 请求提交同一 Snapshot 下两条字节相同的归档 Action Chunk，分别从该 Snapshot 开始执行。Smoke 要求两候选都完整执行、每一步物理子步监测完整，并比较候选起始状态、逐步物理状态、action、reward/done、Contact 事件和完整 Contact Monitoring 结构。数值误差仍受 `state_atol`（默认 `1e-6`）约束。分支前后用 Snapshot 诊断检查主环境；还要求 Bridge `main_state_restored=true`。输出 JSON 保存往返比较、重复候选一致性、图像比较、绑定核验、Action Chunk、逐步 reward/done、接触覆盖、Compiler 判定、接触证据和恢复结果。`current_scene_physical_collision` 与历史回放诊断分开记录：`historical_decision_state_matches`、`historical_decision_images_pixel_exact`、`historical_decision_observation_matches` 分别描述指令/机器人状态（按 `state_atol`）、图像和完整决策观测是否匹配；分支状态只报告当前场景分支的物理结果，不将图像不一致的分支称为历史精确复现。Bridge 分支报告 violation 但主状态恢复检查失败时，最终 Smoke 仍报告恢复失败。
 
 ### 静态预检与测试状态
 
 - 只读预检真实 `logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz` 成功：目标决策索引为 14，前缀含 70 个 `[7]` 动作，Step 70 预测 Chunk 为 5×7 且与归档对应的 Step 70～74 执行动作逐元素相同；两路归档图像均为 256×256 RGB，机器人状态包含 EEF 位置/四元数和夹爪关节位置。本次没有连接真实 Bridge、执行物理仿真或运行 Rollout，因此还没有真实状态匹配/碰撞复现结论。
-- 新增的 unittest 使用 Fake Bridge 覆盖：从 NPZ 选择连续前缀和原始 Chunk、严格模式的图像不匹配阻断、允许图像差异时继续当前场景分支并保存当前 RGB/差异图、图像允许模式仍拒绝机器人状态不匹配、缺少绑定或当前 Geometry Inventory 冲突时禁止 Snapshot/Branch、完整分支/现有 Compiler/主状态恢复校验、短 Chunk 不得通过完整性检查。测试不是 MuJoCo 有效性证据。
+- 新增的 unittest 使用 Fake Bridge 覆盖：从 NPZ 选择连续前缀和原始 Chunk、严格模式的图像不匹配阻断、允许图像差异时继续当前场景分支并保存当前 RGB/差异图、图像允许模式仍拒绝机器人状态不匹配、缺少绑定或当前 Geometry Inventory 冲突时禁止 Snapshot/Branch、立即 Snapshot/Restore 失败阻断、两次相同分支结果一致性校验、完整分支/现有 Compiler/主状态恢复校验、短 Chunk 不得通过完整性检查。额外的 MuJoCo 小模型测试检查 Euler step 边界缓存同步、原地 Snapshot/Restore integration state 保持以及相同动作序列的 state/contact 重复性；这些测试不替代真实 LIBERO-Safety 验证。
 
 ### 手动真实验证
 
@@ -912,7 +920,7 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
   research/gs_opd/smoke/safety_bridge.py
 ```
 
-终端二：重放 70 个归档动作，核验观测后最多运行一个分支 Chunk；此命令不调用 π₀.₅，且不会将 Step 70～74 动作执行到主 Rollout。以下使用图像差异诊断模式；移除 `--allow-image-mismatch` 即恢复默认严格的逐像素图像门槛。
+终端二：重放 70 个归档动作，核验观测后先做一次 Snapshot→Restore 原地往返，再从同一 Snapshot 分别运行两次完全相同的 Step 70～74 Action Chunk；此命令不调用 π₀.₅，分支动作不会进入主 Rollout。以下使用图像差异诊断模式；移除 `--allow-image-mismatch` 即恢复默认严格的逐像素图像门槛。
 
 ```bash
 cd /workspace/zy_workspace/RLinf
@@ -928,13 +936,14 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
   --out logs/gs_opd/replay_archive_step70_contact_smoke.json
 ```
 
-若指令、机器人状态、当前 Geometry Inventory 绑定、完整子步接触覆盖或 Restore 校验未通过，实验会在相应阶段停止或返回 unknown。图像不同但其他前置检查通过时，允许检测当前场景接触；最终状态使用 `current_scene_physical_collision_detected` 等当前分支结果，并独立记录历史决策状态与图像匹配情况。真实 Bridge 命令需要人工运行；Smoke 单测不替代该验证。
+若指令、机器人状态、当前 Geometry Inventory 绑定、原地往返、重复分支一致性、完整子步接触覆盖或 Restore 校验未通过，实验会在相应阶段停止或返回 unknown。图像不同但其他前置检查通过时，允许检测当前场景接触；最终状态使用 `current_scene_physical_collision_detected` 等当前分支结果，并独立记录历史决策状态与图像匹配情况。真实 Bridge 命令需要人工运行；Smoke 单测不替代该验证。
 
 **检查清单（Checklist）**
 
 - [x] 新增独立 Bridge 客户端 Smoke，复用现有 Reset/Step/Snapshot/Branch/Compiler 接口。
 - [x] 保留严格默认模式；新增可选图像差异诊断模式，任务/机器人状态与双相机可用性仍是硬门槛。
 - [x] Snapshot 前检查规则涉及的 Teacher 语义绑定与当前 Geometry Inventory 一致；显式记录未进行当前视觉重识别。
-- [x] 检查原始 Action Chunk 的归档执行一致性、分支完整步数、物理子步覆盖和分支后主状态恢复。
+- [x] 在分支前执行 Snapshot→Restore 原地往返检查；从一个 Snapshot 重复执行同一归档 Chunk，比较完整状态和 Contact 结果。
+- [x] 检查原始 Action Chunk 的归档执行一致性、每个分支的完整步数、物理子步覆盖和分支后主状态恢复。
 - [x] 只读预检真实 NPZ；完成 Fake Bridge unittest、Python 语法检查和 `git diff --check`。
 - [ ] 在固定 L0T0 的真实 Safety Bridge 环境运行 Smoke，确认重放观测匹配并由当前绑定/Geometry Inventory 将接触编译为 violation。

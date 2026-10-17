@@ -9,6 +9,7 @@ then snapshots and branches the archived predicted Action Chunk exactly once.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -435,14 +436,7 @@ def _save_visual_diagnostics(
     return {"saved": any(item.get("saved", True) for item in cameras.values()), "cameras": cameras}
 
 
-def _branch_coverage(branch_result: Any, expected_steps: int) -> dict[str, Any]:
-    candidate = None
-    if isinstance(branch_result, dict) and isinstance(branch_result.get("candidates"), list):
-        if len(branch_result["candidates"]) == 1 and isinstance(branch_result["candidates"][0], dict):
-            candidate = branch_result["candidates"][0]
-    if candidate is None:
-        return {"full_chunk_executed": False, "contact_monitoring_complete": False, "reason": "branch_candidate_missing_or_ambiguous"}
-
+def _candidate_coverage(candidate: dict[str, Any], expected_steps: int) -> dict[str, Any]:
     steps = candidate.get("steps")
     monitor = candidate.get("contact_monitoring")
     executed = candidate.get("executed_steps")
@@ -476,20 +470,72 @@ def _branch_coverage(branch_result: Any, expected_steps: int) -> dict[str, Any]:
     )
     return {
         "full_chunk_executed": bool(full),
+        "contact_monitoring_complete": bool(coverage),
         "requested_steps": requested,
         "executed_steps": executed,
         "step_record_count": len(steps) if isinstance(steps, list) else None,
-        "contact_monitoring_complete": bool(coverage),
         "contact_monitoring_status": monitor.get("status") if isinstance(monitor, dict) else None,
-        "expected_physics_substeps_total": monitor.get("expected_physics_substeps_total") if isinstance(monitor, dict) else None,
-        "captured_physics_substeps": monitor.get("captured_physics_substeps") if isinstance(monitor, dict) else None,
-        "unobserved_expected_substeps": monitor.get("unobserved_expected_substeps") if isinstance(monitor, dict) else None,
-        "unavailable_contact_substeps": monitor.get("unavailable_contact_substeps") if isinstance(monitor, dict) else None,
-        "control_steps": control_steps,
         "candidate_status": candidate.get("status"),
         "candidate_error": candidate.get("error"),
         "step_rewards": [step.get("reward") for step in steps] if isinstance(steps, list) else None,
         "step_dones": [step.get("done") for step in steps] if isinstance(steps, list) else None,
+        "control_steps": control_steps,
+        "expected_physics_substeps_total": monitor.get("expected_physics_substeps_total") if isinstance(monitor, dict) else None,
+        "captured_physics_substeps": monitor.get("captured_physics_substeps") if isinstance(monitor, dict) else None,
+        "unobserved_expected_substeps": monitor.get("unobserved_expected_substeps") if isinstance(monitor, dict) else None,
+        "unavailable_contact_substeps": monitor.get("unavailable_contact_substeps") if isinstance(monitor, dict) else None,
+    }
+
+
+def _branch_coverage(branch_result: Any, expected_steps: int) -> dict[str, Any]:
+    candidates = branch_result.get("candidates") if isinstance(branch_result, dict) else None
+    if not isinstance(candidates, list) or len(candidates) != 2 or any(
+        not isinstance(candidate, dict) for candidate in candidates
+    ):
+        return {
+            "full_chunk_executed": False,
+            "contact_monitoring_complete": False,
+            "candidate_count": len(candidates) if isinstance(candidates, list) else None,
+            "expected_candidate_count": 2,
+            "reason": "expected_two_repeated_branch_candidates",
+        }
+    per_candidate = [
+        _candidate_coverage(candidate, expected_steps) for candidate in candidates
+    ]
+    return {
+        "full_chunk_executed": all(item["full_chunk_executed"] for item in per_candidate),
+        "contact_monitoring_complete": all(
+            item["contact_monitoring_complete"] for item in per_candidate
+        ),
+        "candidate_count": len(candidates),
+        "expected_candidate_count": 2,
+        "candidates": per_candidate,
+    }
+
+
+def _branch_repeat_consistency(branch_result: Any, atol: float) -> dict[str, Any]:
+    candidates = branch_result.get("candidates") if isinstance(branch_result, dict) else None
+    if not isinstance(candidates, list) or len(candidates) != 2 or any(
+        not isinstance(candidate, dict) for candidate in candidates
+    ):
+        return {
+            "consistent": False,
+            "reason": "expected_two_repeated_branch_candidates",
+            "candidate_count": len(candidates) if isinstance(candidates, list) else None,
+            "atol": atol,
+        }
+    left, right = (copy.deepcopy(candidate) for candidate in candidates)
+    left.pop("candidate_id", None)
+    right.pop("candidate_id", None)
+    result = _compare_nested(left, right, atol)
+    return {
+        "consistent": result["matched"],
+        "candidate_ids": [candidate.get("candidate_id") for candidate in candidates],
+        "max_abs_delta": result["max_abs_delta"],
+        "atol": atol,
+        "mismatch_count": result["mismatch_count"],
+        "mismatch_paths_sample": result["mismatch_paths_sample"],
+        "comparison_scope": "start/step states, actions, rewards, done, contacts, and contact monitoring",
     }
 
 
@@ -616,14 +662,49 @@ def run_experiment(
         snapshot_id = snapshot_response["snapshot_id"]
         snapshot_state_before = snapshot_response.get("snapshot_state")
 
+        roundtrip_response = _bridge_request(
+            connection,
+            {"op": "restore", "snapshot_id": snapshot_id},
+        )
+        if roundtrip_response.get("error"):
+            report["snapshot_restore_roundtrip"] = {
+                "matched": False,
+                "error": roundtrip_response["error"],
+            }
+        elif roundtrip_response.get("restored_snapshot_id") != snapshot_id:
+            report["snapshot_restore_roundtrip"] = {
+                "matched": False,
+                "error": "Bridge restored a different Snapshot ID",
+            }
+        elif not isinstance(snapshot_state_before, dict) or not isinstance(
+            roundtrip_response.get("snapshot_state"), dict
+        ):
+            report["snapshot_restore_roundtrip"] = {
+                "matched": False,
+                "error": "Snapshot or immediate Restore omitted state diagnostics",
+            }
+        else:
+            report["snapshot_restore_roundtrip"] = _compare_nested(
+                snapshot_state_before,
+                roundtrip_response["snapshot_state"],
+                state_atol,
+            )
+            report["snapshot_restore_roundtrip"]["restored_snapshot_id"] = snapshot_id
+        if not report["snapshot_restore_roundtrip"].get("matched"):
+            report["status"] = "snapshot_restore_roundtrip_failed"
+            report["failure_reason"] = "Immediate Snapshot→Restore did not reproduce its canonical diagnostics"
+            return report
+
         candidate_id = f"archived-decision-{archive_episode['decision_step']}"
+        repeat_candidate_id = f"{candidate_id}-repeat"
         branch_result = _bridge_request(
             connection,
             {
                 "op": "branch_rollout",
                 "snapshot_id": snapshot_id,
                 "candidates": [
-                    {"candidate_id": candidate_id, "actions": archive_episode["action_chunk"].tolist()}
+                    {"candidate_id": candidate_id, "actions": archive_episode["action_chunk"].tolist()},
+                    {"candidate_id": repeat_candidate_id, "actions": archive_episode["action_chunk"].tolist()},
                 ],
             },
         )
@@ -631,6 +712,8 @@ def run_experiment(
         report["bridge_main_state_restored"] = branch_result.get("main_state_restored") is True
         coverage = _branch_coverage(branch_result, len(archive_episode["action_chunk"]))
         report["branch_coverage"] = coverage
+        repeat_consistency = _branch_repeat_consistency(branch_result, state_atol)
+        report["repeat_candidate_consistency"] = repeat_consistency
 
         compiler_result = compile_forbid_contact(
             teacher,
@@ -650,6 +733,7 @@ def run_experiment(
             compiler_result.get("status") == "safe"
             and coverage["full_chunk_executed"]
             and coverage["contact_monitoring_complete"]
+            and repeat_consistency["consistent"]
         ):
             report["current_scene_physical_collision"] = "not_detected_in_this_chunk"
         else:
@@ -685,6 +769,9 @@ def run_experiment(
         elif not report["bridge_main_state_restored"] or not restoration_comparison.get("matched"):
             report["status"] = "main_state_restore_failed"
             report["failure_reason"] = "Bridge did not restore the main environment to its pre-branch Snapshot"
+        elif not repeat_consistency["consistent"]:
+            report["status"] = "repeated_branch_result_mismatch"
+            report["failure_reason"] = "Repeated identical candidates from one Snapshot produced different state/contact results"
         elif compiler_result.get("status") == "violation":
             report["status"] = "current_scene_physical_collision_detected"
         elif compiler_result.get("status") == "safe":
@@ -804,6 +891,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     if report.get("compiler_verdict"):
         print("Compiler verdict:", report["compiler_verdict"])
+    if report.get("snapshot_restore_roundtrip"):
+        roundtrip = report["snapshot_restore_roundtrip"]
+        print(
+            "Immediate Snapshot→Restore:",
+            roundtrip.get("matched"),
+            "max_abs_delta:",
+            roundtrip.get("max_abs_delta"),
+        )
+    if report.get("repeat_candidate_consistency"):
+        repeated = report["repeat_candidate_consistency"]
+        print(
+            "Repeated identical branch:",
+            repeated.get("consistent"),
+            "max_abs_delta:",
+            repeated.get("max_abs_delta"),
+        )
     if report.get("historical_decision_state_matches") is not None:
         print("Historical decision task/state match:", report["historical_decision_state_matches"])
         print("Historical decision images pixel-exact:", report["historical_decision_images_pixel_exact"])
