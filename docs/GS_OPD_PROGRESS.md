@@ -1047,3 +1047,45 @@ cd /workspace/zy_workspace/RLinf
 - [x] 绑定校验与其他 unsupported/conflicting 规则的 fail-closed 行为保留。
 - [x] 相关单测、语法检查、`git diff --check` 通过；无仿真运行。
 - [x] 修复已 Push；等待人工重跑 80 步采集。
+
+## 跨 Action Chunk 的 S70→S75 接触诊断 Smoke（2026-10-17）
+
+- 新增 `research/gs_opd/smoke/cross_chunk_contact_smoke.py`，针对已归档的 80 步 On-Policy Episode。只读检查实际 NPZ 确认决策步为 `0, 5, …, 75`，预测动作偏移覆盖 0～80；使用既有归档加载器按 `decision_step_indices` 和 `predicted_action_offsets` 提取 Step 70、75 的两个 5×7 A⁰，并分别与对应 `executed_actions` 完全相等。没有调用 Student、Teacher 或 SAM 3，也没有重新生成动作。
+- Smoke 重置固定 Bridge，逐项重放 Step 0～69；当前任务指令、双相机可用性和 S70 机器人观测必须通过。`--allow-image-mismatch` 只将 S70 的 RGB 像素差异保留为诊断；机器人状态仍按 `1e-6` 比较。随后核对 Teacher 全部 object-contact 规则涉及的双对象语义 Body/Geom 绑定与活动 Geometry Inventory。
+- 前置检查通过后，对 S70 创建同一个 Snapshot 并做 Snapshot→Restore 往返检查；一次 `branch_rollout` 从该 Snapshot 独立运行 A=`A⁰₇₀`（5 步）和 B=`A⁰₇₀ || A⁰₇₅`（10 步）。每条分支都要求完整控制步和完整物理子步 Contact Monitoring；复用现有 `compile_forbid_contact()` 和 Safety IR v2 / 语义映射分别计算 verdict。分支返回后另外比较 Bridge 恢复标志和主环境 Snapshot 诊断。
+- Smoke 对 A/B 前五步精确核验回传动作，对物理状态、每步 contacts、子步覆盖、Control-step 监控和前缀内首次接触身份/位置/法向按 `1e-6` 比较，并单独比较第五步结束状态。B 的首次 object-to-object violation 索引、物理子步、Body/Geom、世界接触位置/法向和最大可用力均从 Compiler evidence 计算；报告会说明首次违规是否位于零基索引 5～9，不预设任何碰撞步或 verdict。
+- 与归档 Step 75 观测的可用字段比较当前覆盖 EEF 位置和夹爪关节位置；Bridge 的 `branch_rollout` 逐步记录不含 RGB 或 EEF 四元数，因此这些字段明确标为 unavailable，不能声称完整视觉观测精确复现。`diagnostic_complete` 表示诊断完整，不表示找到安全动作；B 是原始归档动作拼接，任何 verdict 都不是 Repair 成功证明。
+- 对真实归档做了只读文件预检：Step 70/75 分别位于决策索引 14/15；两个预测 Chunk 均为 5×7，且与归档对应已执行动作逐元素相同。Fake Bridge 测试使用真实 Contact Compiler，覆盖完整性、分支前缀、S75 可用状态字段、Compiler 首次违规时间、绑定失败、子步监测不完整和图像差异门槛；7 项 unittest、Python 语法检查通过。没有连接 Bridge、启动仿真或模型，所以这里不报告真实接触结果。
+
+### 手动真实运行命令
+
+终端一启动固定 LIBERO-Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二运行 S70→S75 两分支诊断。此命令不加载 π₀.₅ 或 VLM；移除 `--allow-image-mismatch` 会要求 S70 双相机逐像素一致：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/cross_chunk_contact_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_object_v2_80step.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --allow-image-mismatch \
+  --out logs/gs_opd/cross_chunk_contact_s70_s75.json
+```
+
+**检查清单（Checklist）**
+
+- [x] 按归档决策索引和 offsets 提取 S70/S75 两个原始 A⁰，并确认它们等于相应已执行动作。
+- [x] 新增同一 Snapshot 下 5 步 A 与 10 步 B 的独立分支、完整子步监测和真实 Compiler 判定。
+- [x] 检查前五步分支一致性、S75 可用状态字段及分支后主环境恢复；图像豁免不放宽物理状态、绑定、动作、覆盖或 Restore 检查。
+- [x] Fake Bridge + 真实 Compiler 的 7 项单测及 Python 语法检查通过；未启动 Bridge、仿真、Student 或 VLM。
+- [ ] 人工运行真实 Bridge Smoke，审查 A/B 的实际完整性、Safety verdict 和首次碰撞证据；不得将 B 的结果当成 Repair 成功证明。
