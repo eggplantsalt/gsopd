@@ -89,6 +89,166 @@ def _pair_ids(pair: Any) -> tuple[int, int] | None:
     return ids
 
 
+def _pair_names(pair: Any) -> tuple[str, str] | None:
+    if not isinstance(pair, list) or len(pair) != 2:
+        return None
+    names = tuple(item.get("name") for item in pair if isinstance(item, dict))
+    if len(names) != 2 or any(not isinstance(name, str) or not name for name in names):
+        return None
+    return names
+
+
+def _is_id_list(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        return None
+    if len(set(value)) != len(value):
+        return None
+    return value
+
+
+def _object_contact_violation(
+    evidence: Any,
+    check: dict[str, Any],
+    compiled_rules: list[Any],
+    events: list[Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve object/object evidence against its active binding and raw event."""
+    if not isinstance(evidence, dict):
+        return None, "object_contact_evidence_is_malformed"
+    rule = next(
+        (
+            item for item in compiled_rules
+            if isinstance(item, dict)
+            and item.get("rule_id") == check.get("rule_id")
+            and item.get("subject_object_id") == check.get("subject_id")
+            and item.get("target_object_id") == check.get("target_id")
+        ),
+        None,
+    )
+    if rule is None or rule.get("decision") != "forbid" or rule.get("predicate") != "contact":
+        return None, "compiled_object_contact_rule_binding_is_missing_or_conflicting"
+    try:
+        subject_body_id = int(rule["subject_body_id"])
+        target_body_id = int(rule["target_body_id"])
+    except (KeyError, TypeError, ValueError):
+        return None, "compiled_object_contact_body_binding_is_missing"
+    if subject_body_id == target_body_id:
+        return None, "compiled_object_contact_bodies_are_not_distinct"
+    subject_geom_ids = _is_id_list(rule.get("subject_geom_ids"))
+    target_geom_ids = _is_id_list(rule.get("target_geom_ids"))
+    if subject_geom_ids is None or target_geom_ids is None:
+        return None, "compiled_object_contact_geom_binding_is_missing"
+    if (
+        evidence.get("classification") != "forbidden_object_object_contact"
+        or evidence.get("subject_object_id") != check.get("subject_id")
+        or evidence.get("target_object_id") != check.get("target_id")
+    ):
+        return None, "object_contact_evidence_semantic_identity_conflicts_with_rule"
+    try:
+        evidence_subject_body = int(evidence["subject_body_id"])
+        evidence_target_body = int(evidence["target_body_id"])
+        control_step = int(evidence["first_control_step"])
+        physics_substep = int(evidence["first_physics_substep"])
+    except (KeyError, TypeError, ValueError):
+        return None, "object_contact_evidence_body_or_timing_is_missing"
+    if (
+        evidence_subject_body != subject_body_id
+        or evidence_target_body != target_body_id
+        or control_step < 0
+        or physics_substep < 0
+    ):
+        return None, "object_contact_evidence_disagrees_with_current_semantic_body_binding"
+    geom_ids = _pair_ids(evidence.get("geom_pair"))
+    body_ids = _pair_ids(evidence.get("body_pair"))
+    geom_names = _pair_names(evidence.get("geom_pair"))
+    body_names = _pair_names(evidence.get("body_pair"))
+    if geom_ids is None or body_ids is None or geom_names is None or body_names is None:
+        return None, "object_contact_evidence_pair_identity_is_malformed"
+    if set(body_ids) != {subject_body_id, target_body_id}:
+        return None, "object_contact_evidence_pair_does_not_match_bound_bodies"
+
+    # The compiler's semantic geom IDs are visual anchors and need not be the
+    # collision geom that contacted. Bind the raw collision geoms by their
+    # corresponding body IDs, preserving the event's geom/body ordering.
+    subject_pair_sides = [index for index, body_id in enumerate(body_ids) if body_id == subject_body_id]
+    target_pair_sides = [index for index, body_id in enumerate(body_ids) if body_id == target_body_id]
+    if len(subject_pair_sides) != 1 or len(target_pair_sides) != 1:
+        return None, "object_contact_evidence_has_ambiguous_bound_body_side"
+    subject_side = subject_pair_sides[0]
+    target_side = target_pair_sides[0]
+    subject_geom_id = geom_ids[subject_side]
+    target_geom_id = geom_ids[target_side]
+    if subject_geom_id in target_geom_ids or target_geom_id in subject_geom_ids:
+        return None, "object_contact_collision_geom_conflicts_with_opposite_semantic_binding"
+
+    matching_events = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if (
+            _pair_ids(event.get("geom_pair")) == geom_ids
+            and _pair_ids(event.get("body_pair")) == body_ids
+            and _pair_names(event.get("geom_pair")) == geom_names
+            and _pair_names(event.get("body_pair")) == body_names
+            and event.get("first_control_step") == control_step
+            and event.get("first_physics_substep") == physics_substep
+        ):
+            matching_events.append(event)
+    if len(matching_events) != 1:
+        return None, "object_contact_evidence_has_no_unique_matching_raw_monitor_event"
+    event = matching_events[0]
+    if event.get("classification") != "scene_scene" or event.get("robot_involved") is not False:
+        return None, "object_contact_raw_event_is_not_a_scene_scene_contact"
+    if event.get("contact_position_status") != "available":
+        return None, "object_contact_world_position_is_unavailable"
+    if event.get("contact_normal_status") != "available":
+        return None, "object_contact_world_normal_is_unavailable"
+    try:
+        position = _vector(event.get("first_contact_position_world"), 3, "object contact position")
+        normal = _unit(
+            event.get("first_contact_normal_geom1_to_geom2_world"),
+            "object contact normal",
+        )
+        normal_geom_ids = tuple(int(value) for value in event["contact_normal_geom_ids"])
+    except Exception:
+        return None, "object_contact_world_position_or_normal_is_malformed"
+    if normal is None or normal_geom_ids not in (geom_ids, geom_ids[::-1]):
+        return None, "object_contact_normal_geom_order_disagrees_with_raw_event"
+    # MuJoCo's contact frame first axis points from the first geom in
+    # contact_normal_geom_ids toward the second. Move the rule subject away
+    # from the target object, independent of event pair sort order.
+    subject_is_normal_geom1 = normal_geom_ids[0] == subject_geom_id
+    if not subject_is_normal_geom1 and normal_geom_ids[1] != subject_geom_id:
+        return None, "object_contact_normal_does_not_reference_bound_subject_geom"
+    away = -normal if subject_is_normal_geom1 else normal
+    return {
+        "violation_source": "object_contact_check",
+        "contact_type": "object_to_object",
+        "rule_id": check.get("rule_id"),
+        "moving_object_id": check.get("subject_id"),
+        "obstacle_object_id": check.get("target_id"),
+        "moving_object_body_id": subject_body_id,
+        "obstacle_object_body_id": target_body_id,
+        "moving_object_semantic_geom_ids": subject_geom_ids,
+        "obstacle_object_semantic_geom_ids": target_geom_ids,
+        "moving_object_contact_geom_id": subject_geom_id,
+        "obstacle_contact_geom_id": target_geom_id,
+        "control_step": control_step,
+        "physics_substep": physics_substep,
+        "geom_pair": evidence["geom_pair"],
+        "body_pair": evidence["body_pair"],
+        "contact_position_world": position.tolist(),
+        "contact_normal_geom1_to_geom2_world": normal.tolist(),
+        "normal_geom_ids_order": list(normal_geom_ids),
+        "normal_convention": "MuJoCo contact.frame first axis, first contact_normal_geom_ids geom toward second",
+        "normal_away_from_obstacle": away.tolist(),
+        "max_force_norm": evidence.get("max_force_norm"),
+        "source_event": event,
+    }, None
+
+
 def locate_first_violation(
     branch_result: dict[str, Any],
     compiled_result: dict[str, Any],
@@ -101,57 +261,107 @@ def locate_first_violation(
     if baseline is None:
         return None, "baseline_branch_candidate_is_missing"
     evidence = compiled.get("evidence")
-    if not isinstance(evidence, list) or not evidence:
+    object_checks = compiled.get("object_contact_checks")
+    has_object_violation = isinstance(object_checks, list) and any(
+        isinstance(check, dict) and check.get("verdict") == "violation"
+        and isinstance(check.get("evidence"), list) and check["evidence"]
+        for check in object_checks
+    )
+    if (not isinstance(evidence, list) or not evidence) and not has_object_violation:
         return None, "compiled_violation_has_no_contact_evidence"
     gripper_ids = compiled_result.get("gripper_geom_ids")
-    if not isinstance(gripper_ids, list) or not gripper_ids:
-        return None, "compiled_result_has_no_gripper_geometry_identity"
-    gripper_ids = {int(item) for item in gripper_ids}
-    ordered_evidence = sorted(
-        evidence,
-        key=lambda item: (
-            int(item.get("first_control_step", 1 << 30)),
-            int(item.get("first_physics_substep", 1 << 30)),
-        ),
-    )
     monitor = baseline.get("contact_monitoring")
     events = monitor.get("events") if isinstance(monitor, dict) else None
     if not isinstance(events, list):
         return None, "baseline_substep_contact_events_are_missing"
-    for item in ordered_evidence:
+    violation_items: list[tuple[int, int, str, Any, Any]] = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                try:
+                    violation_items.append((
+                        int(item.get("first_control_step", 1 << 30)),
+                        int(item.get("first_physics_substep", 1 << 30)),
+                        "gripper",
+                        item,
+                        None,
+                    ))
+                except (TypeError, ValueError):
+                    continue
+    compiled_rules = compiled_result.get("compiled_object_contact_rules")
+    if not isinstance(compiled_rules, list):
+        compiled_rules = []
+    if isinstance(object_checks, list):
+        for check in object_checks:
+            if not isinstance(check, dict) or check.get("verdict") != "violation":
+                continue
+            object_evidence = check.get("evidence")
+            if not isinstance(object_evidence, list):
+                continue
+            for item in object_evidence:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    violation_items.append((
+                        int(item.get("first_control_step", 1 << 30)),
+                        int(item.get("first_physics_substep", 1 << 30)),
+                        "object_object",
+                        item,
+                        check,
+                    ))
+                except (TypeError, ValueError):
+                    continue
+    if not violation_items:
+        return None, "compiled_violation_has_no_parseable_contact_evidence"
+    violation_items.sort(key=lambda item: (item[0], item[1]))
+    if not isinstance(gripper_ids, list) or not gripper_ids:
+        gripper_ids_set = set()
+    else:
+        try:
+            gripper_ids_set = {int(item) for item in gripper_ids}
+        except (TypeError, ValueError):
+            gripper_ids_set = set()
+    for evidence_control_step, evidence_physics_substep, evidence_kind, item, check in violation_items:
+        if evidence_kind == "object_object":
+            object_violation, object_error = _object_contact_violation(
+                item, check, compiled_rules, events
+            )
+            if object_violation is not None:
+                return object_violation, None
+            return None, object_error or "object_contact_evidence_could_not_be_joined"
+        if not gripper_ids_set:
+            return None, "compiled_result_has_no_gripper_geometry_identity"
         geom_pair = item.get("geom_pair")
         ids = _pair_ids(geom_pair)
-        if ids is None or sum(geom_id in gripper_ids for geom_id in ids) != 1:
-            continue
-        event_candidates = []
-        for event in events:
-            if not isinstance(event, dict) or _pair_ids(event.get("geom_pair")) != ids:
+        if ids is None or sum(geom_id in gripper_ids_set for geom_id in ids) != 1:
+            return None, "gripper_violation_evidence_has_invalid_geom_pair_or_identity"
+        event = None
+        for raw_event in events:
+            if not isinstance(raw_event, dict) or _pair_ids(raw_event.get("geom_pair")) != ids:
                 continue
-            if event.get("first_control_step") != item.get("first_control_step"):
+            if raw_event.get("first_control_step") != evidence_control_step:
                 continue
-            event_candidates.append(event)
-        if not event_candidates:
-            continue
-        event = min(
-            event_candidates,
-            key=lambda value: int(value.get("first_physics_substep", 1 << 30)),
-        )
+            if raw_event.get("first_physics_substep") == evidence_physics_substep:
+                event = raw_event
+                break
+        if event is None:
+            return None, "gripper_violation_evidence_has_no_matching_raw_contact_event"
         position = event.get("first_contact_position_world")
         normal = event.get("first_contact_normal_geom1_to_geom2_world")
         normal_geom_ids = event.get("contact_normal_geom_ids")
         if event.get("contact_position_status") != "available":
-            continue
+            return None, "gripper_violation_contact_position_is_unavailable"
         if event.get("contact_normal_status") != "available":
-            continue
+            return None, "gripper_violation_contact_normal_is_unavailable"
         try:
             position = _vector(position, 3, "contact position")
             normal = _unit(normal, "contact normal")
             normal_geom_ids = tuple(int(value) for value in normal_geom_ids)
         except Exception:
-            continue
+            return None, "gripper_violation_contact_position_or_normal_is_malformed"
         if normal is None or normal_geom_ids not in (ids, ids[::-1]):
-            continue
-        robot_geom_id = next(geom_id for geom_id in ids if geom_id in gripper_ids)
+            return None, "gripper_violation_normal_geom_order_disagrees_with_raw_event"
+        robot_geom_id = next(geom_id for geom_id in ids if geom_id in gripper_ids_set)
         robot_is_geom1_in_normal = normal_geom_ids[0] == robot_geom_id
         # MuJoCo contact.frame's first axis points from raw geom1 toward raw geom2.
         away = -normal if robot_is_geom1_in_normal else normal
@@ -161,6 +371,8 @@ def locate_first_violation(
             "geom_pair": geom_pair,
             "body_pair": item.get("body_pair"),
             "robot_geom_id": robot_geom_id,
+            "violation_source": "gripper_contact_evidence",
+            "contact_type": "gripper_to_object",
             "contact_position_world": position.tolist(),
             "contact_normal_geom1_to_geom2_world": normal.tolist(),
             "normal_geom_ids_order": list(normal_geom_ids),

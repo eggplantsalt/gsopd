@@ -10,6 +10,7 @@ from research.gs_opd.repair.verifier_guided_repair import (
     build_repair_actions,
     derive_repair_directions,
     evaluate_task_progress,
+    locate_first_violation,
     run_verifier_guided_repair,
 )
 
@@ -186,8 +187,6 @@ class VerifierGuidedRepairTests(unittest.TestCase):
 
     def test_contact_evidence_drives_direction_and_multi_step_window(self):
         branch = _branch()
-        from research.gs_opd.repair.verifier_guided_repair import locate_first_violation
-
         violation, error = locate_first_violation(branch, _compiled())
         self.assertIsNone(error)
         self.assertEqual(violation["control_step"], 2)
@@ -214,6 +213,131 @@ class VerifierGuidedRepairTests(unittest.TestCase):
         changed_steps = np.flatnonzero(np.linalg.norm(repaired[:, :3] - self.actions[:, :3], axis=1) > 0)
         self.assertGreaterEqual(len(changed_steps), 3)
         np.testing.assert_array_equal(repaired[:, 3:], self.actions[:, 3:])
+
+    def test_object_contact_evidence_uses_bound_body_and_actual_normal_geom_order(self):
+        branch = _branch(event=False)
+        candidate = branch["candidates"][0]
+        candidate["contact_monitoring"]["events"] = [{
+            "geom_pair": [{"id": 101, "name": "collision_geom_subject"}, {"id": 202, "name": "collision_geom_target"}],
+            "body_pair": [{"id": 11, "name": "subject_body"}, {"id": 22, "name": "target_body"}],
+            "classification": "scene_scene",
+            "robot_involved": False,
+            "first_control_step": 2,
+            "first_physics_substep": 4,
+            "contact_position_status": "available",
+            "first_contact_position_world": [0.2, 0.3, 0.4],
+            "contact_normal_status": "available",
+            "first_contact_normal_geom1_to_geom2_world": [1.0, 0.0, 0.0],
+            # The raw contact normal is target→subject even though the event's
+            # displayed geom pair is subject→target.
+            "contact_normal_geom_ids": [202, 101],
+            "max_force_norm": 3.0,
+        }]
+        compiled = {
+            "status": "violation",
+            "gripper_geom_ids": [10],
+            "compiled_object_contact_rules": [{
+                "rule_id": "object-rule",
+                "predicate": "contact",
+                "decision": "forbid",
+                "subject_object_id": "carried",
+                "target_object_id": "obstacle",
+                "subject_body_id": 11,
+                "subject_geom_ids": [7],  # semantic visual anchor, not collision geom 101
+                "target_body_id": 22,
+                "target_geom_ids": [8],  # semantic visual anchor, not collision geom 202
+            }],
+            "candidates": [{
+                "candidate_id": "repair-A0",
+                "verdict": "violation",
+                "evidence": [],
+                "object_contact_checks": [{
+                    "rule_id": "object-rule",
+                    "subject_id": "carried",
+                    "target_id": "obstacle",
+                    "verdict": "violation",
+                    "evidence": [{
+                        "classification": "forbidden_object_object_contact",
+                        "subject_object_id": "carried",
+                        "target_object_id": "obstacle",
+                        "subject_body_id": 11,
+                        "target_body_id": 22,
+                        "geom_pair": candidate["contact_monitoring"]["events"][0]["geom_pair"],
+                        "body_pair": candidate["contact_monitoring"]["events"][0]["body_pair"],
+                        "first_control_step": 2,
+                        "first_physics_substep": 4,
+                        "max_force_norm": 3.0,
+                    }],
+                }],
+            }],
+        }
+
+        violation, error = locate_first_violation(branch, compiled)
+        self.assertIsNone(error)
+        self.assertEqual(violation["contact_type"], "object_to_object")
+        self.assertEqual(violation["control_step"], 2)
+        self.assertEqual(violation["physics_substep"], 4)
+        self.assertEqual(violation["moving_object_contact_geom_id"], 101)
+        self.assertEqual(violation["obstacle_contact_geom_id"], 202)
+        self.assertEqual(violation["normal_away_from_obstacle"], [1.0, 0.0, 0.0])
+        self.assertEqual(violation["contact_position_world"], [0.2, 0.3, 0.4])
+
+    def test_object_contact_normal_away_direction_tracks_subject_side(self):
+        for body_pair, normal_geom_ids, expected_away in (
+            ([{"id": 22, "name": "target_body"}, {"id": 11, "name": "subject_body"}], [101, 202], [1.0, 0.0, 0.0]),
+            ([{"id": 11, "name": "subject_body"}, {"id": 22, "name": "target_body"}], [101, 202], [-1.0, -0.0, -0.0]),
+        ):
+            branch = _branch(event=False)
+            candidate = branch["candidates"][0]
+            geom_pair = [{"id": 101, "name": "geom_a"}, {"id": 202, "name": "geom_b"}]
+            # The first case maps the subject to the second event geom. The
+            # second maps it to the first. Normal order always follows IDs.
+            if body_pair[0]["id"] == 22:
+                geom_pair = [{"id": 101, "name": "geom_a"}, {"id": 202, "name": "geom_b"}]
+            event = {
+                "geom_pair": geom_pair,
+                "body_pair": body_pair,
+                "classification": "scene_scene",
+                "robot_involved": False,
+                "first_control_step": 2,
+                "first_physics_substep": 4,
+                "contact_position_status": "available",
+                "first_contact_position_world": [0.0, 0.0, 0.0],
+                "contact_normal_status": "available",
+                "first_contact_normal_geom1_to_geom2_world": [1.0, 0.0, 0.0],
+                "contact_normal_geom_ids": normal_geom_ids,
+            }
+            candidate["contact_monitoring"]["events"] = [event]
+            evidence = {
+                "classification": "forbidden_object_object_contact",
+                "subject_object_id": "carried",
+                "target_object_id": "obstacle",
+                "subject_body_id": 11,
+                "target_body_id": 22,
+                "geom_pair": geom_pair,
+                "body_pair": body_pair,
+                "first_control_step": 2,
+                "first_physics_substep": 4,
+            }
+            compiled = {
+                "status": "violation",
+                "compiled_object_contact_rules": [{
+                    "rule_id": "r", "predicate": "contact", "decision": "forbid",
+                    "subject_object_id": "carried", "target_object_id": "obstacle",
+                    "subject_body_id": 11, "subject_geom_ids": [7],
+                    "target_body_id": 22, "target_geom_ids": [8],
+                }],
+                "candidates": [{
+                    "candidate_id": "repair-A0", "verdict": "violation", "evidence": [],
+                    "object_contact_checks": [{
+                        "rule_id": "r", "subject_id": "carried", "target_id": "obstacle",
+                        "verdict": "violation", "evidence": [evidence],
+                    }],
+                }],
+            }
+            violation, error = locate_first_violation(branch, compiled)
+            self.assertIsNone(error)
+            self.assertEqual(violation["normal_away_from_obstacle"], expected_away)
 
     def test_window_envelope_covers_early_and_final_chunk_boundaries(self):
         _, _, first = _window_envelope(5, 0, 1, 2)

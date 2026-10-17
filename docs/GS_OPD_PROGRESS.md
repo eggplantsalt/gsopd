@@ -947,3 +947,55 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 检查原始 Action Chunk 的归档执行一致性、每个分支的完整步数、物理子步覆盖和分支后主状态恢复。
 - [x] 只读预检真实 NPZ；完成 Fake Bridge unittest、Python 语法检查和 `git diff --check`。
 - [ ] 在固定 L0T0 的真实 Safety Bridge 环境运行 Smoke，确认重放观测匹配并由当前绑定/Geometry Inventory 将接触编译为 violation。
+
+## Step 70 Object-to-Object Geometry-Guided Repair Smoke（2026-10-17）
+
+### 实现内容
+
+- `research/gs_opd/repair/verifier_guided_repair.py` 的 `locate_first_violation()` 现在同时读取原有 Gripper-to-Object `evidence` 和 `object_contact_checks[].evidence`。对象接触证据必须能关联到编译器根据当前语义绑定生成的 forbid 规则、subject/target Body ID，以及分支 Contact Monitoring 中控制步、物理子步、Geom/Body ID 和名称完全相同的唯一原始事件；接触位置或法向不可用、绑定冲突或事件无法唯一匹配时返回明确错误，不推测方向。
+- 对 Object-to-Object 碰撞，Repair 将规则 subject 的 Body 作为正在搬运的对象。语义绑定中的 Geom 是视觉定位锚点，不要求它恰好是产生碰撞的 MuJoCo 碰撞 Geom；碰撞 Geom 通过原始事件中同序的 Geom/Body 对归属到已绑定 Body。方向按 `contact_normal_geom_ids` 的实际 MuJoCo 顺序解释：subject 位于法向第一 Geom 时取 `-normal`，位于第二 Geom 时取 `+normal`。原有 Gripper-to-Object 法向兼容路径保留。
+- 新增 `research/gs_opd/smoke/object_geometry_guided_repair_smoke.py`。它复用归档加载、Reset/Step 重放、指令/机器人状态比较、当前 Geometry Inventory 绑定校验和现有 `Snapshot` / `restore` / `branch_rollout` / Compiler 接口。A0 必须完整执行且接触监控完整，并由当前 Compiler 明确判为 Object-to-Object violation；否则不会进入 Repair 搜索。
+- Smoke 查询 Bridge 的只读 `repair_context`，使用 Safety IR 中唯一的 `target_object` Body 作为任务进度依据（多个目标时要求显式指定）。它调用现有 `run_verifier_guided_repair()`，候选仍使用既有方向、窗口、多尺度幅度、动作约束及任务进度门槛。每批候选通过一个 `branch_rollout` 请求从同一个 Snapshot 独立开始；每次分支后额外比较主环境 Snapshot diagnostics。任何 Restore 不匹配都会清空 A+ 并终止为失败。
+- JSON 结果包含 A0、首个接触的规则/对象/Body/Geom/时间/位置/法向及原始事件、活动控制器参数、所有搜索尝试的方向/幅度/窗口/动作、分支完整性、Compiler 结果、任务进度、动作约束、恢复诊断和 A+（若通过）。结果分类区分 `no_safe_candidate_found` 与 `safe_candidates_failed_task_progress`；短 Chunk 的目标物体位移仍只是已有 Repair 定义的时间对齐进度代理，不等同任务完成证明。
+
+### 静态验证与当前限制
+
+- 新增几何证据单测覆盖：语义锚点 Geom 不同于碰撞 Geom、subject 在事件 Geom 对两侧时的离障碍方向，以及依据真实法向 Geom 顺序反转法向的情况。新增 Smoke Fake Bridge 测试确认 A0 门槛、同一 Snapshot 分支请求、主状态检查和 A+ 输出。
+- Repair 核心、新 Smoke、On-Policy Repair/Collection、归档 Contact Smoke 和 Contact Compiler 共 50 项 unittest 通过。已执行 Python 语法检查与 `git diff --check`；没有连接 Bridge、启动仿真、调用 VLM 或运行完整 Rollout，因此当前没有真实 A+ 或真实修复成功结论。
+- 真实运行依赖一份含 `object_contact_rules` 的有效 Safety IR v2，以及 `semantic_bindings_l0t0.json` 中这些规则对象当前场景的绑定。下方使用已有的 `initial_center_distinction_teacher_raw.txt`；不要用缺少对象接触规则的旧原始 Teacher JSON 替代。`--allow-image-mismatch` 只放宽归档图像逐像素一致门槛，任务指令、机器人状态、当前 Body/Geom 绑定、完整 Chunk、接触监控、任务进度和 Snapshot 恢复门槛仍然生效。
+
+### 手动真实实验命令
+
+终端一启动固定 L0T0 Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二重放归档 Step 0～69，在当前 Step 70 状态验证 A0，并执行受验证的几何引导 Repair 搜索。脚本不会调用 π₀.₅，也不会把 A+ 执行到主环境：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/object_geometry_guided_repair_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_osc_fixed.npz \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --decision-step 70 \
+  --allow-image-mismatch \
+  --out logs/gs_opd/object_geometry_guided_repair_step70.json
+```
+
+可选 `--object-id` 和 `--task-object-id` 只在 Safety IR 中存在多个匹配对象时使用；它们必须分别对应 forbid object-contact subject 和有当前物理绑定的 `target_object`。搜索预算可用 `--max-candidate-evaluations` 调整，默认沿用核心 Repair 配置的 96 次上限。
+
+**检查清单（Checklist）**
+
+- [x] 扩展首个违规定位，支持对象接触证据与原始子步 Contact 的严格关联，并保持旧 Gripper-to-Object 兼容。
+- [x] 按真实碰撞 Geom 顺序和两侧 Body 身份计算搬运物体离障碍方向，不硬编码场景名称/ID/碰撞步。
+- [x] 新增独立归档重放 Repair Smoke；A0 violation、全 Chunk、完整 Contact Monitoring、任务进度、动作约束和主环境恢复均为必要条件。
+- [x] 增加定点单测；相关 50 项 unittest 通过，Python 语法检查及 `git diff --check` 通过。
+- [ ] 人工启动 Safety Bridge，运行 Step 70 Smoke 并审查是否存在安全且保持任务进度的 A+。
