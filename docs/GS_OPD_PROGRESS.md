@@ -1242,6 +1242,7 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - 接口在决策状态及每步执行后复用 `geom_set_min_distance` 查询，返回逐状态有符号间隙、固定阈值告警、首次触发步、相邻间隙变化/持续接近判断和 Chunk 终点最近 Geom Pair。阈值默认沿用 5/10/20 mm，持续接近沿用全部相邻间隙变化均小于 `-1e-9 m` 的原判据。结果明确标记几何间隙不是安全证明。
 - 开始模拟前和结束时均恢复并按 `1e-6` 比较 Snapshot 诊断。任何距离查询、动作步执行或恢复不完整都会得到 `unknown`；无法确认无风险时不会输出 `no_warning`。确定观察到阈值越界的警告仍会保留，同时完整性状态为 unknown。
 - 原 `near_far_gap_smoke.py` 的距离查询及阈值/趋势分析改为调用共享函数，归档 S65/S70/S75 校验和历史标签仍由 Smoke 自己处理。
+- Near–Far 结果现在附带 Snapshot ID 与当前五步 A⁰ 的 SHA-256 指纹，供后续通用 Repair 接口确认预警与动作来源一致。
 - 轻量测试覆盖阈值风险和持续接近、无预警、距离查询 unknown、最终恢复失败，以及非固定决策步索引。Near-Far 新接口及原 Smoke 回归测试共 13 项通过，Python 语法和 `git diff --check` 通过；未启动 Safety Bridge、仿真或模型。
 
 **检查清单（Checklist）**
@@ -1249,3 +1250,18 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 新接口只使用调用方传入的 Snapshot、当前 A⁰ Chunk 和已验证 Geom 集合。
 - [x] 接口模拟后始终尝试恢复并严格核验原 Snapshot；查询不完整和恢复不符 fail-closed。
 - [ ] 人工在真实 Bridge 环境调用接口，核对当前观测、逐步间隙与恢复结果；未运行实验前不宣称真实场景预警有效。
+
+## GS-OPD Step 2.2：通用 Near–Far 几何引导提前 Repair 搜索
+
+- 新增 `research/gs_opd/repair/early_repair.py` 的 `run_early_repair_search()`，接受任意当前决策 Snapshot、五步 A⁰、Near–Far 结果、Safety IR v2、Teacher 语义绑定和当前 Geometry/Gripper Inventory、Repair Context、任务物体绑定及 A⁰ 分支验证结果。模块不读取归档、不固定决策步或对象 ID，也不选择候选或创建训练标签。
+- 只有当前 A⁰ 完整执行、子步 Contact Monitoring 完整、Contact Compiler 明确判为 safe，且 Near–Far 结果为 complete/warning 时才进入候选搜索。接口核对 Near–Far 的 Snapshot ID、动作指纹、六个间距样本和目标/障碍物 Geom 集合，并核对 A⁰ 物理验证结果对同一 Snapshot 和动作指纹的来源声明。
+- 候选方向、平滑窗口、多尺度幅度、动作约束、完整五步分支、Contact Compiler、同时间范围任务进度和终点间隙改善复用既有提前 Repair Smoke 函数。每条候选都从同一 Snapshot 分支验证；端点间隙复测后检查恢复。返回全部合格候选的 ID、动作和验证结果，不提供候选选择或 A⁺ 标签。
+- 若 Near–Far unknown、A⁰ 安全证明失败、任一候选监测/Compiler/任务进度/间隙验证不完整，或 Snapshot 恢复无法确认，结果均为不可执行。完整搜索但没有合格候选时返回 `no_qualified_candidates`；有候选但存在未完成验证时返回 `not_executable`。
+- 旧 `early_repair_s70_smoke.py` 的算法和默认候选 ID 保持兼容；新增可选 `candidate_prefix` 供通用调用生成非归档标识。
+- 使用 `gsopd_teacher` 环境运行 Repair、通用入口、旧 Smoke、Near–Far 和 Student Lookahead 相关测试共 59 项，54 项通过、5 项因需要 LIBERO-Safety MuJoCo 环境而跳过；Python 语法检查和 `git diff --check` 通过。新增接口测试使用 Mock Bridge，没有启动真实仿真或模型，因此尚未验证通用入口在真实 Bridge 上的候选表现。
+
+**检查清单（Checklist）**
+
+- [x] 覆盖 S70 以外决策索引、多个合格候选、无合格候选、Near–Far unknown、A⁰ 物理证明失败、候选验证不完整和 Snapshot 恢复失败。
+- [x] 旧 S70 Smoke 候选 ID 默认行为通过回归测试。
+- [ ] 在真实 Bridge 上为当前任意决策状态提供已验证输入并人工运行；未运行前不声称存在真实可用候选。

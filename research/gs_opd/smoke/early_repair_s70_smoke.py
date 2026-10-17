@@ -138,11 +138,11 @@ def _find_endpoint_pair(distance: dict[str, Any], subject_body_id: int, obstacle
         or distance.get("distance_reliable") is not True
         or not isinstance(distance.get("minimum_pair"), dict)
     ):
-        raise ValueError("S75 A0 endpoint distance query is unavailable or incomplete")
+        raise ValueError("A0 chunk endpoint distance query is unavailable or incomplete")
     pair = distance["minimum_pair"]
     geom_a, geom_b = pair.get("geom_a"), pair.get("geom_b")
     if not isinstance(geom_a, dict) or not isinstance(geom_b, dict):
-        raise ValueError("S75 minimum Geom pair metadata is incomplete")
+        raise ValueError("Endpoint minimum Geom pair metadata is incomplete")
     if geom_a.get("body_id") == subject_body_id and geom_b.get("body_id") == obstacle_body_id:
         ordered = pair
     elif geom_b.get("body_id") == subject_body_id and geom_a.get("body_id") == obstacle_body_id:
@@ -176,14 +176,14 @@ def derive_clearance_directions(
     world_up: Any,
     baseline_eef_positions: Any = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Get away and two lateral directions from S75 A0 closest-point geometry."""
+    """Get away and two lateral directions from the supplied A0 endpoint geometry."""
     pair = _find_endpoint_pair(distance, subject_body_id, obstacle_body_id)
     subject_point = np.asarray(pair["closest_point_on_subject_world"], dtype=np.float64)
     obstacle_point = np.asarray(pair["closest_point_on_obstacle_world"], dtype=np.float64)
     away_raw = subject_point - obstacle_point
     away_norm = float(np.linalg.norm(away_raw))
     if not np.isfinite(away_norm) or away_norm <= 1e-10:
-        raise ValueError("S75 nearest-point segment has no resolvable away direction")
+        raise ValueError("Nearest-point segment has no resolvable away direction")
     away = away_raw / away_norm
     up_array = np.asarray(world_up, dtype=np.float64)
     if up_array.shape != (3,) or not np.isfinite(up_array).all() or np.linalg.norm(up_array) <= 1e-10:
@@ -198,7 +198,7 @@ def derive_clearance_directions(
             motion = positions[-1] - positions[0]
             lateral = np.cross(motion, away)
             lateral_norm = float(np.linalg.norm(lateral))
-            lateral_source = "cross(S70 A0 EEF motion, nearest_geom_away)"
+            lateral_source = "cross(A0 EEF motion, nearest_geom_away)"
     if lateral_norm <= 1e-10:
         basis = np.eye(3)[int(np.argmin(np.abs(away)))]
         lateral = np.cross(basis, away)
@@ -213,7 +213,7 @@ def derive_clearance_directions(
         {"name": "nearest_geom_lateral_negative", "direction_world": (-lateral).tolist(), "basis_source": lateral_source},
     ]
     return directions, {
-        "source": "S75 endpoint of archived S70 A0; no S75-policy action or collision event used",
+        "source": "current A0 chunk endpoint nearest-point geometry; no future action or collision event used",
         "nearest_pair": pair,
         "nearest_point_separation_norm_m": away_norm,
         "mesh_approximation": pair["mesh_approximation"],
@@ -257,16 +257,19 @@ def generate_clearance_candidates(
     config: RepairConfig = PROBE_CONFIG,
     *,
     max_candidates: int = MAX_CANDIDATES,
+    candidate_prefix: str = "early-s70",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Use the existing smooth Repair action builder for a bounded probe grid."""
     actions = np.asarray(original_actions, dtype=np.float64)
     if actions.shape != (CHUNK_LENGTH, 7) or not np.isfinite(actions).all():
-        raise ValueError("S70 A0 must be a finite (5,7) action chunk")
+        raise ValueError("A0 must be a finite (5,7) action chunk")
     if isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or not 1 <= max_candidates <= MAX_CANDIDATES:
         raise ValueError(f"max_candidates must be in [1, {MAX_CANDIDATES}]")
+    if not isinstance(candidate_prefix, str) or not candidate_prefix.strip():
+        raise ValueError("candidate_prefix must be a non-empty string")
     bound_check = _osc_input_bounds_check(actions, controller_context)
     if bound_check.get("status") != "pass":
-        raise ValueError(f"S70 A0 does not satisfy active OSC input bounds: {bound_check}")
+        raise ValueError(f"A0 does not satisfy active OSC input bounds: {bound_check}")
     if not directions:
         return [], [{"reason": "no_geometric_repair_directions"}]
     specs: list[dict[str, Any]] = []
@@ -277,7 +280,7 @@ def generate_clearance_candidates(
             for amplitude in AMPLITUDES_M:
                 if counter >= max_candidates:
                     return specs, rejected
-                candidate_id = f"early-s70-{counter + 1:03d}"
+                candidate_id = f"{candidate_prefix}-{counter + 1:03d}"
                 # build_repair_actions requires a field named violation_step to
                 # center its envelope. Here the value is only a geometric
                 # smoothing anchor; no violation event is invented or implied.
@@ -376,7 +379,7 @@ def evaluate_same_horizon_progress(
     )
     result["comparison_horizon_steps"] = CHUNK_LENGTH
     result["aligned_prefix_steps_compared"] = CHUNK_LENGTH
-    result["comparison_semantics"] = "A0 and candidate both execute actions 0..4 from the same S70 Snapshot"
+    result["comparison_semantics"] = "A0 and candidate both execute actions 0..4 from the same decision Snapshot"
     result["eef_displacement_is_not_task_success"] = True
     return result
 
@@ -502,7 +505,7 @@ def replay_and_measure_endpoint(
     try:
         result["restore_before_replay"] = _restore_and_compare(connection, snapshot_id, snapshot_state)
         if result["restore_before_replay"].get("matched") is not True:
-            result["reason"] = "could_not_restore_S70_before_endpoint_replay"
+            result["reason"] = "could_not_restore_snapshot_before_endpoint_replay"
             return result
         final_response = None
         for index, action in enumerate(actions):
@@ -561,7 +564,7 @@ def replay_and_measure_endpoint(
         result["main_state_restored"] = result["restore_after_replay"].get("matched") is True
         if not result["main_state_restored"]:
             result["status"] = "restore_failed"
-            result["reason"] = "S70 main-state restoration failed after endpoint replay"
+            result["reason"] = "Main-state restoration failed after endpoint replay"
     return result
 
 
@@ -593,7 +596,7 @@ def assess_candidate(
     baseline_gap_m: float | None,
     endpoint_replay: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Fail-closed gates for one full S70 candidate; no train-label semantics."""
+    """Fail-closed gates for one full candidate; no train-label semantics."""
     result: dict[str, Any] = {
         "candidate_id": spec["candidate_id"],
         "actions": np.asarray(spec["actions"], dtype=np.float64).tolist(),

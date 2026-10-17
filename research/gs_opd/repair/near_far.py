@@ -8,6 +8,7 @@ exploratory evidence, not a collision-safety proof.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Any
 
@@ -17,6 +18,14 @@ GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
 TREND_EPSILON_M = 1e-9
 CHUNK_LENGTH = 5
 SNAPSHOT_ATOL = 1e-6
+
+
+def action_chunk_fingerprint(actions: Any) -> str:
+    """Return a stable fingerprint for a finite five-step seven-dimensional chunk."""
+    array = np.asarray(actions, dtype=np.float64)
+    if array.shape != (CHUNK_LENGTH, 7) or not np.isfinite(array).all():
+        raise ValueError(f"actions must be finite with shape ({CHUNK_LENGTH}, 7)")
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
 def _bridge_request(connection: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -394,6 +403,8 @@ def forecast_near_far_risk(
         "risk_verdict": risk_verdict,
         "risk_warning": risk_warning,
         "decision_step": decision_step,
+        "snapshot_id": snapshot_id,
+        "action_chunk_sha256": action_chunk_fingerprint(actions),
         "forecast_scope": "current Snapshot plus the supplied five-step A0 only",
         "historical_or_future_actions_used": False,
         "thresholds_m": [float(value) for value in thresholds_m],

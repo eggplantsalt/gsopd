@@ -90,6 +90,8 @@ class NearFarForecastTests(unittest.TestCase):
         self.assertEqual([item["step_index"] for item in result["distance_samples"]], list(range(41, 47)))
         self.assertEqual(result["endpoint_closest_geom_evidence"]["geom_a"]["id"], 10)
         self.assertTrue(result["sustained_approach"])
+        self.assertEqual(result["snapshot_id"], "snapshot-1")
+        self.assertEqual(len(result["action_chunk_sha256"]), 64)
         self.assertEqual(bridge.restore_count, 2)
         self.assertEqual(bridge.state_index, 0)
 

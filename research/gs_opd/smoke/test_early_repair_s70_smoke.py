@@ -147,6 +147,19 @@ class EarlyRepairGeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active OSC input bounds"):
             smoke.generate_clearance_candidates(actions, directions, context)
 
+    def test_generic_candidate_prefix_is_available_and_default_remains_compatible(self):
+        actions = np.zeros((5, 7), dtype=np.float64)
+        directions = [{"name": "away", "direction_world": [1, 0, 0]}]
+        context = _controller_context()
+        default_specs, _ = smoke.generate_clearance_candidates(
+            actions, directions, context, max_candidates=1
+        )
+        generic_specs, _ = smoke.generate_clearance_candidates(
+            actions, directions, context, max_candidates=1, candidate_prefix="early"
+        )
+        self.assertEqual(default_specs[0]["candidate_id"], "early-s70-001")
+        self.assertEqual(generic_specs[0]["candidate_id"], "early-001")
+
     def test_reverse_geom_order_is_normalized_using_body_identity(self):
         distance = {
             "query_complete": True,
