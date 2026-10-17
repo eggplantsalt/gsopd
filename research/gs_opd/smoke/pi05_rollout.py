@@ -694,6 +694,151 @@ def prepare_on_policy_safety_collection(
     }
 
 
+def _near_far_result_is_complete(
+    result, snapshot, actions, target_geom_ids, obstacle_geom_ids, decision_step
+):
+    """Fail closed unless the forecast covers this Snapshot/A0 and restored it."""
+    if not isinstance(result, dict) or not isinstance(snapshot, dict):
+        return False
+    if result.get("status") != "complete" or result.get("risk_verdict") not in ("warning", "no_warning"):
+        return False
+    if result.get("risk_warning") is not (result.get("risk_verdict") == "warning"):
+        return False
+    if result.get("snapshot_id") != snapshot.get("snapshot_id"):
+        return False
+    try:
+        from research.gs_opd.repair.near_far import action_chunk_fingerprint
+
+        if result.get("action_chunk_sha256") != action_chunk_fingerprint(actions):
+            return False
+    except Exception:
+        return False
+    if (
+        result.get("simulation_complete") is not True
+        or result.get("requested_action_steps") != 5
+        or result.get("executed_action_steps") != 5
+    ):
+        return False
+    samples = result.get("distance_samples")
+    if not isinstance(samples, list) or len(samples) != 6:
+        return False
+    for index, item in enumerate(samples):
+        distance = item.get("minimum_distance_m") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("distance_available") is not True
+            or item.get("step_index") != decision_step + index
+            or isinstance(distance, bool)
+            or not isinstance(distance, (int, float, np.integer, np.floating))
+            or not np.isfinite(distance)
+        ):
+            return False
+    restore = result.get("snapshot_restore")
+    if not isinstance(restore, dict) or any(
+        not isinstance(restore.get(key), dict) or restore[key].get("matched") is not True
+        for key in ("before", "after")
+    ):
+        return False
+    if not isinstance(target_geom_ids, list) or not isinstance(obstacle_geom_ids, list):
+        return False
+    try:
+        return (
+            set(result.get("target_geom_ids", [])) == set(target_geom_ids)
+            and set(result.get("obstacle_geom_ids", [])) == set(obstacle_geom_ids)
+            and not (set(target_geom_ids) & set(obstacle_geom_ids))
+        )
+    except TypeError:
+        return False
+
+
+def _validated_early_repair_candidates(result, expected_shape):
+    """Recheck Early Repair's executable contract before any candidate can run."""
+    def invalid(reason):
+        return {"valid": False, "reason": reason, "candidates": []}
+
+    if not isinstance(result, dict) or result.get("executable") is not True:
+        return invalid("early_repair_did_not_report_executable")
+    if not (
+        result.get("verification_complete") is True
+        and result.get("candidate_results_complete") is True
+        and result.get("candidate_validation_complete") is True
+        and result.get("candidate_branch_main_state_restored") is True
+    ):
+        return invalid("early_repair_candidate_verification_is_incomplete")
+    restore = result.get("snapshot_restore")
+    if not isinstance(restore, dict) or any(
+        not isinstance(restore.get(key), dict) or restore[key].get("matched") is not True
+        for key in ("before", "after")
+    ):
+        return invalid("early_repair_final_snapshot_restore_not_confirmed")
+    if result.get("errors"):
+        return invalid("early_repair_report_contains_errors")
+    qualified = result.get("qualified_candidates")
+    candidate_results = result.get("candidate_results")
+    if not isinstance(qualified, list) or not qualified:
+        return invalid("early_repair_has_no_qualified_candidates")
+    if not isinstance(candidate_results, list) or not candidate_results:
+        return invalid("early_repair_candidate_results_missing")
+    by_id = {}
+    for candidate in candidate_results:
+        if not isinstance(candidate, dict):
+            return invalid("early_repair_candidate_result_malformed")
+        candidate_id = candidate.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id or candidate_id in by_id:
+            return invalid("early_repair_candidate_ids_missing_or_duplicate")
+        by_id[candidate_id] = candidate
+        if candidate.get("candidate_validation_complete") is not True:
+            return invalid("early_repair_contains_incompletely_validated_candidate_results")
+
+    validated = []
+    seen = set()
+    for item in qualified:
+        if not isinstance(item, dict):
+            return invalid("early_repair_qualified_candidate_malformed")
+        candidate_id = item.get("candidate_id")
+        verification = item.get("verification")
+        if not isinstance(candidate_id, str) or not candidate_id or candidate_id in seen:
+            return invalid("early_repair_qualified_candidate_ids_missing_or_duplicate")
+        seen.add(candidate_id)
+        candidate_result = by_id.get(candidate_id)
+        if not isinstance(verification, dict) or candidate_result is None:
+            return invalid("early_repair_qualified_candidate_has_no_matching_result")
+        if not (
+            verification.get("accepted_for_probe") is True
+            and verification.get("candidate_validation_complete") is True
+            and verification.get("full_five_step_chunk") is True
+            and verification.get("contact_monitoring_complete") is True
+            and verification.get("physical_safety_verdict") == "safe"
+            and isinstance(verification.get("action_constraints"), dict)
+            and verification["action_constraints"].get("status") == "pass"
+            and isinstance(verification.get("task_progress"), dict)
+            and verification["task_progress"].get("status") == "pass"
+            and isinstance(verification.get("endpoint_replay"), dict)
+            and verification["endpoint_replay"].get("status") == "complete"
+            and verification["endpoint_replay"].get("main_state_restored") is True
+        ):
+            return invalid("early_repair_candidate_lacks_required_safety_progress_or_restore_checks")
+        try:
+            actions = np.asarray(item.get("actions"), dtype=np.float32)
+            recorded = np.asarray(verification.get("actions"), dtype=np.float32)
+            result_actions = np.asarray(candidate_result.get("actions"), dtype=np.float32)
+        except (TypeError, ValueError):
+            return invalid("early_repair_candidate_actions_are_not_numeric")
+        if any(
+            value.shape != expected_shape or not np.isfinite(value).all()
+            for value in (actions, recorded, result_actions)
+        ):
+            return invalid("early_repair_candidate_action_shape_or_values_are_invalid")
+        if not (
+            np.array_equal(actions, recorded)
+            and np.array_equal(actions, result_actions)
+            and candidate_result.get("accepted_for_probe") is True
+        ):
+            return invalid("early_repair_candidate_actions_or_acceptance_do_not_match")
+        validated.append({"candidate_id": candidate_id, "actions": actions})
+    return {"valid": True, "reason": None, "candidates": validated}
+
+
 def run_on_policy_safety_collection_decision(
     conn,
     chunk,
@@ -701,6 +846,8 @@ def run_on_policy_safety_collection_decision(
     chunk_index,
     decision_step,
     collection_context,
+    repair_rng=None,
+    repair_selection_seed=0,
 ):
     """Verify A0 from a fresh Snapshot and optionally search for a safe A+."""
     import sys
@@ -740,6 +887,13 @@ def run_on_policy_safety_collection_decision(
         "repair_status": None,
         "repair_failure_reason": None,
         "repair_search": None,
+        "near_far_status": None,
+        "near_far_risk_verdict": None,
+        "near_far_result": None,
+        "early_repair_status": None,
+        "early_repair_search": None,
+        "early_repair_selected_candidate_id": None,
+        "repair_selection_episode_seed": int(repair_selection_seed),
         "repaired_action_chunk_A_plus": None,
         "training_action_chunk": None,
         "training_label_valid": False,
@@ -861,12 +1015,233 @@ def run_on_policy_safety_collection_decision(
             return report
 
         if report["a0_verdict"] == "safe":
+            if not isinstance(report["a0_branch_summary"].get("contact_monitoring"), dict) or report["a0_branch_summary"]["contact_monitoring"].get("status") != "complete":
+                report.update({
+                    "status": "a0_contact_monitoring_unknown",
+                    "a0_verdict": "unknown",
+                    "repair_status": "skipped_a0_unknown",
+                    "must_abort_episode": True,
+                })
+                add_failure("A0_contact_monitoring_was_not_complete")
+                return report
+
+            # Near-Far operates only on the unique object-to-object forbid pair
+            # already present in the validated Safety IR and bound to this
+            # active Geometry Inventory. Never infer a pair from object names.
+            near_far_result = None
+            pair_subject_id = None
+            pair_obstacle_id = None
+            forecast_started = False
+            try:
+                if not isinstance(snapshot.get("snapshot_state"), dict):
+                    raise ValueError("snapshot_state_missing_for_near_far_restore_verification")
+                binding_validation = collection_context.get("semantic_binding_validation")
+                if not isinstance(binding_validation, dict) or binding_validation.get("valid") is not True:
+                    raise ValueError("semantic_geometry_binding_validation_missing_or_invalid")
+                from research.gs_opd.smoke.near_far_gap_smoke import (
+                    _resolve_bound_geom_sets,
+                    _select_forbid_pair,
+                )
+                from research.gs_opd.repair.near_far import (
+                    forecast_near_far_risk,
+                )
+
+                object_rules = [
+                    rule for rule in teacher.get("object_contact_rules", [])
+                    if isinstance(rule, dict)
+                    and rule.get("decision") == "forbid"
+                    and rule.get("predicate") == "contact"
+                    and rule.get("phase") == "any"
+                ]
+                pairs = {
+                    (rule.get("subject_id"), rule.get("target_id"))
+                    for rule in object_rules
+                    if isinstance(rule.get("subject_id"), str)
+                    and isinstance(rule.get("target_id"), str)
+                }
+                if len(pairs) != 1:
+                    raise ValueError("near_far_requires_one_unambiguous_forbid_object_contact_pair")
+                pair_subject_id, pair_obstacle_id = next(iter(pairs))
+                _select_forbid_pair(teacher, pair_subject_id, pair_obstacle_id)
+                task_binding = collection_context.get("task_object_binding")
+                subject_binding = binding_validation.get("objects", {}).get(pair_subject_id)
+                if (
+                    not isinstance(task_binding, dict)
+                    or task_binding.get("object_id") != pair_subject_id
+                    or not isinstance(subject_binding, dict)
+                    or task_binding.get("body_id") != subject_binding.get("body_id")
+                ):
+                    raise ValueError("near_far_subject_does_not_match_the_validated_task_object_binding")
+                _, target_geom_ids, obstacle_geom_ids = _resolve_bound_geom_sets(
+                    binding_validation,
+                    geometry_inventory,
+                    pair_subject_id,
+                    pair_obstacle_id,
+                )
+                forecast_started = True
+                near_far_result = forecast_near_far_risk(
+                    conn,
+                    snapshot,
+                    actions,
+                    target_geom_ids,
+                    obstacle_geom_ids,
+                    decision_step=int(decision_step),
+                )
+                report["near_far_geom_bindings"] = {
+                    "subject_object_id": pair_subject_id,
+                    "obstacle_object_id": pair_obstacle_id,
+                    "target_geom_ids": target_geom_ids,
+                    "obstacle_geom_ids": obstacle_geom_ids,
+                    "source": "Safety IR pair, semantic binding, and active Geometry Inventory",
+                }
+                report["near_far_result"] = near_far_result
+                report["near_far_status"] = near_far_result.get("status")
+                report["near_far_risk_verdict"] = near_far_result.get("risk_verdict")
+            except Exception as exc:
+                if forecast_started:
+                    report["main_state_restored"] = False
+                near_far_result = {
+                    "status": "unknown",
+                    "risk_verdict": "unknown",
+                    "risk_warning": None,
+                    "unknown_reasons": [f"{type(exc).__name__}: {exc}"],
+                    "snapshot_restore": {"before": None, "after": None},
+                }
+                report["near_far_result"] = near_far_result
+                report["near_far_status"] = "unknown"
+                report["near_far_risk_verdict"] = "unknown"
+
+            restore = near_far_result.get("snapshot_restore") if isinstance(near_far_result, dict) else None
+            restore_after = restore.get("after") if isinstance(restore, dict) else None
+            if isinstance(restore_after, dict) and restore_after.get("matched") is not True:
+                report["main_state_restored"] = False
+            if not _near_far_result_is_complete(
+                near_far_result,
+                snapshot,
+                actions,
+                report["near_far_geom_bindings"].get("target_geom_ids") if isinstance(report.get("near_far_geom_bindings"), dict) else None,
+                report["near_far_geom_bindings"].get("obstacle_geom_ids") if isinstance(report.get("near_far_geom_bindings"), dict) else None,
+                int(decision_step),
+            ):
+                report.update({
+                    "status": "near_far_unknown",
+                    "a0_verdict": "unknown",
+                    "repair_status": "skipped_near_far_unknown",
+                    "must_abort_episode": True,
+                })
+                for reason in near_far_result.get("unknown_reasons", []):
+                    add_failure(reason)
+                if report["main_state_restored"] is not True:
+                    report["status"] = "aborted_main_state_restore_failed"
+                    add_failure("near_far_snapshot_restore_failed")
+                if not report["failure_reasons"]:
+                    add_failure("near_far_forecast_did_not_complete_with_resolved_verdict")
+                return report
+
+            if near_far_result.get("risk_verdict") == "no_warning":
+                report.update({
+                    "status": "a0_safe",
+                    "repair_status": "skipped_a0_safe_no_near_far_warning",
+                    "training_action_chunk": actions.tolist(),
+                    "training_label_valid": True,
+                    "label_source": "compiler_and_near_far_verified_safe_A0",
+                })
+                return report
+
+            report["repair_attempted"] = True
+            report["repair_status"] = "early_repair_searching"
+            try:
+                from research.gs_opd.repair.early_repair import run_early_repair_search
+                from research.gs_opd.repair.near_far import action_chunk_fingerprint
+
+                compiled_a0 = next(
+                    item for item in compiled.get("candidates", [])
+                    if isinstance(item, dict)
+                    and item.get("candidate_id") == a0_candidate_id
+                    and item.get("verdict") == "safe"
+                )
+                a0_physical_validation = {
+                    "main_state_restored": True,
+                    "snapshot_id": report["snapshot_id"],
+                    "action_chunk_sha256": action_chunk_fingerprint(actions),
+                    "branch_candidate": baseline_candidate,
+                    "compiler_candidate": compiled_a0,
+                }
+                early = run_early_repair_search(
+                    conn,
+                    snapshot,
+                    actions,
+                    near_far_result,
+                    teacher,
+                    semantic_results,
+                    collection_context["semantic_binding_validation"],
+                    geometry_inventory,
+                    gripper_inventory,
+                    collection_context["repair_context"],
+                    collection_context.get("task_object_binding"),
+                    a0_physical_validation,
+                    subject_object_id=pair_subject_id,
+                    obstacle_object_id=pair_obstacle_id,
+                )
+            except Exception as exc:
+                early = {
+                    "status": "not_executable",
+                    "executable": False,
+                    "verification_complete": False,
+                    "candidate_results_complete": False,
+                    "candidate_validation_complete": False,
+                    "qualified_candidates": [],
+                    "candidate_results": [],
+                    "snapshot_restore": {"before": None, "after": None},
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+            report["early_repair_search"] = early
+            report["early_repair_status"] = early.get("status")
+            report["main_state_restored"] = (
+                isinstance(early.get("snapshot_restore"), dict)
+                and isinstance(early["snapshot_restore"].get("after"), dict)
+                and early["snapshot_restore"]["after"].get("matched") is True
+            )
+            validated_candidates = _validated_early_repair_candidates(early, actions.shape)
+            if not validated_candidates.get("valid"):
+                report.update({
+                    "status": (
+                        "aborted_main_state_restore_failed"
+                        if report["main_state_restored"] is not True
+                        else "early_repair_unavailable"
+                    ),
+                    "repair_status": "early_repair_failed",
+                    "must_abort_episode": True,
+                })
+                report["repair_failure_reason"] = validated_candidates.get("reason")
+                add_failure(validated_candidates.get("reason"))
+                for reason in early.get("errors", []):
+                    add_failure(reason)
+                return report
+
+            rng = repair_rng if repair_rng is not None else np.random.default_rng(repair_selection_seed)
+            try:
+                selected_index = int(rng.integers(len(validated_candidates["candidates"])))
+            except Exception as exc:
+                report.update({
+                    "status": "early_repair_unavailable",
+                    "repair_status": "early_repair_failed",
+                    "must_abort_episode": True,
+                })
+                add_failure(f"early_repair_candidate_selection_failed:{type(exc).__name__}:{exc}")
+                return report
+            selected = validated_candidates["candidates"][selected_index]
+            plus = selected["actions"]
             report.update({
-                "status": "a0_safe",
-                "repair_status": "skipped_a0_safe",
-                "training_action_chunk": actions.tolist(),
+                "status": "a0_safe_early_repaired",
+                "repair_status": "early_repair_candidate_selected",
+                "early_repair_status": "qualified_candidate_selected",
+                "early_repair_selected_candidate_id": selected["candidate_id"],
+                "early_repair_selection_index": selected_index,
+                "repaired_action_chunk_A_plus": plus.tolist(),
+                "training_action_chunk": plus.tolist(),
                 "training_label_valid": True,
-                "label_source": "compiler_verified_safe_A0",
+                "label_source": "near_far_verified_geometry_guided_A_plus",
             })
             return report
 
@@ -1048,6 +1423,47 @@ def select_verified_execution_chunk(decision, predicted_actions):
 
     verdict = decision.get("a0_verdict")
     if verdict == "safe":
+        if decision.get("status") == "a0_safe_early_repaired":
+            if not (
+                decision.get("training_label_valid") is True
+                and decision.get("repair_attempted") is True
+                and decision.get("repair_status") == "early_repair_candidate_selected"
+                and decision.get("early_repair_status") == "qualified_candidate_selected"
+                and decision.get("main_state_restored") is True
+            ):
+                return {"valid": False, "reason": "early_repair_selection_or_restore_is_not_valid"}
+            validated = _validated_early_repair_candidates(
+                decision.get("early_repair_search"), a0.shape
+            )
+            if not validated.get("valid"):
+                return {"valid": False, "reason": validated.get("reason")}
+            candidate_id = decision.get("early_repair_selected_candidate_id")
+            selected = next(
+                (item for item in validated["candidates"] if item["candidate_id"] == candidate_id),
+                None,
+            )
+            try:
+                plus = np.asarray(decision.get("repaired_action_chunk_A_plus"), dtype=np.float32)
+                labeled = np.asarray(decision.get("training_action_chunk"), dtype=np.float32)
+            except (TypeError, ValueError):
+                return {"valid": False, "reason": "early_repair_selected_actions_are_not_numeric"}
+            if (
+                selected is None
+                or plus.shape != a0.shape
+                or labeled.shape != a0.shape
+                or not np.isfinite(plus).all()
+                or not np.isfinite(labeled).all()
+                or not np.array_equal(plus, labeled)
+                or not np.array_equal(plus, selected["actions"])
+            ):
+                return {"valid": False, "reason": "early_repair_selected_candidate_actions_do_not_match"}
+            return {
+                "valid": True,
+                "actions": plus.copy(),
+                "source": "near_far_verified_geometry_guided_A_plus",
+                "candidate_id": candidate_id,
+                "reason": None,
+            }
         if decision.get("status") != "a0_safe" or decision.get("training_label_valid") is not True:
             return {"valid": False, "reason": "safe_A0_is_not_marked_valid"}
         try:
@@ -1127,8 +1543,12 @@ def _classify_safety_abort(decision):
     status = decision.get("status")
     if status in ("invalid_A0_action_shape", "invalid_A0_action_values"):
         return "invalid_action"
+    if decision.get("near_far_status") == "unknown":
+        return "near_far_verification_unknown"
     if decision.get("a0_verdict") == "unknown":
         return "safety_verification_unknown"
+    if decision.get("early_repair_status") not in (None, "qualified_candidate_selected"):
+        return "early_repair_failed"
     if status in ("violation_unrepaired", "repair_exception"):
         return "repair_failed"
     if decision.get("a0_verdict") == "violation":
@@ -1214,6 +1634,8 @@ try:
     trace_writer = None
     collection_enabled = args.on_policy_safety_collection
     trace_output_path = args.on_policy_safety_out if collection_enabled else args.trace_out
+    repair_selection_seed = 0
+    repair_selection_rng = np.random.default_rng(repair_selection_seed) if collection_enabled else None
     if trace_output_path is not None:
         import sys
 
@@ -1254,6 +1676,7 @@ try:
                     else None
                 ),
                 "task_binding_policy": "per-run Safety IR binding validated against the active fixed-task MuJoCo model",
+                "repair_selection_episode_seed": repair_selection_seed,
             })
         trace_writer = TrajectoryWriter(
             trace_output_path,
@@ -1366,6 +1789,8 @@ try:
                     chunk_index=chunk_index,
                     decision_step=steps,
                     collection_context=collection_context,
+                    repair_rng=repair_selection_rng,
+                    repair_selection_seed=repair_selection_seed,
                 )
             except Exception as exc:
                 safety_decision = {

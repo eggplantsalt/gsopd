@@ -1265,3 +1265,18 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 覆盖 S70 以外决策索引、多个合格候选、无合格候选、Near–Far unknown、A⁰ 物理证明失败、候选验证不完整和 Snapshot 恢复失败。
 - [x] 旧 S70 Smoke 候选 ID 默认行为通过回归测试。
 - [ ] 在真实 Bridge 上为当前任意决策状态提供已验证输入并人工运行；未运行前不声称存在真实可用候选。
+
+## GS-OPD Step 2.3：On-Policy Near–Far 与 Early Repair 执行集成
+
+- 在现有 `run_on_policy_safety_collection_decision()` 中，复用 A⁰ 的同一次 Snapshot、完整五步 Branch 与 Contact Compiler 结果。仅当 Compiler 明确判定 safe 且分支接触监测完整时，才进行 Near–Far 预警；A⁰ violation 继续走原有 Verifier-Guided Repair。
+- Near–Far 对象对必须来自 Safety IR 中唯一的 `forbid contact` object-to-object 规则，并通过现有语义绑定校验、当前 Geometry Inventory、任务物体绑定解析目标和障碍 Geom 集合。缺少唯一规则、有效绑定、完整间距样本或 Snapshot 恢复证明时，当前 Chunk 在主环境执行前终止。
+- Near–Far complete/no_warning 时选择并执行 A⁰。complete/warning 时，将同一 Snapshot、A⁰ 指纹、原始分支与 safe Compiler 候选及全部当前验证输入交给 `run_early_repair_search()`；对其 executable、全候选验证完成、分支及最终 Snapshot 恢复状态、动作形状/有限值和候选 ID/动作一致性再次 fail-closed 校验，然后从合格候选中随机选择并执行一条 A⁺。
+- 随机选择器使用每个 Episode 持续复用的 `numpy.random.default_rng(0)`，并把 Episode seed、Near–Far 完整结果、Early Repair 报告、选择索引/候选 ID、原始 A⁰ 和实际 `selected_action_chunk`/来源写入既有 decision safety record。`TrajectoryWriter` 与 NPZ Schema 未修改。Student 下一决策仍由实际执行后的新观测生成。
+- 新增单测覆盖 A⁰ safe/no-warning、warning 下多个候选与固定 seed 的可复现选择、Near–Far unknown、无 Early Repair 合格候选、Early Repair 最终恢复失败、主环境动作前的终止门控，并保留 A⁰ violation→Verifier-Guided Repair 回归。On-Policy 测试 24 项通过；Near–Far、Early Repair 和原有 Repair 相关测试共 60 项通过（5 项因需要 LIBERO-Safety MuJoCo 环境跳过）。语法检查与 `git diff --check` 通过。没有启动模型、Bridge 或仿真，真实环境下候选表现尚未验证。
+
+**检查清单（Checklist）**
+
+- [x] safe/no-warning 执行已验证 A⁰；safe/warning 仅执行完整验证并恢复成功的随机选择 A⁺；violation 仍使用现有 Verifier-Guided Repair。
+- [x] Near–Far 几何集合来自 Safety IR、已校验语义绑定和当前 Geometry Inventory；复用 A⁰ 的 Branch/Compiler 结果。
+- [x] unknown、无合格候选、动作无效或恢复未确认的路径在当前 Chunk 主环境 `step` 前终止；测试及静态检查通过。
+- [ ] 人工启动 Bridge 并运行受限 On-Policy Episode，检查 Near–Far 预警、选中候选 ID、实际动作与执行后 Snapshot/任务状态。

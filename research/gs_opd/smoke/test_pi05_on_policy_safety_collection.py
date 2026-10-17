@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import numpy as np
 from research.gs_opd.data.trajectory_writer import TrajectoryWriter
+from research.gs_opd.repair.near_far import action_chunk_fingerprint
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -28,6 +29,8 @@ def _load_helpers():
         "_resolve_task_object_binding",
         "prepare_on_policy_safety_collection",
         "run_on_policy_safety_collection_decision",
+        "_near_far_result_is_complete",
+        "_validated_early_repair_candidates",
         "select_verified_execution_chunk",
         "_new_safety_episode_summary",
         "_update_safety_episode_summary",
@@ -217,6 +220,125 @@ def _branch(candidate_id, action_count, *, restored=True):
     return {"main_state_restored": restored, "candidates": [candidate]}
 
 
+def _near_far_context():
+    context = _context()
+    teacher = context["teacher"]
+    teacher["objects"] = [
+        {"id": "object_1", "name": "carried bowl", "role": "target_object"},
+        {"id": "object_2", "name": "route obstacle", "role": "obstacle"},
+    ]
+    teacher["object_contact_rules"] = [{
+        "id": "forbid_carried_object_contact",
+        "subject_id": "object_1",
+        "target_id": "object_2",
+        "predicate": "contact",
+        "decision": "forbid",
+        "phase": "any",
+        "reason": "Keep the carried object clear of the obstacle.",
+    }]
+    semantic_results = {
+        "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
+        "object_2": _semantic_binding("object_2", 22, "obstacle_body", 32),
+    }
+    semantic_results["object_1"]["teacher_object"].update({
+        "name": "carried bowl", "role": "target_object"
+    })
+    semantic_results["object_2"]["teacher_object"].update({
+        "name": "route obstacle", "role": "obstacle"
+    })
+    geometry, gripper = _bridge_preflight_inventories(semantic_results)
+    context.update({
+        "object_id": "object_1",
+        "semantic_result": semantic_results["object_1"],
+        "semantic_results": semantic_results,
+        "object_contact_rules": teacher["object_contact_rules"],
+        "semantic_binding_validation": {
+            "valid": True,
+            "objects": {
+                object_id: {
+                    "status": "matches_current_geometry_inventory",
+                    "body_id": result["physical_association"]["body_id"],
+                    "body_name": result["physical_association"]["body_name"],
+                    "geom_ids": result["physical_association"]["geom_ids"],
+                }
+                for object_id, result in semantic_results.items()
+            },
+        },
+        "geometry_inventory": geometry,
+        "gripper_inventory": gripper,
+        "safety_target_binding": {"object_id": "object_1", "body_id": 21},
+        "task_object_binding": {"status": "matched_by_iou", "object_id": "object_1", "body_id": 21},
+    })
+    return context
+
+
+def _complete_near_far_result(actions, *, risk="no_warning", restored=True, decision_step=0):
+    return {
+        "status": "complete" if restored else "unknown",
+        "risk_verdict": risk if restored else "unknown",
+        "risk_warning": risk == "warning" if restored else None,
+        "snapshot_id": "snapshot-safe",
+        "action_chunk_sha256": action_chunk_fingerprint(actions),
+        "target_geom_ids": [31],
+        "obstacle_geom_ids": [32],
+        "requested_action_steps": 5,
+        "executed_action_steps": 5,
+        "simulation_complete": True,
+        "distance_samples": [
+            {
+                "distance_available": True,
+                "minimum_distance_m": 0.1 - index * 0.001,
+                "step_index": decision_step + index,
+            }
+            for index in range(6)
+        ],
+        "snapshot_restore": {
+            "before": {"matched": True},
+            "after": {"matched": restored},
+        },
+        "unknown_reasons": [] if restored else ["snapshot_restore_after_forecast_failed"],
+    }
+
+
+def _qualified_early_result(actions_by_id, *, restored=True, executable=True):
+    results = []
+    qualified = []
+    for candidate_id, actions in actions_by_id.items():
+        candidate = {
+            "candidate_id": candidate_id,
+            "actions": np.asarray(actions, dtype=np.float32).tolist(),
+            "accepted_for_probe": True,
+            "candidate_validation_complete": True,
+            "full_five_step_chunk": True,
+            "contact_monitoring_complete": True,
+            "physical_safety_verdict": "safe",
+            "action_constraints": {"status": "pass"},
+            "task_progress": {"status": "pass"},
+            "endpoint_replay": {"status": "complete", "main_state_restored": True},
+        }
+        results.append(candidate)
+        qualified.append({
+            "candidate_id": candidate_id,
+            "actions": candidate["actions"],
+            "verification": candidate,
+        })
+    return {
+        "status": "qualified_candidates_available" if executable else "not_executable",
+        "executable": executable,
+        "verification_complete": True,
+        "candidate_results_complete": True,
+        "candidate_validation_complete": True,
+        "candidate_branch_main_state_restored": True,
+        "candidate_results": results,
+        "qualified_candidates": qualified,
+        "snapshot_restore": {
+            "before": {"matched": True},
+            "after": {"matched": restored},
+        },
+        "errors": [] if restored else ["snapshot_restore_unverified"],
+    }
+
+
 class OnPolicySafetyCollectionTests(unittest.TestCase):
     def setUp(self):
         self.helpers = _load_helpers()
@@ -225,9 +347,11 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.call = self.helpers["run_on_policy_safety_collection_decision"]
 
     def test_safe_a0_is_a_valid_label_and_skips_repair(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        context = _near_far_context()
         conn = FakeConnection([
-            {"snapshot_id": "snapshot-1"},
-            _branch("on-policy-A0-000000", len(self.chunk)),
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000000", len(actions)),
         ])
         compiled = {
             "status": "safe",
@@ -237,19 +361,176 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
             return_value=compiled,
         ) as compiler, patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=_complete_near_far_result(actions, decision_step=9),
+        ) as forecast, patch(
             "research.gs_opd.repair.verifier_guided_repair.run_verifier_guided_repair",
         ) as repair:
-            result = self.call(conn, self.chunk, "move the bowl", 0, 0, _context())
+            result = self.call(conn, actions, "move the bowl", 0, 9, context)
 
         self.assertEqual(result["a0_verdict"], "safe")
         self.assertEqual(result["status"], "a0_safe")
         self.assertTrue(result["training_label_valid"])
-        np.testing.assert_array_equal(result["training_action_chunk"], self.chunk.tolist())
+        np.testing.assert_array_equal(result["training_action_chunk"], actions.tolist())
         self.assertFalse(result["repair_attempted"])
-        self.assertEqual(result["semantic_binding_results"], _context()["semantic_results"])
-        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], _context()["semantic_results"])
+        self.assertEqual(result["semantic_binding_results"], context["semantic_results"])
+        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], context["semantic_results"])
+        self.assertEqual(forecast.call_args.args[3:5], ([31], [32]))
+        self.assertEqual(result["near_far_risk_verdict"], "no_warning")
         repair.assert_not_called()
         self.assertEqual([request["op"] for request in conn.requests], ["snapshot", "branch_rollout"])
+
+    def test_safe_a0_warning_selects_only_fully_qualified_early_repair_candidate(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        candidate_a = actions.copy()
+        candidate_a[:, 0] = 0.01
+        candidate_b = actions.copy()
+        candidate_b[:, 1] = -0.01
+        context = _near_far_context()
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000004", "verdict": "safe"}],
+        }
+        early = _qualified_early_result({"early-left": candidate_a, "early-right": candidate_b})
+
+        def decide(seed):
+            connection = FakeConnection([
+                {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+                _branch("on-policy-A0-000004", len(actions)),
+            ])
+            with patch(
+                "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+                return_value=compiled,
+            ), patch(
+                "research.gs_opd.repair.near_far.forecast_near_far_risk",
+                return_value=_complete_near_far_result(actions, risk="warning", decision_step=17),
+            ) as forecast, patch(
+                "research.gs_opd.repair.early_repair.run_early_repair_search",
+                return_value=early,
+            ) as early_search:
+                result = self.call(
+                    connection,
+                    actions,
+                    "move the carried bowl",
+                    4,
+                    17,
+                    context,
+                    repair_rng=np.random.default_rng(seed),
+                    repair_selection_seed=seed,
+                )
+            self.assertEqual([request["op"] for request in connection.requests], ["snapshot", "branch_rollout"])
+            self.assertEqual(early_search.call_args.args[1]["snapshot_id"], "snapshot-safe")
+            self.assertEqual(early_search.call_args.args[2].shape, (5, 7))
+            self.assertEqual(early_search.call_args.kwargs["subject_object_id"], "object_1")
+            self.assertEqual(early_search.call_args.kwargs["obstacle_object_id"], "object_2")
+            self.assertEqual(forecast.call_args.args[3:5], ([31], [32]))
+            return result
+
+        first = decide(23)
+        second = decide(23)
+        self.assertEqual(first["a0_verdict"], "safe")
+        self.assertEqual(first["status"], "a0_safe_early_repaired")
+        self.assertEqual(first["near_far_risk_verdict"], "warning")
+        self.assertEqual(first["repair_selection_episode_seed"], 23)
+        self.assertTrue(first["training_label_valid"])
+        self.assertEqual(first["early_repair_selected_candidate_id"], second["early_repair_selected_candidate_id"])
+        selected = self.helpers["select_verified_execution_chunk"](first, actions)
+        self.assertTrue(selected["valid"])
+        self.assertEqual(selected["candidate_id"], first["early_repair_selected_candidate_id"])
+        self.assertEqual(selected["source"], "near_far_verified_geometry_guided_A_plus")
+        self.assertFalse(np.array_equal(selected["actions"], actions))
+
+    def test_near_far_unknown_stops_before_early_repair_or_main_step(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        context = _near_far_context()
+        connection = FakeConnection([
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000000", len(actions)),
+        ])
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000000", "verdict": "safe"}],
+        }
+        unknown = {**_complete_near_far_result(actions), "status": "unknown", "risk_verdict": "unknown", "risk_warning": None}
+        with patch(
+            "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            return_value=compiled,
+        ), patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=unknown,
+        ), patch(
+            "research.gs_opd.repair.early_repair.run_early_repair_search",
+        ) as early:
+            result = self.call(connection, actions, "move the bowl", 0, 6, context)
+
+        self.assertEqual(result["status"], "near_far_unknown")
+        self.assertEqual(result["a0_verdict"], "unknown")
+        self.assertTrue(result["must_abort_episode"])
+        self.assertFalse(self.helpers["select_verified_execution_chunk"](result, actions)["valid"])
+        self.assertFalse(any(request["op"] == "step" for request in connection.requests))
+        early.assert_not_called()
+
+    def test_early_repair_without_qualified_candidate_stops_before_main_step(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        context = _near_far_context()
+        connection = FakeConnection([
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000000", len(actions)),
+        ])
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000000", "verdict": "safe"}],
+        }
+        no_candidate = _qualified_early_result({}, executable=False)
+        with patch(
+            "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            return_value=compiled,
+        ), patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=_complete_near_far_result(actions, risk="warning", decision_step=7),
+        ), patch(
+            "research.gs_opd.repair.early_repair.run_early_repair_search",
+            return_value=no_candidate,
+        ):
+            result = self.call(connection, actions, "move the bowl", 0, 7, context)
+
+        self.assertEqual(result["status"], "early_repair_unavailable")
+        self.assertTrue(result["must_abort_episode"])
+        self.assertFalse(result["training_label_valid"])
+        self.assertFalse(self.helpers["select_verified_execution_chunk"](result, actions)["valid"])
+        self.assertFalse(any(request["op"] == "step" for request in connection.requests))
+
+    def test_early_repair_snapshot_restore_failure_stops_before_main_step(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        context = _near_far_context()
+        connection = FakeConnection([
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000000", len(actions)),
+        ])
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000000", "verdict": "safe"}],
+        }
+        actions_plus = actions.copy()
+        actions_plus[:, 0] = 0.01
+        restore_failure = _qualified_early_result({"candidate": actions_plus}, restored=False, executable=False)
+        with patch(
+            "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            return_value=compiled,
+        ), patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=_complete_near_far_result(actions, risk="warning", decision_step=8),
+        ), patch(
+            "research.gs_opd.repair.early_repair.run_early_repair_search",
+            return_value=restore_failure,
+        ):
+            result = self.call(connection, actions, "move the bowl", 0, 8, context)
+
+        self.assertEqual(result["status"], "aborted_main_state_restore_failed")
+        self.assertFalse(result["main_state_restored"])
+        self.assertTrue(result["must_abort_episode"])
+        self.assertFalse(self.helpers["select_verified_execution_chunk"](result, actions)["valid"])
+        self.assertFalse(any(request["op"] == "step" for request in connection.requests))
 
     def test_unknown_a0_is_recorded_and_skips_repair(self):
         conn = FakeConnection([
@@ -391,6 +672,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertEqual(result["status"], "aborted_main_state_restore_failed")
         self.assertFalse(result["training_label_valid"])
         self.assertTrue(self.helpers["_must_abort_safety_episode"](result))
+        self.assertFalse(any(request["op"] == "step" for request in conn.requests))
 
     def test_verified_safe_a0_is_selected_for_execution(self):
         decision = {
@@ -460,6 +742,10 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.assertEqual(
             classify({"main_state_restored": True, "status": "a0_unknown", "a0_verdict": "unknown"}),
             "safety_verification_unknown",
+        )
+        self.assertEqual(
+            classify({"main_state_restored": True, "status": "near_far_unknown", "near_far_status": "unknown", "a0_verdict": "unknown"}),
+            "near_far_verification_unknown",
         )
         self.assertEqual(
             classify({"main_state_restored": True, "status": "violation_unrepaired", "a0_verdict": "violation"}),
