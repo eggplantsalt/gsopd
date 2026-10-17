@@ -1193,3 +1193,45 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 所有候选都受 36 条硬上限、同一 Snapshot Branch、完整 Contact Monitoring、Compiler、同五步搬运进度、OSC/Workspace/关节和间隙 Restore 检查约束。
 - [x] 12 项轻量单测、Python 语法检查和 `git diff --check` 通过；不产生 A⁺ 训练标签，未启动仿真或模型。
 - [ ] 人工运行 Bridge Smoke 并审查逐候选 JSON；不把几何余量或五步探测通过外推为未来安全。
+
+## S70→S75′ Student 闭环前瞻验证 Smoke（2026-10-17）
+
+- 新增 `research/gs_opd/smoke/early_repair_student_lookahead_smoke.py`。它读取已有 `logs/gs_opd/early_repair_s70.json`，只选择 `accepted_for_probe=true` 且保存的 `endpoint_gap_m >= 0.010` 的修正候选，按文件顺序最多选 2 条；候选不足时不降低阈值，并明确设置 `no_eligible_repair_candidates`。无合格修正候选时仍可单独评估原始 A⁰ 路线。
+- 从归档重放前 70 个实际动作，严格核对任务指令与 S70 机器人状态，校验 Teacher 两个对象绑定与当前 Geometry Inventory，再建立唯一 S70 Snapshot。A⁰ 与所选修正候选在同一次 `branch_rollout` 请求中从该 Snapshot 各自执行五步；每条路线必须完整执行、Contact Monitoring 子步覆盖完整、Contact Compiler verdict 为 safe、当前控制器动作范围有效，并通过与 A⁰ 同五步的目标物体任务进度比较，才会进入 S75′ 的真实观测和 Student 推理阶段。
+- 每条通过当前五步门槛的路线都会先恢复并严格核验 S70，再在主 Bridge 环境逐步执行该路线的五个动作，以获取各自真实的 S75/S75′ RGB、机器人状态、reward/done 和最终 Snapshot。分支端点与普通 `step(include_snapshot_state=true)` 的完整诊断均保留；物理一致性以完整 `mujoco_integration_state` 按 `1e-6` 比较，派生运动学缓存差异单独诊断。随后从该路线的 S75 Snapshot 重新调用 π₀.₅ 预测五步，并通过另一个 `branch_rollout` 完整记录物理子步接触、调用同一 Teacher/Compiler 判定，最后核验 S75 分支恢复和 S70 主状态恢复。
+- Student 配置与 `pi05_rollout.py` 对齐：默认 checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`、`libero_spatial_openpi_pi05_smoke` Hydra 配置、`get_model(...).to("cuda:0").eval()`、`openpi.torch_compile=false`、`predict_action_batch(mode="eval")`；不导入会立即加载模型/启动 Rollout 的 `pi05_rollout.py`。图像使用 `get_libero_image()` 与 `get_libero_wrist_image()` 旋转 180°，状态编码为 EEF position + `quat2axisangle(EEF quaternion)` + gripper qpos。预测结果必须是有限 `(5,7)` 动作且通过当前 OSC 输入范围检查。
+- JSON 逐路线记录 S70 五步安全、Compiler 与首次违规证据、任务进度、S75 真实 RGB 尺寸与状态、黑碗/香水瓶绑定间隙、该状态重新预测的完整 Student 动作、后续五步的完整物理子步覆盖、Safety verdict、首次违规控制步/物理子步、相对 A⁰ Student 路线的同五步任务进度诊断、异常及 Snapshot 恢复结果。数据只写报告 JSON，不写入 NPZ 或 A⁺ 训练集；几何间隙不是安全证明。
+- 新增 7 项纯轻量单测，覆盖候选 `>=10mm` 选择及最多 2 条、无候选时不放宽阈值、坏动作拒绝、当前 Chunk fail-closed 门槛、Student `(5,7)`/有限值校验和违规时间映射。单测、Python 语法检查与 `git diff --check` 通过；未启动 Bridge、MuJoCo 仿真或 π₀.₅ 模型，因此尚无实际 S75′ 安全结论。
+
+### 手动运行命令
+
+终端一启动 LIBERO-Safety Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二运行 S70→S75′ Student 前瞻验证（会加载 π₀.₅ 并运行有限的 Bridge 分支仿真）：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/early_repair_student_lookahead_smoke.py \
+  --archive logs/gs_opd/on_policy_safety_l0t0_object_v2_80step.npz \
+  --early-repair-json logs/gs_opd/early_repair_s70.json \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --checkpoint /workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft \
+  --out logs/gs_opd/early_repair_student_lookahead.json
+```
+
+**检查清单（Checklist）**
+
+- [x] 候选选择严格使用既有 `accepted_for_probe` 和 `endpoint_gap_m >= 10mm`，最多 2 条；原始 A⁰ 路线始终独立纳入。
+- [x] S70 当前 Chunk 与每条 S75′ Student Chunk 均走现有 Snapshot、Branch、完整 Contact Monitor 和 Teacher Contact Compiler；后续 Student 动作由该路线真实 S75 观测重新推理。
+- [x] 7 项轻量单测、语法检查和 `git diff --check` 通过；未启动模型或仿真，未生成训练标签。
+- [ ] 人工运行 Smoke，检查各路线当前 Chunk 门槛、S75′ 新预测、后续 Contact verdict/首次违规时间及最终 S70 恢复。
