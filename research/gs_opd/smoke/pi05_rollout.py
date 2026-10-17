@@ -594,17 +594,35 @@ def prepare_on_policy_safety_collection(
         for reason in preflight.get("unknown_reasons", [])
         if reason != "branch_rollout_has_no_candidate_results"
     ]
-    has_gripper_rule = any(
-        isinstance(rule, dict)
+    selected_contact_rules = [
+        rule
+        for rule in teacher.get("rules", [])
+        if isinstance(rule, dict)
         and rule.get("target_id") == object_id
         and rule.get("predicate") == "contact"
-        and "gripper" in rule.get("subject_parts", [])
-        for rule in teacher.get("rules", [])
-    )
-    if not has_gripper_rule and not object_contact_rules:
+    ]
+    if not selected_contact_rules and not object_contact_rules:
         preflight_errors.append("teacher_has_no_supported_contact_rules_for_collection")
-    if has_gripper_rule and preflight.get("compiled_rule") is None:
-        preflight_errors.append("gripper_contact_rule_did_not_compile")
+    if selected_contact_rules:
+        # The current robot-part compiler accepts exactly one gripper rule for
+        # this target. An explicit allow is valid without the forbid-only
+        # compiled_rule field; all other shapes remain fail-closed.
+        if len(selected_contact_rules) != 1:
+            preflight_errors.append("multiple_or_conflicting_gripper_contact_rules")
+        else:
+            selected_rule = selected_contact_rules[0]
+            supported_gripper_rule = (
+                selected_rule.get("subject_parts") == ["gripper"]
+                and selected_rule.get("phase") == "any"
+                and selected_rule.get("decision") in ("allow", "forbid")
+            )
+            if not supported_gripper_rule:
+                preflight_errors.append("unsupported_or_unknown_gripper_contact_rule")
+            elif (
+                selected_rule["decision"] == "forbid"
+                and preflight.get("compiled_rule") is None
+            ):
+                preflight_errors.append("gripper_contact_rule_did_not_compile")
     if (
         preflight.get("target_binding") is None
         or not preflight.get("gripper_geom_ids")

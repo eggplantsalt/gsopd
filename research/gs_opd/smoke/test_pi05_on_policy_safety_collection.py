@@ -137,6 +137,71 @@ def _semantic_binding(object_id, body_id, body_name, geom_id):
     }
 
 
+def _bridge_preflight_inventories(semantic_results):
+    mapped_geometries = {}
+    for result in semantic_results.values():
+        association = result["physical_association"]
+        geom_id = association["geom_ids"][0]
+        mapped_geometries[geom_id] = {
+            "geom_id": geom_id,
+            "geom_name": f"geom_{geom_id}",
+            "body_id": association["body_id"],
+            "body_name": association["body_name"],
+            "category": "scene",
+        }
+    geom_count = max([1, *mapped_geometries]) + 1
+    geometries = []
+    for geom_id in range(geom_count):
+        if geom_id in mapped_geometries:
+            geometries.append(mapped_geometries[geom_id])
+        elif geom_id == 0:
+            geometries.append({
+                "geom_id": 0,
+                "geom_name": "gripper_geom",
+                "body_id": 1,
+                "body_name": "robot_gripper_body",
+                "category": "robot",
+            })
+        elif geom_id == 1:
+            geometries.append({
+                "geom_id": 1,
+                "geom_name": "arm_geom",
+                "body_id": 2,
+                "body_name": "robot_arm_body",
+                "category": "robot",
+            })
+        else:
+            geometries.append({
+                "geom_id": geom_id,
+                "geom_name": f"scene_geom_{geom_id}",
+                "body_id": 1000 + geom_id,
+                "body_name": f"scene_body_{geom_id}",
+                "category": "scene",
+            })
+    geometry_inventory = {
+        "status": "complete",
+        "robot_classification_status": "available",
+        "geom_count": geom_count,
+        "geometries": geometries,
+    }
+    gripper_inventory = {
+        "status": "complete",
+        "robot_classification_status": "available",
+        "robot_body_ids": [1, 2],
+        "model_body_count": 3,
+        "grippers": [{
+            "status": "complete",
+            "geometries": [{
+                "geom_id": 0,
+                "geom_name": "gripper_geom",
+                "body_id": 1,
+                "body_name": "robot_gripper_body",
+            }],
+        }],
+    }
+    return geometry_inventory, gripper_inventory
+
+
 def _branch(candidate_id, action_count, *, restored=True):
     candidate = {
         "candidate_id": candidate_id,
@@ -355,19 +420,16 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
             "object_2": _semantic_binding("object_2", 22, "blocker_body", 32),
         }
-        geometry = {
-            "status": "complete",
-            "geometries": [
-                {"geom_id": 31, "geom_name": "bowl_geom", "body_id": 21, "body_name": "bowl_body", "category": "scene"},
-                {"geom_id": 32, "geom_name": "blocker_geom", "body_id": 22, "body_name": "blocker_body", "category": "scene"},
-            ],
-        }
-        preflight = {
-            "compiled_rule": None,
-            "target_binding": {"object_id": "object_1", "body_id": 21, "geom_ids": [31]},
-            "gripper_geom_ids": [3, 4],
-            "unknown_reasons": ["branch_rollout_has_no_candidate_results"],
-        }
+        geometry, gripper = _bridge_preflight_inventories(semantic_results)
+        teacher["rules"] = [{
+            "id": "gripper_allow_pickup",
+            "subject_parts": ["gripper"],
+            "target_id": "object_1",
+            "predicate": "contact",
+            "decision": "allow",
+            "phase": "any",
+            "reason": "The task requires picking up the target object.",
+        }]
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             teacher_path = root / "teacher.json"
@@ -376,36 +438,81 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             semantic_path.write_text(json.dumps(semantic_results), encoding="utf-8")
             conn = FakeConnection([
                 geometry,
-                {"status": "complete", "gripper_geom_ids": [3, 4]},
+                gripper,
                 {"status": "available"},
             ])
-            with patch(
-                "research.gs_opd.smoke.replay_archive_contact_smoke._validate_current_bindings",
-                return_value={"valid": True, "objects": {"object_1": {}, "object_2": {}}, "errors": []},
-            ) as validate_bindings, patch(
-                "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
-                return_value=preflight,
-            ) as compiler:
-                context = self.helpers["prepare_on_policy_safety_collection"](
-                    conn,
-                    teacher_path,
-                    "object_1",
-                    semantic_results_path=semantic_path,
-                )
+            context = self.helpers["prepare_on_policy_safety_collection"](
+                conn,
+                teacher_path,
+                "object_1",
+                semantic_results_path=semantic_path,
+            )
 
         self.assertEqual(set(context["semantic_results"]), {"object_1", "object_2"})
         self.assertTrue(context["semantic_binding_validation"]["valid"])
         self.assertEqual(context["task_object_binding"]["object_id"], "object_1")
         self.assertEqual(context["task_object_id"], "object_1")
         self.assertEqual(context["task_object_binding"]["body_id"], 21)
-        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], semantic_results)
-        self.assertEqual(validate_bindings.call_args.args[1], semantic_results)
+        self.assertIsNone(context["preflight_result"]["compiled_rule"])
+        self.assertEqual(
+            context["preflight_result"]["unknown_reasons"],
+            ["branch_rollout_has_no_candidate_results"],
+        )
+
+    def test_mixed_gripper_allow_and_object_forbid_preflight_uses_real_compiler(self):
+        # Mirrors the current L0T0 pattern: allow grasping the carried bowl,
+        # while forbidding its contact with the route obstacle.
+        teacher = _teacher_v2_object_only()
+        teacher["objects"][0]["name"] = "akita black bowl"
+        teacher["objects"][1]["id"] = "object_4"
+        teacher["objects"][1]["name"] = "small ridged cylinder"
+        teacher["objects"][1]["role"] = "obstacle"
+        teacher["object_contact_rules"][0]["target_id"] = "object_4"
+        teacher["rules"] = [{
+            "id": "rule_1",
+            "subject_parts": ["gripper"],
+            "target_id": "object_1",
+            "predicate": "contact",
+            "decision": "allow",
+            "phase": "any",
+            "reason": "The task requires picking up the bowl.",
+        }]
+        semantic_results = {
+            "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
+            "object_4": _semantic_binding("object_4", 22, "obstacle_body", 32),
+        }
+        semantic_results["object_1"]["teacher_object"]["name"] = "akita black bowl"
+        semantic_results["object_4"]["teacher_object"]["name"] = "small ridged cylinder"
+        geometry, gripper = _bridge_preflight_inventories(semantic_results)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic_results.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_results), encoding="utf-8")
+            conn = FakeConnection([geometry, gripper, {"status": "available"}])
+            context = self.helpers["prepare_on_policy_safety_collection"](
+                conn,
+                teacher_path,
+                "object_1",
+                semantic_results_path=semantic_path,
+            )
+
+        self.assertTrue(context["semantic_binding_validation"]["valid"])
+        self.assertEqual(
+            [rule["decision"] for rule in context["teacher"]["rules"]],
+            ["allow"],
+        )
+        self.assertEqual(context["object_contact_rules"][0]["target_id"], "object_4")
+        self.assertEqual(context["object_contact_rules"][0]["decision"], "forbid")
+        self.assertIsNone(context["preflight_result"]["compiled_rule"])
 
     def test_object_only_preflight_rejects_inconsistent_object_binding_map(self):
         teacher = _teacher_v2_object_only()
         semantic_results = {
             "object_1": _semantic_binding("object_1", 21, "bowl_body", 31),
         }
+        geometry, gripper = _bridge_preflight_inventories(semantic_results)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             teacher_path = root / "teacher.json"
@@ -413,14 +520,11 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
             semantic_path.write_text(json.dumps(semantic_results), encoding="utf-8")
             conn = FakeConnection([
-                {"status": "complete"},
-                {"status": "complete"},
+                geometry,
+                gripper,
                 {"status": "available"},
             ])
             with patch(
-                "research.gs_opd.smoke.replay_archive_contact_smoke._validate_current_bindings",
-                return_value={"valid": False, "errors": ["semantic_binding_missing:object_2"]},
-            ), patch(
                 "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
             ) as compiler:
                 with self.assertRaisesRegex(ValueError, "semantic_binding_missing:object_2"):
@@ -432,7 +536,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
                     )
         compiler.assert_not_called()
 
-    def test_legacy_gripper_rule_preflight_still_requires_and_accepts_compiled_rule(self):
+    def test_legacy_gripper_forbid_preflight_still_compiles(self):
         teacher = _teacher_v2_object_only()
         teacher["objects"] = [
             {
@@ -456,11 +560,51 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             "reason": "Avoid forbidden contact.",
         }]
         teacher.pop("object_contact_rules")
-        semantic_result = {"semantic_decision": {"status": "resolved", "object_id": "object_4"}}
-        preflight = {
-            "compiled_rule": {"target_object_id": "object_4"},
-            "target_binding": {"object_id": "object_4", "body_id": 9},
-            "gripper_geom_ids": [3, 4],
+        semantic_result = _semantic_binding("object_1", 21, "bowl_body", 31)
+        teacher["objects"][0]["id"] = "object_1"
+        teacher["objects"][0]["name"] = "bowl"
+        teacher["rules"][0]["target_id"] = "object_1"
+        geometry, gripper = _bridge_preflight_inventories({"object_1": semantic_result})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_result), encoding="utf-8")
+            conn = FakeConnection([
+                geometry,
+                gripper,
+                {"status": "available"},
+            ])
+            context = self.helpers["prepare_on_policy_safety_collection"](
+                conn,
+                teacher_path,
+                "object_1",
+                semantic_path,
+            )
+
+        self.assertEqual(context["semantic_results"], {"object_1": semantic_result})
+        self.assertEqual(context["task_object_binding"], None)
+        self.assertIsNotNone(context["preflight_result"]["compiled_rule"])
+
+    def test_gripper_forbid_that_fails_to_compile_is_rejected(self):
+        teacher = _teacher_v2_object_only()
+        teacher["object_contact_rules"] = []
+        teacher["rules"] = [{
+            "id": "gripper_forbid",
+            "subject_parts": ["gripper"],
+            "target_id": "object_1",
+            "predicate": "contact",
+            "decision": "forbid",
+            "phase": "any",
+            "reason": "Avoid contact with the object.",
+        }]
+        semantic_result = _semantic_binding("object_1", 21, "bowl_body", 31)
+        geometry, gripper = _bridge_preflight_inventories({"object_1": semantic_result})
+        failed_preflight = {
+            "compiled_rule": None,
+            "target_binding": {"object_id": "object_1", "body_id": 21},
+            "gripper_geom_ids": [0],
             "unknown_reasons": ["branch_rollout_has_no_candidate_results"],
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -469,26 +613,47 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             semantic_path = root / "semantic.json"
             teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
             semantic_path.write_text(json.dumps(semantic_result), encoding="utf-8")
-            conn = FakeConnection([
-                {"status": "complete"},
-                {"status": "complete"},
-                {"status": "available"},
-            ])
+            conn = FakeConnection([geometry, gripper, {"status": "available"}])
             with patch(
                 "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
-                return_value=preflight,
-            ) as compiler:
-                context = self.helpers["prepare_on_policy_safety_collection"](
+                return_value=failed_preflight,
+            ):
+                with self.assertRaisesRegex(ValueError, "gripper_contact_rule_did_not_compile"):
+                    self.helpers["prepare_on_policy_safety_collection"](
+                        conn,
+                        teacher_path,
+                        "object_1",
+                        semantic_path,
+                    )
+
+    def test_unknown_gripper_rule_remains_fail_closed(self):
+        teacher = _teacher_v2_object_only()
+        teacher["object_contact_rules"] = []
+        teacher["rules"] = [{
+            "id": "gripper_unknown",
+            "subject_parts": ["gripper"],
+            "target_id": "object_1",
+            "predicate": "contact",
+            "decision": "unknown",
+            "phase": "any",
+            "reason": "The contact permission is uncertain.",
+        }]
+        semantic_result = _semantic_binding("object_1", 21, "bowl_body", 31)
+        geometry, gripper = _bridge_preflight_inventories({"object_1": semantic_result})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            teacher_path = root / "teacher.json"
+            semantic_path = root / "semantic.json"
+            teacher_path.write_text(json.dumps(teacher), encoding="utf-8")
+            semantic_path.write_text(json.dumps(semantic_result), encoding="utf-8")
+            conn = FakeConnection([geometry, gripper, {"status": "available"}])
+            with self.assertRaisesRegex(ValueError, "unsupported_or_unknown_gripper_contact_rule"):
+                self.helpers["prepare_on_policy_safety_collection"](
                     conn,
                     teacher_path,
-                    "object_4",
+                    "object_1",
                     semantic_path,
                 )
-
-        self.assertEqual(context["semantic_results"], {"object_4": semantic_result})
-        self.assertEqual(context["task_object_binding"], None)
-        self.assertIsNotNone(context["preflight_result"]["compiled_rule"])
-        self.assertEqual(compiler.call_args.kwargs["object_semantic_results"], {"object_4": semantic_result})
 
     def test_collection_cli_accepts_semantic_results_map_within_80_step_budget(self):
         with tempfile.TemporaryDirectory() as temp_dir:

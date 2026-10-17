@@ -1032,3 +1032,18 @@ cd /workspace/zy_workspace/RLinf
 - [x] A0 与 Repair 候选 Compiler 调用接收完整语义映射，任务进度绑定从该映射解析。
 - [x] 轻量 On-Policy Collection 测试、Python 语法检查和 `git diff --check` 通过；没有启动仿真、模型或 Rollout。
 - [ ] 人工运行短程采集并检查 NPZ 标签、绑定及 Episode 汇总。
+
+## On-Policy Preflight：允许的 Gripper 接触规则（2026-10-17）
+
+- 检查实际 `logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt` 后确认：`object_1` 的抓取规则和 `object_3` 的放置规则均为 `gripper contact allow`；另有独立 Object-to-Object 规则 `object_1 contact object_4 forbid`。当前 Compiler 只为 Gripper-to-Object `forbid` 生成 `compiled_rule`，`allow` 返回 `None` 是正常结果。
+- Preflight 改为按选中对象的 Gripper 规则决策处理：结构合法的唯一 `allow` 不要求 forbid 专用 `compiled_rule`；`forbid` 仍必须成功编译。未知决策、多个/冲突规则、非单一 gripper 部位或不支持的 phase 继续 fail-closed。Object-to-Object 两侧 Body/Geom 校验没有改变。
+- 回归测试使用与当前 L0T0 相同的 `object_1 allow + object_1→object_4 forbid` 规则组合，通过真实 `compile_forbid_contact()` 和绑定校验逻辑验证 Preflight 能通过；另覆盖 Gripper forbid 编译失败、Object-to-Object 绑定不完整时拒绝，以及旧 Gripper-only forbid 正常编译。
+- 本次未启动 Safety Bridge、π₀.₅ 或 Rollout。完成相关单测、语法检查和 `git diff --check` 后，已提交并 Push 本修复；实际 80 步运行仍待人工重新执行。
+
+**检查清单（Checklist）**
+
+- [x] 从真实 Teacher 文件确认 Gripper allow 与 Object-to-Object forbid 规则。
+- [x] 合法 allow 不再被要求提供 forbid-only `compiled_rule`；forbid 编译失败仍拒绝。
+- [x] 绑定校验与其他 unsupported/conflicting 规则的 fail-closed 行为保留。
+- [x] 相关单测、语法检查、`git diff --check` 通过；无仿真运行。
+- [x] 修复已 Push；等待人工重跑 80 步采集。
