@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from research.gs_opd.smoke.replay_archive_contact_smoke import (
+    ArchiveValidationError,
     _branch_coverage,
     load_archive_episode,
     run_experiment,
@@ -118,7 +119,7 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
             )
         )
 
-        def semantic(object_id, body_id, body_name, geom_id, geom_name):
+        def semantic(object_id, body_id, body_name, geom_id, geom_name, name, role):
             return {
                 "status": "resolved",
                 "semantic_decision": {
@@ -127,7 +128,11 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
                     "reason": "visual candidate association",
                     "status": "resolved",
                 },
-                "teacher_object": {"object_id": object_id, "name": body_name},
+                "teacher_object": {
+                    "object_id": object_id,
+                    "name": name,
+                    "role": role,
+                },
                 "selected_candidate": {"candidate_index": 0},
                 "physical_association": {
                     "status": "matched_by_iou",
@@ -140,8 +145,12 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
             }
 
         bindings = {
-            "object_payload": semantic("object_payload", 21, "payload_body", 1, "payload_geom"),
-            "object_obstacle": semantic("object_obstacle", 22, "obstacle_body", 2, "obstacle_geom"),
+            "object_payload": semantic(
+                "object_payload", 21, "payload_body", 1, "payload_geom", "carried object", "target_object"
+            ),
+            "object_obstacle": semantic(
+                "object_obstacle", 22, "obstacle_body", 2, "obstacle_geom", "route obstacle", "obstacle"
+            ),
         }
         return teacher, bindings
 
@@ -239,6 +248,16 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
         np.testing.assert_array_equal(episode["action_chunk"], values["chunk"])
         self.assertEqual(episode["decision_index"], 0)
 
+    def test_archive_loader_rejects_chunk_that_differs_from_executed_actions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, _values = self._write_archive(Path(temp_dir))
+            with np.load(archive_path, allow_pickle=False) as loaded:
+                arrays = {key: loaded[key].copy() for key in loaded.files}
+            arrays["executed_actions"][3, 0] += 1e-3
+            np.savez_compressed(archive_path, **arrays)
+            with self.assertRaisesRegex(ArchiveValidationError, "differs from its archived executed actions"):
+                load_archive_episode(archive_path, decision_step=3)
+
     def test_observation_mismatch_prevents_snapshot_and_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path, values = self._write_archive(Path(temp_dir))
@@ -260,7 +279,8 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
 
         connection = FakeConnection(handler)
         report = run_experiment(connection, episode, teacher, bindings, "object_payload")
-        self.assertEqual(report["status"], "initial_state_mismatch")
+        self.assertEqual(report["status"], "initial_image_mismatch")
+        self.assertTrue(report["decision_observation_comparison"]["state_matched"])
         self.assertFalse(report["snapshot_created"])
         self.assertFalse(report["branch_called"])
         self.assertNotIn("snapshot", [request["op"] for request in connection.requests])
@@ -299,14 +319,182 @@ class ReplayArchiveContactSmokeTest(unittest.TestCase):
 
         connection = FakeConnection(handler)
         report = run_experiment(connection, episode, teacher, bindings, "object_payload")
-        self.assertEqual(report["status"], "violation_reproduced", report)
+        self.assertEqual(report["status"], "current_scene_physical_collision_detected", report)
         self.assertEqual(report["compiler_verdict"], "violation")
+        self.assertTrue(report["historical_decision_state_matches"])
+        self.assertTrue(report["historical_decision_images_pixel_exact"])
+        self.assertTrue(report["historical_decision_observation_matches"])
+        self.assertEqual(report["current_scene_physical_collision"], "detected")
+        self.assertTrue(report["semantic_binding_validation"]["valid"])
         self.assertTrue(report["branch_coverage"]["full_chunk_executed"])
         self.assertTrue(report["branch_coverage"]["contact_monitoring_complete"])
         self.assertTrue(report["main_state_restoration"]["snapshot_diagnostics_match"])
         self.assertEqual(report["contact_evidence"][0]["first_control_step"], 1)
         self.assertEqual(report["contact_evidence"][0]["first_physics_substep"], 0)
         self.assertEqual(snapshot_count["value"], 2)
+
+    def test_allow_image_mismatch_runs_current_scene_branch_and_saves_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path, values = self._write_archive(root)
+            episode = load_archive_episode(archive_path, decision_step=3)
+            output_path = root / "results" / "replay.json"
+            teacher, bindings = self._teacher_and_bindings()
+            geometry, gripper = self._inventories()
+            diagnostics = {
+                "mujoco_integration_state": [0.1, 0.2],
+                "robot_states": [{"joint_qpos": [0.3], "eef_pos": [0.1, 0.2, 0.3]}],
+                "object_states": {},
+            }
+            snapshots = iter(("snapshot-before", "snapshot-after"))
+
+            def handler(request):
+                operation = request["op"]
+                if operation == "reset":
+                    return self._packed_observation(values["expected"])
+                if operation == "step":
+                    response = self._packed_observation(values["expected"])
+                    image = np.full((4, 5, 3), 99, dtype=np.uint8)
+                    response["images"]["agentview_image"] = _bridge_image(image)
+                    return response
+                if operation == "geometry_inventory":
+                    return geometry
+                if operation == "gripper_geometry_inventory":
+                    return gripper
+                if operation == "snapshot":
+                    return {"snapshot_id": next(snapshots), "snapshot_state": diagnostics}
+                if operation == "branch_rollout":
+                    np.testing.assert_array_equal(request["candidates"][0]["actions"], values["chunk"])
+                    return self._contact_branch()
+                self.fail(f"Unexpected Bridge operation: {operation}")
+
+            connection = FakeConnection(handler)
+            report = run_experiment(
+                connection,
+                episode,
+                teacher,
+                bindings,
+                "object_payload",
+                allow_image_mismatch=True,
+                output_path=output_path,
+            )
+
+            self.assertEqual(
+                report["status"],
+                "current_scene_physical_collision_detected",
+                report,
+            )
+            self.assertTrue(report["historical_decision_state_matches"])
+            self.assertFalse(report["historical_decision_images_pixel_exact"])
+            self.assertFalse(report["historical_decision_observation_matches"])
+            self.assertEqual(report["current_scene_physical_collision"], "detected")
+            self.assertTrue(report["semantic_binding_validation"]["valid"])
+            self.assertTrue(report["branch_coverage"]["full_chunk_executed"])
+            self.assertTrue(report["branch_coverage"]["contact_monitoring_complete"])
+            self.assertTrue(report["main_state_restoration"]["snapshot_diagnostics_match"])
+            self.assertIn("branch_rollout", [request["op"] for request in connection.requests])
+            for key in ("agentview_image", "robot0_eye_in_hand_image"):
+                camera = report["visual_diagnostics"]["cameras"][key]
+                self.assertTrue(Path(camera["current_image"]).is_file())
+                self.assertIsNotNone(camera["absolute_difference_image"])
+                self.assertTrue(Path(camera["absolute_difference_image"]).is_file())
+
+    def test_allow_image_mismatch_does_not_allow_robot_state_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, values = self._write_archive(Path(temp_dir))
+            episode = load_archive_episode(archive_path, decision_step=3)
+        teacher, bindings = self._teacher_and_bindings()
+
+        def handler(request):
+            if request["op"] in ("reset", "step"):
+                response = self._packed_observation(values["expected"])
+                if request["op"] == "step":
+                    response["state"]["robot0_eef_pos"][0] += 1e-3
+                return response
+            self.fail(f"Unexpected Bridge request after state mismatch: {request}")
+
+        connection = FakeConnection(handler)
+        report = run_experiment(
+            connection,
+            episode,
+            teacher,
+            bindings,
+            "object_payload",
+            allow_image_mismatch=True,
+        )
+        self.assertEqual(report["status"], "initial_state_mismatch")
+        self.assertFalse(report["snapshot_created"])
+        self.assertNotIn("snapshot", [request["op"] for request in connection.requests])
+
+    def test_allow_image_mismatch_does_not_allow_instruction_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, values = self._write_archive(Path(temp_dir))
+            episode = load_archive_episode(archive_path, decision_step=3)
+        teacher, bindings = self._teacher_and_bindings()
+
+        def handler(request):
+            response = self._packed_observation(values["expected"])
+            if request["op"] == "step":
+                response["instruction"] = "a different task"
+            if request["op"] in ("reset", "step"):
+                return response
+            self.fail(f"Unexpected Bridge request after instruction mismatch: {request}")
+
+        connection = FakeConnection(handler)
+        report = run_experiment(
+            connection,
+            episode,
+            teacher,
+            bindings,
+            "object_payload",
+            allow_image_mismatch=True,
+        )
+        self.assertEqual(report["status"], "initial_task_mismatch")
+        self.assertFalse(report["snapshot_created"])
+        self.assertNotIn("snapshot", [request["op"] for request in connection.requests])
+
+    def test_missing_or_conflicting_current_bindings_stop_before_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, values = self._write_archive(Path(temp_dir))
+            episode = load_archive_episode(archive_path, decision_step=3)
+        teacher, original_bindings = self._teacher_and_bindings()
+        original_geometry, gripper = self._inventories()
+
+        cases = []
+        missing_binding = dict(original_bindings)
+        del missing_binding["object_obstacle"]
+        cases.append(("missing", missing_binding, original_geometry))
+
+        conflicting_geometry = json.loads(json.dumps(original_geometry))
+        conflicting_geometry["geometries"][2]["geom_name"] = "different_active_geom"
+        cases.append(("geometry-conflict", original_bindings, conflicting_geometry))
+
+        for label, bindings, geometry in cases:
+            with self.subTest(label=label):
+                def handler(request):
+                    operation = request["op"]
+                    if operation in ("reset", "step"):
+                        return self._packed_observation(values["expected"])
+                    if operation == "geometry_inventory":
+                        return geometry
+                    if operation == "gripper_geometry_inventory":
+                        return gripper
+                    self.fail(f"Unexpected Bridge operation before binding validation: {operation}")
+
+                connection = FakeConnection(handler)
+                report = run_experiment(
+                    connection,
+                    episode,
+                    teacher,
+                    bindings,
+                    "object_payload",
+                    allow_image_mismatch=True,
+                )
+                self.assertEqual(report["status"], "binding_validation_failed")
+                self.assertFalse(report["semantic_binding_validation"]["valid"])
+                self.assertFalse(report["snapshot_created"])
+                self.assertNotIn("snapshot", [request["op"] for request in connection.requests])
+                self.assertNotIn("branch_rollout", [request["op"] for request in connection.requests])
 
     def test_short_chunk_is_not_reported_as_full(self):
         branch = {

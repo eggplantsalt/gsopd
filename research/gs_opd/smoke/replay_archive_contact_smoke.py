@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from research.gs_opd.smoke.contact_safety_compiler_smoke import (
     AUTHKEY,
     BRIDGE_PORT,
+    _resolve_target_binding,
     compile_forbid_contact,
 )
 from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
@@ -209,6 +211,7 @@ def compare_observation(
 
     image_results: dict[str, Any] = {}
     images_match = True
+    images_available = True
     for key in CAMERA_KEYS:
         observed = None
         target = expected["images"][key]
@@ -227,6 +230,7 @@ def compare_observation(
                 matched = False
         except Exception as exc:
             same_shape = same_dtype = False
+            images_available = False
             differing_pixels = None
             max_abs_error = None
             matched = False
@@ -249,6 +253,7 @@ def compare_observation(
         "matched": state_match and images_match and instruction_match,
         "state_matched": state_match,
         "images_matched": images_match,
+        "images_available": images_available,
         "instruction_matched": instruction_match,
         "state": state_results,
         "images": image_results,
@@ -313,6 +318,121 @@ def _geometry_summary(inventory: Any) -> dict[str, Any]:
         "geom_count": inventory.get("geom_count"),
         "error": inventory.get("error"),
     }
+
+
+def _validate_current_bindings(
+    teacher: dict[str, Any],
+    semantic_results: dict[str, Any],
+    geometry_inventory: Any,
+) -> dict[str, Any]:
+    """Check archived semantic bindings against the active model inventory."""
+    teacher_objects = {
+        item["id"]: item for item in teacher.get("objects", []) if isinstance(item, dict)
+    }
+    rules = teacher.get("object_contact_rules", [])
+    required_ids = sorted(
+        {
+            object_id
+            for rule in rules
+            if isinstance(rule, dict)
+            for object_id in (rule.get("subject_id"), rule.get("target_id"))
+            if isinstance(object_id, str)
+        }
+    )
+    result: dict[str, Any] = {
+        "valid": False,
+        "binding_source": "pre-existing semantic results; not re-run on current RGB",
+        "current_visual_reidentification_performed": False,
+        "geometry_inventory": _geometry_summary(geometry_inventory),
+        "objects": {},
+        "errors": [],
+    }
+    if not required_ids:
+        result["errors"].append("teacher_has_no_object_contact_binding_targets")
+        return result
+    body_owners: dict[int, str] = {}
+    for object_id in required_ids:
+        teacher_object = teacher_objects.get(object_id)
+        semantic = semantic_results.get(object_id)
+        if teacher_object is None or not isinstance(semantic, dict):
+            result["objects"][object_id] = {"status": "missing"}
+            result["errors"].append(f"semantic_binding_missing:{object_id}")
+            continue
+        semantic_teacher_object = semantic.get("teacher_object")
+        if (
+            not isinstance(semantic_teacher_object, dict)
+            or semantic_teacher_object.get("name") != teacher_object.get("name")
+            or semantic_teacher_object.get("role") != teacher_object.get("role")
+        ):
+            result["objects"][object_id] = {"status": "teacher_semantics_mismatch"}
+            result["errors"].append(f"semantic_binding_teacher_object_mismatch:{object_id}")
+            continue
+        binding, _geom_by_id, _body_by_id, error = _resolve_target_binding(
+            semantic,
+            object_id,
+            geometry_inventory,
+        )
+        if error is not None or binding is None:
+            result["objects"][object_id] = {
+                "status": "geometry_binding_mismatch",
+                "error": error or "binding_not_resolved",
+            }
+            result["errors"].append(f"current_geometry_binding_mismatch:{object_id}:{error}")
+            continue
+        prior_owner = body_owners.get(binding["body_id"])
+        if prior_owner is not None and prior_owner != object_id:
+            result["objects"][object_id] = {
+                "status": "conflicting_body_binding",
+                "body_id": binding["body_id"],
+                "conflicts_with": prior_owner,
+            }
+            result["errors"].append(
+                f"distinct_teacher_objects_share_current_body:{prior_owner}:{object_id}"
+            )
+            continue
+        body_owners[binding["body_id"]] = object_id
+        result["objects"][object_id] = {
+            "status": "matches_current_geometry_inventory",
+            "body_id": binding["body_id"],
+            "body_name": binding["body_name"],
+            "geom_ids": binding["geom_ids"],
+            "geom_names": binding["geom_names"],
+        }
+    result["valid"] = not result["errors"] and len(result["objects"]) == len(required_ids)
+    return result
+
+
+def _save_visual_diagnostics(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+    output_path: Path | None,
+) -> dict[str, Any]:
+    """Save current camera frames and per-pixel absolute-difference images."""
+    if output_path is None:
+        return {"saved": False, "reason": "output_path_not_provided", "cameras": {}}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cameras: dict[str, Any] = {}
+    for key in CAMERA_KEYS:
+        try:
+            current = _decode_bridge_image(actual, key)
+        except Exception as exc:
+            cameras[key] = {"saved": False, "error": f"{type(exc).__name__}: {exc}"}
+            continue
+        prefix = output_path.with_name(f"{output_path.stem}_{key}")
+        current_path = prefix.with_name(prefix.name + "_current.png")
+        Image.fromarray(current).save(current_path)
+        expected_image = expected["images"][key]
+        diff_path = None
+        if expected_image.shape == current.shape:
+            delta = np.abs(current.astype(np.int16) - expected_image.astype(np.int16)).astype(np.uint8)
+            diff_path = prefix.with_name(prefix.name + "_absolute_difference.png")
+            Image.fromarray(delta).save(diff_path)
+        cameras[key] = {
+            "current_image": str(current_path.resolve()),
+            "absolute_difference_image": str(diff_path.resolve()) if diff_path else None,
+            "current_shape": list(current.shape),
+        }
+    return {"saved": any(item.get("saved", True) for item in cameras.values()), "cameras": cameras}
 
 
 def _branch_coverage(branch_result: Any, expected_steps: int) -> dict[str, Any]:
@@ -396,6 +516,8 @@ def run_experiment(
     semantic_results: dict[str, Any],
     object_id: str,
     state_atol: float = 1e-6,
+    allow_image_mismatch: bool = False,
+    output_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run the guarded reset/replay/compare/snapshot/branch/compiler sequence."""
     report: dict[str, Any] = {
@@ -409,6 +531,8 @@ def run_experiment(
         "status": "failed",
         "snapshot_created": False,
         "branch_called": False,
+        "allow_image_mismatch": bool(allow_image_mismatch),
+        "current_visual_reidentification_performed": False,
     }
     try:
         reset_response = _bridge_request(connection, {"op": "reset"})
@@ -441,14 +565,48 @@ def run_experiment(
             archive_episode["expected_observation"], last_response, state_atol
         )
         report["decision_observation_comparison"] = observation_comparison
-        if not observation_comparison["matched"]:
+        report["historical_decision_state_matches"] = (
+            observation_comparison["instruction_matched"]
+            and observation_comparison["state_matched"]
+        )
+        report["historical_decision_images_pixel_exact"] = observation_comparison["images_matched"]
+        report["historical_decision_observation_matches"] = observation_comparison["matched"]
+        report["visual_diagnostics"] = _save_visual_diagnostics(
+            archive_episode["expected_observation"],
+            last_response,
+            output_path,
+        )
+        if not observation_comparison["instruction_matched"]:
+            report["status"] = "initial_task_mismatch"
+            report["failure_reason"] = "Bridge task instruction differs from the archived decision"
+            return report
+        if not observation_comparison["state_matched"]:
             report["status"] = "initial_state_mismatch"
-            report["failure_reason"] = "Replayed state or raw camera image differs from the archived decision; no Snapshot or branch was created"
+            report["failure_reason"] = "Replayed robot state differs from the archived decision; no Snapshot or branch was created"
+            return report
+        if not observation_comparison["images_available"]:
+            report["status"] = "current_camera_unavailable"
+            report["failure_reason"] = "Could not decode both current Bridge camera images"
+            return report
+        if not observation_comparison["images_matched"] and not allow_image_mismatch:
+            report["status"] = "initial_image_mismatch"
+            report["failure_reason"] = "Raw camera images differ from archive; strict mode stopped before Snapshot/branch"
             return report
 
         geometry_inventory = _bridge_request(connection, {"op": "geometry_inventory"})
         gripper_inventory = _bridge_request(connection, {"op": "gripper_geometry_inventory"})
         report["geometry_inventory"] = _geometry_summary(geometry_inventory)
+        binding_validation = _validate_current_bindings(
+            teacher,
+            semantic_results,
+            geometry_inventory,
+        )
+        report["semantic_binding_validation"] = binding_validation
+        if not binding_validation["valid"]:
+            report["status"] = "binding_validation_failed"
+            report["failure_reason"] = "Historical semantic bindings are missing, conflicting, or disagree with the active Geometry Inventory"
+            return report
+
         snapshot_response = _bridge_request(connection, {"op": "snapshot"})
         if snapshot_response.get("error") or not isinstance(snapshot_response.get("snapshot_id"), str):
             report["status"] = "snapshot_failed"
@@ -486,6 +644,16 @@ def run_experiment(
         report["compiler_result"] = compiler_result
         report["compiler_verdict"] = compiler_result.get("status")
         report["contact_evidence"] = _object_contact_evidence(compiler_result)
+        if compiler_result.get("status") == "violation":
+            report["current_scene_physical_collision"] = "detected"
+        elif (
+            compiler_result.get("status") == "safe"
+            and coverage["full_chunk_executed"]
+            and coverage["contact_monitoring_complete"]
+        ):
+            report["current_scene_physical_collision"] = "not_detected_in_this_chunk"
+        else:
+            report["current_scene_physical_collision"] = "unknown"
 
         # The Bridge's branch result flag is checked independently against the
         # same-state diagnostics captured before and after branch execution.
@@ -518,9 +686,9 @@ def run_experiment(
             report["status"] = "main_state_restore_failed"
             report["failure_reason"] = "Bridge did not restore the main environment to its pre-branch Snapshot"
         elif compiler_result.get("status") == "violation":
-            report["status"] = "violation_reproduced"
+            report["status"] = "current_scene_physical_collision_detected"
         elif compiler_result.get("status") == "safe":
-            report["status"] = "no_violation_observed"
+            report["status"] = "current_scene_no_collision_observed_in_chunk"
         else:
             report["status"] = "unknown"
             report["failure_reason"] = "Compiler could not establish a complete object-contact verdict"
@@ -554,6 +722,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=BRIDGE_PORT)
     parser.add_argument("--state-atol", type=float, default=1e-6)
+    parser.add_argument(
+        "--allow-image-mismatch",
+        action="store_true",
+        help=(
+            "treat raw RGB pixel differences as diagnostics after instruction/state checks; "
+            "this does not establish exact historical replay or current visual re-identification"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.decision_step < 1:
@@ -601,6 +777,8 @@ def main(argv: list[str] | None = None) -> int:
                 semantic_results,
                 object_id,
                 args.state_atol,
+                allow_image_mismatch=args.allow_image_mismatch,
+                output_path=args.out,
             )
         finally:
             connection.close()
@@ -626,10 +804,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     if report.get("compiler_verdict"):
         print("Compiler verdict:", report["compiler_verdict"])
+    if report.get("historical_decision_state_matches") is not None:
+        print("Historical decision task/state match:", report["historical_decision_state_matches"])
+        print("Historical decision images pixel-exact:", report["historical_decision_images_pixel_exact"])
+    if report.get("current_scene_physical_collision"):
+        print("Current-scene physical collision:", report["current_scene_physical_collision"])
+    if report.get("semantic_binding_validation"):
+        print("Current Geometry Inventory bindings:", report["semantic_binding_validation"]["valid"])
     print(f"Result: {args.out.resolve()}")
-    if report.get("status") == "violation_reproduced":
+    if report.get("status") in {
+        "current_scene_physical_collision_detected",
+    }:
         return 0
-    if report.get("status") == "no_violation_observed":
+    if report.get("status") in {
+        "current_scene_no_collision_observed_in_chunk",
+    }:
         return 1
     return 2
 
