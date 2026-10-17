@@ -1235,3 +1235,17 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] S70 当前 Chunk 与每条 S75′ Student Chunk 均走现有 Snapshot、Branch、完整 Contact Monitor 和 Teacher Contact Compiler；后续 Student 动作由该路线真实 S75 观测重新推理。
 - [x] 7 项轻量单测、语法检查和 `git diff --check` 通过；未启动模型或仿真，未生成训练标签。
 - [ ] 人工运行 Smoke，检查各路线当前 Chunk 门槛、S75′ 新预测、后续 Contact verdict/首次违规时间及最终 S70 恢复。
+
+## GS-OPD Step 2.1：通用 Near–Far 风险预警接口
+
+- 新增 `research/gs_opd/repair/near_far.py`，提供 `forecast_near_far_risk()`。调用者传入当前 Bridge、包含 `snapshot_id` 和 `snapshot_state` 的 Snapshot、有限 `(5, 7)` 原始 A⁰ Chunk、已验证且不重叠的目标/障碍物 Geom ID 集合及风险阈值；接口只从该 Snapshot 执行这五步，不读取归档、固定决策步或未来动作。
+- 接口在决策状态及每步执行后复用 `geom_set_min_distance` 查询，返回逐状态有符号间隙、固定阈值告警、首次触发步、相邻间隙变化/持续接近判断和 Chunk 终点最近 Geom Pair。阈值默认沿用 5/10/20 mm，持续接近沿用全部相邻间隙变化均小于 `-1e-9 m` 的原判据。结果明确标记几何间隙不是安全证明。
+- 开始模拟前和结束时均恢复并按 `1e-6` 比较 Snapshot 诊断。任何距离查询、动作步执行或恢复不完整都会得到 `unknown`；无法确认无风险时不会输出 `no_warning`。确定观察到阈值越界的警告仍会保留，同时完整性状态为 unknown。
+- 原 `near_far_gap_smoke.py` 的距离查询及阈值/趋势分析改为调用共享函数，归档 S65/S70/S75 校验和历史标签仍由 Smoke 自己处理。
+- 轻量测试覆盖阈值风险和持续接近、无预警、距离查询 unknown、最终恢复失败，以及非固定决策步索引。Near-Far 新接口及原 Smoke 回归测试共 13 项通过，Python 语法和 `git diff --check` 通过；未启动 Safety Bridge、仿真或模型。
+
+**检查清单（Checklist）**
+
+- [x] 新接口只使用调用方传入的 Snapshot、当前 A⁰ Chunk 和已验证 Geom 集合。
+- [x] 接口模拟后始终尝试恢复并严格核验原 Snapshot；查询不完整和恢复不符 fail-closed。
+- [ ] 人工在真实 Bridge 环境调用接口，核对当前观测、逐步间隙与恢复结果；未运行实验前不宣称真实场景预警有效。

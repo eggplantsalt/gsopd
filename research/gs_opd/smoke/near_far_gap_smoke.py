@@ -17,6 +17,12 @@ from typing import Any
 import numpy as np
 
 from research.gs_opd.smoke.contact_safety_compiler_smoke import AUTHKEY, BRIDGE_PORT
+from research.gs_opd.repair.near_far import (
+    GAP_THRESHOLDS_M,
+    TREND_EPSILON_M,
+    evaluate_gap_samples,
+    query_geom_gap,
+)
 from research.gs_opd.smoke.replay_archive_contact_smoke import (
     CAMERA_KEYS,
     STATE_KEYS,
@@ -37,8 +43,6 @@ STEP_70 = 70
 STEP_75 = 75
 CHUNK_LENGTH = STEP_75 - STEP_70
 STATE_ATOL = 1e-6
-GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
-TREND_EPSILON_M = 1e-9
 
 
 class NearFarArchiveError(ValueError):
@@ -226,46 +230,16 @@ def _query_gap(
     obstacle_geom_ids: list[int],
     distmax_m: float,
 ) -> dict[str, Any]:
-    response = _bridge_request(
+    sample = query_geom_gap(
         connection,
-        {
-            "op": "geom_set_min_distance",
-            "geom_ids_a": subject_geom_ids,
-            "geom_ids_b": obstacle_geom_ids,
-            "distmax_m": distmax_m,
-        },
+        subject_geom_ids=subject_geom_ids,
+        obstacle_geom_ids=obstacle_geom_ids,
+        distmax_m=distmax_m,
+        step_index=global_step,
     )
-    value = response.get("minimum_distance_m")
-    valid = bool(
-        response.get("query_complete") is True
-        and response.get("distance_reliable") is True
-        and isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
-    return {
-        "state": state_label,
-        "global_step": global_step,
-        "distance_available": valid,
-        "minimum_distance_m": float(value) if valid else None,
-        "query_status": response.get("status", "unavailable"),
-        "query_complete": response.get("query_complete") is True,
-        "distance_reliable": response.get("distance_reliable") is True,
-        "distmax_m": response.get("distmax_m", distmax_m),
-        "pair_count_requested": response.get("pair_count_requested"),
-        "pair_count_attempted": response.get("pair_count_attempted"),
-        "pair_count_censored_at_distmax": response.get("pair_count_censored_at_distmax"),
-        "pair_error_count": response.get("pair_error_count", len(response.get("pair_errors", []))),
-        "minimum_pair": response.get("minimum_pair"),
-        "mesh_approximation": response.get("mesh_approximation"),
-        "warnings": response.get("warnings", []),
-        "errors": (
-            response.get("errors")
-            if response.get("errors") is not None
-            else response.get("pair_errors", [])[:10]
-        ),
-        "not_a_safety_proof": True,
-    }
+    sample["state"] = state_label
+    sample["global_step"] = global_step
+    return sample
 
 
 def analyze_gap_trajectory(
@@ -276,41 +250,22 @@ def analyze_gap_trajectory(
     """Compute fixed-threshold alerts only from S70 and the A0_70 replay horizon."""
     by_label = {item.get("state"): item for item in samples}
     s70_to_s75 = [by_label.get(f"S{step}") for step in range(STEP_70, STEP_75 + 1)]
-    valid_window = all(
-        isinstance(item, dict) and item.get("distance_available") is True
-        for item in s70_to_s75
-    )
+    forecast = evaluate_gap_samples(s70_to_s75, thresholds_m, TREND_EPSILON_M)
+    all_samples_analysis = evaluate_gap_samples(samples, thresholds_m, TREND_EPSILON_M)
+    valid_window = forecast["all_distance_queries_valid"]
     deltas = []
-    for previous, current in zip(s70_to_s75, s70_to_s75[1:]):
-        if (
-            isinstance(previous, dict)
-            and isinstance(current, dict)
-            and previous.get("distance_available") is True
-            and current.get("distance_available") is True
-        ):
-            delta = float(current["minimum_distance_m"]) - float(previous["minimum_distance_m"])
-            elapsed = int(current["global_step"]) - int(previous["global_step"])
-            deltas.append(
-                {
-                    "from_state": previous["state"],
-                    "to_state": current["state"],
-                    "gap_change_m": delta,
-                    "control_steps_elapsed": elapsed,
-                    "gap_change_m_per_control_step": delta / elapsed if elapsed > 0 else None,
-                }
-            )
-        else:
-            deltas.append({"from_state": previous.get("state") if previous else None,
-                           "to_state": current.get("state") if current else None,
-                           "gap_change_m": None,
-                           "control_steps_elapsed": None,
-                           "gap_change_m_per_control_step": None,
-                           "available": False})
-    sustained = bool(
-        valid_window
-        and len(deltas) == CHUNK_LENGTH
-        and all(item["gap_change_m"] < -TREND_EPSILON_M for item in deltas)
-    )
+    for index, item in enumerate(forecast["adjacent_gap_changes"]):
+        previous = s70_to_s75[index]
+        current = s70_to_s75[index + 1]
+        deltas.append({
+            "from_state": previous.get("state") if isinstance(previous, dict) else None,
+            "to_state": current.get("state") if isinstance(current, dict) else None,
+            "gap_change_m": item["gap_change_m"],
+            "control_steps_elapsed": item.get("control_steps_elapsed"),
+            "gap_change_m_per_control_step": item["gap_change_m_per_control_step"],
+            **({"available": False} if item.get("available") is False else {}),
+        })
+    sustained = forecast["sustained_approach"]
     collision = historical_collision or {}
     collision_valid = collision.get("status") == "violation" and collision.get("validated") is True
     collision_step = collision.get("absolute_control_step") if collision_valid else None
@@ -318,47 +273,24 @@ def analyze_gap_trajectory(
     collision_substep = collision.get("first_physics_substep") if collision_valid else None
 
     alerts = []
-    for threshold in thresholds_m:
-        observed = [item for item in samples if item.get("distance_available") is True]
+    for threshold_index, threshold in enumerate(thresholds_m):
+        all_alert = all_samples_analysis["threshold_alerts"][threshold_index]
+        forecast_alert = forecast["threshold_alerts"][threshold_index]
         first_any = next(
-            (item for item in observed if float(item["minimum_distance_m"]) <= threshold),
+            (item for item in samples
+             if item.get("step_index", item.get("global_step")) == all_alert.get("first_observed_trigger_step")),
             None,
-        )
-        first_any_index = next(
-            (
-                index
-                for index, item in enumerate(samples)
-                if item.get("distance_available") is True
-                and float(item["minimum_distance_m"]) <= threshold
-            ),
-            None,
-        )
-        first_any_known = bool(
-            first_any_index is not None
-            and all(item.get("distance_available") is True for item in samples[:first_any_index])
-        )
-        s70_first_index = next(
-            (
-                index
-                for index, item in enumerate(s70_to_s75)
-                if isinstance(item, dict)
-                and item.get("distance_available") is True
-                and float(item["minimum_distance_m"]) <= threshold
-            ),
-            None,
-        )
-        missing_before_s70_trigger = (
-            s70_first_index is not None
-            and any(
-                not isinstance(item, dict) or item.get("distance_available") is not True
-                for item in s70_to_s75[:s70_first_index]
-            )
-        )
+        ) if all_alert.get("first_observed_trigger_step") is not None else None
+        first_any_known = all_alert["earliest_trigger_is_known"]
         s70_distance = by_label.get("S70")
-        if s70_first_index is not None:
-            trigger = s70_to_s75[s70_first_index]
+        if forecast_alert["first_observed_trigger_step"] is not None:
+            trigger = next(
+                item for item in s70_to_s75
+                if isinstance(item, dict)
+                and item.get("step_index", item.get("global_step")) == forecast_alert["first_observed_trigger_step"]
+            )
             prediction_triggered: bool | None = True
-            earliest_step = None if missing_before_s70_trigger else trigger["global_step"]
+            earliest_step = forecast_alert["first_trigger_step"]
         elif valid_window:
             trigger = None
             prediction_triggered = False
@@ -396,11 +328,13 @@ def analyze_gap_trajectory(
                 "first_trigger_step_in_s70_forecast": earliest_step,
                 "first_observed_trigger_step_in_s70_forecast": trigger.get("global_step") if trigger else None,
                 "first_crossing_step_from_s65_observation": (
-                    first_any.get("global_step") if first_any and first_any_known else None
+                    first_any.get("global_step", first_any.get("step_index")) if first_any and first_any_known else None
                 ),
-                "first_observed_crossing_step_from_s65_observation": first_any.get("global_step") if first_any else None,
+                "first_observed_crossing_step_from_s65_observation": first_any.get("global_step", first_any.get("step_index")) if first_any else None,
                 "earliest_s65_crossing_is_known": first_any_known,
-                "earliest_trigger_is_known": bool(trigger is not None and not missing_before_s70_trigger),
+                "earliest_trigger_is_known": bool(
+                    trigger is not None and forecast_alert["earliest_trigger_is_known"]
+                ),
                 "trigger_distance_m": trigger.get("minimum_distance_m") if trigger else None,
                 "lead_to_historical_s75_contact": lead,
             }
@@ -411,7 +345,7 @@ def analyze_gap_trajectory(
         "s70_to_s75_all_distance_queries_valid": valid_window,
         "adjacent_gap_changes": deltas,
         "sustained_approach_over_s70_a0_70": sustained if valid_window else None,
-        "approach_definition": f"all five sampled gap changes are < {-TREND_EPSILON_M:g} m",
+        "approach_definition": forecast["approach_definition"],
         "threshold_alerts": alerts,
         "historical_collision_used_only_for_posthoc_lead": collision_valid,
         "not_a_safety_proof": True,
