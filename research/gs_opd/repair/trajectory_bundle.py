@@ -270,8 +270,25 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             raise ValueError(
                 "local_bypass_goal obstacle is not between start and target"
             )
+        safety_clearance = _number(
+            construction.get("safety_clearance_m"),
+            "goal.construction.safety_clearance_m",
+        )
+        if not math.isclose(
+            safety_clearance, config.clearance_m, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "local_bypass_goal safety clearance must match the configured curve clearance"
+            )
+        exit_clearance = _number(
+            construction.get("exit_clearance_m"),
+            "goal.construction.exit_clearance_m",
+        )
         required_separation = (
-            carried["radius_m"] + obstacle["radius_m"] + config.clearance_m
+            carried["radius_m"]
+            + obstacle["radius_m"]
+            + config.clearance_m
+            + exit_clearance
         )
         goal_offset = position - obstacle_center
         projected_offset = float(np.dot(goal_offset, forward))
@@ -300,6 +317,8 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             "carried_registered_task_object": carried_task_object,
             "placement_target_registered_task_object": target_task_object,
             "native_target_key": native_target_key,
+            "safety_clearance_m": safety_clearance,
+            "exit_clearance_m": exit_clearance,
             "required_sphere_center_separation_m": required_separation,
             "actual_sphere_center_separation_m": float(np.linalg.norm(goal_offset)),
             "actual_conservative_sphere_gap_m": float(

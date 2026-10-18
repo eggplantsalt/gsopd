@@ -340,6 +340,8 @@ class PlanningGeometryTests(unittest.TestCase):
             self.assertTrue(result["geometry_query_succeeded"])
             self.assertTrue(result["state_consistency"]["matched"])
             self.assertEqual(result["candidate_count"], 18)
+            self.assertEqual(result["screen_pass_count"], 18)
+            self.assertEqual(result["local_bypass_exit_clearance_m"], 0.02)
             self.assertTrue((Path(directory) / "planning_geometry.json").is_file())
             self.assertTrue((Path(directory) / "scene.json").is_file())
             self.assertTrue((Path(directory) / "trajectory_bundle.json").is_file())
@@ -380,9 +382,42 @@ class PlanningGeometryTests(unittest.TestCase):
             np.linalg.norm(endpoint - obstacle)
             - scene["carried"]["radius_m"]
             - query["objects"][construction["obstacle_object_id"]]["radius_m"],
-            0.01,
+            0.03,
         )
+        self.assertEqual(construction["safety_clearance_m"], 0.01)
+        self.assertEqual(construction["exit_clearance_m"], 0.02)
         self.assertNotEqual(endpoint.tolist(), target.tolist())
+
+    def test_exit_clearance_is_configurable_and_target_space_is_required(self):
+        query = self.query()
+        scene = smoke._build_local_bypass_scene(
+            query, self.payload, exit_clearance_m=0.03
+        )
+        construction = scene["goal"]["construction"]
+        self.assertEqual(construction["exit_clearance_m"], 0.03)
+        self.assertGreaterEqual(
+            construction["endpoint_conservative_sphere_gap_m"], 0.04
+        )
+
+        insufficient_space = copy.deepcopy(query)
+        insufficient_space["goal"]["targets"][0][
+            "body_origin_world_m_diagnostic_only"
+        ] = [0.05, 0, 0.45]
+        with self.assertRaisesRegex(
+            smoke._LocalGoalUnavailable,
+            "no_forbidden_obstacle_in_forward_corridor",
+        ):
+            smoke._build_local_bypass_scene(insufficient_space, self.payload)
+
+        wrong_target_direction = copy.deepcopy(query)
+        wrong_target_direction["goal"]["targets"][0][
+            "body_origin_world_m_diagnostic_only"
+        ] = [-0.8, 0, 0.45]
+        with self.assertRaisesRegex(
+            smoke._LocalGoalUnavailable,
+            "no_forbidden_obstacle_in_forward_corridor",
+        ):
+            smoke._build_local_bypass_scene(wrong_target_direction, self.payload)
 
     def test_local_bypass_reports_degenerate_missing_and_misdirected_geometry(self):
         query = self.query()

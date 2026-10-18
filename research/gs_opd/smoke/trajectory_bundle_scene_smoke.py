@@ -230,8 +230,26 @@ class _LocalGoalUnavailable(ValueError):
         self.diagnostics = diagnostics or []
 
 
-def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
+def _build_local_bypass_scene(
+    query, payload, *, clearance_m=0.01, exit_clearance_m=0.02
+):
     """Build a local endpoint from same-state spheres and the active BDDL On target."""
+    if (
+        isinstance(clearance_m, bool)
+        or not isinstance(clearance_m, (int, float))
+        or not math.isfinite(float(clearance_m))
+        or clearance_m < 0
+    ):
+        raise ValueError("local_bypass_goal_unavailable:clearance_m_invalid")
+    if (
+        isinstance(exit_clearance_m, bool)
+        or not isinstance(exit_clearance_m, (int, float))
+        or not math.isfinite(float(exit_clearance_m))
+        or exit_clearance_m < 0
+    ):
+        raise ValueError("local_bypass_goal_unavailable:exit_clearance_m_invalid")
+    clearance_m = float(clearance_m)
+    exit_clearance_m = float(exit_clearance_m)
     state_id = query["state_id"]
     objects = query["objects"]
     carried = objects[payload["carried_binding"]["object_id"]]
@@ -327,7 +345,8 @@ def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
         offset = center - start
         along = float(np.dot(offset, forward))
         lateral = float(np.linalg.norm(offset - along * forward))
-        required_separation = carried_radius + radius + clearance_m
+        minimum_separation = carried_radius + radius + clearance_m
+        required_separation = minimum_separation + exit_clearance_m
         endpoint_along = along + required_separation
         reasons = []
         if not (0 < along < target_distance):
@@ -343,6 +362,8 @@ def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
                 "projection_from_start_m": along,
                 "lateral_distance_from_task_direction_m": lateral,
                 "required_center_separation_m": required_separation,
+                "safety_clearance_m": clearance_m,
+                "exit_clearance_m": exit_clearance_m,
                 "rejection_reasons": reasons,
             }
         )
@@ -372,7 +393,7 @@ def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
     )
     if (
         not np.isfinite(local_goal_position).all()
-        or conservative_gap < clearance_m
+        or conservative_gap < clearance_m + exit_clearance_m
         or obstacle_projection + endpoint_separation >= target_distance
     ):
         raise ValueError(
@@ -410,9 +431,11 @@ def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
             ),
             "obstacle_selection_rule": "nearest_eligible_forbidden_obstacle_along_task_direction",
             "required_sphere_center_separation_m": required_separation,
+            "safety_clearance_m": clearance_m,
             "endpoint_sphere_center_separation_m": endpoint_separation,
             "endpoint_conservative_sphere_gap_m": conservative_gap,
             "clearance_margin_m": clearance_m,
+            "exit_clearance_m": exit_clearance_m,
             "numeric_padding_m": numeric_pad,
             "all_obstacle_forward_checks": diagnostics,
         },
@@ -439,6 +462,7 @@ def run_scene_smoke(
     *,
     subject_id: str | None = None,
     expected_instruction: str | None = None,
+    exit_clearance_m: float = 0.02,
 ) -> dict[str, Any]:
     """Query twice without reset/step; screen local bypass proposals if derivable."""
     directory = Path(out_dir)
@@ -463,6 +487,7 @@ def run_scene_smoke(
         "final_placement_goal_verified": False,
         "goal_status": "unavailable",
         "requested_candidate_count": 18,
+        "local_bypass_exit_clearance_m": exit_clearance_m,
         "candidate_count": 0,
         "screen_pass_count": None,
         "rejection_reason_counts": {},
@@ -487,7 +512,10 @@ def run_scene_smoke(
         bundle_config = BundleConfig(candidate_count=18)
         try:
             scene = _build_local_bypass_scene(
-                first, payload, clearance_m=bundle_config.clearance_m
+                first,
+                payload,
+                clearance_m=bundle_config.clearance_m,
+                exit_clearance_m=exit_clearance_m,
             )
         except ValueError as exc:
             report.update(
@@ -585,6 +613,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--semantic-results-json", type=Path, required=True)
     parser.add_argument("--subject-object-id")
     parser.add_argument("--expected-instruction")
+    parser.add_argument(
+        "--exit-clearance-m",
+        type=float,
+        default=0.02,
+        help="additional local bypass endpoint space beyond the sphere safety clearance (default: 0.02 m)",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     teacher = parse_teacher_output_v2(args.teacher_json.read_text(encoding="utf-8"))
@@ -598,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir,
             subject_id=args.subject_object_id,
             expected_instruction=args.expected_instruction,
+            exit_clearance_m=args.exit_clearance_m,
         )
     finally:
         connection.close()
@@ -618,6 +653,7 @@ def main(argv: list[str] | None = None) -> int:
                     "trajectory_executability_verified",
                     "goal_status",
                     "final_placement_goal_verified",
+                    "local_bypass_exit_clearance_m",
                 )
             },
             ensure_ascii=False,

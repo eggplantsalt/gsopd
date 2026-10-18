@@ -63,7 +63,14 @@ def local_bypass_scene():
     carried = value["carried"]
     obstacle = value["obstacles"][0]
     forward = np.asarray([1.0, 0.0, 0.0])
-    required = carried["radius_m"] + obstacle["radius_m"] + 0.01
+    safety_clearance = 0.01
+    exit_clearance = 0.02
+    required = (
+        carried["radius_m"]
+        + obstacle["radius_m"]
+        + safety_clearance
+        + exit_clearance
+    )
     separation = required + 1e-6
     obstacle_center = np.asarray(obstacle["center_world_m"], dtype=float)
     value["goal"] = {
@@ -89,6 +96,8 @@ def local_bypass_scene():
             },
             "carried_registered_task_object": "payload",
             "direction_source": "active_bddl_on_target_body_origin_direction_only",
+            "safety_clearance_m": safety_clearance,
+            "exit_clearance_m": exit_clearance,
         },
     }
     return value
@@ -155,7 +164,14 @@ class TrajectoryBundleTests(unittest.TestCase):
             - input_scene["carried"]["radius_m"]
             - input_scene["obstacles"][0]["radius_m"]
         )
-        self.assertGreaterEqual(expected_gap, result["config"]["clearance_m"])
+        self.assertGreaterEqual(
+            expected_gap,
+            result["config"]["clearance_m"]
+            + goal["construction"]["exit_clearance_m"],
+        )
+        self.assertEqual(goal["construction"]["exit_clearance_m"], 0.02)
+        self.assertGreaterEqual(result["screen_pass_count"], 1)
+        self.assertEqual(result["candidate_count"], 18)
         np.testing.assert_array_equal(
             np.asarray(result["candidates"][0]["points_world_m"])[-1],
             np.asarray(goal["position_world_m"]),
@@ -175,7 +191,12 @@ class TrajectoryBundleTests(unittest.TestCase):
             ].update(used_as_final_goal=True),
             lambda s: s["goal"].update(
                 position_world_m=[0.1, 0, 0.5]
-            ),  # too close to the obstacle for the configured clearance
+            ),  # does not include the configured exit margin
+            lambda s: s["goal"]["construction"].pop("exit_clearance_m"),
+            lambda s: s["goal"]["construction"].update(safety_clearance_m=0.02),
+            lambda s: s["goal"]["construction"].update(
+                forward_world=[0.0, 1.0, 0.0]
+            ),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index):
@@ -197,6 +218,32 @@ class TrajectoryBundleTests(unittest.TestCase):
             all(
                 not candidate["passes_geometric_screen"]
                 for candidate in result["candidates"]
+            )
+        )
+        self.assertTrue(
+            all(
+                any(reason.startswith("start_sphere_clearance_insufficient:") for reason in item["rejection_reasons"])
+                for item in result["candidates"]
+            )
+        )
+
+    def test_local_bypass_rejects_an_unsafe_endpoint_for_all_candidates(self):
+        input_scene = local_bypass_scene()
+        input_scene["obstacles"].append(
+            sphere(
+                "endpoint-obstacle",
+                input_scene["goal"]["position_world_m"],
+                0.05,
+            )
+        )
+        result = planner.generate_trajectory_bundle(input_scene)
+        self.assertEqual(result["candidate_count"], 18)
+        self.assertEqual(result["screen_pass_count"], 0)
+        self.assertTrue(
+            all(
+                "goal_sphere_clearance_insufficient:endpoint-obstacle"
+                in item["rejection_reasons"]
+                for item in result["candidates"]
             )
         )
 
