@@ -1551,3 +1551,70 @@ cd /workspace/zy_workspace/RLinf
 - [x] 独立 12～24 条三维 B-Spline 候选、保守球间隙界、JSON/SVG 及逐条拒绝原因已实现。
 - [x] 新增 16 项及相关回归 76 项通过，未修改现有控制/执行/安全判定路径。
 - [ ] 补充同状态完整包围球和目标侧中心的实际核验来源，再检查真实场景几何可行性；本轮没有仿真或物理安全结论。
+
+## 真实规划几何只读查询与 Scene Smoke（2026-10-18）
+
+### 实现与几何来源审计
+
+- `safety_bridge.py` 新增只读 `planning_geometry` 操作；新增独立 `trajectory_bundle_scene_smoke.py` 和对应测试。当前局部目标是将已核验的语义物体绑定转换为同一真实状态下的完整碰撞包围球；全局路线中的控制转换、Snapshot 轨迹验证与实际任务执行仍是后续阶段。
+- 审计了当前 MuJoCo **3.3.2** 的编译模型字段与官方粗筛实现：碰撞粗筛使用 `geom_xpos` 为球心、`geom_rbound` 为半径。[MuJoCo 3.3.2 实现](https://github.com/google-deepmind/mujoco/blob/3.3.2/src/engine/engine_collision_driver.c#L118) 支持这一中心/半径约定；本轮没有把可见 Mask、Teacher 名称或 Body 原点直接当成完整几何边界。
+- 查询从活动 LIBERO `objects_dict/fixtures_dict` 确认语义绑定的根 Body，逐项检查当前 Geometry Inventory 的 Body/Geom ID 与名称，再遍历完整 Body 子树。包含 `contype/conaffinity` 启用的所有 Geom，以及由显式 Contact Pair 启用的零掩码 Geom；视觉专用且无显式碰撞对的 Geom 单独列出，不作为碰撞边界。语义绑定原先只命中一个可见 Geom，也不会限制完整碰撞 Geom 集合。
+- 每个组件读取编译 `geom_rbound`、scratch `geom_xpos`，并用编译 primitive 尺寸或**全部编译 Mesh 顶点**复核半径；包含实际 Geom/Contact Pair margin 及数值余量。以 canonical 根 Body 位置为合并球心，取 `max(组件球心距 + 组件半径)` 得到保守合并球。这是有完整半径证明的物体包围球中心定义，不是放置目标坐标推断。
+- 返回 `object_id`、根/子 Body IDs、完整碰撞 Geom IDs、原绑定 Geom IDs、排除的视觉 Geom、每个组件的世界坐标/半径、合并球、同状态标识及来源。缺少有效绑定、无碰撞 Geom、非有限/无效半径、未知或无限几何类型、重叠物体子树等情况明确返回 unavailable/error；不返回部分成功作为完整边界。
+- 仅在由积分状态重建的 scratch `MjData` 上做 `mj_forward`。查询前后严格核验完整 integration state、所用编译几何/坐标框架指纹及 live kinematics cache 均未改变。`state_id` 为模型几何、积分状态和任务指令的内容指纹，不是可恢复的 Snapshot ID。未审计的控制/传感等全局回调、外部插件和 flex 模型会明确拒绝查询。
+
+### 目标 G 的真实限制
+
+- 静态审计当前固定任务 BDDL，目标为 `On(搬运物体, 放置目标)`；活动任务注册表可将其关联到实际目标 Body 和附属编译 Site。接口返回这些物理 ID、Body 原点、Site 位置/尺寸及原生谓词，全部标记为诊断信息。
+- 审计 `LIBERO-Safety/libero/libero/envs/predicates/base_predicates.py::On` 和 `object_states/base_object_states.py::ObjectState.check_ontop()`：当前实现依赖接触与相对高度，没有给出经验证的、对完整搬运物体球心安全的目标区域。因此**本轮没有可靠依据从目标 Body 原点或 Site 中心生成 G**，也没有加入半径/高度虚构偏移。
+- 当前 Bridge 的原生目标审计会返回 `goal.status="goal_unavailable"`、`verified=false`、`position_world_m=null`。这并不否认几何包围球查询本身可以成功。Scene Smoke 保存真实查询和目标诊断，但不调用生成器冒充 18 条真实候选：`candidate_count=0`，`screen_pass_count=null` 表示未生成/未初筛。
+- 客户端仅在收到同状态、带明确物理目标 Body、`carried_sphere_center` 语义及已验证安全区域声明的目标后，才会调用**原有** `generate_trajectory_bundle(..., candidate_count=18)`。当前原生 `On` 路径没有这样的目标证明。该条件分支的测试使用明确标识的合成协议夹具，不能作为真实目标、18 条真实轨迹或任务成功的证据。
+- 下一步先补充并独立验证放置目标的安全球心区域定义，再运行真实几何轨迹初筛；通过初筛后仍需要独立控制/物理/任务验证。本轮不修改 B-Spline 算法、Near–Far、Local Recovery、OSC、Student、Compiler 或训练链路。
+
+### Scene Smoke 的验证与输出
+
+- 解析现有 Safety IR v2，复用 `_validate_current_bindings()` 和 forbid-pair 校验；对选中搬运物体的**全部禁止接触障碍物**请求完整边界。默认从唯一合法搬运 subject 推断；不按物体名称匹配 Geom，不硬编码对象 ID。
+- 指令优先取已有语义绑定的 `task_instruction`，需所有已提供声明一致，也可用 `--expected-instruction` 明确传入；与活动 Bridge 的任务指令严格相等。没有指令来源或绑定/规则冲突时，在几何请求前停止。沿用旧绑定不代表完成了当前 RGB 视觉重识别，报告明确记录 false。
+- 前后各执行一次只读 `planning_geometry`，重复核对同模型绑定、完整球包围证据、状态指纹、完整 integration state 精确相等、几何边界和目标诊断相同。期间不发送 reset、step、branch 或 restore。若状态变化，禁止保存候选 Bundle。
+- 输出目录需为空或不含本 Smoke 的保留文件，避免与旧状态结果混淆。总是尽量保存 `scene_smoke_report.json`、`planning_geometry.json` 和 `planning_geometry_after.json`。只有目标证明与前后状态一致性全部通过，才保存 `scene.json` 及既有生成器的 `trajectory_bundle.json/.svg`、几何通过数量和拒绝统计。
+- 报告分别记录几何查询是否成功、目标是否可用、请求/实际候选数和轨迹可执行性。`physical_safety_verified`、`trajectory_executability_verified` 均为 false；goal unavailable 的 CLI 退出码为 2，不应将其误写为规划成功。
+
+### 静态验证结果
+
+- 使用现有 `/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python`，MuJoCo 3.3.2，新增 **15 项**测试及几何 Bundle、Near–Far 距离、控制器回归共 **43 项通过**。只编译合成小模型并调用只读 `mj_forward`，未执行 `mj_step/env.step`，未创建真实 LIBERO 环境、启动 Bridge 服务或模型。
+- 覆盖完整子 Body/隐藏碰撞组件、零掩码显式碰撞对、全部 Mesh 顶点、canonical 坐标与 stale live cache、非有限/未知边界、错误绑定/任务、只含视觉 Geom、自定义回调拒绝、原点/Site 不冒充 G、前后状态变化、指令缺失/冲突、旧输出保护和协议输出。
+- 静态 AST 比对确认原有 **34 个 Bridge 函数/类定义均未改变**；新增代码仅为规划查询辅助函数与一个 dispatch 分支。真实 L0T0 的查询成功与否仍待人工运行，43 项测试通过不能替代这一结果。
+- 另对现有真实 Teacher/语义绑定文件与**归档** `contact_safety_compiler_object_4/bridge_geometry_inventory.json` 做只读离线 preflight，规则、Body/Geom 身份和已有任务指令校验通过。这仅验证文件组合可构造请求，不是当前 Bridge 的完整几何查询结果。
+- 三份改动 Python 文件的 `py_compile`、两个新文件的 Ruff lint/格式、新增 Bridge 辅助代码的 Ruff/格式及 `git diff --check` 通过。Bridge 全文件仍有 4 项历史 Ruff 问题（旧导入布局、版权头/空行），与修改前相同、无新增；没有为此调整原有初始化/导入顺序。
+
+### 人工运行命令
+
+服务端需加载新增操作；若已有旧进程，请在你选择的状态时机人工重启。以下仍使用现有固定任务初始化；Smoke 本身不重置或重放环境：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+另一终端只读查询服务端当时的真实状态，输出到新目录：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  -m research.gs_opd.smoke.trajectory_bundle_scene_smoke \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --out-dir logs/gs_opd/trajectory_bundle_scene_v1
+```
+
+若前置绑定与几何检查成功，但目标仍是当前原生 `On` 关系，预期终端报告 `geometry_query_succeeded=true / status=goal_unavailable`，并保存诊断、不生成伪造目标轨迹；这是假设前置检查成功后的**预期行为，尚非真实实验结果**。
+
+**检查清单（Checklist）**
+
+- [x] 完整碰撞 Geom 的保守包围球、状态/来源信息及只读 Scene Smoke 已实现；15 项新增及相关回归 43 项通过。
+- [x] 放置目标 Body/Site 只作物理诊断，无法证明安全球心目标时明确 goal_unavailable。
+- [ ] 人工确认真实 L0T0 包围球查询成功和前后状态完全一致；本轮未运行服务端或真实查询。
+- [ ] 定义并物理核验安全目标区域，再生成真实 18 条轨迹；可执行性及任务可行性仍待后续验证。

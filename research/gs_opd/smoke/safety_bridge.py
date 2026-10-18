@@ -783,6 +783,503 @@ def _geometry_inventory():
     )
 
 
+def _planning_model_signature(model):
+    """Fingerprint compiled geometry and frames used by this read-only query."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    fields = (
+        "body_parentid",
+        "body_pos",
+        "body_quat",
+        "body_mocapid",
+        "qpos0",
+        "jnt_type",
+        "jnt_bodyid",
+        "jnt_pos",
+        "jnt_axis",
+        "jnt_qposadr",
+        "geom_bodyid",
+        "geom_type",
+        "geom_dataid",
+        "geom_pos",
+        "geom_quat",
+        "geom_size",
+        "geom_rbound",
+        "geom_contype",
+        "geom_conaffinity",
+        "geom_margin",
+        "pair_geom1",
+        "pair_geom2",
+        "pair_margin",
+        "mesh_vertadr",
+        "mesh_vertnum",
+        "mesh_vert",
+        "mesh_face",
+        "site_bodyid",
+        "site_pos",
+        "site_quat",
+        "site_size",
+        "site_type",
+    )
+    for name in fields:
+        values = np.ascontiguousarray(getattr(model, name))
+        digest.update(name.encode())
+        digest.update(str((values.dtype, values.shape)).encode())
+        digest.update(values.tobytes())
+    digest.update(bytes(model.names))
+    digest.update(np.asarray(model.opt.gravity, dtype=np.float64).tobytes())
+    return digest.hexdigest()
+
+
+def _planning_cache_signature(data):
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in ("geom_xpos", "geom_xmat", "xpos", "xquat", "site_xpos", "site_xmat"):
+        digest.update(np.ascontiguousarray(getattr(data, name)).tobytes())
+    return digest.hexdigest()
+
+
+def _planning_registered_objects(model_wrapper, task_env):
+    entries = {}
+    for mapping in ("objects_dict", "fixtures_dict"):
+        for key, obj in getattr(task_env, mapping, {}).items():
+            root = getattr(obj, "root_body", None)
+            if not isinstance(root, str):
+                raise ValueError(f"Task object {key!r} has no physical root Body")
+            body_id = int(model_wrapper.body_name2id(root))
+            if body_id <= 0 or body_id in entries:
+                raise ValueError("Task object roots are invalid or ambiguous")
+            entries[body_id] = {"key": key, "object": obj, "body_name": root}
+    return entries
+
+
+def _planning_body_subtree(model, root):
+    if root <= 0 or root >= int(model.nbody):
+        raise ValueError("Planning root Body is outside the active model")
+    result = set()
+    for body in range(1, int(model.nbody)):
+        current, visited = body, set()
+        while current:
+            if current in visited or current < 0 or current >= int(model.nbody):
+                raise ValueError("Compiled Body hierarchy is invalid")
+            visited.add(current)
+            if current == root:
+                result.add(body)
+                break
+            current = int(model.body_parentid[current])
+    return result
+
+
+def _planning_component_sphere(model, scratch, geom_id, pair_margin):
+    """Use the compiled broadphase ball, checking finite primitives/mesh bounds."""
+    kind = int(model.geom_type[geom_id])
+    size = np.asarray(model.geom_size[geom_id], dtype=np.float64)
+    center = np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64)
+    rbound = float(model.geom_rbound[geom_id])
+    if (
+        center.shape != (3,)
+        or size.shape != (3,)
+        or not np.isfinite(center).all()
+        or not np.isfinite(size).all()
+        or np.any(size < 0)
+        or not np.isfinite(rbound)
+        or rbound <= 0
+    ):
+        raise ValueError(
+            f"Geom {geom_id} has no finite positive compiled bounding ball"
+        )
+    geom = mujoco.mjtGeom
+    sources = "compiled geom_rbound centered at scratch geom_xpos"
+    if kind == int(geom.mjGEOM_SPHERE):
+        checked_radius = float(size[0])
+    elif kind == int(geom.mjGEOM_CAPSULE):
+        checked_radius = float(size[0] + size[1])
+    elif kind == int(geom.mjGEOM_CYLINDER):
+        checked_radius = float(np.hypot(size[0], size[1]))
+    elif kind == int(geom.mjGEOM_ELLIPSOID):
+        checked_radius = float(size.max())
+    elif kind == int(geom.mjGEOM_BOX):
+        checked_radius = float(np.linalg.norm(size))
+    elif kind == int(geom.mjGEOM_MESH):
+        mesh_id = int(model.geom_dataid[geom_id])
+        if not 0 <= mesh_id < int(model.nmesh):
+            raise ValueError(f"Geom {geom_id} mesh association is invalid")
+        address, count = (
+            int(model.mesh_vertadr[mesh_id]),
+            int(model.mesh_vertnum[mesh_id]),
+        )
+        vertices = np.asarray(
+            model.mesh_vert[address : address + count], dtype=np.float64
+        )
+        if (
+            count <= 0
+            or vertices.shape != (count, 3)
+            or not np.isfinite(vertices).all()
+        ):
+            raise ValueError(f"Geom {geom_id} compiled mesh vertices are incomplete")
+        checked_radius = float(np.linalg.norm(vertices, axis=1).max())
+        sources += "; checked against all compiled mesh vertices, not visible pixels"
+    else:
+        raise ValueError(
+            f"Geom {geom_id} type {kind} has no supported finite enclosure"
+        )
+    margin = max(float(model.geom_margin[geom_id]), pair_margin.get(geom_id, 0.0))
+    if (
+        not np.isfinite(checked_radius)
+        or checked_radius <= 0
+        or not np.isfinite(margin)
+        or margin < 0
+    ):
+        raise ValueError(f"Geom {geom_id} compiled bound or contact margin is invalid")
+    padding = 1e-10 * max(1.0, float(np.abs(center).max()), rbound, checked_radius)
+    radius = max(rbound, checked_radius) + margin + padding
+    if not np.isfinite(radius):
+        raise ValueError(f"Geom {geom_id} enclosure overflow")
+    return {
+        "geom_id": geom_id,
+        "type_id": kind,
+        "center_world_m": center.tolist(),
+        "geom_rbound_m": rbound,
+        "checked_geometry_radius_m": checked_radius,
+        "contact_margin_m": margin,
+        "numerical_padding_m": padding,
+        "radius_m": float(np.nextafter(radius, np.inf)),
+        "source": sources,
+    }
+
+
+def _planning_object_sphere(
+    binding, inventory, model_wrapper, scratch, registered, state_id
+):
+    model = model_wrapper._model
+    if not isinstance(binding, dict):
+        raise ValueError(
+            "Planning binding must be a current validated Body/Geom mapping"
+        )
+    object_id, body = binding.get("object_id"), binding.get("body_id")
+    if (
+        not isinstance(object_id, str)
+        or not object_id
+        or isinstance(body, bool)
+        or not isinstance(body, int)
+    ):
+        raise ValueError("Planning binding object/Body ID is invalid")
+    if body not in registered or registered[body]["body_name"] != binding.get(
+        "body_name"
+    ):
+        raise ValueError("Bound Body is not a verified registered task-object root")
+    geom_count = int(model.ngeom)
+    bound_ids, error = _validated_geom_id_list(
+        binding.get("geom_ids"), "binding Geoms", geom_count
+    )
+    names = binding.get("geom_names")
+    if error or not isinstance(names, list) or len(names) != len(bound_ids):
+        raise ValueError(error or "Planning binding Geom names are incomplete")
+    subtree = _planning_body_subtree(model, body)
+    by_id = {entry["geom_id"]: entry for entry in inventory["geometries"]}
+    for geom_id, name in zip(bound_ids, names):
+        current = by_id[geom_id]
+        if (
+            current["body_id"] != body
+            or current["geom_name"] != name
+            or current["body_name"] != binding["body_name"]
+        ):
+            raise ValueError(
+                "Semantic Geom identity conflicts with the current Geometry Inventory"
+            )
+    all_ids = [g for g in range(geom_count) if int(model.geom_bodyid[g]) in subtree]
+    if not all_ids or any(by_id[g].get("category") != "scene" for g in all_ids):
+        raise ValueError(
+            "Full object subtree is empty or robot/scene classification is unavailable"
+        )
+    pair_margin = {}
+    for index in range(int(model.npair)):
+        a, b = int(model.pair_geom1[index]), int(model.pair_geom2[index])
+        margin = float(model.pair_margin[index])
+        if (
+            not (0 <= a < geom_count and 0 <= b < geom_count)
+            or not np.isfinite(margin)
+            or margin < 0
+        ):
+            raise ValueError("Compiled explicit Contact Pair metadata is incomplete")
+        for geom_id in (a, b):
+            pair_margin[geom_id] = max(pair_margin.get(geom_id, 0.0), margin)
+    collision_ids = [
+        g
+        for g in all_ids
+        if int(model.geom_contype[g]) != 0
+        or int(model.geom_conaffinity[g]) != 0
+        or g in pair_margin
+    ]
+    if not collision_ids:
+        raise ValueError("Registered object has no confirmed collision Geoms")
+    components = [
+        _planning_component_sphere(model, scratch, g, pair_margin)
+        for g in collision_ids
+    ]
+    declared = getattr(registered[body]["object"], "contact_geoms", None)
+    if declared is not None:
+        declared_ids = {int(model_wrapper.geom_name2id(name)) for name in declared}
+        if not declared_ids.issubset(set(all_ids)):
+            raise ValueError(
+                "Task object's declared collision Geoms escape its registered subtree"
+            )
+    center = np.asarray(scratch.xpos[body], dtype=np.float64)
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("Canonical object root position is unavailable")
+    radius = max(
+        float(np.linalg.norm(np.asarray(item["center_world_m"]) - center))
+        + item["radius_m"]
+        for item in components
+    )
+    radius = float(
+        np.nextafter(
+            radius + 1e-10 * max(1.0, radius, float(np.abs(center).max())), np.inf
+        )
+    )
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("Merged object sphere is invalid")
+    for item in components:
+        g = item["geom_id"]
+        item.update({
+            "geom_name": by_id[g]["geom_name"],
+            "body_id": by_id[g]["body_id"],
+            "body_name": by_id[g]["body_name"],
+        })
+    return {
+        "object_id": object_id,
+        "body_id": body,
+        "body_name": binding["body_name"],
+        "registered_task_object": registered[body]["key"],
+        "body_ids": sorted(subtree),
+        "semantic_binding_geom_ids": bound_ids,
+        "geom_ids": collision_ids,
+        "excluded_visual_only_geom_ids": sorted(set(all_ids) - set(collision_ids)),
+        "components": components,
+        "center_world_m": center.tolist(),
+        "radius_m": radius,
+        "center_definition": "canonical registered root position; radius encloses every collision component",
+        "covers_all_associated_collision_geoms": True,
+        "binding_verified": True,
+        "enclosure_verified": True,
+        "state_id": state_id,
+        "binding_source": "registered task-object root and current Geometry Inventory identity checks",
+        "enclosure_source": "union of all subtree compiled Geom balls including explicit pairs and contact margins",
+        "future_articulation_or_motion_verified": False,
+    }
+
+
+def _planning_goal_diagnostics(task_env, model_wrapper, scratch, registered, carried):
+    """Audit native task targets without manufacturing a safe object-center goal."""
+    result = {
+        "status": "goal_unavailable",
+        "verified": False,
+        "position_world_m": None,
+        "position_semantics": None,
+        "safe_center_region_verified": False,
+        "reason": "Native placement predicates do not specify a verified collision-clear carried-sphere-center region",
+        "source": "active task parsed BDDL goal_state and compiled target Body/sites",
+        "bddl_file": str(getattr(task_env, "bddl_file_name", "")),
+        "targets": [],
+    }
+    problem = getattr(task_env, "parsed_problem", {})
+    goals = problem.get("goal_state") if isinstance(problem, dict) else None
+    result["native_goal_predicates"] = copy.deepcopy(goals)
+    if not isinstance(goals, (list, tuple)):
+        result["reason"] = "Active task goal predicates are unavailable"
+        return result
+    subject = carried["registered_task_object"]
+    by_key = {entry["key"]: (body, entry) for body, entry in registered.items()}
+    for predicate in goals:
+        if (
+            not isinstance(predicate, (list, tuple))
+            or len(predicate) != 3
+            or predicate[1] != subject
+        ):
+            continue
+        if str(predicate[0]).lower() not in ("on", "in"):
+            continue
+        target_key = predicate[2]
+        target = {"predicate": list(predicate), "verified_center_goal": False}
+        site_model = (
+            getattr(task_env, "object_sites_dict", {}).get(target_key)
+            if isinstance(target_key, str)
+            else None
+        )
+        if site_model is not None and target_key not in by_key:
+            target["native_target_site_key"] = target_key
+            target_key = getattr(site_model, "parent_name", None)
+        if not isinstance(target_key, str) or target_key not in by_key:
+            target["reason"] = (
+                "Task target is not a directly registered physical object Body"
+            )
+            result["targets"].append(target)
+            continue
+        body, entry = by_key[target_key]
+        subtree = _planning_body_subtree(model_wrapper._model, body)
+        target.update({
+            "registered_task_object": target_key,
+            "body_id": body,
+            "body_name": entry["body_name"],
+            "body_origin_world_m_diagnostic_only": np.asarray(
+                scratch.xpos[body]
+            ).tolist(),
+            "body_origin_is_carried_center_goal": False,
+            "sites_diagnostic_only": [],
+        })
+        model = model_wrapper._model
+        for site_id in range(int(model.nsite)):
+            if int(model.site_bodyid[site_id]) in subtree:
+                target["sites_diagnostic_only"].append({
+                    "site_id": site_id,
+                    "site_name": model_wrapper.site_id2name(site_id),
+                    "type_id": int(model.site_type[site_id]),
+                    "position_world_m": np.asarray(scratch.site_xpos[site_id]).tolist(),
+                    "size": np.asarray(model.site_size[site_id]).tolist(),
+                    "safe_center_semantics_verified": False,
+                })
+        result["targets"].append(target)
+    if not result["targets"]:
+        result["reason"] = (
+            "No direct native placement goal for the physically bound carried object"
+        )
+    return result
+
+
+def _planning_geometry(carried_binding, obstacle_bindings, expected_instruction):
+    """Read complete planning bounds on scratch data, with exact nonmutation checks."""
+    import hashlib
+
+    sim, task_env = env.sim, env.env
+    model = sim.model._model
+    result = {
+        "operation": "planning_geometry",
+        "status": "unavailable",
+        "query_complete": False,
+        "physical_state_unchanged": False,
+        "objects": {},
+        "goal": {"status": "goal_unavailable"},
+        "frame": "world",
+        "units": "m",
+        "physical_safety_verified": False,
+    }
+    before = signature = cache = None
+    try:
+        before = _mujoco_integration_state(sim)
+        signature = _planning_model_signature(model)
+        cache = _planning_cache_signature(sim.data._data)
+        if before.ndim != 1 or not np.isfinite(before).all():
+            raise ValueError("Current complete integration state is invalid")
+        if (
+            not isinstance(expected_instruction, str)
+            or not expected_instruction
+            or expected_instruction != task.language
+        ):
+            raise ValueError(
+                "Expected task instruction does not match the active Bridge task"
+            )
+        if not isinstance(obstacle_bindings, list) or not obstacle_bindings:
+            raise ValueError(
+                "At least one verified forbidden-contact obstacle binding is required"
+            )
+        if int(getattr(model, "nflex", 0)) != 0:
+            raise ValueError(
+                "Planning enclosure does not support deformable flex geometry"
+            )
+        if int(getattr(model, "nplugin", 0)) != 0:
+            raise ValueError(
+                "Planning query cannot confirm external plugin state is read-only"
+            )
+        for callback in (
+            "get_mjcb_control",
+            "get_mjcb_passive",
+            "get_mjcb_sensor",
+            "get_mjcb_contactfilter",
+            "get_mjcb_act_dyn",
+            "get_mjcb_act_gain",
+            "get_mjcb_act_bias",
+        ):
+            getter = getattr(mujoco, callback, None)
+            if not callable(getter) or getter() is not None:
+                raise ValueError(
+                    f"Planning scratch forward cannot audit custom callback {callback}"
+                )
+        inventory = _geometry_inventory()
+        result["geometry_inventory"] = inventory
+        if (
+            inventory.get("status") != "complete"
+            or inventory.get("robot_classification_status") != "available"
+        ):
+            raise ValueError("Current Geometry Inventory is incomplete")
+        state_id = hashlib.sha256(
+            signature.encode() + before.tobytes() + task.language.encode()
+        ).hexdigest()
+        result.update({
+            "state_id": state_id,
+            "model_geometry_sha256": signature,
+            "mujoco_integration_state": before.tolist(),
+            "instruction": task.language,
+            "mujoco_version": mujoco.__version__,
+        })
+        scratch = _diagnostic_data_from_integration_state(sim)
+        registered = _planning_registered_objects(sim.model, task_env)
+        all_bindings = [carried_binding, *obstacle_bindings]
+        for binding in all_bindings:
+            sphere = _planning_object_sphere(
+                binding, inventory, sim.model, scratch, registered, state_id
+            )
+            if sphere["object_id"] in result["objects"]:
+                raise ValueError("Planning object IDs are duplicated")
+            for prior in result["objects"].values():
+                if set(prior["body_ids"]) & set(sphere["body_ids"]):
+                    raise ValueError(
+                        "Planning bindings have overlapping physical object subtrees"
+                    )
+            result["objects"][sphere["object_id"]] = sphere
+        carried = result["objects"][carried_binding["object_id"]]
+        gravity = np.asarray(model.opt.gravity, dtype=np.float64)
+        norm = float(np.linalg.norm(gravity))
+        if gravity.shape != (3,) or not np.isfinite(norm) or norm <= 1e-12:
+            raise ValueError("World-up cannot be confirmed from the active gravity")
+        result.update({
+            "world_up": (-gravity / norm).tolist(),
+            "scratch_forward_used": True,
+            "carried_object_id": carried_binding["object_id"],
+            "obstacle_object_ids": [item["object_id"] for item in obstacle_bindings],
+            "goal": _planning_goal_diagnostics(
+                task_env, sim.model, scratch, registered, carried
+            ),
+            "status": "complete",
+            "query_complete": True,
+        })
+    except Exception as exc:
+        result["error"] = f"Planning geometry unavailable: {type(exc).__name__}: {exc}"
+    finally:
+        try:
+            after = _mujoco_integration_state(sim)
+            check = {
+                "integration_state_equal": before is not None
+                and np.array_equal(before, after),
+                "model_geometry_equal": signature is not None
+                and signature == _planning_model_signature(model),
+                "live_kinematics_cache_equal": cache is not None
+                and cache == _planning_cache_signature(sim.data._data),
+            }
+            result["state_consistency"] = check
+            result["physical_state_unchanged"] = all(check.values())
+        except Exception as exc:
+            result["state_consistency_error"] = str(exc)
+        if not result["physical_state_unchanged"]:
+            result.update({
+                "status": "unavailable",
+                "query_complete": False,
+                "error": "Planning query could not prove the complete state/model/caches unchanged",
+            })
+    return result
+
+
 def _validated_geom_id_list(raw_ids, label, geom_count):
     if not isinstance(raw_ids, list) or not raw_ids:
         return None, f"{label} must be a non-empty array of Geom IDs"
@@ -1863,6 +2360,17 @@ try:
                             "error": f"Geom distance query failed: {type(exc).__name__}: {exc}",
                             "not_a_safety_proof": True,
                         }
+                elif request["op"] == "planning_geometry":
+                    try:
+                        result = _planning_geometry(
+                            request.get("carried_binding"),
+                            request.get("obstacle_bindings"),
+                            request.get("expected_instruction"),
+                        )
+                    except Exception as exc:
+                        result = {"operation": "planning_geometry", "status": "unavailable",
+                                  "query_complete": False, "physical_state_unchanged": False,
+                                  "error": f"Planning geometry failed: {type(exc).__name__}: {exc}"}
                 elif request["op"] == "gripper_geometry_inventory":
                     try:
                         result = _gripper_geometry_inventory()
