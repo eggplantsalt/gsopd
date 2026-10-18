@@ -1834,3 +1834,38 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 复用现有 Safety IR/绑定复核、几何 Scene Smoke、Bundle、OSC Tracker、Contact Compiler、Snapshot 分支和状态恢复逻辑。
 - [x] 117 项相关合成 unittest、语法检查和 diff 检查通过；新模块 Ruff 检查通过。
 - [ ] 在真实 π₀.₅ Episode 中确认稳定抓持被检测，并核查所有真实几何候选与分支结果、Compiler、任务段和最终主环境恢复。
+
+## PandaGripper 闭合状态解析修复（2026-10-19）
+
+- 已审计当前使用的 `/workspace/zy_workspace/LIBERO-Safety/third_party/robosuite-1.4/robosuite/models/grippers/panda_gripper.py` 和 `gripper_model.py`。`GripperModel.__init__()` 将 `current_action` 初始化为 `zeros(dof)`，Panda 的 `dof=1`，因此初始状态是形状 `(1,)` 的 `[0]`。`PandaGripper.format_action()` 随后以 `[-1, +1] * speed * sign(action)` 更新该字段，`speed=0.01`；源码注释明确 `action=+1` 表示闭合、`action=-1` 表示打开。首次格式化后 `current_action` 是形状 `(2,)` 的相反数执行器对：负/正方向表示闭合，正/负方向表示打开。Panda XML 的左右位置执行器控制范围分别为 `[0, 0.04]` 和 `[-0.04, 0]`，与这组配对符号相符。
+- 新增 `repair/panda_gripper_state.py` 作为只读的共享解释器。初始单维零值是有效的中性状态，但不构成闭合证据；双执行器值必须有限、处于 `[-1, 1]` 且大小相等、符号相反。只有负/正配对才产生闭合命令进度，正/负配对明确解释为打开，闭合命令进度达到原有 `0.9` 才报告已闭合。该进度表示 robosuite 控制状态，不是测得的夹指开口或抓持成功；左右指真实接触仍独立检查。
+- `safety_bridge.py` 的只读 `grasp_state` 与轨迹跟踪初始/逐步抓持检查现在共用该解析器，并同时返回原始 `current_action`、解析进度/状态、左右指接触及具体拒绝原因。`trajectory_tracking.py` 对每个分支的初始和逐步证据重新解析原始执行器值，并核对 Bridge 的结构化闭合诊断；格式错误、打开方向、低于阈值、单指接触及缺失/矛盾数据均 fail-closed。原有连续 3 个不同状态门控、阈值、OSC、Snapshot、Compiler 和几何逻辑未调整。
+- 新增 `test_panda_gripper_state.py` 覆盖初始化零值、闭合/打开执行器配对、部分闭合、形状/方向/范围/非有限值错误和分支证据冲突；测试还直接执行本机 vendored `PandaGripper.format_action()` 方法，核对实际产生的闭合和打开双执行器值。Bridge 抓持查询测试覆盖双指接触下的闭合、初始化中性和打开状态。已有左右指面分类回归继续覆盖双指、单指及不可用接触。目标环境 `unittest` 共 45 项通过（Parser、Bridge 验收、Trajectory Tracking）；Python 语法检查、相关 Ruff 检查和 `git diff --check` 通过。真实 Episode 和 MuJoCo 分支未启动。
+
+重新运行一次 240 步真实物理验收仍使用同一 Bridge 连接。先在第一个终端启动 Bridge，再在第二个终端运行 Rollout：
+
+```bash
+# Terminal 1: start the LIBERO-Safety Bridge
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+
+# Terminal 2: run one 240-step π₀.₅ physical-acceptance Episode
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/RLinf/.venv/bin/python \
+  research/gs_opd/smoke/pi05_rollout.py \
+  --max-steps 240 \
+  --trajectory-bundle-physical-validation \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --trajectory-validation-out logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance.json \
+  --video-out logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance.mp4
+```
+
+**检查清单（Checklist）**
+
+- [x] 以本机 robosuite 源码为依据处理 PandaGripper 的初始化与已格式化双执行器状态。
+- [x] Bridge 实时抓持、跟踪分支初始/逐步状态及客户端分支验收使用一致的负/正闭合极性与 `0.9` 阈值。
+- [x] 合成单元测试通过；真实 240 步抓持统计和物理分支结果等待人工运行核查。

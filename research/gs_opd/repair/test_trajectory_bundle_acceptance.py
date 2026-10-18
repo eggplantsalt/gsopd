@@ -157,6 +157,16 @@ class OpposingFingerContactTests(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_live_grasp_state"
         )
+        sides_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_tracking_gripper_sides"
+        )
+        closure_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_parse_tracking_gripper_closure"
+        )
 
         class Model:
             nbody = 20
@@ -173,17 +183,35 @@ class OpposingFingerContactTests(unittest.TestCase):
             def body_id2name(body_id):
                 return f"body-{body_id}"
 
+            @staticmethod
+            def geom_name2id(name):
+                return {"left": 1, "left-pad": 1, "right": 2, "right-pad": 2}[name]
+
         class Sim:
             model = ModelWrapper()
             data = type("Data", (), {"_data": object()})()
 
+        class PandaGripper:
+            current_action = [-0.95, 0.95]
+            _important_geoms = {
+                "left_finger": ["left"],
+                "left_fingerpad": ["left-pad"],
+                "right_finger": ["right"],
+                "right_fingerpad": ["right-pad"],
+            }
+
+            @staticmethod
+            def correct_naming(names):
+                return names
+
+        robot = type("Robot", (), {"gripper": PandaGripper()})()
         fake_env = type(
             "Env",
             (),
             {
                 "sim": Sim(),
                 "env": object(),
-                "robots": [object()],
+                "robots": [robot],
             },
         )()
         contacts = {
@@ -241,16 +269,14 @@ class OpposingFingerContactTests(unittest.TestCase):
             },
             "_planning_body_subtree": lambda _model, _body: {10},
             "_geometry_inventory": lambda: inventory,
-            "_tracking_gripper_sides": lambda _robot: (
-                {"left": {1}, "right": {2}},
-                __import__("numpy").array([1.0]),
-            ),
             "_collect_contacts": lambda: contacts,
             "_tracking_snapshot_state_id": lambda _snapshot: "state-current",
         }
         exec(
             compile(
-                ast.Module(body=[function], type_ignores=[]), str(bridge_path), "exec"
+                ast.Module(body=[sides_function, closure_function, function], type_ignores=[]),
+                str(bridge_path),
+                "exec",
             ),
             namespace,
         )
@@ -266,8 +292,53 @@ class OpposingFingerContactTests(unittest.TestCase):
         )
         self.assertEqual(response["status"], "pass")
         self.assertTrue(response["grasp_confirmed"])
+        self.assertEqual(response["gripper_current_action"], [-0.95, 0.95])
+        self.assertAlmostEqual(
+            response["gripper_closure"]["close_command_fraction"], 0.95
+        )
+        self.assertTrue(response["gripper_closed"])
+        self.assertTrue(response["finger_contacts"]["left"])
+        self.assertTrue(response["finger_contacts"]["right"])
         self.assertEqual(response["state_id"], "state-current")
         self.assertTrue(response["physical_state_unchanged"])
+
+        robot.gripper.current_action = [0.0]
+        neutral_response = namespace["_live_grasp_state"](
+            {
+                "object_id": "carry",
+                "body_id": 10,
+                "body_name": "body-10",
+                "geom_ids": [0],
+                "geom_names": ["object-a"],
+            },
+            "move the object",
+        )
+        self.assertEqual(neutral_response["status"], "not_grasped")
+        self.assertEqual(neutral_response["gripper_current_action"], [0.0])
+        self.assertEqual(neutral_response["gripper_closure"]["status"], "pass")
+        self.assertEqual(neutral_response["gripper_closure"]["close_command_fraction"], 0.0)
+        self.assertFalse(neutral_response["grasp_confirmed"])
+        self.assertTrue(neutral_response["finger_contacts"]["left"])
+        self.assertTrue(neutral_response["finger_contacts"]["right"])
+
+        robot.gripper.current_action = [0.95, -0.95]
+        opening_response = namespace["_live_grasp_state"](
+            {
+                "object_id": "carry",
+                "body_id": 10,
+                "body_name": "body-10",
+                "geom_ids": [0],
+                "geom_names": ["object-a"],
+            },
+            "move the object",
+        )
+        self.assertEqual(opening_response["status"], "not_grasped")
+        self.assertFalse(opening_response["grasp_confirmed"])
+        self.assertEqual(
+            opening_response["reason"], "panda_gripper_close_command_below_threshold"
+        )
+        self.assertTrue(opening_response["finger_contacts"]["left"])
+        self.assertTrue(opening_response["finger_contacts"]["right"])
 
 
 class GraspStabilityTests(unittest.TestCase):

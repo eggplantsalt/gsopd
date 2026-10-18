@@ -19,6 +19,7 @@ import unittest
 
 import numpy as np
 
+from research.gs_opd.repair.panda_gripper_state import parse_panda_gripper_closure
 from research.gs_opd.repair.trajectory_tracking import (
     TrackingConfig,
     body_local_offset_from_world_point,
@@ -346,7 +347,8 @@ def _bridge_candidate(
                 "eef_body_relative_quaternion_local_wxyz": [1.0, 0.0, 0.0, 0.0],
                 "relative_position_error_m": 0.0,
                 "relative_rotation_error_rad": 0.0,
-                "gripper_current_action": [1.0],
+                "gripper_current_action": [-0.95, 0.95],
+                "gripper_closure": parse_panda_gripper_closure([-0.95, 0.95]),
             }
         )
         step_contact = contact and index == 0
@@ -415,6 +417,8 @@ def _bridge_candidate(
             "status": "pass" if grasp else "fail",
             "reason": None if grasp else "opposing contact lost",
             "physical_grasp_confirmed_by_distance_only": False,
+            "initial_gripper_current_action": [-0.95, 0.95],
+            "initial_gripper_closure": parse_panda_gripper_closure([-0.95, 0.95]),
             "initial_finger_contacts": {
                 "status": "pass" if grasp else "fail",
                 "left": grasp,

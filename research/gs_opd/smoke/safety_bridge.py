@@ -19,6 +19,7 @@ from libero.libero.envs import OffScreenRenderEnv
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
 # This checkpoint was trained and is normally evaluated with the upstream
 # robosuite v1.4.0 OSC_POSE ranges. The vendored LIBERO-Safety copy has a
 # modified osc_pose.json (all six outputs are +/-2), so apply the upstream
@@ -827,10 +828,15 @@ def _tracking_gripper_sides(robot):
         ):
             raise ValueError(f"PandaGripper {side} Geom IDs do not resolve in the active model")
         groups[side] = ids
-    current_action = np.asarray(getattr(gripper, "current_action", []), dtype=np.float64)
-    if current_action.shape != (1,) or not np.isfinite(current_action).all():
-        raise ValueError("PandaGripper current close action is unavailable")
-    return groups, current_action
+    closure = _parse_tracking_gripper_closure(getattr(gripper, "current_action", None))
+    return groups, closure
+
+
+def _parse_tracking_gripper_closure(current_action):
+    # The import is deferred until after the Bridge has installed the repo root.
+    from research.gs_opd.repair.panda_gripper_state import parse_panda_gripper_closure
+
+    return parse_panda_gripper_closure(current_action)
 
 
 def _live_grasp_state(binding, expected_instruction):
@@ -927,7 +933,7 @@ def _live_grasp_state(binding, expected_instruction):
             raise ValueError("live_grasp_collision_geom_classification_is_incomplete")
         if len(env.robots) != 1:
             raise ValueError("live_grasp_requires_one_active_Panda_robot")
-        gripper_groups, current_action = _tracking_gripper_sides(env.robots[0])
+        gripper_groups, gripper_closure = _tracking_gripper_sides(env.robots[0])
         contacts = _collect_contacts()
         from research.gs_opd.repair.trajectory_bundle_acceptance import (
             classify_opposing_finger_contacts,
@@ -939,7 +945,10 @@ def _live_grasp_state(binding, expected_instruction):
             object_body_ids=subtree,
             gripper_geom_groups=gripper_groups,
         )
-        gripper_closed = bool(current_action[0] >= 0.9)
+        gripper_closed = bool(
+            gripper_closure.get("status") == "pass"
+            and gripper_closure.get("closed") is True
+        )
         grasp_confirmed = (
             contacts.get("status") != "unavailable"
             and sides.get("status") == "pass"
@@ -958,15 +967,25 @@ def _live_grasp_state(binding, expected_instruction):
             raise ValueError("live_grasp_read_changed_physical_or_kinematic_state")
         snapshot_identity = {"mujoco_state": before}
         state_id = _tracking_snapshot_state_id(snapshot_identity)
+        grasp_status = (
+            "pass"
+            if grasp_confirmed
+            else "unavailable"
+            if gripper_closure.get("status") != "pass"
+            or contacts.get("status") == "unavailable"
+            or sides.get("status") == "unavailable"
+            else "not_grasped"
+        )
         result.update({
-            "status": "pass" if grasp_confirmed else "not_grasped",
+            "status": grasp_status,
             "grasp_confirmed": grasp_confirmed,
             "object_id": object_id,
             "body_id": body_id,
             "body_name": body_name,
             "state_id": state_id,
             "state_fingerprint": hashlib.sha256(before.tobytes()).hexdigest(),
-            "gripper_current_action": current_action.tolist(),
+            "gripper_current_action": gripper_closure.get("raw_actuator_action"),
+            "gripper_closure": gripper_closure,
             "gripper_closed": gripper_closed,
             "gripper_close_threshold": 0.9,
             "finger_contacts": {
@@ -983,8 +1002,13 @@ def _live_grasp_state(binding, expected_instruction):
         if not grasp_confirmed:
             if contacts.get("status") == "unavailable":
                 result["reason"] = contacts.get("error", "live_contact_data_unavailable")
+            elif gripper_closure.get("status") != "pass":
+                result["reason"] = (
+                    "Panda_gripper_current_action_unavailable:"
+                    f"{gripper_closure.get('reason') or 'invalid_state'}"
+                )
             elif not gripper_closed:
-                result["reason"] = "Panda_gripper_close_action_below_0.9"
+                result["reason"] = gripper_closure.get("reason") or "Panda_gripper_close_command_below_0.9"
             else:
                 result["reason"] = "opposing_left_and_right_finger_contacts_not_both_present"
     except Exception as exc:
@@ -1152,24 +1176,39 @@ def _track_trajectory_candidate(
             "control_timestep_s": control_timestep,
         })
         result["start_contacts"] = _collect_contacts()
-        gripper_groups, current_gripper_action = _tracking_gripper_sides(robot)
+        gripper_groups, initial_gripper_closure = _tracking_gripper_sides(robot)
         start_sides = _tracking_contact_sides(
             result["start_contacts"], binding, gripper_groups
         )
         grasp = {
             "status": "unavailable",
             "reason": None,
-            "initial_gripper_current_action": current_gripper_action.tolist(),
+            "initial_gripper_current_action": initial_gripper_closure.get(
+                "raw_actuator_action"
+            ),
+            "initial_gripper_closure": initial_gripper_closure,
             "initial_finger_contacts": start_sides,
             "per_step": [],
             "maximum_relative_position_error_m": 0.0,
             "maximum_relative_rotation_error_rad": 0.0,
             "physical_grasp_confirmed_by_distance_only": False,
         }
-        if current_gripper_action[0] < 0.9:
-            grasp.update({"status": "fail", "reason": "initial_Panda_gripper_is_not_closed"})
+        if initial_gripper_closure.get("status") != "pass":
+            reason = initial_gripper_closure.get("reason") or "invalid_current_action"
+            grasp.update({
+                "status": "unavailable",
+                "reason": f"initial_Panda_gripper_action_unavailable:{reason}",
+            })
             result["grasp_evidence"] = grasp
-            raise RuntimeError("initial_grasp_evidence_unavailable: gripper is not closed")
+            raise RuntimeError(f"initial_grasp_evidence_unavailable: {grasp['reason']}")
+        if initial_gripper_closure.get("closed") is not True:
+            reason = initial_gripper_closure.get("reason") or "close_command_below_threshold"
+            grasp.update({
+                "status": "fail",
+                "reason": f"initial_Panda_gripper_is_not_closed:{reason}",
+            })
+            result["grasp_evidence"] = grasp
+            raise RuntimeError(f"initial_grasp_evidence_unavailable: {grasp['reason']}")
         if start_sides.get("status") != "pass":
             grasp.update({"status": start_sides.get("status", "unavailable"), "reason": "initial_opposing_finger_contacts_missing"})
             result["grasp_evidence"] = grasp
@@ -1309,6 +1348,9 @@ def _track_trajectory_candidate(
                 ))
                 step_contacts = _collect_contacts()
                 finger_sides = _tracking_contact_sides(step_contacts, binding, gripper_groups)
+                step_gripper_closure = _parse_tracking_gripper_closure(
+                    getattr(robot.gripper, "current_action", None)
+                )
                 joint_limits = _tracking_joint_limit_check(robot)
                 target_workspace = _tracking_workspace_check(target_eef_position, workspace)
                 actual_workspace = _tracking_workspace_check(eef_position, workspace)
@@ -1318,9 +1360,10 @@ def _track_trajectory_candidate(
                     "eef_body_relative_quaternion_local_wxyz": current_rel_quat.tolist(),
                     "relative_position_error_m": relative_pos_error,
                     "relative_rotation_error_rad": relative_rot_error,
-                    "gripper_current_action": np.asarray(
-                        getattr(robot.gripper, "current_action", []), dtype=np.float64
-                    ).tolist(),
+                    "gripper_current_action": step_gripper_closure.get(
+                        "raw_actuator_action"
+                    ),
+                    "gripper_closure": step_gripper_closure,
                 }
                 grasp["per_step"].append(grasp_step)
                 grasp["maximum_relative_position_error_m"] = max(
@@ -1345,8 +1388,13 @@ def _track_trajectory_candidate(
                     reason = "EEF_pose_tracking_error_exceeded"
                 elif finger_sides.get("status") != "pass":
                     reason = "Panda_opposing_finger_grasp_contact_lost"
-                elif np.asarray(getattr(robot.gripper, "current_action", []), dtype=np.float64).shape != (1,) or float(np.asarray(robot.gripper.current_action, dtype=np.float64)[0]) < 0.9:
-                    reason = "Panda_gripper_close_command_was_not_maintained"
+                elif step_gripper_closure.get("status") != "pass":
+                    reason = (
+                        "Panda_gripper_current_action_unavailable:"
+                        f"{step_gripper_closure.get('reason') or 'invalid_state'}"
+                    )
+                elif step_gripper_closure.get("closed") is not True:
+                    reason = step_gripper_closure.get("reason") or "Panda_gripper_close_command_below_0.9"
                 elif relative_pos_error > options["maximum_grasp_relative_position_error_m"]:
                     reason = "gripper_object_relative_position_changed_beyond_limit"
                 elif relative_rot_error > options["maximum_grasp_relative_rotation_error_rad"]:

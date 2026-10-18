@@ -28,6 +28,10 @@ from typing import Any
 
 import numpy as np
 
+from research.gs_opd.repair.panda_gripper_state import (
+    PANDA_GRIPPER_CLOSE_THRESHOLD,
+    validate_panda_gripper_closure_evidence,
+)
 from research.gs_opd.smoke.contact_safety_compiler_smoke import (
     _complete_monitoring,
     compile_forbid_contact,
@@ -942,6 +946,18 @@ def _candidate_assessment(
         or grasp.get("physical_grasp_confirmed_by_distance_only") is not False
     ):
         errors.append(grasp.get("reason") or "grasp_evidence_not_passed")
+    initial_closed, initial_closure, initial_closure_reason = (
+        validate_panda_gripper_closure_evidence(
+            grasp.get("initial_gripper_current_action"),
+            grasp.get("initial_gripper_closure"),
+            threshold=PANDA_GRIPPER_CLOSE_THRESHOLD,
+        )
+    )
+    if not initial_closed:
+        errors.append(
+            "initial_gripper_closure_not_verified:"
+            f"{initial_closure_reason or initial_closure.get('reason') or 'unknown'}"
+        )
     initial_contacts = grasp.get("initial_finger_contacts", {})
     if (
         not isinstance(initial_contacts, dict)
@@ -1037,15 +1053,23 @@ def _candidate_assessment(
             if isinstance(step_grasp, dict)
             else None
         )
-        if (
-            not isinstance(action, list)
-            or len(action) != 1
-            or isinstance(action[0], bool)
-            or not isinstance(action[0], (int, float))
-            or not math.isfinite(float(action[0]))
-            or float(action[0]) < 0.9
-        ):
-            errors.append(f"step_{index}_gripper_not_confirmed_closed")
+        closure_report = (
+            step_grasp.get("gripper_closure")
+            if isinstance(step_grasp, dict)
+            else None
+        )
+        step_closed, step_closure, step_closure_reason = (
+            validate_panda_gripper_closure_evidence(
+                action,
+                closure_report,
+                threshold=PANDA_GRIPPER_CLOSE_THRESHOLD,
+            )
+        )
+        if not step_closed:
+            errors.append(
+                f"step_{index}_gripper_not_confirmed_closed:"
+                f"{step_closure_reason or step_closure.get('reason') or 'unknown'}"
+            )
     if isinstance(steps, list):
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
