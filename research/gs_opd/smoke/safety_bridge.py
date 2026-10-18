@@ -599,7 +599,10 @@ def _tracking_state_object(diagnostic, body_id):
         or not np.isfinite(quaternion).all()
     ):
         raise ValueError("carried object root pose is incomplete")
-    return position, quaternion / np.linalg.norm(quaternion)
+    quaternion_norm = float(np.linalg.norm(quaternion))
+    if not np.isfinite(quaternion_norm) or quaternion_norm <= 1e-12:
+        raise ValueError("carried object root quaternion is invalid")
+    return position, quaternion / quaternion_norm
 
 
 def _tracking_body_is_ancestor(model, ancestor, body):
@@ -883,13 +886,16 @@ def _tracking_relative_pose(position, quaternion, eef_position, eef_quaternion):
     return relative_position_local, relative_quaternion_local
 
 
-def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate_index):
+def _track_trajectory_candidate(
+    candidate, snapshot, binding, options, candidate_index, reference_plan
+):
     from research.gs_opd.repair.trajectory_tracking import (
+        body_local_offset_from_world_point,
+        body_local_point_to_world,
         quaternion_conjugate,
         quaternion_multiply,
         quaternion_to_matrix,
         quaternion_to_rotation_vector,
-        resample_polyline_by_distance,
         world_pose_tracking_action,
     )
 
@@ -899,11 +905,17 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
     result = {
         "candidate_id": candidate_id,
         "direction": candidate.get("direction"),
-        "goal_world_m": candidate.get("goal_world_m"),
+        "goal_sphere_center_world_m": candidate.get(
+            "goal_sphere_center_world_m"
+        ),
         "control_points_world_m": candidate.get("control_points_world_m"),
         "geometric_points_world_m": candidate.get("points_world_m"),
         "status": "error",
         "requested_steps": 0,
+        "sphere_center_body_local_offset_m": None,
+        "start_object_root_pos_world_m": None,
+        "start_object_root_quat_world_wxyz": None,
+        "start_object_sphere_center_world_m": None,
         "executed_steps": 0,
         "execution_complete": False,
         "snapshot_start_state_match": False,
@@ -927,16 +939,28 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
         ).hexdigest()
         if not restore_matches:
             raise RuntimeError("candidate Snapshot restore did not reproduce full captured state")
-        object_position, object_quaternion = _tracking_state_object(
+        object_root_position, object_quaternion = _tracking_state_object(
             diagnostic, binding["body_id"]
         )
         points = np.asarray(candidate["points_world_m"], dtype=np.float64)
         center_start = np.asarray(binding["center_world_m"], dtype=np.float64)
+        sphere_center_local = body_local_offset_from_world_point(
+            center_start, object_root_position, object_quaternion
+        )
+        reconstructed_sphere_center = body_local_point_to_world(
+            object_root_position, object_quaternion, sphere_center_local
+        )
         if (
-            np.linalg.norm(object_position - center_start) > options["state_tolerance_m"]
-            or np.linalg.norm(points[0] - object_position) > options["state_tolerance_m"]
+            np.linalg.norm(reconstructed_sphere_center - center_start)
+            > options["state_tolerance_m"]
+            or np.linalg.norm(points[0] - reconstructed_sphere_center)
+            > options["state_tolerance_m"]
         ):
-            raise ValueError("trajectory_start_does_not_match_snapshot_object_center")
+            raise ValueError("trajectory_start_does_not_match_snapshot_sphere_center")
+        result["sphere_center_body_local_offset_m"] = sphere_center_local.tolist()
+        result["start_object_root_pos_world_m"] = object_root_position.tolist()
+        result["start_object_root_quat_world_wxyz"] = object_quaternion.tolist()
+        result["start_object_sphere_center_world_m"] = reconstructed_sphere_center.tolist()
         if len(env.robots) != 1 or int(getattr(robot, "action_dim", 0)) != 7:
             raise ValueError("closed-loop tracker requires one 7-D Panda OSC_POSE action")
         if getattr(robot.controller, "name", type(robot.controller).__name__) != "OSC_POSE":
@@ -944,12 +968,14 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
         control_timestep = float(env.env.control_timestep)
         if not math.isclose(control_timestep, 0.05, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("active environment is not configured for 20 Hz OSC control")
-        sampled = resample_polyline_by_distance(
-            points,
-            speed_m_s=options["reference_speed_m_s"],
-            control_timestep_s=control_timestep,
-            maximum_steps=options["max_control_steps_per_candidate"],
-        )
+        sampled = reference_plan
+        if not math.isclose(
+            float(sampled.get("control_timestep_s", float("nan"))),
+            control_timestep,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("preflight_reference_plan_control_timestep_changed")
         references = sampled["reference_points_world_m"]
         result.update({
             "requested_steps": sampled["requested_steps"],
@@ -983,13 +1009,17 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
             raise RuntimeError("initial_grasp_evidence_unavailable: both Panda fingers do not contact the carried object")
         robot_state = diagnostic["robot_states"][0]
         relative_position_local, relative_quaternion_local = _tracking_relative_pose(
-            object_position,
+            reconstructed_sphere_center,
             object_quaternion,
             robot_state["eef_pos"],
             robot_state["eef_quat"],
         )
-        grasp["initial_eef_object_relative_position_local_m"] = relative_position_local.tolist()
-        grasp["initial_eef_object_relative_quaternion_local_wxyz"] = relative_quaternion_local.tolist()
+        grasp["initial_eef_sphere_center_relative_position_body_local_m"] = (
+            relative_position_local.tolist()
+        )
+        grasp["initial_eef_body_relative_quaternion_local_wxyz"] = (
+            relative_quaternion_local.tolist()
+        )
         grasp["status"] = "pass"
         workspace = _tracking_workspace(robot, _diagnostic_data_from_integration_state(sim))
         result["workspace_envelope"] = workspace
@@ -1024,8 +1054,11 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
         tracking_reason = None
         for step_index in range(sampled["requested_steps"]):
             live_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
-            object_position, object_quaternion = _tracking_state_object(
+            object_root_position, object_quaternion = _tracking_state_object(
                 live_diagnostic, binding["body_id"]
+            )
+            sphere_center = body_local_point_to_world(
+                object_root_position, object_quaternion, sphere_center_local
             )
             robot_state = live_diagnostic["robot_states"][0]
             actual_eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
@@ -1084,16 +1117,21 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
                 last_reward = reward  # noqa: F841  # Preserve branch Snapshot bookkeeping.
                 last_done = done  # noqa: F841  # Preserve branch Snapshot bookkeeping.
                 diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
-                object_position, object_quaternion = _tracking_state_object(
+                object_root_position, object_quaternion = _tracking_state_object(
                     diagnostic, binding["body_id"]
+                )
+                sphere_center = body_local_point_to_world(
+                    object_root_position, object_quaternion, sphere_center_local
                 )
                 robot_state = diagnostic["robot_states"][0]
                 eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
                 eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
-                object_error = float(np.linalg.norm(object_position - reference_position))
+                sphere_center_error = float(
+                    np.linalg.norm(sphere_center - reference_position)
+                )
                 eef_error = float(np.linalg.norm(eef_position - target_eef_position))
                 current_rel_pos, current_rel_quat = _tracking_relative_pose(
-                    object_position, object_quaternion, eef_position, eef_quaternion
+                    sphere_center, object_quaternion, eef_position, eef_quaternion
                 )
                 relative_pos_error = float(np.linalg.norm(current_rel_pos - relative_position_local))
                 relative_rot_delta = quaternion_multiply(
@@ -1109,8 +1147,8 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
                 actual_workspace = _tracking_workspace_check(eef_position, workspace)
                 grasp_step = {
                     **finger_sides,
-                    "eef_object_relative_position_local_m": current_rel_pos.tolist(),
-                    "eef_object_relative_quaternion_local_wxyz": current_rel_quat.tolist(),
+                    "eef_sphere_center_relative_position_body_local_m": current_rel_pos.tolist(),
+                    "eef_body_relative_quaternion_local_wxyz": current_rel_quat.tolist(),
                     "relative_position_error_m": relative_pos_error,
                     "relative_rotation_error_rad": relative_rot_error,
                     "gripper_current_action": np.asarray(
@@ -1134,8 +1172,8 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
                     reason = "active_Panda_joint_limit_violated"
                 elif workspace_status != "pass":
                     reason = "Panda_EEF_left_conservative_workspace"
-                elif object_error > options["maximum_object_tracking_error_m"]:
-                    reason = "carried_object_path_tracking_error_exceeded"
+                elif sphere_center_error > options["maximum_sphere_center_tracking_error_m"]:
+                    reason = "carried_sphere_center_path_tracking_error_exceeded"
                 elif eef_error > options["maximum_eef_tracking_error_m"]:
                     reason = "EEF_pose_tracking_error_exceeded"
                 elif finger_sides.get("status") != "pass":
@@ -1153,14 +1191,16 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
                     grasp["reason"] = reason
                 step = {
                     "step_index": step_index,
-                    "reference_object_center_world_m": reference_position.tolist(),
-                    "actual_object_center_world_m": object_position.tolist(),
-                    "actual_object_quaternion_world_wxyz": object_quaternion.tolist(),
+                    "reference_sphere_center_world_m": reference_position.tolist(),
+                    "actual_object_root_pos_world_m": object_root_position.tolist(),
+                    "actual_object_sphere_center_world_m": sphere_center.tolist(),
+                    "sphere_center_body_local_offset_m": sphere_center_local.tolist(),
+                    "actual_object_root_quat_world_wxyz": object_quaternion.tolist(),
                     "actual_eef_position_world_m": eef_position.tolist(),
                     "actual_eef_quaternion_world_wxyz": eef_quaternion.tolist(),
                     "target_eef_position_world_m": target_eef_position.tolist(),
                     "target_eef_quaternion_world_wxyz": target_eef_quaternion.tolist(),
-                    "object_tracking_error_m": object_error,
+                    "sphere_center_tracking_error_m": sphere_center_error,
                     "eef_tracking_error_m": eef_error,
                     "grasp_relative_position_error_m": relative_pos_error,
                     "grasp_relative_rotation_error_rad": relative_rot_error,
@@ -1200,7 +1240,7 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
             and all(not step["done"] for step in result["steps"])
         )
         endpoint_error = (
-            result["steps"][-1]["object_tracking_error_m"]
+            result["steps"][-1]["sphere_center_tracking_error_m"]
             if result["steps"]
             else None
         )
@@ -1214,7 +1254,7 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
         endpoint_reached = (
             endpoint_error is not None
             and np.isfinite(endpoint_error)
-            and endpoint_error <= options["maximum_object_tracking_error_m"]
+            and endpoint_error <= options["maximum_sphere_center_tracking_error_m"]
         )
         result["task_feasibility"] = {
             "status": (
@@ -1232,14 +1272,14 @@ def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate
             "no_terminal_done": no_terminal_state,
             "finite_reward_trace": finite_rewards,
             "opposing_finger_grasp_maintained": grasp_held,
-            "endpoint_object_tracking_error_m": endpoint_error,
+            "endpoint_sphere_center_tracking_error_m": endpoint_error,
             "endpoint_within_tracking_tolerance": endpoint_reached,
         }
         result["closed_loop_tracking"] = {
             "status": "pass" if result["execution_complete"] else "fail",
             "reason": tracking_reason,
-            "maximum_object_tracking_error_m": max(
-                (step["object_tracking_error_m"] for step in result["steps"]), default=None
+            "maximum_sphere_center_tracking_error_m": max(
+                (step["sphere_center_tracking_error_m"] for step in result["steps"]), default=None
             ),
             "maximum_eef_tracking_error_m": max(
                 (step["eef_tracking_error_m"] for step in result["steps"]), default=None
@@ -1298,6 +1338,13 @@ def _track_trajectory_bundle(request):
         }
     expected_context = request.get("repair_context")
     try:
+        from research.gs_opd.repair.trajectory_tracking import (
+            MAX_CONTROL_STEPS_PER_CANDIDATE,
+            MAX_REFERENCE_SPEED_M_S,
+            MAX_TOTAL_CONTROL_STEPS,
+            plan_bundle_reference_paths,
+        )
+
         active_context = _repair_context()
         if (
             not isinstance(expected_context, dict)
@@ -1319,12 +1366,24 @@ def _track_trajectory_bundle(request):
         if (
             isinstance(max_steps, bool)
             or not isinstance(max_steps, int)
-            or max_steps not in range(1, 241)
+            or not 1 <= max_steps <= MAX_CONTROL_STEPS_PER_CANDIDATE
         ):
-            raise ValueError("max_control_steps_per_candidate_must_be_in_1_to_240")
+            raise ValueError(
+                "max_control_steps_per_candidate_must_be_in_1_to_"
+                f"{MAX_CONTROL_STEPS_PER_CANDIDATE}"
+            )
+        max_total_steps = options.get("max_total_control_steps")
+        if (
+            isinstance(max_total_steps, bool)
+            or not isinstance(max_total_steps, int)
+            or not 1 <= max_total_steps <= MAX_TOTAL_CONTROL_STEPS
+        ):
+            raise ValueError(
+                f"max_total_control_steps_must_be_in_1_to_{MAX_TOTAL_CONTROL_STEPS}"
+            )
         for field in (
             "reference_speed_m_s",
-            "maximum_object_tracking_error_m",
+            "maximum_sphere_center_tracking_error_m",
             "maximum_eef_tracking_error_m",
             "maximum_grasp_relative_position_error_m",
             "maximum_grasp_relative_rotation_error_rad",
@@ -1339,8 +1398,49 @@ def _track_trajectory_bundle(request):
                 or float(value) <= 0
             ):
                 raise ValueError(f"tracking option {field} must be finite and positive")
-        if len({item.get("candidate_id") for item in candidates if isinstance(item, dict)}) != len(candidates):
+        if float(options["reference_speed_m_s"]) > MAX_REFERENCE_SPEED_M_S:
+            raise ValueError(
+                "reference_speed_m_s_cannot_exceed_"
+                f"{MAX_REFERENCE_SPEED_M_S}_m_s"
+            )
+        candidate_ids = []
+        candidate_paths = []
+        for candidate in candidates:
+            if (
+                not isinstance(candidate, dict)
+                or not isinstance(candidate.get("candidate_id"), str)
+                or not candidate["candidate_id"]
+                or candidate.get("status") not in (None, "geometric_candidate")
+            ):
+                raise ValueError("candidate_identity_or_status_is_malformed")
+            points = np.asarray(candidate.get("points_world_m"), dtype=np.float64)
+            goal = np.asarray(
+                candidate.get("goal_sphere_center_world_m"), dtype=np.float64
+            )
+            if (
+                points.ndim != 2
+                or points.shape[1] != 3
+                or len(points) < 2
+                or not np.isfinite(points).all()
+                or goal.shape != (3,)
+                or not np.isfinite(goal).all()
+                or np.linalg.norm(points[-1] - goal) > 1e-6
+            ):
+                raise ValueError(
+                    f"candidate_{candidate['candidate_id']}_path_is_malformed"
+                )
+            candidate_ids.append(candidate["candidate_id"])
+            candidate_paths.append(points)
+        if len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError("candidate_ids_are_missing_or_duplicated")
+        reference_plans, planned_total_steps = plan_bundle_reference_paths(
+            candidate_paths,
+            speed_m_s=float(options["reference_speed_m_s"]),
+            control_timestep_s=float(env.env.control_timestep),
+            maximum_steps_per_candidate=max_steps,
+            maximum_total_steps=max_total_steps,
+        )
+        reference_plans_by_id = dict(zip(candidate_ids, reference_plans))
     except Exception as exc:
         return {
             "status": "unavailable",
@@ -1356,6 +1456,8 @@ def _track_trajectory_bundle(request):
         "status": "incomplete",
         "snapshot_id": snapshot_id,
         "trajectory_state_id": request["trajectory_state_id"],
+        "planned_total_control_steps": planned_total_steps,
+        "maximum_total_control_steps": max_total_steps,
         "candidates": [],
         "main_state_restored": False,
         "main_restore_verified": False,
@@ -1377,7 +1479,12 @@ def _track_trajectory_bundle(request):
                 if candidate.get("status") not in (None, "geometric_candidate"):
                     raise ValueError("candidate has an unsupported execution status")
                 item = _track_trajectory_candidate(
-                    candidate, target_snapshot, binding, options, candidate_index
+                    candidate,
+                    target_snapshot,
+                    binding,
+                    options,
+                    candidate_index,
+                    reference_plans_by_id[candidate["candidate_id"]],
                 )
             except Exception as exc:
                 item["status"] = "error"

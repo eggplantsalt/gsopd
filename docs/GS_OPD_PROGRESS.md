@@ -1711,21 +1711,22 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 
 - 新增 `research/gs_opd/repair/trajectory_tracking.py::track_trajectory_bundle()`。它接收当前决策状态的 Snapshot ID、内存中的同状态 `trajectory_bundle.py` Bundle、已核验的搬运对象 Body/Geom binding、Safety IR v2、语义绑定、当前 Geometry Inventory、Gripper Inventory 和活动 `repair_context`。Bundle 的几何候选必须仍标记 `executable=false`、`physical_safety_verified=false`；本接口只跟踪 `passes_geometric_screen=true` 的候选，最多 24 条。
 - 新增 Bridge `track_trajectory_bundle` 操作。调用前要求主环境完整 Snapshot 与请求 Snapshot 完全相同，且 Bundle 的模型/积分状态/任务指令指纹一致。每条候选开始前都从该 Snapshot 恢复并验证完整 Snapshot；全部候选结束后恢复并逐项核验调用前的 Snapshot 与 canonical 状态。候选起始积分状态指纹还会跨候选比较；任一恢复或起点校验不通过，所有候选均不可执行。
-- Bridge 将物体球心曲线按弧长和 20 Hz 环境控制周期重采样，默认参考速度上限 0.04 m/s，每条最多 240 个控制步。起始时读取真实物体与 EEF 位姿，建立物体局部坐标中的 EEF 相对位置/四元数。每步根据实际物体/EEF 状态更新目标 EEF 位姿，再通过活动 OSC_POSE 的世界坐标 delta 和当前 input/output bounds 反算 7 维动作。动作在调用环境前必须通过有限值、归一化 action range、控制器 scaling 一致性和 7 维环境 action spec 检查；没有静默裁剪。目标受控制器 position limits（若配置）和 Panda 模型关节锚点链导出的保守可达半径检查，并在每步核验实际 EEF 工作范围及臂/夹爪关节 qpos limits。若活动控制器 orientation clipping 不能证明关闭，则拒绝该候选。
+- Bridge 将物体球心曲线按弧长和 20 Hz 环境控制周期重采样，参考速度默认 0.04 m/s 且不允许提高；默认单候选最多 480 步、整束最多 7,200 步，硬上限分别为 600 和 12,000 步。所需控制步按 `ceil(curve_length / (reference_speed * 0.05))` 预先计算；例如 0.567 m 路径在 0.04 m/s 下需要 284 步。Bridge 与客户端都会在分支动作前检查单候选及整束预算，超限会明确拒绝，不截断路径或提高速度。起始时从同一 Snapshot 的 Body `root_pos/root_quat` 和已验证几何球心计算球心在 Body 局部坐标中的刚性偏移；后续每步都用真实 Body 位姿将该偏移变换回世界系，轨迹参考、EEF 目标、跟踪误差及终点误差一律使用 `sphere_center`。报告分别给出 `actual_object_root_pos_world_m`、`actual_object_root_quat_world_wxyz`、`actual_object_sphere_center_world_m`、`reference_sphere_center_world_m` 及 `sphere_center_body_local_offset_m`，不再假设 root 与球心重合。随后依据真实球心与 EEF 位姿建立 EEF 相对偏移。每步通过活动 OSC_POSE 的世界坐标 delta 和当前 input/output bounds 反算 7 维动作。动作在调用环境前必须通过有限值、归一化 action range、控制器 scaling 一致性和 7 维环境 action spec 检查；没有静默裁剪。目标受控制器 position limits（若配置）和 Panda 模型关节锚点链导出的保守可达半径检查，并在每步核验实际 EEF 工作范围及臂/夹爪关节 qpos limits。若活动控制器 orientation clipping 不能证明关闭，则拒绝该候选。
 - 初始抓持不是前提假设：只在活动 `PandaGripper` 的 current close action 有效、MuJoCo 中绑定对象同时与模型定义的左/右指面 Geom 接触时开始执行。每步继续检查两侧接触、夹爪闭合命令及 EEF—物体相对位姿变化；丢失接触、位姿异常、动作越界、Workspace/关节限制失败、提前 done 或路径误差超限都会拒绝。抓持输出明确记录为接触支持的抓持保持证据，不以距离不变单独宣称抓持成功。
 - 现有 Compiler 的机器人部位映射只完整支持 `gripper`。IR 中存在 `unknown` 或当前 Compiler 无法映射的其他机器人部位规则时，客户端在发送分支请求前拒绝；所有明确的 gripper 规则目标都会逐一调用现有 Compiler，未分类接触仍会使候选无法通过。
-- 每步记录原始/重采样参考点、物体球心和姿态、EEF 位姿、跟踪误差、实际七维 action、实际 OSC scaling、抓持相对位姿、Contact Monitor 结果、reward/done、关节与工作空间检查及 canonical 状态。Bridge 复用 `_run_env_step_with_contact_monitor()` 获取 `env.step()` 内每个 MuJoCo 物理子步；客户端复用真实 `compile_forbid_contact()` 和全部 `object_contact_rules` 检查。允许的抓持接触、Teacher 禁止接触、Teacher 明确允许的其他物体接触和未分类接触分别输出；不明接触及不完整监测 fail-closed。
+- 每步记录重采样球心参考、Body root 位姿、真实球心及其 Body-local 偏移、EEF 位姿、跟踪误差、实际七维 action、实际 OSC scaling、抓持相对位姿、Contact Monitor 结果、reward/done、关节与工作空间检查及 canonical 状态。结果中的 `goal_sphere_center_world_m` 明确表示球心目标。Bridge 复用 `_run_env_step_with_contact_monitor()` 获取 `env.step()` 内每个 MuJoCo 物理子步；客户端复用真实 `compile_forbid_contact()` 和全部 `object_contact_rules` 检查。允许的抓持接触、Teacher 禁止接触、Teacher 明确允许的其他物体接触和未分类接触分别输出；不明接触及不完整监测 fail-closed。
 - 合格条件还要求完整执行到路径终点、有限 reward trace、未提前终止、逐步路径跟踪通过以及抓持接触保持。`task_feasibility` 只声明“本段局部搬运路径已完成且未终止”，不会声称最终任务成功，也不会生成训练标签。每条候选独立保留原始几何路径、所有控制步诊断、Compiler 结果与拒绝原因；只有全部物理、动作、抓持、任务段和恢复验证都通过的 Candidate ID 才进入 `executable_safe_candidate_ids`。
 
 ### 静态验证与限制
 
-- 新增 `research/gs_opd/repair/test_trajectory_tracking.py`，15 项 unittest 通过：覆盖双指抓持通过/未抓持拒绝、目标超出保守 Workspace、OSC 输入越界不裁剪、世界坐标 pose 到 OSC 映射、禁止的物体/夹爪接触、未分类碰撞 fail-closed、抓持丢失、轨迹/任务段失败、Snapshot 恢复失败、多候选起点一致性、未映射 Teacher 规则预检拒绝和 20 Hz 限速参考路径。测试通过现有 Contact Compiler，但 Bridge 响应使用合成夹具。
+- 新增 `research/gs_opd/repair/test_trajectory_tracking.py`，当前 22 项 unittest 通过：覆盖双指抓持通过/未抓持拒绝、Body 原点与球心有偏移及旋转变化、零偏移、Bundle 与同状态球心绑定冲突及返回偏移冲突拒绝、目标超出保守 Workspace、OSC 输入越界不裁剪、禁止的物体/夹爪接触、未分类碰撞 fail-closed、抓持丢失、Snapshot 恢复失败、多候选隔离、20 Hz 限速、0.567 m 路径超过旧 240 步上限后仍在新预算内、单候选及整束真实超预算拒绝，以及拒绝通过提高参考速度绕过时长预算。测试通过现有 Contact Compiler，但 Bridge 响应和物理状态使用合成夹具。
 - 当前检查只验证了静态代码和 Python 协议替身。没有启动 Safety Bridge、MuJoCo 或 π₀.₅，也没有在真实 Student 持物状态运行；因此没有任何真实 Panda 抓持、动力学跟踪、真实碰撞或 Snapshot 分支成功结论。合成测试不能代替真实 MuJoCo 物理验证。
+- 2026-10-19 定点修复将规划包围球 `sphere_center` 与 MuJoCo Body `root_pos` 分开处理：从决策 Snapshot 的球心和 Body root 位姿计算刚性局部偏移，后续按实时 Body 四元数更新球心；路径起点、EEF 目标、误差、终点和报告统一按球心比较。轨迹弧长按完整离散 B-Spline 点列求和，步数以速度上限 0.04 m/s 和实际已校验 20 Hz 周期计算，并受 480/7,200 默认及 600/12,000 硬上限约束。静态回归覆盖 0.567 m 路径需 284 步、单条与整束超预算以及禁止提高参考速度绕过预算。新增代码仍未在真实 MuJoCo 执行。
 - Workspace 约束使用活动控制器笛卡尔限制（若有）、模型关节锚点链给出的保守外包半径、实际 EEF 路径检查和关节 qpos limits。外包半径不是完整逆运动学可达性证明；无法跟踪时由每步真实反馈误差拒绝。指面持续接触和相对位姿阈值是操作性保持证据，不证明任意摩擦/载荷下的抓持裕量。mesh/几何候选初筛仍不构成物理安全证明。
 
 ### 在 Near–Far 命中的当前决策状态调用
 
-应在 Student 的当前真实观测与动作没有推进前，从当前同一连接获取 Snapshot、控制器/几何清单和 `repair_context`，从该状态的 `planning_geometry` 与已验证绑定生成 Bundle，然后调用通用函数。不要加载历史归档状态拼接轨迹：
+物理验收必须从 **Student 已经真实抓住搬运物体** 的活环境决策状态开始，且调用过程中 Student 尚未执行下一动作。不要从 Bridge 冷启动后的未抓持 L0T0 初始状态运行，也不要用历史 Snapshot、RGB 或动作替代当前状态。最短入口是在持久运行的 Student/On-Policy 进程中，确认当前真实抓持后用同一 Bridge connection 依次读取 Snapshot、活动控制器/几何清单和 `repair_context`，并从这个 Snapshot 生成 `planning_geometry`、绑定和 Bundle，再调用下面接口：
 
 ```python
 # connection 是已连接到当前 Safety Bridge 的 multiprocessing.Connection。
@@ -1758,7 +1759,10 @@ result = track_trajectory_bundle(
     semantic_results=current_semantic_bindings,
     geometry_inventory=geometry_inventory,
     gripper_inventory=gripper_inventory,
-    config=TrackingConfig(max_control_steps_per_candidate=240),
+    config=TrackingConfig(
+        max_control_steps_per_candidate=480,
+        max_total_control_steps=7200,
+    ),
 )
 print(result["status"], result["executable_safe_candidate_ids"])
 ```
@@ -1777,6 +1781,6 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
 **检查清单（Checklist）**
 
 - [x] 新增可复用客户端接口和闭环 Bridge 操作；世界坐标物体路径通过反馈目标 EEF 位姿转换为活动 OSC 动作，并复用子步 Contact Monitor、Contact Compiler 和 Snapshot。
-- [x] 15 项合成单元测试及 Python 语法检查通过；测试覆盖抓持、碰撞、约束、路径失败、恢复和候选隔离。
+- [x] 22 项合成单元测试及 Python 语法检查通过；测试覆盖抓持、球心刚性偏移、路径时长预算、碰撞、约束、恢复和候选隔离。
 - [ ] 在真实 Student 已抓持的决策状态确认左右指面真实接触、完整候选闭环、Compiler 判定及分支/调用者状态恢复。
 - [ ] 实测 OSC 跟踪误差、控制步预算、Workspace 拒绝率和操作性抓持保持条件是否适用于真实轨迹。

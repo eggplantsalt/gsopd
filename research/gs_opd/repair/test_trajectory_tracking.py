@@ -21,8 +21,12 @@ import numpy as np
 
 from research.gs_opd.repair.trajectory_tracking import (
     TrackingConfig,
+    body_local_offset_from_world_point,
+    body_local_point_to_world,
     check_workspace_target,
     inverse_osc_world_delta,
+    plan_bundle_reference_paths,
+    quaternion_to_matrix,
     resample_polyline_by_distance,
     track_trajectory_bundle,
     world_pose_tracking_action,
@@ -160,6 +164,7 @@ def _fixtures(candidate_count=1):
         "geom_ids": [0],
         "geom_names": ["carry_geom"],
         "semantic_binding_geom_ids": [0],
+        "center_world_m": [0.0, 0.0, 0.0],
         "state_id": STATE_ID,
         "binding_verified": True,
         "covers_all_associated_collision_geoms": True,
@@ -252,8 +257,25 @@ def _event(kind):
 
 
 def _bridge_candidate(
-    candidate_id, *, grasp=True, tracking=True, collision=False, fingerprint=FINGERPRINT
+    candidate_id,
+    *,
+    grasp=True,
+    tracking=True,
+    collision=False,
+    fingerprint=FINGERPRINT,
+    sphere_offset=(0.0, 0.0, 0.0),
+    object_quaternion=(1.0, 0.0, 0.0, 0.0),
+    step_quaternions=None,
 ):
+    sphere_offset = np.asarray(sphere_offset, dtype=np.float64)
+    object_quaternion = np.asarray(object_quaternion, dtype=np.float64)
+
+    def root_from_sphere(center, quaternion):
+        rotation = quaternion_to_matrix(quaternion)
+        return (
+            np.asarray(center, dtype=np.float64) - rotation @ sphere_offset
+        ).tolist()
+
     events = [_event("grasp")] if grasp else []
     if collision:
         events.append(_event("collision"))
@@ -261,13 +283,27 @@ def _bridge_candidate(
     steps = []
     grasp_steps = []
     control_steps = []
-    for index in range(2):
+    control_step_count = 5
+    for index in range(control_step_count):
+        sphere_center = [0.01 * (index + 1) / control_step_count, 0.0, 0.0]
+        step_quaternion = (
+            np.asarray(
+                step_quaternions[min(index, len(step_quaternions) - 1)],
+                dtype=np.float64,
+            )
+            if step_quaternions is not None
+            else object_quaternion
+        )
         steps.append(
             {
                 "step_index": index,
-                "reference_object_center_world_m": [0.005 * (index + 1), 0.0, 0.0],
-                "actual_object_center_world_m": [0.005 * (index + 1), 0.0, 0.0],
-                "actual_object_quaternion_world_wxyz": [1.0, 0.0, 0.0, 0.0],
+                "reference_sphere_center_world_m": sphere_center,
+                "actual_object_root_pos_world_m": root_from_sphere(
+                    sphere_center, step_quaternion
+                ),
+                "actual_object_sphere_center_world_m": sphere_center,
+                "sphere_center_body_local_offset_m": sphere_offset.tolist(),
+                "actual_object_root_quat_world_wxyz": step_quaternion.tolist(),
                 "actual_eef_position_world_m": [0.0, 0.0, 0.0],
                 "actual_eef_quaternion_world_wxyz": [1.0, 0.0, 0.0, 0.0],
                 "action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
@@ -283,8 +319,10 @@ def _bridge_candidate(
                     "object_states": {
                         "carried": {
                             "body_id": 10,
-                            "root_pos": [0.005 * (index + 1), 0.0, 0.0],
-                            "root_quat": [1.0, 0.0, 0.0, 0.0],
+                            "root_pos": root_from_sphere(
+                                sphere_center, step_quaternion
+                            ),
+                            "root_quat": step_quaternion.tolist(),
                         }
                     },
                 },
@@ -293,7 +331,7 @@ def _bridge_candidate(
                     "contacts": [],
                 },
                 "tracking_status": "pass" if tracking else "fail",
-                "object_tracking_error_m": 0.0 if tracking else 0.1,
+                "sphere_center_tracking_error_m": 0.0 if tracking else 0.1,
                 "eef_tracking_error_m": 0.0,
                 "joint_limits": {"status": "pass"},
                 "workspace": {"status": "pass"},
@@ -304,8 +342,8 @@ def _bridge_candidate(
                 "status": "pass" if grasp else "fail",
                 "left": grasp,
                 "right": grasp,
-                "eef_object_relative_position_local_m": [0.0, 0.0, 0.0],
-                "eef_object_relative_quaternion_local_wxyz": [1.0, 0.0, 0.0, 0.0],
+                "eef_sphere_center_relative_position_body_local_m": [0.0, 0.0, 0.0],
+                "eef_body_relative_quaternion_local_wxyz": [1.0, 0.0, 0.0, 0.0],
                 "relative_position_error_m": 0.0,
                 "relative_rotation_error_rad": 0.0,
                 "gripper_current_action": [1.0],
@@ -332,10 +370,19 @@ def _bridge_candidate(
         "snapshot_start_state_match": True,
         "start_state_fingerprint": fingerprint,
         "execution_complete": True,
-        "requested_steps": 2,
-        "executed_steps": 2,
-        "goal_world_m": [0.01, 0.0, 0.0],
-        "reference_path": [[0.0, 0.0, 0.0], [0.005, 0.0, 0.0], [0.01, 0.0, 0.0]],
+        "sphere_center_body_local_offset_m": sphere_offset.tolist(),
+        "start_object_root_pos_world_m": root_from_sphere(
+            [0.0, 0.0, 0.0], object_quaternion
+        ),
+        "start_object_root_quat_world_wxyz": object_quaternion.tolist(),
+        "start_object_sphere_center_world_m": [0.0, 0.0, 0.0],
+        "requested_steps": control_step_count,
+        "executed_steps": control_step_count,
+        "goal_sphere_center_world_m": [0.01, 0.0, 0.0],
+        "reference_path": [
+            [0.01 * index / control_step_count, 0.0, 0.0]
+            for index in range(control_step_count + 1)
+        ],
         "start_state": {
             "mujoco_integration_state": [0.0],
             "robot_states": [
@@ -344,8 +391,8 @@ def _bridge_candidate(
             "object_states": {
                 "carried": {
                     "body_id": 10,
-                    "root_pos": [0.0, 0.0, 0.0],
-                    "root_quat": [1.0, 0.0, 0.0, 0.0],
+                    "root_pos": root_from_sphere([0.0, 0.0, 0.0], object_quaternion),
+                    "root_quat": object_quaternion.tolist(),
                 }
             },
         },
@@ -361,7 +408,7 @@ def _bridge_candidate(
         "steps": steps,
         "closed_loop_tracking": {
             "status": "pass" if tracking else "fail",
-            "maximum_object_tracking_error_m": 0.0 if tracking else 0.1,
+            "maximum_sphere_center_tracking_error_m": 0.0 if tracking else 0.1,
             "maximum_eef_tracking_error_m": 0.0,
         },
         "grasp_evidence": {
@@ -373,8 +420,17 @@ def _bridge_candidate(
                 "left": grasp,
                 "right": grasp,
             },
-            "initial_eef_object_relative_position_local_m": [0.0, 0.0, 0.0],
-            "initial_eef_object_relative_quaternion_local_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "initial_eef_sphere_center_relative_position_body_local_m": [
+                0.0,
+                0.0,
+                0.0,
+            ],
+            "initial_eef_body_relative_quaternion_local_wxyz": [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
             "per_step": grasp_steps,
         },
         "contact_monitoring": {
@@ -382,11 +438,13 @@ def _bridge_candidate(
             "sampling_point": "immediately_after_each_successful_MjSim.step",
             "robot_classification_status": "available",
             "control_steps": control_steps,
-            "expected_physics_substeps_total": 2,
-            "captured_physics_substeps": 2,
+            "expected_physics_substeps_total": control_step_count,
+            "captured_physics_substeps": control_step_count,
             "unobserved_expected_substeps": 0,
             "contact_substeps": 1 if contact else 0,
-            "no_contact_substeps": 1 if contact else 2,
+            "no_contact_substeps": control_step_count - 1
+            if contact
+            else control_step_count,
             "unavailable_contact_substeps": 0,
             "events": events,
         },
@@ -428,7 +486,7 @@ class TrajectoryTrackingTests(unittest.TestCase):
             connection,
             "snapshot-1",
             *fixtures,
-            config=TrackingConfig(reference_speed_m_s=0.1),
+            config=TrackingConfig(),
         )
         return result, connection
 
@@ -446,6 +504,10 @@ class TrajectoryTrackingTests(unittest.TestCase):
         self.assertEqual(
             connection.request["carried_binding"]["semantic_binding_geom_ids"], [0]
         )
+        self.assertEqual(
+            connection.request["options"]["max_control_steps_per_candidate"], 480
+        )
+        self.assertEqual(connection.request["options"]["max_total_control_steps"], 7200)
 
     def test_ungrasped_start_is_rejected(self):
         result, _ = self._run([_bridge_candidate("candidate-0", grasp=False)])
@@ -453,6 +515,26 @@ class TrajectoryTrackingTests(unittest.TestCase):
         self.assertIn(
             "initial_opposing_finger_contact_evidence_missing",
             result["candidates"][0]["rejection_reasons"],
+        )
+
+    def test_bundle_and_verified_binding_sphere_centers_must_match(self):
+        fixtures = _fixtures(1)
+        fixtures[1]["center_world_m"] = [0.001, 0.0, 0.0]
+        connection = FakeConnection([_bridge_candidate("candidate-0")])
+        with self.assertRaisesRegex(ValueError, "sphere center differs"):
+            track_trajectory_bundle(connection, "snapshot-1", *fixtures)
+        self.assertIsNone(connection.request)
+
+    def test_reported_sphere_offset_must_match_snapshot_binding(self):
+        candidate = _bridge_candidate("offset-mismatch")
+        candidate["sphere_center_body_local_offset_m"] = [0.001, 0.0, 0.0]
+        result, _ = self._run([candidate])
+        self.assertEqual(result["executable_safe_candidate_ids"], [])
+        self.assertTrue(
+            any(
+                reason.startswith("candidate_start_state_invalid:")
+                for reason in result["candidates"][0]["rejection_reasons"]
+            )
         )
 
     def test_unknown_or_unmapped_robot_part_rule_stops_preflight(self):
@@ -649,6 +731,60 @@ class TrajectoryTrackingTests(unittest.TestCase):
             [FINGERPRINT, FINGERPRINT],
         )
 
+    def test_nonzero_body_local_sphere_offset_tracks_after_body_rotation(self):
+        half_turn = np.sqrt(0.5)
+        candidate = _bridge_candidate(
+            "rotating-offset",
+            sphere_offset=(0.03, 0.0, 0.0),
+            object_quaternion=(1.0, 0.0, 0.0, 0.0),
+            step_quaternions=[
+                (half_turn, 0.0, 0.0, half_turn),
+                (1.0, 0.0, 0.0, 0.0),
+            ],
+        )
+        result, _ = self._run([candidate])
+        self.assertEqual(result["executable_safe_candidate_ids"], ["rotating-offset"])
+        self.assertEqual(result["candidates"][0]["status"], "verified_safe_tracking")
+        np.testing.assert_allclose(
+            candidate["start_object_root_pos_world_m"],
+            [-0.03, 0.0, 0.0],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            candidate["steps"][0]["actual_object_root_pos_world_m"],
+            [0.002, -0.03, 0.0],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            candidate["steps"][0]["actual_object_sphere_center_world_m"],
+            [0.002, 0.0, 0.0],
+        )
+
+    def test_body_local_sphere_offset_transforms_and_zero_offset(self):
+        quarter_turn = [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]
+        local = body_local_offset_from_world_point(
+            [0.2, 0.3, 0.0], [0.2, 0.2, 0.0], quarter_turn
+        )
+        np.testing.assert_allclose(local, [0.1, 0.0, 0.0], atol=1e-12)
+        world = body_local_point_to_world([0.2, 0.2, 0.0], quarter_turn, local)
+        np.testing.assert_allclose(world, [0.2, 0.3, 0.0], atol=1e-12)
+        rotated_center = body_local_point_to_world(
+            [0.2, 0.2, 0.0], quarter_turn, [0.1, 0.0, 0.0]
+        )
+        unrotated_center = body_local_point_to_world(
+            [0.2, 0.2, 0.0], [1.0, 0.0, 0.0, 0.0], [0.1, 0.0, 0.0]
+        )
+        self.assertFalse(np.allclose(rotated_center, unrotated_center))
+        zero_local = body_local_offset_from_world_point(
+            [0.2, 0.2, 0.0], [0.2, 0.2, 0.0], quarter_turn
+        )
+        np.testing.assert_allclose(zero_local, np.zeros(3), atol=1e-12)
+        np.testing.assert_allclose(
+            body_local_point_to_world([0.2, 0.2, 0.0], quarter_turn, zero_local),
+            [0.2, 0.2, 0.0],
+            atol=1e-12,
+        )
+
     def test_resampling_is_bounded_to_20_hz_reference_speed(self):
         result = resample_polyline_by_distance(
             [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0]],
@@ -658,6 +794,46 @@ class TrajectoryTrackingTests(unittest.TestCase):
         )
         self.assertEqual(result["requested_steps"], 10)
         self.assertLessEqual(result["maximum_reference_displacement_m"], 0.002 + 1e-12)
+
+    def test_realistic_long_path_exceeds_old_240_step_cap_within_new_budget(self):
+        config = TrackingConfig()
+        plans, total = plan_bundle_reference_paths(
+            [[[0.0, 0.0, 0.0], [0.567, 0.0, 0.0]]],
+            speed_m_s=config.reference_speed_m_s,
+            control_timestep_s=0.05,
+            maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+            maximum_total_steps=config.max_total_control_steps,
+        )
+        self.assertEqual(plans[0]["requested_steps"], 284)
+        self.assertGreater(plans[0]["requested_steps"], 240)
+        self.assertEqual(total, 284)
+        self.assertLessEqual(plans[0]["maximum_reference_displacement_m"], 0.002)
+
+    def test_true_per_candidate_and_bundle_over_budget_paths_are_rejected(self):
+        config = TrackingConfig()
+        with self.assertRaisesRegex(ValueError, "exceeding_limit_480"):
+            plan_bundle_reference_paths(
+                [[[0.0, 0.0, 0.0], [0.962, 0.0, 0.0]]],
+                speed_m_s=config.reference_speed_m_s,
+                control_timestep_s=0.05,
+                maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+                maximum_total_steps=config.max_total_control_steps,
+            )
+        with self.assertRaisesRegex(ValueError, "exceeding_total_budget_300"):
+            plan_bundle_reference_paths(
+                [
+                    [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
+                    [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
+                ],
+                speed_m_s=config.reference_speed_m_s,
+                control_timestep_s=0.05,
+                maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+                maximum_total_steps=300,
+            )
+
+    def test_reference_speed_cannot_be_increased_to_bypass_duration_budget(self):
+        with self.assertRaisesRegex(ValueError, "cannot exceed 0.04 m/s"):
+            TrackingConfig(reference_speed_m_s=0.05).validate()
 
 
 if __name__ == "__main__":
