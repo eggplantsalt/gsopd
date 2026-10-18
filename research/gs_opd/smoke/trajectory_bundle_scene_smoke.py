@@ -330,11 +330,6 @@ def _build_local_bypass_scene(
 
     start = np.asarray(carried["center_world_m"], dtype=np.float64)
     carried_radius = float(carried["radius_m"])
-    task_target_vector = target_position - start
-    task_target_distance = float(np.linalg.norm(task_target_vector))
-    if not math.isfinite(task_target_distance) or task_target_distance <= 1e-9:
-        raise ValueError("local_bypass_goal_unavailable:placement_direction_degenerate")
-    task_forward = task_target_vector / task_target_distance
 
     obstacle_candidates = []
     diagnostics = []
@@ -344,23 +339,16 @@ def _build_local_bypass_scene(
         radius = float(obstacle["radius_m"])
         offset = center - start
         center_distance = float(np.linalg.norm(offset))
-        along = float(np.dot(offset, task_forward))
-        lateral = float(np.linalg.norm(offset - along * task_forward))
         minimum_separation = carried_radius + radius + clearance_m
         required_separation = minimum_separation + exit_clearance_m
         reasons = []
         if not math.isfinite(center_distance) or center_distance <= 1e-9:
             reasons.append("carried_and_obstacle_centers_coincident")
-        if not (0 < along < task_target_distance):
-            reasons.append("obstacle_not_between_carried_state_and_bddl_target")
-        if lateral > required_separation:
-            reasons.append("obstacle_outside_forward_carried_sphere_corridor")
         diagnostics.append(
             {
                 "obstacle_object_id": binding["object_id"],
                 "obstacle_center_world_m": center.tolist(),
-                "projection_from_start_m": along,
-                "lateral_distance_from_task_direction_m": lateral,
+                "center_distance_from_start_m": center_distance,
                 "required_center_separation_m": required_separation,
                 "safety_clearance_m": clearance_m,
                 "exit_clearance_m": exit_clearance_m,
@@ -368,25 +356,29 @@ def _build_local_bypass_scene(
             }
         )
         if not reasons:
-            obstacle_candidates.append((along, obstacle, required_separation))
+            obstacle_candidates.append((center_distance, obstacle, required_separation))
     if not obstacle_candidates:
         raise _LocalGoalUnavailable(
-            "local_bypass_goal_unavailable:no_forbidden_obstacle_in_forward_corridor",
+            "local_bypass_goal_unavailable:no_non_degenerate_forbidden_obstacle",
             diagnostics,
         )
-    # Select the nearest eligible obstacle along the BDDL task direction, then
-    # define the local bypass from the carried sphere center toward that obstacle.
-    obstacle_projection, obstacle, required_separation = min(
+    # The semantic BDDL target does not constrain local geometry. Select the
+    # nearest verified forbidden obstacle by same-state center distance.
+    obstacle_distance, obstacle, required_separation = min(
         obstacle_candidates, key=lambda item: item[0]
     )
     obstacle_center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
     obstacle_vector = obstacle_center - start
-    obstacle_distance = float(np.linalg.norm(obstacle_vector))
-    if not math.isfinite(obstacle_distance) or obstacle_distance <= 1e-9:
+    actual_obstacle_distance = float(np.linalg.norm(obstacle_vector))
+    if (
+        not math.isfinite(actual_obstacle_distance)
+        or actual_obstacle_distance <= 1e-9
+        or not math.isclose(obstacle_distance, actual_obstacle_distance, rel_tol=0, abs_tol=1e-12)
+    ):
         raise ValueError(
             "local_bypass_goal_unavailable:carried_and_obstacle_centers_coincident"
         )
-    bypass_forward = obstacle_vector / obstacle_distance
+    bypass_forward = obstacle_vector / actual_obstacle_distance
     scale = max(
         1.0, required_separation, float(np.abs(obstacle["center_world_m"]).max())
     )
@@ -418,7 +410,6 @@ def _build_local_bypass_scene(
             "obstacle_object_id": obstacle["object_id"],
             "obstacle_center_world_m": obstacle_center.tolist(),
             "forward_world": bypass_forward.tolist(),
-            "task_direction_world": task_forward.tolist(),
             "placement_target_direction_reference": {
                 "body_id": target_body_id,
                 "body_name": target_body_name,
@@ -432,14 +423,8 @@ def _build_local_bypass_scene(
             "carried_registered_task_object": carried_task_key,
             "direction_source": "same_state_carried_sphere_center_to_obstacle_sphere_center",
             "task_reference_source": "active_bddl_on_target_body_origin_semantic_reference_only",
-            "obstacle_projection_from_start_m": obstacle_projection,
-            "obstacle_center_distance_from_start_m": obstacle_distance,
-            "obstacle_lateral_distance_m": next(
-                item["lateral_distance_from_task_direction_m"]
-                for item in diagnostics
-                if item["obstacle_object_id"] == obstacle["object_id"]
-            ),
-            "obstacle_selection_rule": "nearest_eligible_forbidden_obstacle_along_bddl_task_direction",
+            "obstacle_center_distance_from_start_m": actual_obstacle_distance,
+            "obstacle_selection_rule": "nearest_bound_forbidden_obstacle_by_center_distance",
             "required_sphere_center_separation_m": required_separation,
             "safety_clearance_m": clearance_m,
             "endpoint_sphere_center_separation_m": endpoint_separation,
@@ -447,7 +432,7 @@ def _build_local_bypass_scene(
             "clearance_margin_m": clearance_m,
             "exit_clearance_m": exit_clearance_m,
             "numeric_padding_m": numeric_pad,
-            "all_obstacle_forward_checks": diagnostics,
+            "all_obstacle_selection_checks": diagnostics,
         },
     }
     scene = {
@@ -473,6 +458,7 @@ def run_scene_smoke(
     subject_id: str | None = None,
     expected_instruction: str | None = None,
     exit_clearance_m: float = 0.02,
+    local_exit_region_scale: float = 0.5,
 ) -> dict[str, Any]:
     """Query twice without reset/step; screen local bypass proposals if derivable."""
     directory = Path(out_dir)
@@ -498,6 +484,7 @@ def run_scene_smoke(
         "goal_status": "unavailable",
         "requested_candidate_count": 18,
         "local_bypass_exit_clearance_m": exit_clearance_m,
+        "local_exit_region_scale": local_exit_region_scale,
         "candidate_count": 0,
         "screen_pass_count": None,
         "rejection_reason_counts": {},
@@ -519,7 +506,10 @@ def run_scene_smoke(
             first, teacher, semantic_results, payload
         )
         first_valid = True
-        bundle_config = BundleConfig(candidate_count=18)
+        bundle_config = BundleConfig(
+            candidate_count=18,
+            local_exit_region_scale=local_exit_region_scale,
+        )
         try:
             scene = _build_local_bypass_scene(
                 first,
@@ -590,8 +580,23 @@ def run_scene_smoke(
                 "screen_pass_count",
                 "screen_rejected_count",
                 "rejection_reason_counts",
+                "local_exit_region",
             )
         })
+        report["candidate_goals_world_m"] = [
+            {
+                "candidate_id": item["candidate_id"],
+                "goal_world_m": item["goal_world_m"],
+                "goal_local_coordinates_m": item["goal_local_coordinates_m"],
+                "direction": item["direction"],
+                "passes_geometric_screen": item["passes_geometric_screen"],
+                "continuous_gap_lower_bound_m": item["screening"][
+                    "continuous_gap_lower_bound_m"
+                ],
+                "rejection_reasons": item["rejection_reasons"],
+            }
+            for item in bundle["candidates"]
+        ]
         (directory / "scene.json").write_text(
             json.dumps(report["scene"], ensure_ascii=False, indent=2, allow_nan=False)
             + "\n",
@@ -629,6 +634,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0.02,
         help="additional local bypass endpoint space beyond the sphere safety clearance (default: 0.02 m)",
     )
+    parser.add_argument(
+        "--local-exit-region-scale",
+        type=float,
+        default=0.5,
+        help="half-extent of the local exit region relative to the inflated sphere radius (0, 1]",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     teacher = parse_teacher_output_v2(args.teacher_json.read_text(encoding="utf-8"))
@@ -643,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
             subject_id=args.subject_object_id,
             expected_instruction=args.expected_instruction,
             exit_clearance_m=args.exit_clearance_m,
+            local_exit_region_scale=args.local_exit_region_scale,
         )
     finally:
         connection.close()
@@ -664,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
                     "goal_status",
                     "final_placement_goal_verified",
                     "local_bypass_exit_clearance_m",
+                    "local_exit_region_scale",
                 )
             },
             ensure_ascii=False,

@@ -144,8 +144,12 @@ class TrajectoryBundleTests(unittest.TestCase):
                 points[0], input_scene["carried"]["center_world_m"]
             )
             np.testing.assert_array_equal(
-                points[-1], input_scene["goal"]["position_world_m"]
+                points[-1], candidate["goal_world_m"]
             )
+            np.testing.assert_array_equal(
+                candidate["goal_world_m"], input_scene["goal"]["position_world_m"]
+            )
+            self.assertIsNone(candidate["goal_local_coordinates_m"])
             self.assertGreater(candidate["goal_side_projection_m"], 0)
             self.assertGreater(candidate["length_m"], 0.8)
             self.assertGreaterEqual(
@@ -180,10 +184,137 @@ class TrajectoryBundleTests(unittest.TestCase):
         self.assertEqual(goal["construction"]["exit_clearance_m"], 0.02)
         self.assertGreaterEqual(result["screen_pass_count"], 1)
         self.assertEqual(result["candidate_count"], 18)
-        np.testing.assert_array_equal(
-            np.asarray(result["candidates"][0]["points_world_m"])[-1],
-            np.asarray(goal["position_world_m"]),
+        self.assertIsNotNone(result["local_exit_region"])
+
+    def test_local_exit_region_samples_three_orthogonal_families_and_exact_endpoints(self):
+        input_scene = local_bypass_scene()
+        result = planner.generate_trajectory_bundle(input_scene)
+        region = result["local_exit_region"]
+        self.assertEqual(region["region_type"], "bounded_plane_behind_obstacle")
+        self.assertAlmostEqual(
+            region["half_extent_m"],
+            region["reference_inflated_radius_m"] * region["region_scale"],
         )
+        normal, lateral, up = (
+            np.asarray(region[key], dtype=float)
+            for key in ("normal_world", "lateral_world", "up_world")
+        )
+        np.testing.assert_allclose(
+            np.asarray([np.linalg.norm(normal), np.linalg.norm(lateral), np.linalg.norm(up)]),
+            1.0,
+            atol=1e-12,
+            rtol=0,
+        )
+        np.testing.assert_allclose(
+            np.asarray([np.dot(normal, lateral), np.dot(normal, up), np.dot(lateral, up)]),
+            0.0,
+            atol=1e-12,
+            rtol=0,
+        )
+        candidates = result["candidates"]
+        goals = np.asarray([item["goal_world_m"] for item in candidates])
+        self.assertEqual(len(np.unique(goals, axis=0)), 18)
+        self.assertEqual(result["screen_pass_count"], 18)
+        self.assertEqual(
+            [sum(item["direction"] == name for item in candidates) for name in ("left", "right", "above")],
+            [6, 6, 6],
+        )
+        start = np.asarray(input_scene["carried"]["center_world_m"])
+        obstacle = np.asarray(input_scene["obstacles"][0]["center_world_m"])
+        required = (
+            input_scene["carried"]["radius_m"]
+            + input_scene["obstacles"][0]["radius_m"]
+            + result["config"]["clearance_m"]
+            + input_scene["goal"]["construction"]["exit_clearance_m"]
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate["candidate_id"]):
+                goal = np.asarray(candidate["goal_world_m"])
+                local = np.asarray(candidate["goal_local_coordinates_m"])
+                reconstructed = (
+                    np.asarray(region["base_center_world_m"])
+                    + local[0] * normal
+                    + local[1] * lateral
+                    + local[2] * up
+                )
+                np.testing.assert_allclose(goal, reconstructed, atol=1e-12, rtol=0)
+                self.assertLessEqual(np.max(np.abs(local[1:])), region["half_extent_m"])
+                self.assertGreaterEqual(float(np.dot(goal - obstacle, normal)), required)
+                self.assertGreaterEqual(
+                    candidate["goal_side_projection_m"], required
+                )
+                for other in input_scene["obstacles"]:
+                    self.assertGreaterEqual(
+                        float(
+                            np.linalg.norm(
+                                goal - np.asarray(other["center_world_m"])
+                            )
+                        )
+                        - input_scene["carried"]["radius_m"]
+                        - other["radius_m"],
+                        result["config"]["clearance_m"],
+                    )
+                points = np.asarray(candidate["points_world_m"])
+                np.testing.assert_array_equal(points[0], start)
+                np.testing.assert_array_equal(points[-1], goal)
+                controls = np.asarray(candidate["control_points_world_m"])
+                np.testing.assert_array_equal(controls[0], start)
+                np.testing.assert_array_equal(controls[-1], goal)
+                self.assertEqual(candidate["goal_endpoint_error_m"], 0.0)
+                if candidate["direction"] == "left":
+                    self.assertGreater(local[1], 0)
+                elif candidate["direction"] == "right":
+                    self.assertLess(local[1], 0)
+                else:
+                    self.assertGreater(local[2], 0)
+                self.assertFalse(candidate["physical_safety_verified"])
+                self.assertFalse(candidate["executable"])
+
+    def test_local_exit_region_degenerate_scale_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "region is degenerate"):
+            planner.generate_trajectory_bundle(
+                local_bypass_scene(), planner.BundleConfig(local_exit_region_scale=0.0)
+            )
+        with self.assertRaisesRegex(ValueError, r"must be in \[0, 1\]"):
+            planner.generate_trajectory_bundle(
+                local_bypass_scene(), planner.BundleConfig(local_exit_region_scale=1.01)
+            )
+
+    def test_secondary_obstacle_is_checked_against_each_candidate_endpoint(self):
+        input_scene = local_bypass_scene()
+        baseline = planner.generate_trajectory_bundle(input_scene)
+        endpoint = baseline["candidates"][0]["goal_world_m"]
+        input_scene["obstacles"].append(
+            sphere("secondary-bound-obstacle", endpoint, 0.02)
+        )
+        checked = planner.generate_trajectory_bundle(input_scene)
+        first = checked["candidates"][0]
+        self.assertIn("goal_sphere_clearance_insufficient:secondary-bound-obstacle", first["rejection_reasons"])
+        self.assertEqual(
+            {item["obstacle_id"] for item in first["screening"]["checks"]},
+            {"arbitrary-obstacle", "secondary-bound-obstacle"},
+        )
+
+    def test_svg_shows_exit_region_and_each_candidate_endpoint_in_every_view(self):
+        result = planner.generate_trajectory_bundle(local_bypass_scene())
+        svg = planner._bundle_svg(result)
+        root = ET.fromstring(svg)
+        namespace = {"s": "http://www.w3.org/2000/svg"}
+        views = root.findall("s:g", namespace)
+        self.assertEqual(
+            {view.attrib["data-view"] for view in views}, {"XY", "XZ", "YZ"}
+        )
+        for view in views:
+            self.assertEqual(
+                len(view.findall("s:polygon[@data-kind='local-exit-region']", namespace)),
+                1,
+            )
+            endpoints = view.findall("s:circle[@data-kind='candidate-endpoint']", namespace)
+            self.assertEqual(len(endpoints), 18)
+            self.assertEqual(
+                {item.attrib["data-candidate-id"] for item in endpoints},
+                {item["candidate_id"] for item in result["candidates"]},
+            )
 
     def test_local_bypass_goal_rejects_invalid_direction_evidence_and_clearance(self):
         mutations = (
@@ -301,7 +432,7 @@ class TrajectoryBundleTests(unittest.TestCase):
             sphere(
                 "endpoint-obstacle",
                 input_scene["goal"]["position_world_m"],
-                0.05,
+                0.3,
             )
         )
         result = planner.generate_trajectory_bundle(input_scene)

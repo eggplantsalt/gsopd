@@ -42,6 +42,7 @@ class BundleConfig:
     minimum_curve_samples: int = 65
     maximum_curve_samples: int = 4097
     clearance_error_m: float = 0.001
+    local_exit_region_scale: float = 0.5
 
 
 def _vector(value: Any, field: str) -> np.ndarray:
@@ -372,7 +373,93 @@ def _configuration(config: BundleConfig) -> None:
     if config.maximum_curve_samples < config.minimum_curve_samples:
         raise ValueError("maximum_curve_samples is smaller than minimum_curve_samples")
     _number(config.clearance_m, "clearance_m")
+    _number(config.local_exit_region_scale, "local_exit_region_scale")
+    if config.local_exit_region_scale > 1.0:
+        raise ValueError("local_exit_region_scale must be in [0, 1]")
     _number(config.clearance_error_m, "clearance_error_m", positive=True)
+
+
+def _local_exit_frame(normal_world: np.ndarray, world_up: np.ndarray):
+    """Return a deterministic orthonormal lateral/up frame around the exit normal."""
+    up = world_up - float(np.dot(world_up, normal_world)) * normal_world
+    up_norm = float(np.linalg.norm(up))
+    if not math.isfinite(up_norm) or up_norm < 1e-8:
+        reference = np.eye(3)[int(np.argmin(np.abs(normal_world)))]
+        up = reference - float(np.dot(reference, normal_world)) * normal_world
+        up_norm = float(np.linalg.norm(up))
+    if not math.isfinite(up_norm) or up_norm < 1e-8:
+        raise ValueError("local exit region basis is degenerate")
+    up /= up_norm
+    lateral = np.cross(up, normal_world)
+    lateral_norm = float(np.linalg.norm(lateral))
+    if not math.isfinite(lateral_norm) or lateral_norm < 1e-8:
+        raise ValueError("local exit region lateral axis is degenerate")
+    lateral /= lateral_norm
+    up = np.cross(normal_world, lateral)
+    up /= np.linalg.norm(up)
+    return lateral, up
+
+
+def _local_exit_region(scene, config):
+    """Create a bounded rectangular exit region in the plane normal to S->O."""
+    if scene["goal"]["goal_type"] != "local_bypass_goal":
+        return None
+    if config.local_exit_region_scale <= 0:
+        raise ValueError("local exit region is degenerate: scale must be positive")
+    construction = scene["goal"]["construction"]
+    normal = np.asarray(construction["forward_world"], dtype=np.float64)
+    world_up = np.asarray(scene["world_up"], dtype=np.float64)
+    lateral, up = _local_exit_frame(normal, world_up)
+    reference_radius = float(construction["required_sphere_center_separation_m"])
+    extent = reference_radius * config.local_exit_region_scale
+    if not math.isfinite(extent) or extent <= 1e-9:
+        raise ValueError("local exit region is degenerate: finite extent is required")
+    return {
+        "region_type": "bounded_plane_behind_obstacle",
+        "base_center_world_m": list(scene["goal"]["position_world_m"]),
+        "normal_world": normal.tolist(),
+        "lateral_world": lateral.tolist(),
+        "up_world": up.tolist(),
+        "reference_inflated_radius_m": reference_radius,
+        "region_scale": config.local_exit_region_scale,
+        "half_extent_m": extent,
+        "local_coordinate_bounds_m": {
+            "normal": [0.0, 0.0],
+            "lateral": [-extent, extent],
+            "up": [-extent, extent],
+        },
+        "state_id": scene["state_id"],
+        "physical_safety_verified": False,
+        "executable": False,
+    }
+
+
+def _candidate_exit_goal(region, candidate_index, candidate_count):
+    """Deterministically sample three distinct rays through the bounded region."""
+    if region is None:
+        return None, None
+    family = ("left", "right", "above")[candidate_index % 3]
+    level = candidate_index // 3
+    level_count = math.ceil(candidate_count / 3)
+    fraction = (level + 1) / level_count
+    extent = region["half_extent_m"]
+    amplitude = extent * fraction
+    cross_axis = 0.15 * amplitude
+    if family == "left":
+        coordinates = np.asarray([0.0, amplitude, cross_axis])
+    elif family == "right":
+        coordinates = np.asarray([0.0, -amplitude, cross_axis])
+    else:
+        lateral_sign = 1.0 if level % 2 == 0 else -1.0
+        coordinates = np.asarray([0.0, lateral_sign * cross_axis, amplitude])
+    axes = np.asarray([
+        region["normal_world"],
+        region["lateral_world"],
+        region["up_world"],
+    ])
+    offset = coordinates @ axes
+    goal = np.asarray(region["base_center_world_m"], dtype=np.float64) + offset
+    return goal, coordinates.tolist()
 
 
 def _spline_data(control_points: Any) -> tuple[np.ndarray, np.ndarray, float]:
@@ -529,15 +616,21 @@ def generate_trajectory_bundle(
     if not math.isfinite(length) or length < 1e-9:
         raise ValueError("start and goal must define a finite nonzero path")
     forward = (goal - start) / length
-    lateral = np.cross(up, forward)
-    lateral_norm = float(np.linalg.norm(lateral))
-    if lateral_norm < 1e-8:
-        raise ValueError(
-            "start-goal axis is parallel to world_up; left/right directions are undefined"
-        )
-    lateral /= lateral_norm
-    above = np.cross(forward, lateral)
-    above /= np.linalg.norm(above)
+    local_exit_region = _local_exit_region(scene, config)
+    if local_exit_region is not None:
+        forward = np.asarray(local_exit_region["normal_world"], dtype=np.float64)
+        lateral = np.asarray(local_exit_region["lateral_world"], dtype=np.float64)
+        above = np.asarray(local_exit_region["up_world"], dtype=np.float64)
+    else:
+        lateral = np.cross(up, forward)
+        lateral_norm = float(np.linalg.norm(lateral))
+        if lateral_norm < 1e-8:
+            raise ValueError(
+                "start-goal axis is parallel to world_up; left/right directions are undefined"
+            )
+        lateral /= lateral_norm
+        above = np.cross(forward, lateral)
+        above /= np.linalg.norm(above)
     straight = []
     for obstacle in obstacles:
         center = np.asarray(obstacle["center_world_m"])
@@ -558,6 +651,11 @@ def generate_trajectory_bundle(
     levels = np.linspace(1.2, 2.6, math.ceil(config.candidate_count / 3))
     candidates = []
     for index in range(config.candidate_count):
+        candidate_goal, goal_local_coordinates = _candidate_exit_goal(
+            local_exit_region, index, config.candidate_count
+        )
+        if candidate_goal is None:
+            candidate_goal = goal
         direction_name, direction = (
             ("left", lateral),
             ("right", -lateral),
@@ -586,26 +684,35 @@ def generate_trajectory_bundle(
             entry,
             peak,
             exit_point,
-            goal + 0.35 * (exit_point - goal),
-            goal,
+            candidate_goal + 0.35 * (exit_point - candidate_goal),
+            candidate_goal,
         ])
         curve, screening, reasons = _screen_curve(
             controls, carried["radius_m"], obstacles, config
         )
-        endpoint_error = float(np.linalg.norm(curve[-1] - goal))
-        goal_axis = goal - center
-        goal_axis_norm = float(np.linalg.norm(goal_axis))
-        target_side = (
-            float(np.dot(curve[-1] - center, goal_axis / goal_axis_norm))
-            if goal_axis_norm > 1e-12
-            else 0.0
-        )
+        endpoint_error = float(np.linalg.norm(curve[-1] - candidate_goal))
+        if local_exit_region is not None:
+            target_side = float(np.dot(candidate_goal - center, forward))
+            if target_side < local_exit_region["reference_inflated_radius_m"]:
+                reasons.append(
+                    f"goal_behind_obstacle_clearance_insufficient:{primary['object_id']}"
+                )
+        else:
+            goal_axis = candidate_goal - center
+            goal_axis_norm = float(np.linalg.norm(goal_axis))
+            target_side = (
+                float(np.dot(curve[-1] - center, goal_axis / goal_axis_norm))
+                if goal_axis_norm > 1e-12
+                else 0.0
+            )
         if endpoint_error > 1e-10 or target_side <= 0:
             reasons.append("goal_side_region_not_reached")
         candidates.append({
             "candidate_id": f"trajectory-{index + 1:03d}",
             "direction": direction_name,
             "direction_world": direction.tolist(),
+            "goal_world_m": candidate_goal.tolist(),
+            "goal_local_coordinates_m": goal_local_coordinates,
             "offset_scale": float(levels[level]),
             "lateral_or_above_offset_m": float(offset),
             "waypoints_world_m": np.asarray([
@@ -613,7 +720,7 @@ def generate_trajectory_bundle(
                 entry,
                 peak,
                 exit_point,
-                goal,
+                candidate_goal,
             ]).tolist(),
             "control_points_world_m": controls.tolist(),
             "points_world_m": curve.tolist(),
@@ -642,6 +749,7 @@ def generate_trajectory_bundle(
             "above": above.tolist(),
         },
         "goal_type": scene["goal"]["goal_type"],
+        "local_exit_region": local_exit_region,
         "straight_line_minimum_gap_m": min(item[0] for item in straight),
         "candidate_count": len(candidates),
         "screen_pass_count": passed,
@@ -656,7 +764,7 @@ def generate_trajectory_bundle(
         "executable": False,
         "limitations": [
             "Caller must supply conservative enclosures of the entire carried object and every relevant obstacle in the same state.",
-            "A local_bypass_goal is a geometry-derived waypoint behind an obstacle using the BDDL On target Body origin for direction only; it is not a final placement location or proof of task completion.",
+            "A local_bypass_goal is the center of a bounded geometry-derived exit region behind an obstacle; its BDDL On target is task context and is not the final placement location.",
             "B-spline control waypoints are not interpolation constraints; the sampled curve and its bound are screened.",
             "Static sphere geometry omits the robot/gripper, orientation, support contacts, dynamics and task feasibility.",
             "No control, time parameterization, Snapshot, contact verification or action execution is performed.",
@@ -697,9 +805,35 @@ def _bundle_svg(bundle):
     ])
     start = np.asarray(scene["carried"]["center_world_m"])
     goal = np.asarray(scene["goal"]["position_world_m"])
+    exit_region = bundle.get("local_exit_region")
+    region_corners = None
+    if exit_region is not None:
+        region_center = np.asarray(exit_region["base_center_world_m"], dtype=float)
+        lateral_offset = (
+            np.asarray(exit_region["lateral_world"], dtype=float)
+            * exit_region["half_extent_m"]
+        )
+        up_offset = (
+            np.asarray(exit_region["up_world"], dtype=float)
+            * exit_region["half_extent_m"]
+        )
+        region_corners = np.asarray([
+            region_center - lateral_offset - up_offset,
+            region_center + lateral_offset - up_offset,
+            region_center + lateral_offset + up_offset,
+            region_center - lateral_offset + up_offset,
+        ])
     for panel, (a, b, name) in enumerate(((0, 1, "XY"), (0, 2, "XZ"), (1, 2, "YZ"))):
         group = ET.SubElement(root, "g", {"data-view": name})
-        extents = [all_points[:, [a, b]], np.asarray([start[[a, b]], goal[[a, b]]])]
+        extents = [
+            all_points[:, [a, b]],
+            np.asarray([start[[a, b]], goal[[a, b]]]),
+            np.asarray([item["goal_world_m"] for item in bundle["candidates"]])[
+                :, [a, b]
+            ],
+        ]
+        if region_corners is not None:
+            extents.append(region_corners[:, [a, b]])
         for sphere in scene["obstacles"]:
             center = np.asarray(sphere["center_world_m"])[[a, b]]
             radius = (
@@ -721,6 +855,30 @@ def _bundle_svg(bundle):
             return float(panel * 380 + 190 + x), float(195 - y)
 
         label(group, panel * 380 + 22, 43, f"{name}: world axes (m), equal scale")
+        if region_corners is not None:
+            ET.SubElement(
+                group,
+                "polygon",
+                {
+                    "points": " ".join(
+                        f"{x:.3f},{y:.3f}"
+                        for x, y in (pixel(point) for point in region_corners)
+                    ),
+                    "fill": "#77c77d",
+                    "fill-opacity": "0.14",
+                    "stroke": "#188237",
+                    "stroke-dasharray": "5 3",
+                    "data-kind": "local-exit-region",
+                },
+            )
+            region_center_px = pixel(exit_region["base_center_world_m"])
+            label(
+                group,
+                region_center_px[0] + 4,
+                region_center_px[1] - 8,
+                "local exit region",
+                fill="#12692a",
+            )
         for sphere in scene["obstacles"]:
             x, y = pixel(sphere["center_world_m"])
             radius = (
@@ -766,8 +924,27 @@ def _bundle_svg(bundle):
             ET.SubElement(
                 line, "title"
             ).text = f"{candidate['candidate_id']} {candidate['direction']}: {candidate['rejection_reasons'] or 'passes geometric screen only'}"
+            if exit_region is not None:
+                endpoint_px = pixel(candidate["goal_world_m"])
+                marker = ET.SubElement(
+                    group,
+                    "circle",
+                    {
+                        "cx": str(endpoint_px[0]),
+                        "cy": str(endpoint_px[1]),
+                        "r": "3.2",
+                        "fill": colors[candidate["direction"]],
+                        "stroke": "#ffffff",
+                        "stroke-width": "0.8",
+                        "data-kind": "candidate-endpoint",
+                        "data-candidate-id": candidate["candidate_id"],
+                    },
+                )
+                ET.SubElement(marker, "title").text = (
+                    f"{candidate['candidate_id']} {candidate['direction']} endpoint"
+                )
         goal_label = (
-            "local bypass"
+            "exit region base"
             if bundle.get("goal_type") == "local_bypass_goal"
             else "goal"
         )
@@ -825,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--candidate-count", type=int, default=18)
     parser.add_argument("--clearance-m", type=float, default=0.01)
+    parser.add_argument("--local-exit-region-scale", type=float, default=0.5)
     args = parser.parse_args(argv)
     try:
 
@@ -847,7 +1025,9 @@ def main(argv: list[str] | None = None) -> int:
         bundle = generate_trajectory_bundle(
             scene,
             BundleConfig(
-                candidate_count=args.candidate_count, clearance_m=args.clearance_m
+                candidate_count=args.candidate_count,
+                clearance_m=args.clearance_m,
+                local_exit_region_scale=args.local_exit_region_scale,
             ),
         )
         outputs = save_trajectory_bundle(bundle, args.out_dir)
@@ -860,6 +1040,7 @@ def main(argv: list[str] | None = None) -> int:
                 "candidate_count": bundle["candidate_count"],
                 "screen_pass_count": bundle["screen_pass_count"],
                 "screen_rejected_count": bundle["screen_rejected_count"],
+                "local_exit_region": bundle["local_exit_region"],
                 "physical_safety_verified": False,
                 "outputs": outputs,
             },

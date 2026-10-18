@@ -343,6 +343,13 @@ class PlanningGeometryTests(unittest.TestCase):
             self.assertEqual(result["candidate_count"], 18)
             self.assertEqual(result["screen_pass_count"], 18)
             self.assertEqual(result["local_bypass_exit_clearance_m"], 0.02)
+            self.assertEqual(result["local_exit_region_scale"], 0.5)
+            self.assertEqual(len(result["candidate_goals_world_m"]), 18)
+            self.assertEqual(
+                len({tuple(item["goal_world_m"]) for item in result["candidate_goals_world_m"]}),
+                18,
+            )
+            self.assertEqual(result["local_exit_region"]["region_scale"], 0.5)
             self.assertTrue((Path(directory) / "planning_geometry.json").is_file())
             self.assertTrue((Path(directory) / "scene.json").is_file())
             self.assertTrue((Path(directory) / "trajectory_bundle.json").is_file())
@@ -404,6 +411,19 @@ class PlanningGeometryTests(unittest.TestCase):
             0.0,
             0.5,
         ]
+        target = np.asarray(
+            query["goal"]["targets"][0]["body_origin_world_m_diagnostic_only"]
+        )
+        target_direction = (target - start) / np.linalg.norm(target - start)
+        relative_obstacle = (
+            np.asarray(query["objects"]["object_2"]["center_world_m"]) - start
+        )
+        legacy_forward_projection = float(np.dot(relative_obstacle, target_direction))
+        legacy_lateral_distance = float(
+            np.linalg.norm(relative_obstacle - legacy_forward_projection * target_direction)
+        )
+        self.assertAlmostEqual(legacy_forward_projection, 0.262936)
+        self.assertAlmostEqual(legacy_lateral_distance, 0.210115)
         scene = smoke._build_local_bypass_scene(
             query, self.payload, exit_clearance_m=0.02
         )
@@ -415,8 +435,6 @@ class PlanningGeometryTests(unittest.TestCase):
         goal = np.asarray(scene["goal"]["position_world_m"])
         goal_projection = float(np.dot(goal - start, target_direction))
         target_distance = float(np.linalg.norm(target - start))
-        self.assertAlmostEqual(construction["obstacle_projection_from_start_m"], 0.262936)
-        self.assertAlmostEqual(construction["obstacle_lateral_distance_m"], 0.210115)
         self.assertAlmostEqual(
             construction["required_sphere_center_separation_m"], 0.230447
         )
@@ -476,33 +494,58 @@ class PlanningGeometryTests(unittest.TestCase):
             context.exception.diagnostics[0]["rejection_reasons"],
         )
 
-    def test_local_bypass_reports_degenerate_missing_and_misdirected_geometry(self):
+    def test_bddl_target_position_does_not_constrain_local_bypass_geometry(self):
         query = self.query()
-        cases = []
         degenerate = copy.deepcopy(query)
         degenerate["goal"]["targets"][0]["body_origin_world_m_diagnostic_only"] = (
             degenerate["objects"]["object_1"]["center_world_m"]
         )
-        cases.append(("placement_direction_degenerate", degenerate))
+        # BDDL target identity remains required, but its position has no role in
+        # selecting the obstacle direction or constraining the local endpoint.
+        degenerate_scene = smoke._build_local_bypass_scene(degenerate, self.payload)
+        self.assertEqual(
+            degenerate_scene["goal"]["construction"]["task_reference_source"],
+            "active_bddl_on_target_body_origin_semantic_reference_only",
+        )
         missing = copy.deepcopy(query)
         missing["goal"]["targets"] = []
-        cases.append(("compiled_bddl_target_body_missing_or_ambiguous", missing))
+        with self.assertRaisesRegex(
+            ValueError, "compiled_bddl_target_body_missing_or_ambiguous"
+        ):
+            smoke._build_local_bypass_scene(missing, self.payload)
         wrong_direction = copy.deepcopy(query)
         wrong_direction["objects"]["object_2"]["center_world_m"] = [-0.8, 0, 0.5]
-        cases.append(("no_forbidden_obstacle_in_forward_corridor", wrong_direction))
         outside_corridor = copy.deepcopy(query)
         outside_corridor["objects"]["object_2"]["center_world_m"] = [0, 0.5, 0.5]
-        cases.append(("no_forbidden_obstacle_in_forward_corridor", outside_corridor))
-        for expected, value in cases:
-            with self.subTest(expected=expected):
-                with self.assertRaisesRegex(ValueError, expected):
-                    smoke._build_local_bypass_scene(value, self.payload)
-        with self.assertRaises(smoke._LocalGoalUnavailable) as context:
-            smoke._build_local_bypass_scene(wrong_direction, self.payload)
-        self.assertIn(
-            "obstacle_not_between_carried_state_and_bddl_target",
-            context.exception.diagnostics[0]["rejection_reasons"],
-        )
+        for value in (wrong_direction, outside_corridor):
+            with self.subTest(center=value["objects"]["object_2"]["center_world_m"]):
+                local_scene = smoke._build_local_bypass_scene(value, self.payload)
+                obstacle = np.asarray(
+                    local_scene["goal"]["construction"]["obstacle_center_world_m"]
+                )
+                start = np.asarray(local_scene["carried"]["center_world_m"])
+                forward = np.asarray(local_scene["goal"]["construction"]["forward_world"])
+                goal = np.asarray(local_scene["goal"]["position_world_m"])
+                self.assertGreater(float(np.dot(obstacle - start, forward)), 0)
+                self.assertGreater(float(np.dot(goal - obstacle, forward)), 0)
+
+    def test_configurable_local_exit_region_scale_is_written_to_report(self):
+        bridge = ReadOnlyBridge(self.h)
+        with tempfile.TemporaryDirectory() as directory:
+            result = smoke.run_scene_smoke(
+                bridge,
+                self.teacher,
+                self.semantic,
+                directory,
+                local_exit_region_scale=0.3,
+            )
+            self.assertEqual(result["status"], "complete", result)
+            self.assertEqual(result["local_exit_region_scale"], 0.3)
+            self.assertEqual(result["local_exit_region"]["region_scale"], 0.3)
+            saved = json.loads(
+                (Path(directory) / "trajectory_bundle.json").read_text()
+            )
+            self.assertEqual(saved["local_exit_region"]["region_scale"], 0.3)
 
     def test_scene_change_prevents_saving_any_candidate_bundle(self):
         bridge = ReadOnlyBridge(self.h)

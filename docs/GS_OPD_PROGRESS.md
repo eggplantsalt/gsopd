@@ -1662,3 +1662,45 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 54 项相关单测、语法检查、Ruff lint 和 diff 检查通过；日志数值合成场景候选通过数 18/18，不安全起点/终点场景各拒绝 18/18。
 - [ ] 在当前真实 L0T0 Bridge 上运行上面的只读 Smoke，检查实际几何包围球、18 条候选的通过/拒绝情况和查询前后状态。
 - [ ] 后续仍需用独立 OSC/MuJoCo 完整接触验证确认任何候选的物理安全与可执行性。
+
+## 局部出口区域与多终点轨迹采样（2026-10-18）
+
+### 当前生成行为
+
+- 保留已核验的同状态 Teacher/Body/Geom 绑定、完整障碍物保守包围球、`S→O` 单位绕障方向，以及 10 mm 安全间隙和 20 mm 默认出口余量。BDDL `On` 目标继续校验并记录为任务语义上下文，不参与局部几何方向、出口位置或可行域限制。
+- 原单点 G 现在是局部出口区域的中心基准。生成器在垂直于 `S→O` 的平面内建立确定性的正交 `lateral/up` 基；区域半边长为 `local_exit_region_scale × (r_carried + r_obstacle + clearance + exit_clearance)`。默认 `local_exit_region_scale=0.5`，CLI 可设置 `(0, 1]` 范围内的值。区域法向坐标固定为 0，因此每个出口点都处于障碍物后侧的同一出口平面；区域范围随同状态包围球尺度变化，不使用场景世界坐标偏置。
+- 默认 18 条候选按左绕、右绕、上绕各 6 条确定性生成。每族的幅度按区域半边长分级；左/右族沿相反 lateral 方向，上绕族沿 up 方向并交替微量 lateral 偏移，因此 18 个 `Gᵢ` 都有不同的三维坐标。每个点都由正交局部基和区域相对坐标重建，不改变 S→O 绕行法向距离。
+- `trajectory_bundle.json` 分别保存 `local_exit_region` 与每条候选的 `goal_world_m`、`goal_local_coordinates_m`、方向、完整 Waypoint/B-Spline 控制点、离散曲线、长度、终点误差、逐个绑定障碍物的连续间隙下界和拒绝原因。所有曲线共用同一个真实查询起点 S，并以各自 Gᵢ 作为精确控制点和曲线终点。XY/XZ/YZ SVG 绘出出口区域投影和每条候选的独立终点标记。
+- B-Spline 构造、全曲线采样间误差界、10 mm 连续间隙筛选以及全部已绑定障碍物检查没有放宽。端点区域只做保守几何初筛：每个候选仍标记 `physical_safety_verified=false`、`executable=false`，不能作为 MuJoCo 安全或动作可执行证据。
+
+### 静态验证与真实场景状态
+
+- 当前规划器与只读 Scene Smoke 两个测试文件共 **47 项 unittest 通过**。默认合成局部绕行场景中 18/18 条轨迹通过原连续球间隙初筛；测试也覆盖 18 个不同出口点、三族方向、精确曲线端点、尺度退化/越界、附加障碍物、端点不安全和全部候选拒绝。
+- 四个相关 Python 文件的语法检查、仓库环境 `/workspace/zy_workspace/RLinf/.venv/bin/ruff check` 及 `git diff --check` 通过；没有安装工具或依赖。
+- 本轮没有启动 Bridge、创建/重置仿真、执行环境动作或查询真实 L0T0 几何。以上数量和通过率仅来自合成静态夹具，不能推断真实场景的包围球尺寸、候选通过数、物理安全性或轨迹可执行性。
+
+### 真实 L0T0 只读 Smoke 命令
+
+服务端需运行包含 `planning_geometry` 的当前 Bridge 实现，并处于你要检查的 L0T0 状态。若 Bridge 已经运行，不要为了本 Smoke 重置环境；在另一终端使用新输出目录：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  -m research.gs_opd.smoke.trajectory_bundle_scene_smoke \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --expected-instruction "pick up the akita black bowl on the stove and place it on the plate" \
+  --exit-clearance-m 0.02 \
+  --local-exit-region-scale 0.5 \
+  --out-dir logs/gs_opd/trajectory_bundle_scene_local_bypass_region_l0t0_v1
+```
+
+该客户端只请求 Geometry Inventory 和两次只读 `planning_geometry`，用于比较查询前后的状态；不会 reset、step 或执行候选。真实候选通过数以新目录的 `scene_smoke_report.json` 与 `trajectory_bundle.json` 为准。
+
+**检查清单（Checklist）**
+
+- [x] 单点局部 G 扩展为尺度受限的三维局部出口区域；18 条候选分别记录不同 Gᵢ 与完整几何诊断。
+- [x] 47 项相关 unittest、Python 语法检查、`git diff --check` 通过；静态合成场景 18/18 几何初筛通过。
+- [ ] 在真实 L0T0 Bridge 上执行只读 Smoke 并检查实际候选统计及前后状态一致性。
+- [ ] 使用独立完整接触/动力学验证任何候选的物理安全、可执行性及任务可行性。
