@@ -1363,3 +1363,19 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 评估完成不等于候选合格；unavailable 不生成执行动作或训练标签，也不污染其他合格候选。
 - [x] 真正的物理验证、接触监测和恢复不完整继续失败关闭，68 项单测及静态检查通过。
 - [ ] 人工重跑后核对：同类全部证据不足的搜索应准确报告 `no_qualified_candidates`，不期待本修复自动产生 S35 合格动作。
+
+## Early Repair：使用三维相对位置检查局部连续性
+
+- 移除 Early Repair 专用可行性判定中基线 EEF 至少运动 5 mm、物体至少运动 2 mm 的前提。两者路程继续作为诊断记录，静止或低速状态不再仅因运动量不足被拒绝；共享 Violation Repair 的门槛未改。
+- 对起始及五个动作后状态计算世界坐标三维向量 `r(t) = object.root_pos(t) - EEF.pos(t)`。记录完整六个相对位置，检查基线、候选各自相对初始状态的最大三维变化，以及候选与 A⁰ 同步状态的最大三维偏差；继续沿用 0.05 m 容许值。旧标量距离变化保留为诊断，不能替代三维检查。
+- 相对位置连续时，pass 仅表示五步局部运动学可行，`grasp_evidence.status=kinematic_consistency_only`；`physical_grasp_confirmed`、`task_success_confirmed` 和 `high_quality_training_label_created` 均为 false。绝对距离接近不作为物理抓持的证据，静止持物与附近独立支撑的静止物体在这些位置数据下可能不可区分。
+- 基线三维相对位置明显不稳定时返回已完成但 unavailable 的 `baseline_grasp_evidence_unreliable`；候选相对位置明显偏离时返回 fail；状态或 reward/done 缺失继续返回评估不完整。上轮完成性/合格性契约保持有效，证据不足候选不进入合格列表。
+- Contact Compiler、动作/工作空间约束、Snapshot、奖励/终止判定、gap 改善及最大 gap 选择、Near–Far 和 Violation Repair 未修改。此项位置启发式不能证明力闭合、接触抓持或任务成功；世界坐标相对位置也会随真实持物旋转而改变，当前没有进行旋转补偿，可能保守拒绝此类候选。
+- 在现有 `gsopd_teacher` 环境运行相关测试 **71 项通过**，覆盖静止、低速、侧向绕行、物体脱离、距离不变但三维方向改变、证据不足、缺失状态以及原有奖励/恢复/选择回归；三份 Python 文件语法检查和 `git diff --check` 通过。未启动模型或仿真，未重写历史 NPZ；不能根据 S35 的旧标量摘要宣称其 16 条间隙改善候选已通过新的三维检查。
+
+**检查清单（Checklist）**
+
+- [x] 最低运动量不再是 Early Repair 的抓持保持前提，路程仅作诊断。
+- [x] 检查完整三维相对位置，区分局部运动学可行、抓持未确认与明确脱离；不声称启发式 pass 是任务成功或高质量示范。
+- [x] 71 项单测及语法/diff 检查通过，其他安全、奖励与恢复门槛保持原值。
+- [ ] 人工重跑受限 Episode，核对真实 S35 候选的六帧相对向量、物理安全、间隙及执行后任务表现。

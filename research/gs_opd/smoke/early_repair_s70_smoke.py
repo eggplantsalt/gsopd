@@ -60,9 +60,8 @@ AMPLITUDES_M = (0.008, 0.016, 0.024, 0.032)
 WINDOWS = ((1, 3), (2, 2))  # geometry-centered smoothing envelopes; not collision times
 GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
 MIN_GAP_IMPROVEMENT_M = 1e-6
-# This is a conservative heuristic for preserving an already demonstrated
-# grasp across a short detour. It is evidence for task continuity, not a
-# gripper-contact or task-success proof.
+# Bound the world-frame relative-position change over a short detour;
+# positions alone cannot confirm a physical grasp or task success.
 MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M = 0.05
 OBJECT_ID = "object_1"
 OBSTACLE_ID = "object_4"
@@ -458,32 +457,36 @@ def evaluate_early_repair_task_feasibility(
 ) -> dict[str, Any]:
     """Check same-horizon detour feasibility without requiring A0-direction progress.
 
-    The former 70% root-position projection remains diagnostic only. Passing
-    requires complete states, a bound task object, reward/termination checks,
-    and baseline-supported EEF/object co-motion that remains within a bounded
-    relative-distance change. This is a short-horizon grasp-preservation
-    heuristic, not a success label.
+    Passing requires complete states, a bound task object, reward/termination
+    checks, and bounded changes in the 3-D object-to-EEF relative position.
+    Motion magnitudes and A0-direction progress are diagnostics only. A pass
+    establishes local kinematic continuity, not a grasp or task-success label.
 
     ``evaluation_complete`` means the required states and reward/done signals
     were available for assessment. A complete assessment may still return
-    ``unavailable`` when those observations do not establish a reliable grasp.
+    ``unavailable`` when baseline relative motion is too inconsistent to use
+    as a reference. Stationary and nearby objects cannot be identified as
+    physically grasped from these positions alone.
     """
     result: dict[str, Any] = {
         "status": "unavailable",
         "evaluation_complete": False,
         "reason": None,
-        "basis": "same_horizon_grasp_preservation_and_no_reward_loss",
+        "basis": "same_horizon_3d_relative_position_consistency_and_no_reward_loss",
         "aligned_prefix_steps_compared": CHUNK_LENGTH,
         "comparison_horizon_steps": CHUNK_LENGTH,
         "high_quality_training_label_created": False,
+        "physical_grasp_confirmed": False,
+        "task_success_confirmed": False,
         "original_a0_direction_70_percent_diagnostic": {
             **(original_direction_diagnostic or {}),
             "used_as_hard_gate": False,
         },
         "grasp_evidence": {
             "status": "unavailable",
-            "relative_distance_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
-            "limitation": "EEF/object kinematic co-motion is heuristic evidence and does not prove a physical grasp.",
+            "relative_position_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
+            "physical_grasp_confirmed": False,
+            "limitation": "Positions alone cannot distinguish a grasped object from a nearby or independently supported object.",
         },
     }
     if not _complete_five_steps(baseline) or not _complete_five_steps(candidate):
@@ -527,36 +530,48 @@ def evaluate_early_repair_task_feasibility(
     result["evaluation_complete"] = True
     baseline_eef, baseline_object = baseline_path
     candidate_eef, candidate_object = candidate_path
-    baseline_relative = np.linalg.norm(baseline_object - baseline_eef, axis=1)
-    candidate_relative = np.linalg.norm(candidate_object - candidate_eef, axis=1)
+    baseline_relative_vectors = baseline_object - baseline_eef
+    candidate_relative_vectors = candidate_object - candidate_eef
+    baseline_relative = np.linalg.norm(baseline_relative_vectors, axis=1)
+    candidate_relative = np.linalg.norm(candidate_relative_vectors, axis=1)
     baseline_object_path_m = float(np.linalg.norm(np.diff(baseline_object, axis=0), axis=1).sum())
     baseline_eef_path_m = float(np.linalg.norm(np.diff(baseline_eef, axis=0), axis=1).sum())
     baseline_relative_range_m = float(np.max(baseline_relative) - np.min(baseline_relative))
-    relative_error = np.abs(candidate_relative - baseline_relative)
-    max_relative_error_m = float(np.max(relative_error))
-    grasp_reliable = bool(
-        baseline_object_path_m >= config.minimum_object_motion_m
-        and baseline_eef_path_m >= config.minimum_eef_progress_m
-        and baseline_relative_range_m <= MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M
+    baseline_relative_changes = baseline_relative_vectors - baseline_relative_vectors[0]
+    candidate_relative_changes = candidate_relative_vectors - candidate_relative_vectors[0]
+    baseline_max_relative_change_m = float(np.linalg.norm(baseline_relative_changes, axis=1).max())
+    candidate_max_relative_change_m = float(np.linalg.norm(candidate_relative_changes, axis=1).max())
+    max_relative_error_m = float(np.linalg.norm(
+        candidate_relative_vectors - baseline_relative_vectors, axis=1
+    ).max())
+    baseline_consistent = baseline_max_relative_change_m <= MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M
+    candidate_consistent = bool(
+        candidate_max_relative_change_m <= MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M
+        and max_relative_error_m <= MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M
     )
     result["grasp_evidence"] = {
-        "status": "reliable_heuristic" if grasp_reliable else "unreliable",
-        "method": "same_horizon_baseline_object_eef_co_motion_and_relative_distance",
+        "status": "kinematic_consistency_only" if baseline_consistent and candidate_consistent else "unreliable",
+        "method": "same_horizon_world_frame_3d_object_to_eef_relative_position",
+        "physical_grasp_confirmed": False,
         "baseline_object_path_length_m": baseline_object_path_m,
         "baseline_eef_path_length_m": baseline_eef_path_m,
+        "motion_magnitudes_role": "diagnostic_only_no_minimum_motion_requirement",
         "baseline_relative_distance_range_m": baseline_relative_range_m,
-        "candidate_max_aligned_relative_distance_error_m": max_relative_error_m,
-        "relative_distance_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
-        "baseline_motion_thresholds_m": {
-            "task_object": config.minimum_object_motion_m,
-            "eef": config.minimum_eef_progress_m,
-        },
-        "limitation": "This kinematic heuristic cannot distinguish every supported-object configuration from a grasp.",
+        "candidate_max_aligned_relative_distance_error_m": float(np.abs(candidate_relative - baseline_relative).max()),
+        "baseline_relative_position_world_m": baseline_relative_vectors.tolist(),
+        "candidate_relative_position_world_m": candidate_relative_vectors.tolist(),
+        "baseline_max_relative_position_change_m": baseline_max_relative_change_m,
+        "candidate_max_relative_position_change_m": candidate_max_relative_change_m,
+        "candidate_max_aligned_relative_position_error_m": max_relative_error_m,
+        "baseline_relative_motion_consistent": baseline_consistent,
+        "candidate_relative_motion_consistent": candidate_consistent,
+        "relative_position_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
+        "limitation": "Kinematic consistency cannot prove physical grasp or success; world-frame offsets can change under object/EEF rotation, which is not compensated here.",
     }
-    if not grasp_reliable:
+    if not baseline_consistent:
         result["reason"] = "baseline_grasp_evidence_unreliable"
         return result
-    if max_relative_error_m > MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M:
+    if not candidate_consistent:
         result["status"] = "fail"
         result["reason"] = "candidate_task_object_eef_relative_position_changed_abnormally"
         return result

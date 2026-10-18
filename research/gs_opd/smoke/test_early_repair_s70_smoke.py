@@ -78,6 +78,14 @@ def _candidate(
     }
 
 
+def _with_task_object_offset(candidate, offset):
+    states = [candidate["start_state"], *[step["state"] for step in candidate["steps"]]]
+    for state in states:
+        obj = state["object_states"]["bowl"]
+        obj["root_pos"] = (np.asarray(obj["root_pos"]) + np.asarray(offset)).tolist()
+    return candidate
+
+
 def _assess_safe_candidate(baseline, candidate):
     context = _controller_context()
     actions = np.zeros((5, 7), dtype=np.float64)
@@ -287,7 +295,9 @@ class EarlyRepairProgressTests(unittest.TestCase):
         task = report["task_progress"]
         self.assertEqual(task["status"], "pass")
         self.assertTrue(task["evaluation_complete"])
-        self.assertEqual(task["grasp_evidence"]["status"], "reliable_heuristic")
+        self.assertEqual(task["grasp_evidence"]["status"], "kinematic_consistency_only")
+        self.assertFalse(task["physical_grasp_confirmed"])
+        self.assertFalse(task["task_success_confirmed"])
         self.assertLess(
             task["original_a0_direction_70_percent_diagnostic"]["task_object_root_pos_projection"][
                 "candidate_translation_progress_fraction"
@@ -340,8 +350,56 @@ class EarlyRepairProgressTests(unittest.TestCase):
             report["rejection_reasons"],
         )
 
-    def test_insufficient_baseline_grasp_is_a_completed_ineligible_assessment(self):
-        baseline = _candidate("baseline", 0.003482, 0.004693)
+    def test_stationary_relative_state_can_pass_without_claiming_a_grasp(self):
+        # The same positions could also describe an independently supported
+        # object near a stationary hand; only kinematic continuity is tested.
+        baseline = _with_task_object_offset(_candidate("baseline", 0.0, 0.0), [0.03, -0.02, -0.08])
+        candidate = _with_task_object_offset(_candidate("stationary", 0.0, 0.0), [0.03, -0.02, -0.08])
+        task = smoke.evaluate_early_repair_task_feasibility(baseline, candidate, {"body_id": 23})
+
+        self.assertEqual(task["status"], "pass")
+        self.assertTrue(task["evaluation_complete"])
+        self.assertEqual(task["grasp_evidence"]["baseline_eef_path_length_m"], 0.0)
+        self.assertEqual(task["grasp_evidence"]["candidate_max_relative_position_change_m"], 0.0)
+        self.assertFalse(task["grasp_evidence"]["physical_grasp_confirmed"])
+        self.assertFalse(task["physical_grasp_confirmed"])
+        self.assertFalse(task["task_success_confirmed"])
+        self.assertFalse(task["high_quality_training_label_created"])
+
+    def test_low_speed_relative_state_has_no_minimum_motion_gate(self):
+        for object_motion, eef_motion in ((0.0034822, 0.00469311), (0.0005, 0.0004)):
+            with self.subTest(object_motion=object_motion, eef_motion=eef_motion):
+                baseline = _with_task_object_offset(
+                    _candidate("baseline", object_motion, eef_motion), [0.0, 0.0, -0.08]
+                )
+                candidate = _with_task_object_offset(
+                    _candidate("low_speed", object_motion, eef_motion), [0.0, 0.0, -0.08]
+                )
+                task = smoke.evaluate_early_repair_task_feasibility(baseline, candidate, {"body_id": 23})
+                self.assertEqual(task["status"], "pass")
+                self.assertTrue(task["evaluation_complete"])
+                self.assertLess(task["grasp_evidence"]["baseline_eef_path_length_m"], 0.005)
+                self.assertFalse(task["physical_grasp_confirmed"])
+                self.assertFalse(task["high_quality_training_label_created"])
+
+    def test_unchanged_scalar_distance_cannot_hide_3d_relative_displacement(self):
+        baseline = _with_task_object_offset(_candidate("baseline", 0.02, 0.02), [0.08, 0.0, 0.0])
+        candidate = _candidate("relative_side_slip", 0.02, 0.02)
+        states = [candidate["start_state"], *[step["state"] for step in candidate["steps"]]]
+        for state, angle in zip(states, np.linspace(0.0, np.pi / 2.0, 6)):
+            eef = np.asarray(state["robot_states"][0]["eef_pos"])
+            state["object_states"]["bowl"]["root_pos"] = (
+                eef + [0.08 * np.cos(angle), 0.08 * np.sin(angle), 0.0]
+            ).tolist()
+        task = smoke.evaluate_early_repair_task_feasibility(baseline, candidate, {"body_id": 23})
+
+        self.assertEqual(task["status"], "fail")
+        self.assertEqual(task["reason"], "candidate_task_object_eef_relative_position_changed_abnormally")
+        self.assertLess(task["grasp_evidence"]["candidate_max_aligned_relative_distance_error_m"], 1e-12)
+        self.assertGreater(task["grasp_evidence"]["candidate_max_relative_position_change_m"], 0.05)
+
+    def test_inconsistent_baseline_relative_positions_are_completed_but_unavailable(self):
+        baseline = _candidate("baseline", 0.1, 0.02)
         candidate = _candidate("candidate", 0.01, 0.01)
         report = _assess_safe_candidate(baseline, candidate)
 
@@ -351,7 +409,7 @@ class EarlyRepairProgressTests(unittest.TestCase):
         self.assertEqual(report["task_progress"]["reason"], "baseline_grasp_evidence_unreliable")
         self.assertFalse(report["training_label_valid"])
 
-    def test_missing_reward_is_incomplete_even_if_grasp_evidence_is_insufficient(self):
+    def test_missing_reward_is_incomplete_even_with_consistent_relative_positions(self):
         baseline = _candidate("baseline", 0.003482, 0.004693)
         candidate = _candidate("candidate", 0.01, 0.01)
         del candidate["steps"][1]["reward"]

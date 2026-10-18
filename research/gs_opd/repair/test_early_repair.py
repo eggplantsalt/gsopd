@@ -110,8 +110,7 @@ def _task_assessment(*, grasp_evidence_sufficient: bool = True) -> dict[str, Any
     if not grasp_evidence_sufficient:
         for index, step in enumerate(baseline["steps"]):
             fraction = (index + 1) / 5
-            step["state"]["robot_states"][0]["eef_pos"][0] = 0.004 * fraction
-            step["state"]["object_states"]["moving"]["root_pos"][0] = 0.003 * fraction
+            step["state"]["object_states"]["moving"]["root_pos"][1] = 0.08 * fraction
     return probe.evaluate_early_repair_task_feasibility(
         baseline, _bridge_candidate("candidate"), {"body_id": 10}
     )
