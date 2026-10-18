@@ -29,6 +29,7 @@ def _load_helpers():
         "_resolve_task_object_binding",
         "prepare_on_policy_safety_collection",
         "run_on_policy_safety_collection_decision",
+        "_run_bias_collection_decision",
         "_near_far_result_is_complete",
         "_validated_early_repair_candidates",
         "select_verified_execution_chunk",
@@ -358,7 +359,8 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         self.helpers = _load_helpers()
         self.chunk = np.zeros((3, 7), dtype=np.float32)
         self.chunk[:, 6] = -1.0
-        self.call = self.helpers["run_on_policy_safety_collection_decision"]
+        # Retain regression coverage of the legacy bias baseline contract.
+        self.call = self.helpers["_run_bias_collection_decision"]
 
     def test_safe_a0_is_a_valid_label_and_skips_repair(self):
         actions = np.zeros((5, 7), dtype=np.float32)

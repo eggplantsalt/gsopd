@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument(
         "--on-policy-safety-collection",
         action="store_true",
-        help="Verify every predicted chunk with Snapshot/Branch Rollout, collect labels, and continue the original Student actions.",
+        help="Verify Student chunks, execute safe local recovery when needed, and collect actual transitions.",
     )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
@@ -915,13 +915,14 @@ def _validated_early_repair_candidates(result, expected_shape):
     }
 
 
-def run_on_policy_safety_collection_decision(
+def _run_bias_collection_decision(
     conn,
     chunk,
     instruction,
     chunk_index,
     decision_step,
     collection_context,
+    recovery_state=None,
 ):
     """Verify A0 from a fresh Snapshot and optionally search for a safe A+."""
     import sys
@@ -1023,8 +1024,8 @@ def run_on_policy_safety_collection_decision(
         snapshot = bridge_request({"op": "snapshot"})
         report["snapshot_id"] = snapshot.get("snapshot_id")
         if not isinstance(report["snapshot_id"], str):
-            # Snapshot creation is read-only; continue Student A0 as an
-            # explicitly unknown sample because no branch changed the state.
+            # Record the unknown decision; execution selection rejects it
+            # before any unverified Student action can reach the environment.
             report["main_state_restored"] = True
             report["status"] = "unknown_snapshot_unavailable"
             add_failure(snapshot.get("error", "snapshot_operation_returned_no_id"))
@@ -1094,6 +1095,18 @@ def run_on_policy_safety_collection_decision(
             report["a0_verdict"] = "unknown"
             report.update({"status": "a0_unknown", "repair_status": "skipped_a0_unknown"})
             add_failure("A0_safe_verdict_did_not_cover_the_requested_full_chunk")
+            return report
+
+        if recovery_state is not None and teacher.get("object_contact_rules"):
+            from research.gs_opd.repair.local_recovery import (
+                run_local_escape_and_recovery,
+            )
+
+            recovery = run_local_escape_and_recovery(
+                conn, snapshot, actions, baseline_candidate, report["a0_verdict"],
+                collection_context, recovery_state, str(instruction), int(decision_step),
+            )
+            report.update(recovery)
             return report
 
         if report["a0_verdict"] == "safe":
@@ -1483,6 +1496,23 @@ def _new_safety_episode_summary():
     }
 
 
+def run_on_policy_safety_collection_decision(
+    conn, chunk, instruction, chunk_index, decision_step, collection_context,
+):
+    """Use one episode-local recovery state for the bound object-contact task."""
+    from research.gs_opd.repair.local_recovery import RecoveryState
+
+    state = None
+    if collection_context["teacher"].get("object_contact_rules"):
+        state = collection_context.setdefault("recovery_state", RecoveryState())
+        if not isinstance(state, RecoveryState):
+            raise ValueError("collection recovery_state must be episode-local RecoveryState")
+    return _run_bias_collection_decision(
+        conn, chunk, instruction, chunk_index, decision_step, collection_context,
+        recovery_state=state,
+    )
+
+
 def select_verified_execution_chunk(decision, predicted_actions):
     """Select A0 or A+ only when its exact chunk passed the required gates."""
     try:
@@ -1506,6 +1536,13 @@ def select_verified_execution_chunk(decision, predicted_actions):
         return {"valid": False, "reason": "safety_record_A0_is_not_numeric"}
     if recorded_a0.shape != a0.shape or not np.isfinite(recorded_a0).all() or not np.array_equal(recorded_a0, a0):
         return {"valid": False, "reason": "safety_record_A0_does_not_match_student_prediction"}
+
+    if "recovery_search" in decision:
+        from research.gs_opd.repair.local_recovery import (
+            select_verified_recovery_execution,
+        )
+
+        return select_verified_recovery_execution(decision, a0)
 
     verdict = decision.get("a0_verdict")
     if verdict == "safe":
@@ -1629,6 +1666,8 @@ def _classify_safety_abort(decision):
     status = decision.get("status")
     if status in ("invalid_A0_action_shape", "invalid_A0_action_values"):
         return "invalid_action"
+    if status in ("local_recovery_unavailable", "actual_recovery_execution_failed", "bounded_recovery_stop"):
+        return status
     if decision.get("near_far_status") == "unknown":
         return "near_far_verification_unknown"
     if decision.get("a0_verdict") == "unknown":
@@ -1663,6 +1702,21 @@ def _update_safety_episode_summary(summary, decision):
         summary["valid_a_plus_count"] += 1
     if decision.get("training_label_valid") is True:
         summary["valid_training_label_count"] += 1
+    recovery = decision.get("recovery")
+    if isinstance(recovery, dict):
+        actual = recovery.get("actual_execution") or {}
+        summary["recovery_decision_count"] = summary.get("recovery_decision_count", 0) + 1
+        summary["verified_safe_recovery_chunk_count"] = summary.get("verified_safe_recovery_chunk_count", 0) + int(actual.get("verified_safe_recovery_chunk") is True)
+        summary["task_success_observed_in_main_environment"] = summary.get("task_success_observed_in_main_environment", False) or actual.get("task_success_observed") is True
+        if actual.get("status") == "complete":
+            transitions = summary.setdefault("recovery_transition_counts", {})
+            transition = recovery.get("transition", "unknown")
+            transitions[transition] = transitions.get(transition, 0) + 1
+        counts = summary.setdefault("recovery_rejection_reason_counts", {})
+        search = decision.get("recovery_search") or {}
+        for key in ("rejection_reason_counts", "constraint_rejection_reason_counts", "selection_rejection_reason_counts"):
+            for reason, count in search.get(key, {}).items():
+                counts[str(reason)] = counts.get(str(reason), 0) + count
     for reason in decision.get("failure_reasons", []):
         summary["failure_reason_counts"][str(reason)] = summary["failure_reason_counts"].get(str(reason), 0) + 1
     repair_search = decision.get("repair_search")
@@ -1909,8 +1963,8 @@ try:
                     chunk,
                     safety_record=safety_decision,
                 )
-            _update_safety_episode_summary(safety_episode_summary, safety_decision)
             if _must_abort_safety_episode(safety_decision):
+                _update_safety_episode_summary(safety_episode_summary, safety_decision)
                 collection_abort_reason = collection_abort_reason or safety_decision.get("status") or "branch_restore_unconfirmed"
                 collection_abort_status = collection_abort_status or _classify_safety_abort(safety_decision)
                 print(
@@ -1923,27 +1977,99 @@ try:
         else:
             execution_chunk = chunk
 
+        actual_chunk_actions = []
+        actual_chunk_post = []
         for action_index, action in enumerate(execution_chunk):
-            conn.send({"op": "step", "action": action.tolist()})
-            data = conn.recv()
+            payload = {"op": "step", "action": action.tolist()}
+            if collection_enabled:
+                payload["include_snapshot_state"] = True
+            conn.send(payload)
+            response = conn.recv()
+            if collection_enabled and (not isinstance(response, dict) or response.get("error")):
+                collection_abort_reason = "main_environment_step_failed"
+                collection_abort_status = "actual_recovery_execution_failed"
+                safety_decision["training_label_valid"] = False
+                safety_decision["must_abort_episode"] = True
+                safety_decision["status"] = "actual_recovery_execution_failed"
+                safety_decision["failure_reasons"].append(collection_abort_reason)
+                break
+            data = response
             steps += 1
+            actual_chunk_actions.append(action.copy())
+            actual_chunk_post.append(data)
             if trace_writer is not None:
-                trace_writer.add_step(
-                    step_index=steps - 1,
-                    chunk_index=chunk_index,
-                    action_index=action_index,
-                    action=action,
-                    bridge_data=data,
-                )
+                try:
+                    trace_writer.add_step(
+                        step_index=steps - 1, chunk_index=chunk_index,
+                        action_index=action_index, action=action, bridge_data=data,
+                    )
+                except ValueError as exc:
+                    if not collection_enabled:
+                        raise
+                    collection_abort_reason = str(exc)
+                    collection_abort_status = "actual_recovery_execution_failed"
+                    safety_decision["training_label_valid"] = False
+                    safety_decision["must_abort_episode"] = True
+                    safety_decision["failure_reasons"].append(str(exc))
+                    break
             if video_frames is not None:
                 video_frames.append(get_video_frame(data))
             success = success or data["reward"] > 0
             done = bool(data["done"])
 
+            if collection_enabled and "recovery_execution" in safety_decision:
+                from research.gs_opd.repair.local_recovery import (
+                    validate_actual_recovery_step,
+                )
+
+                checked = validate_actual_recovery_step(safety_decision, action_index, action, data)
+                safety_decision["recovery"].setdefault("actual_step_checks", []).append(checked)
+                if checked["status"] != "complete":
+                    collection_abort_reason = checked["reason"]
+                    collection_abort_status = "actual_recovery_execution_failed"
+                    safety_decision.update({
+                        "must_abort_episode": True, "training_label_valid": False,
+                        "status": "actual_recovery_execution_failed",
+                    })
+                    safety_decision["failure_reasons"].append(collection_abort_reason)
+                    break
+
             if steps % 20 == 0 or success or done:
                 print(f"STEP={steps} REWARD={data['reward']} DONE={done} SUCCESS={success}", flush=True)
 
             if steps >= args.max_steps or done or success:
+                break
+
+        if collection_enabled:
+            if "recovery_execution" in safety_decision:
+                from research.gs_opd.repair.local_recovery import (
+                    commit_recovery_execution,
+                )
+                from research.gs_opd.repair.near_far import query_geom_gap
+
+                recovery_record = safety_decision["recovery"]
+                actual_gap = query_geom_gap(
+                    conn,
+                    subject_geom_ids=recovery_record["subject_geom_ids"],
+                    obstacle_geom_ids=recovery_record["obstacle_geom_ids"],
+                    step_index=steps,
+                )
+                committed = commit_recovery_execution(
+                    collection_context["recovery_state"], safety_decision,
+                    actual_chunk_actions, actual_chunk_post, collection_context, actual_gap,
+                )
+                if committed.get("status") != "complete" or (committed.get("must_stop") and not success):
+                    safety_decision.update({
+                        "must_abort_episode": True, "training_label_valid": False,
+                        "status": "actual_recovery_execution_failed" if committed.get("status") != "complete" else "bounded_recovery_stop",
+                    })
+                    reason = committed.get("reason", "bounded_recovery_progress_budget_exhausted")
+                    safety_decision["failure_reasons"].append(reason)
+                    collection_abort_reason = reason
+                    collection_abort_status = safety_decision["status"]
+            safety_decision = trace_writer.finalize_decision_execution(chunk_index, safety_decision)
+            _update_safety_episode_summary(safety_episode_summary, safety_decision)
+            if collection_abort_reason is not None:
                 break
 
     if args.video_out is not None:
@@ -1958,6 +2084,8 @@ try:
 
     safety_summary_path = None
     if collection_enabled:
+        from dataclasses import asdict
+
         if collection_preflight_failure is not None:
             episode_status = "collection_preflight_failed"
         elif collection_abort_reason is not None:
@@ -1981,6 +2109,12 @@ try:
             "preflight_failure": collection_preflight_failure,
             "abort_reason": collection_abort_reason,
             "data_path": str(trace_output_path),
+            "task_success_episode": bool(success and collection_abort_reason is None and collection_preflight_failure is None),
+            "high_quality_complete_demonstration": False,
+            "recovery_state_final": (
+                asdict(collection_context["recovery_state"])
+                if collection_context is not None and "recovery_state" in collection_context else None
+            ),
         })
         safety_summary_path = trace_output_path.with_suffix(".summary.json")
         safety_summary_path.parent.mkdir(parents=True, exist_ok=True)

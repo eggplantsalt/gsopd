@@ -1396,3 +1396,88 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 朝近分量制动、远离分量保留、侧移/抬升、完整修正诊断、OSC 仿射尺度、各项动作上限和旧路径兼容性均有单测。
 - [x] 所有物理安全、任务可行性、gap、Snapshot 恢复及最大 gap 选择门槛继续复用，静态检查和 80 项单测通过。
 - [ ] 人工运行受限 On-Policy Episode，按两类候选统计静态拒绝、物理安全、任务可行性、gap 改善及最终实际执行来源。
+
+## Geometry-Guided Local Escape and Recovery（2026-10-18）
+
+### 当前目标与实现范围
+
+- 总体路线仍为真实观测 → Teacher 语义规则/已验证物理绑定 → Snapshot 物理验证 → 实际执行安全动作 → 从真实新观测继续 Student Rollout → 收集可追溯数据。本次完成局部 Escape 与 Episode 内 Recovery 的第一版代码；没有进行真实 Episode 性能验收，也没有训练。
+- 新增 `research/gs_opd/repair/local_recovery.py`。当前 On-Policy Object-to-Object 路径直接调用该模块；无新增模式开关、固定决策步、历史动作或场景物体 ID。已有 Safety IR、绑定/Inventory 验证、完整 Contact Compiler、Bridge、Near–Far 和共享 Verifier-Guided Repair 实现未修改。Gripper-only 路径保留原验证逻辑。
+- 当前仅接受一个明确的、已绑定的搬运任务物体 → 障碍物 forbid-contact 对。指令、物理 Body 对和连续实际状态必须保持一致；不把当前绑定套用到其他场景。
+
+### 候选、专用约束与物理验收
+
+- 默认尝试 **26 条**：停止朝近运动 1 条、保持位置命令 1 条；8/16/24 mm 三档下，左右侧移、抬升、左右侧移结合抬升、后撤各 1 条，共 18 条；另保留原构造器的三方向 × 两窗口、8 mm 偏置 baseline 共 6 条。生成尝试总数上限 36，不用旧 24 条网格占满预算；旧 S70 Smoke 的默认网格和行为没有修改。
+- 直接构造每步世界 XYZ 位移，再用活动 OSC 的 input/output 中点与 gain 反算最终输入。以最后一个真实主环境命令为起点，前两步以 0.5、1.0 权重过渡，随后维持目标；姿态及夹爪维度逐项保留 A⁰。全部动作先量化为实际 Bridge 使用的 float32，再做分支验证和动作指纹检查；不做 clipping。
+- 新候选使用显式 `recovery_absolute_control` 策略：真实 OSC 输入范围、世界坐标 delta 约定、相邻世界位移命令变化（含上一真实动作边界）不超过 50 mm、活动 Workspace 和 MuJoCo 关节限位均须通过。50 mm 是本版命令连续性策略，不能解释为硬件安全认证。活动控制器明确未设置笛卡尔 `position_limits` 时记录此事实，不虚构 Workspace。缺少必要配置/状态返回不可执行。
+- 直接 Recovery 的相对 A⁰ 每步/累计修正量只作诊断，不应用旧 32/80 mm 搜索预算；六条 legacy baseline 继续使用原相对修正约束。每步真实世界修正向量、最终输入、控制尺度、预算策略及逐条拒绝原因均写入报告。
+- A⁰ 当前 safe 但 Near–Far warning，或 A⁰ 明确 violation 时，可从当前 Snapshot 最近 Geom 对生成 Recovery。方向来自当前几何，不把已碰撞 A⁰ 的终点当作避障起点。每条候选独立从同一 Snapshot 完整执行五步，验证起点积分状态、实际动作、全物理子步 Contact Monitoring、全部 Teacher 规则、Workspace、任务物体/EEF 连续性、奖励/终止，以及终点重放和主状态恢复。任何必要物理验证不完整、Compiler unknown 或恢复失败均 fail-closed。
+- 任务连续性比较候选起始及五步后的三维 `object.root_pos - EEF.pos`，沿用已有 50 mm 容许值，检查奖励保留和无成功奖励的终止；不再用已碰撞 A⁰ 的终点或方向作为 Recovery 的硬参照。只有当前安全 Chunk 的局部运动学证据；`physical_grasp_confirmed`、`task_success_confirmed` 和高质量示范标志不据此置 true。正常无风险 A⁰ 的抓取/放置不套用 Recovery 持物启发式。
+
+### 跨 Chunk 状态与真实执行
+
+- 合格候选先选择具有真实任务物体侧向进展（至少 2 mm）的同侧绕行，其次抬升，再次有限后撤，最后有限制动/静止。优先达到合理间隙，之后比较有效侧向进展和命令路程，最后按 candidate ID 稳定排序；不再一律最大化终点 gap。所有分类都先通过相同物理安全与任务可行性门槛。
+- Episode 状态保留绕行侧别、世界侧向轴、实际间隙历史和阶段。生成候选时保持同侧切向；首次真实侧向执行后锁定侧别，拒绝反向折返。Snapshot 预测不会推进这些状态。
+- 仅在 A⁰ 完整安全且 Near–Far 解除预警、实际间隙超过 20 mm，并连续两段真实执行支持不再接近后，下一决策退出 Recovery、恢复正常 Student 动作。确认阶段继续检查侧向一致性；实际成功奖励单独记录，不从几何指标推断成功。
+- 有界策略：单次 Recovery 最多 12 个 Chunk；Episode 最多 24 个 Recovery A⁺、4 次进入；单次最多后撤 2 段、静止/纯制动保底 1 段、连续无进展 3 段。没有合格候选立即停止；计数只由实际执行更新，Episode 总预算不会因退出重入而清零。
+- `pi05_rollout.py` 真正发送选中 A⁺，随后从普通 `step` 的真实双相机/状态继续 Student 推理。主环境每步附带只读积分状态；与所选分支以 `1e-6` 比较，并核对 reward/done，异常立即停止后续动作。Chunk 后重新查询实际间隙，与分支终点严格核验，再提交 Recovery 状态。
+- `TrajectoryWriter` 保留原 NPZ 字段：`predicted_actions` 是原始 A⁰，`executed_actions` 是实际发送的 A⁰/A⁺。`decision_safety_json` 记录候选类型、修正量、侧别、起点/A⁰/A⁺ 终点间隙、侧向进展、阶段、拒绝统计、实际逐步核验及执行覆盖。部分执行不能把未执行后缀标为完整监督标签；动作不匹配仍保留真实转换并使标签失效。安全 Chunk 标签与最终任务成功、高质量完整示范明确分开。
+
+### 离线证据与测试
+
+只读使用 `logs/gs_opd/brake_steer_60step.npz` 的真实 A⁰、上一实际动作、历史绑定及已保存控制尺度诊断进行生成检查，没有仿真、没有重新推理、没有改写归档：
+
+| 归档决策 | 生成 / 控制约束拒绝 | 超出旧相对预算的直接 Recovery | 制动最大 / 累计相对 A⁰ 修正 |
+| --- | --- | --- | --- |
+| S50 | 26 / 0 | 20 | 43.963 / 176.817 mm |
+| S55 | 26 / 0 | 20 | 41.698 / 185.383 mm |
+
+这些数值包含从上一实际命令平滑过渡后的完整五步修正，不等于旧窗口纯制动的统计。离线只证明生成和输入/命令连续性检查可通过；没有验证碰撞、Workspace 路径、抓持、任务效果或 Snapshot 恢复。
+
+- CPU 环境：`/workspace/zy_workspace/envs/gsopd_teacher/bin/python`。七个直接相关 unittest 模块 **126 项通过**。全部 24 个 GS-OPD unittest 模块 **213 项：206 通过，7 跳过**；跳过项为会创建 MuJoCo 最小模型的 Snapshot 两项和 GeomDistance 五项，遵守本次不启动仿真的要求，不能把它们算作已验证。
+- 五份改动 Python 文件的 `py_compile` 与 `git diff --check` 通过；源文件及进度文档没有截断标记，原有 On-Policy 决策函数完整保留。
+- 新模块、测试和 Writer 的 Ruff lint/格式检查通过。原有 Rollout 与 On-Policy 测试文件分别仍有 10/2 项历史 Ruff 提示（导入布局、版权头等），与本次起点 `8cea42a6` 对比没有新增；未为清理旧格式大范围重写 Rollout。
+- 新增 `test_local_recovery.py`，通过确定性 Bridge 协议替身调用真实规则/绑定验证、Near–Far、Compiler 及 Recovery 实现。覆盖强朝近动作超旧预算、真实输入越界、Workspace/slew、碰撞和 unknown 拒绝、违规 A⁰ Recovery、同侧持续、退出后正常执行、有限后撤/无进展/重入、真实状态异常立即停止、奖励/终止、缺失状态、任务脱离，以及 NPZ 原预测/实际动作和部分执行标签对应。旧 Near–Far/S70/Verifier 回归通过。
+- **证据限制：** 协议替身不是 MuJoCo，离线输入合法不是物理安全。相对位置连续不能证明物理抓持，世界坐标检查可能保守拒绝持物旋转；Mesh 距离仍为近似值。没有运行模型、真实 Bridge、完整 Episode 或训练。真实任务成功率、绕行效率、冻结/后撤次数、实际计算耗时和完整 Episode 恢复可靠性仍需人工实验。
+
+### 人工运行命令与下一步
+
+离线生成诊断（无需 Bridge/模型）：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+/workspace/zy_workspace/envs/gsopd_teacher/bin/python \
+  -m research.gs_opd.repair.local_recovery \
+  --archive logs/gs_opd/brake_steer_60step.npz --steps 50 55
+```
+
+终端一，人工启动现有固定任务 Bridge：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+终端二，使用现有 π₀.₅ 环境运行受限的真实连续采集。这会实际执行受验证动作；程序仍核对当前 Teacher/双对象物理绑定，不适用于其他场景：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/RLinf/.venv/bin/python \
+  research/gs_opd/smoke/pi05_rollout.py \
+  --on-policy-safety-collection --max-steps 80 \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --object-id object_4 \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --on-policy-safety-out logs/gs_opd/local_escape_recovery_80step.npz \
+  --video-out logs/gs_opd/local_escape_recovery_80step.mp4
+```
+
+**检查清单（Checklist）**
+
+- [x] 新 Recovery 不受旧相对 A⁰ 搜索预算误阻断，最终真实控制输入和物理验证没有放宽；旧 Smoke/共享 Repair 保持原行为。
+- [x] 真实执行后才更新跨 Chunk 状态；动作、标签、观测及实际覆盖对应，失败路径停止发送后续动作。
+- [x] 生成离线诊断和 206 项无模型/仿真单测通过；7 项 MuJoCo 用例明确跳过。
+- [ ] 人工运行受限 Episode，核对真实安全通过数、同侧绕行、危险解除后的任务恢复、奖励成功及所有停止原因；尚不宣称真实场景 Recovery 已成功。

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 from pathlib import Path
 
 import numpy as np
-
 
 _CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 _STATE_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
@@ -70,7 +70,7 @@ class TrajectoryWriter:
         for key in _STATE_KEYS:
             decision[key] = _copy_state(bridge_data, key)
         if safety_record is not None:
-            decision["safety_record"] = dict(safety_record)
+            decision["safety_record"] = copy.deepcopy(safety_record)
         self.decisions.append(decision)
 
     def add_step(
@@ -82,6 +82,25 @@ class TrajectoryWriter:
         bridge_data: dict,
     ) -> None:
         """Record one executed action and the Bridge observation it produced."""
+        decision = next(
+            (
+                item
+                for item in reversed(self.decisions)
+                if item["chunk_index"] == chunk_index
+            ),
+            None,
+        )
+        record = decision.get("safety_record") if decision is not None else None
+        mismatch = False
+        if isinstance(record, dict) and record.get("execution_selection_valid") is True:
+            selected = np.asarray(record.get("selected_action_chunk"), dtype=np.float32)
+            actual = np.asarray(action, dtype=np.float32)
+            if (
+                not 0 <= action_index < len(selected)
+                or actual.shape != (7,)
+                or not np.array_equal(actual, selected[action_index])
+            ):
+                mismatch = True
         step = {
             "step_index": int(step_index),
             "chunk_index": int(chunk_index),
@@ -95,6 +114,65 @@ class TrajectoryWriter:
         for key in _STATE_KEYS:
             step[key] = _copy_state(bridge_data, key)
         self.steps.append(step)
+        if mismatch:
+            record["training_label_valid"] = False
+            record["actual_action_mismatch"] = True
+            raise ValueError(
+                "Executed action does not match the selected verified action; actual transition retained"
+            )
+
+    def finalize_decision_execution(
+        self, chunk_index: int, safety_record: dict
+    ) -> dict:
+        """Attach actual coverage; never label unexecuted suffixes as demonstrations."""
+        decision = next(
+            item
+            for item in reversed(self.decisions)
+            if item["chunk_index"] == chunk_index
+        )
+        record = copy.deepcopy(safety_record)
+        transitions = [
+            item for item in self.steps if item["chunk_index"] == chunk_index
+        ]
+        selected = np.asarray(record.get("selected_action_chunk"), dtype=np.float32)
+        count = len(transitions)
+        if selected.ndim != 2 or selected.shape[1:] != (7,):
+            raise ValueError("Finalized decision has no valid selected action chunk")
+        matches = count <= len(selected) and not any(
+            step["action_index"] != index
+            or not np.array_equal(step["action"], selected[index])
+            for index, step in enumerate(transitions)
+        )
+        full = matches and count == len(selected)
+        record["actual_execution"] = {
+            "source": "main_environment_step_responses",
+            "executed_action_steps": count,
+            "requested_action_steps": len(selected),
+            "full_selected_chunk_executed": full,
+            "executed_actions_match_selected_prefix": matches,
+            "unexecuted_suffix_is_training_label": False,
+            "actual_rewards": [item["reward"] for item in transitions],
+            "actual_dones": [item["done"] for item in transitions],
+        }
+        record["training_label_valid"] = (
+            record.get("training_label_valid") is True and full
+        )
+        if not matches:
+            record["actual_action_mismatch"] = True
+        record["supervision_scope"] = (
+            "verified_executed_action_chunk"
+            if record["training_label_valid"]
+            else "no_complete_training_label"
+        )
+        record["valid_supervision_action_steps"] = (
+            count if record["training_label_valid"] else 0
+        )
+        record["task_success_observed_in_main_environment"] = any(
+            item["reward"] > 0 for item in transitions
+        )
+        record["high_quality_task_demonstration"] = False
+        decision["safety_record"] = record
+        return record
 
     def save(self, *, steps: int, chunks: int) -> None:
         """Write decisions, executed transitions, index mappings, and metadata."""
@@ -102,8 +180,8 @@ class TrajectoryWriter:
         step_count = len(self.steps)
         action_offsets = np.zeros(decision_count + 1, dtype=np.int64)
         for index, decision in enumerate(self.decisions):
-            action_offsets[index + 1] = (
-                action_offsets[index] + len(decision["predicted_actions"])
+            action_offsets[index + 1] = action_offsets[index] + len(
+                decision["predicted_actions"]
             )
         if self.decisions:
             predicted_actions = np.concatenate(
@@ -170,19 +248,13 @@ class TrajectoryWriter:
                 dtype=np.str_,
             )
             metadata["safety_decision_schema_version"] = 1
-            arrays["metadata_json"] = np.asarray(
-                json.dumps(metadata, sort_keys=True)
-            )
+            arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
 
         for key in _CAMERA_KEYS:
-            arrays[f"decision_{key}"] = _stack(
-                [item[key] for item in self.decisions]
-            )
+            arrays[f"decision_{key}"] = _stack([item[key] for item in self.decisions])
             arrays[f"post_{key}"] = _stack([item[key] for item in self.steps])
         for key in _STATE_KEYS:
-            arrays[f"decision_{key}"] = _stack(
-                [item[key] for item in self.decisions]
-            )
+            arrays[f"decision_{key}"] = _stack([item[key] for item in self.decisions])
             arrays[f"post_{key}"] = _stack([item[key] for item in self.steps])
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
