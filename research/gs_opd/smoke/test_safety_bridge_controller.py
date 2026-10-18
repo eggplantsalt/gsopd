@@ -35,6 +35,19 @@ def _load_controller_setup():
     return namespace["_configure_pi05_libero_osc_pose"]
 
 
+def _load_action_bound_helpers():
+    tree = ast.parse(BRIDGE_PATH.read_text(encoding="utf-8"))
+    wanted = {"_active_environment_action_bounds", "_validate_tracking_action"}
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(BRIDGE_PATH), "exec"), namespace)
+    return namespace["_active_environment_action_bounds"], namespace["_validate_tracking_action"]
+
+
 class FakeOSCController:
     name = "OSC_POSE"
 
@@ -141,6 +154,95 @@ class SafetyBridgeControllerSetupTests(unittest.TestCase):
             and node.func.id == "_configure_pi05_libero_osc_pose"
         )
         self.assertLess(reset_call.lineno, configure_call.lineno)
+
+
+class FakePandaActionSource:
+    def __init__(self, low=None, high=None):
+        self.action_limits = (
+            np.full(7, -1.0) if low is None else np.asarray(low, dtype=np.float64),
+            np.full(7, 1.0) if high is None else np.asarray(high, dtype=np.float64),
+        )
+
+
+class FakeRobosuiteActionEnv:
+    def __init__(self, robot, action_spec=None):
+        self.robot = robot
+        self._action_spec = action_spec
+
+    @property
+    def action_spec(self):
+        if self._action_spec is not None:
+            return self._action_spec
+        return self.robot.action_limits
+
+
+class FakeOffScreenRenderEnv:
+    """Mirror LIBERO: only the nested robosuite task exposes action_spec."""
+
+    def __init__(self, task_env):
+        self.env = task_env
+
+
+class SafetyBridgeActionBoundsTests(unittest.TestCase):
+    def setUp(self):
+        self.get_bounds, self.validate_action = _load_action_bound_helpers()
+
+    def test_reads_action_spec_from_nested_robosuite_env_and_matches_panda_limits(self):
+        robot = FakePandaActionSource()
+        task_env = FakeRobosuiteActionEnv(robot)
+        wrapper = FakeOffScreenRenderEnv(task_env)
+        self.assertFalse(hasattr(wrapper, "action_spec"))
+
+        low, high = self.get_bounds(wrapper, robot)
+
+        np.testing.assert_array_equal(low, robot.action_limits[0])
+        np.testing.assert_array_equal(high, robot.action_limits[1])
+
+    def test_rejects_missing_action_spec(self):
+        class MissingActionSpec:
+            pass
+
+        with self.assertRaisesRegex(ValueError, "action bounds unavailable"):
+            self.get_bounds(FakeOffScreenRenderEnv(MissingActionSpec()), FakePandaActionSource())
+
+    def test_rejects_non_finite_action_bounds(self):
+        robot = FakePandaActionSource()
+        low = np.full(7, -1.0)
+        high = np.full(7, 1.0)
+        high[2] = np.nan
+        wrapper = FakeOffScreenRenderEnv(FakeRobosuiteActionEnv(robot, (low, high)))
+        with self.assertRaisesRegex(ValueError, "finite 7-D"):
+            self.get_bounds(wrapper, robot)
+
+    def test_rejects_illegal_action_bound_shape(self):
+        robot = FakePandaActionSource()
+        wrapper = FakeOffScreenRenderEnv(
+            FakeRobosuiteActionEnv(robot, (np.full(6, -1.0), np.full(6, 1.0)))
+        )
+        with self.assertRaisesRegex(ValueError, "finite 7-D"):
+            self.get_bounds(wrapper, robot)
+
+    def test_rejects_environment_bounds_that_disagree_with_panda_limits(self):
+        robot = FakePandaActionSource()
+        low = np.full(7, -1.0)
+        high = np.full(7, 1.0)
+        high[-1] = 0.5
+        wrapper = FakeOffScreenRenderEnv(FakeRobosuiteActionEnv(robot, (low, high)))
+        with self.assertRaisesRegex(ValueError, "disagrees with Panda"):
+            self.get_bounds(wrapper, robot)
+
+    def test_action_validation_rejects_bad_shape_non_finite_and_out_of_range(self):
+        low, high = np.full(7, -1.0), np.full(7, 1.0)
+        with self.assertRaisesRegex(ValueError, "finite_7d"):
+            self.validate_action(np.zeros(6), low, high)
+        bad = np.zeros(7)
+        bad[0] = np.inf
+        with self.assertRaisesRegex(ValueError, "finite_7d"):
+            self.validate_action(bad, low, high)
+        bad = np.zeros(7)
+        bad[3] = 1.01
+        with self.assertRaisesRegex(ValueError, "outside_active_environment_bounds"):
+            self.validate_action(bad, low, high)
 
 
 if __name__ == "__main__":

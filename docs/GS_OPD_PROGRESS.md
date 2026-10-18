@@ -1897,3 +1897,19 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 以本机 robosuite 源码为依据处理 PandaGripper 的初始化与已格式化双执行器状态。
 - [x] Bridge 实时抓持、跟踪分支初始/逐步状态及客户端分支验收使用一致的负/正闭合极性与 `0.9` 阈值。
 - [x] 合成单元测试通过；真实 240 步抓持统计和物理分支结果等待人工运行核查。
+## Trajectory Tracking action bounds wrapper fix (2026-10-19)
+
+- Audited the local LIBERO-Safety source at `/workspace/zy_workspace/LIBERO-Safety/libero/libero/envs/env_wrapper.py`: `OffScreenRenderEnv` inherits `ControlEnv`, whose `env` member is the underlying robosuite task environment. `OffScreenRenderEnv` forwards `robots` and `sim`, while its outer wrapper does not expose `action_spec`.
+- Audited vendored robosuite v1.4 source: `RobotEnv.action_spec` concatenates every robot's `action_limits`; Panda `SingleArm.action_limits` concatenates controller limits and gripper limits. The Bridge now reads `env.env.action_spec`, checks its finite 7-D bounds against the active Panda `robot.action_limits`, and retains finite shape, action range, and OSC scaling validation.
+- Adjacent accesses in the tracking path (`env.robots`, `env.sim`, and `env.env.control_timestep`) match the audited wrapper API; no further wrapper-attribute mismatch was found.
+- Added regression cases for an outer wrapper without `action_spec`, valid nested robosuite bounds matching Panda limits, missing/non-finite/invalid-shape/inconsistent bounds, and malformed/non-finite/out-of-range actions.
+- Validation: the Bridge controller, Snapshot, and trajectory tracking unittest modules passed (40 passed, 2 MuJoCo-dependent tests skipped); `py_compile`, Ruff (with the Bridge's existing `CPY001,I001,E402` exclusions), and `git diff --check` passed. Tests ran with Python 3.12.14 from the existing `vllm-env` environment.
+- No Student or MuJoCo physical run was started. v5 physical tracking, grasp retention, tracking errors, and contact results remain to be checked manually.
+- Run blocker found during handoff: the working-tree `research/gs_opd/smoke/pi05_rollout.py` is currently zero bytes, while `HEAD` (`d685b776`) contains a 116,531-byte version. This file is outside this task's allowed edit scope and was not changed; restore/review it before launching the v5 Student command.
+
+Checklist:
+
+- [x] Read local LIBERO and robosuite v1.4 wrapper/action-limit sources.
+- [x] Make the Bridge read bounds from the nested robosuite environment and validate against active Panda limits.
+- [x] Preserve fail-closed action shape, finite-value, bounds, and OSC-scale checks.
+- [ ] Re-run v5 physical acceptance and inspect executed steps, grasp retention, tracking errors, and contacts.

@@ -1107,6 +1107,59 @@ def _tracking_relative_pose(position, quaternion, eef_position, eef_quaternion):
     return relative_position_local, relative_quaternion_local
 
 
+def _active_environment_action_bounds(env, robot):
+    """Read and cross-check the active robosuite and Panda 7-D action bounds."""
+    task_env = getattr(env, "env", None)
+    if task_env is None:
+        raise ValueError("active robosuite environment is unavailable")
+    try:
+        action_low, action_high = task_env.action_spec
+    except Exception as exc:
+        raise ValueError(f"active environment action bounds unavailable: {exc}") from exc
+    try:
+        robot_low, robot_high = robot.action_limits
+    except Exception as exc:
+        raise ValueError(f"active Panda action limits unavailable: {exc}") from exc
+
+    action_low = np.asarray(action_low, dtype=np.float64)
+    action_high = np.asarray(action_high, dtype=np.float64)
+    robot_low = np.asarray(robot_low, dtype=np.float64)
+    robot_high = np.asarray(robot_high, dtype=np.float64)
+    if any(
+        bounds.shape != (7,) or not np.isfinite(bounds).all()
+        for bounds in (action_low, action_high, robot_low, robot_high)
+    ):
+        raise ValueError("active Panda action bounds must be finite 7-D vectors")
+    if (
+        np.any(action_low > action_high)
+        or np.any(robot_low > robot_high)
+        or not np.allclose(action_low, robot_low, rtol=0.0, atol=1e-10)
+        or not np.allclose(action_high, robot_high, rtol=0.0, atol=1e-10)
+    ):
+        raise ValueError("active environment action_spec disagrees with Panda action_limits")
+    return action_low, action_high
+
+
+def _validate_tracking_action(action, action_low, action_high):
+    """Fail closed on malformed, non-finite, or out-of-range OSC actions."""
+    action = np.asarray(action, dtype=np.float64)
+    action_low = np.asarray(action_low, dtype=np.float64)
+    action_high = np.asarray(action_high, dtype=np.float64)
+    if action.shape != (7,) or not np.isfinite(action).all():
+        raise ValueError("computed_action_must_be_finite_7d")
+    if (
+        action_low.shape != (7,)
+        or action_high.shape != (7,)
+        or not np.isfinite(action_low).all()
+        or not np.isfinite(action_high).all()
+        or np.any(action_low > action_high)
+    ):
+        raise ValueError("active_environment_action_bounds_must_be_finite_7d")
+    if np.any(action < action_low - 1e-10) or np.any(action > action_high + 1e-10):
+        raise ValueError("computed_action_outside_active_environment_bounds")
+    return action
+
+
 def _track_trajectory_candidate(
     candidate, snapshot, binding, options, candidate_index, reference_plan
 ):
@@ -1320,19 +1373,8 @@ def _track_trajectory_candidate(
                 fields,
                 gripper_action=1.0,
             )
-            try:
-                action_low, action_high = env.action_spec
-                action_low = np.asarray(action_low, dtype=np.float64)
-                action_high = np.asarray(action_high, dtype=np.float64)
-            except Exception as exc:
-                raise ValueError(f"active environment action bounds unavailable: {exc}") from exc
-            if (
-                action_low.shape != (7,)
-                or action_high.shape != (7,)
-                or np.any(action < action_low - 1e-10)
-                or np.any(action > action_high + 1e-10)
-            ):
-                raise ValueError("computed_action_outside_active_environment_bounds")
+            action_low, action_high = _active_environment_action_bounds(env, robot)
+            action = _validate_tracking_action(action, action_low, action_high)
             desired_output = np.concatenate((target_eef_position - actual_eef_position,
                 quaternion_to_rotation_vector(quaternion_multiply(
                     target_eef_quaternion, quaternion_conjugate(actual_eef_quaternion)
