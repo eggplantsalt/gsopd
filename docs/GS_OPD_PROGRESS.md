@@ -1293,3 +1293,16 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 候选测试核验 24 个网格项的幅度值、两个平滑窗口、绕行上限及 Near–Far 阈值。
 - [x] 通用 Early Repair 测试核验候选生成与评估均收到同一 `PROBE_CONFIG`。
 - [ ] 人工运行 S70 Smoke，比对新旧幅度配置下安全候选数、任务进度和终点间隙；未运行前不宣称效果提升。
+
+## Repair 任务进度：Free Joint qpos 仅作诊断
+
+- 调整 `research/gs_opd/repair/verifier_guided_repair.py::_task_object_progress()`：任务物体推进是否通过，仅以绑定物体 `root_pos` 的基线方向平移投影与既有 70% 阈值判定。Free Joint `joint_qpos` 仍记录变化范数和投影比例，但不再作为额外通过门槛。
+- 缺少物体状态/有限 `root_pos`、基线平移不足以形成可靠方向、候选平移投影低于 70% 时仍不能通过该进度检查；Joint qpos 变化不能替代平移证据。其他 Reward、Contact Compiler、Snapshot、动作约束与候选搜索判定未改。
+- 该辅助函数由 Verifier-Guided Repair 与 Early Repair Smoke 共用；两条调用路径的相关测试一并回归。S40 对应单测通过完整 `evaluate_task_progress()` 验证平移保留率 81%、Joint qpos 投影 68% 时总体任务进度通过；另有测试验证平移低于 70% 仍失败，缺失平移状态仍返回 unavailable。
+- 三个相关测试模块共 43 项通过；本次未启动模型或仿真。
+
+**检查清单（Checklist）**
+
+- [x] Joint qpos 变化仅作为 JSON 诊断字段，不参与 `_task_object_progress()` 的通过判定。
+- [x] Verifier-Guided Repair、通用 Early Repair 和旧 S70 Smoke 相关单测通过。
+- [ ] 人工复核 S40 实验的任务进度报告，确认平移及 qpos 诊断字段符合预期。

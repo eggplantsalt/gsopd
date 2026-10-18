@@ -733,39 +733,41 @@ def _task_object_progress(
     base_pos = _vector(base["root_translation_delta_world_m"], 3, "baseline task object delta")
     candidate_pos = _vector(actual["root_translation_delta_world_m"], 3, "candidate task object delta")
     baseline_distance = float(np.linalg.norm(base_pos))
-    position_progress = None
-    if baseline_distance >= config.minimum_object_motion_m:
-        position_progress = float(np.dot(candidate_pos, base_pos / baseline_distance))
     base_joint = np.asarray(base["joint_qpos_delta"], dtype=np.float64)
     candidate_joint = np.asarray(actual["joint_qpos_delta"], dtype=np.float64)
     joint_progress = None
     joint_distance = float(np.linalg.norm(base_joint))
     if base_joint.shape == candidate_joint.shape and joint_distance >= 1e-6:
         joint_progress = float(np.dot(candidate_joint, base_joint / joint_distance))
-    thresholds = []
-    comparisons = []
-    if position_progress is not None:
-        thresholds.append(config.required_object_progress_fraction * baseline_distance)
-        comparisons.append(position_progress >= thresholds[-1])
-    if joint_progress is not None:
-        thresholds.append(config.required_object_progress_fraction * joint_distance)
-        comparisons.append(joint_progress >= thresholds[-1])
-    if not comparisons:
+    joint_progress_fraction = (
+        joint_progress / joint_distance if joint_progress is not None else None
+    )
+    if baseline_distance < config.minimum_object_motion_m:
         return {
             "status": "no_baseline_task_object_motion",
+            "reason": "insufficient_baseline_task_object_translation",
             "body_id": body_id,
             "prefix_steps_compared": prefix_steps,
             "baseline_translation_m": baseline_distance,
             "baseline_joint_qpos_delta_norm": joint_distance,
+            "candidate_joint_progress": joint_progress,
+            "candidate_joint_progress_fraction": joint_progress_fraction,
+            "joint_qpos_role": "diagnostic_only_not_used_for_progress_acceptance",
         }
+    position_progress = float(np.dot(candidate_pos, base_pos / baseline_distance))
+    required_translation_progress = config.required_object_progress_fraction * baseline_distance
     return {
-        "status": "pass" if all(comparisons) else "fail",
+        "status": "pass" if position_progress >= required_translation_progress else "fail",
         "body_id": body_id,
         "prefix_steps_compared": prefix_steps,
         "baseline_translation_m": baseline_distance,
         "candidate_translation_progress_m": position_progress,
+        "candidate_translation_progress_fraction": position_progress / baseline_distance,
+        "required_translation_progress_m": required_translation_progress,
         "baseline_joint_qpos_delta_norm": joint_distance,
         "candidate_joint_progress": joint_progress,
+        "candidate_joint_progress_fraction": joint_progress_fraction,
+        "joint_qpos_role": "diagnostic_only_not_used_for_progress_acceptance",
         "required_progress_fraction": config.required_object_progress_fraction,
     }
 

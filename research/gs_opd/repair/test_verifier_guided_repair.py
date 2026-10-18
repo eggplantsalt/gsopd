@@ -6,6 +6,7 @@ import numpy as np
 
 from research.gs_opd.repair.verifier_guided_repair import (
     RepairConfig,
+    _task_object_progress,
     _window_envelope,
     build_repair_actions,
     derive_repair_directions,
@@ -525,6 +526,113 @@ class VerifierGuidedRepairTests(unittest.TestCase):
             result["reason"],
             "task_object_progress_failed_or_unavailable_in_aligned_prefix",
         )
+
+    def test_task_object_translation_81_percent_passes_when_joint_qpos_is_68_percent(self):
+        def branch(root_x, joint_x):
+            start_qpos = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            steps = []
+            for index in range(5):
+                fraction = (index + 1) / 5
+                steps.append({
+                    "reward": 0.0,
+                    "done": False,
+                    "state": {
+                        "robot_states": [{"eef_pos": [0.0, 0.0, 0.0]}],
+                        "object_states": {
+                            "task_target": {
+                                "body_id": 77,
+                                "root_pos": [root_x * fraction, 0.0, 0.0],
+                                "joint_qpos": [joint_x * fraction, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                            }
+                        },
+                    },
+                })
+            return {
+                "start_state": {
+                    "robot_states": [{"eef_pos": [0.0, 0.0, 0.0]}],
+                    "object_states": {
+                        "task_target": {
+                            "body_id": 77,
+                            "root_pos": [0.0, 0.0, 0.0],
+                            "joint_qpos": start_qpos,
+                        }
+                    }
+                },
+                "steps": steps,
+            }
+
+        result = evaluate_task_progress(
+            branch(0.010, 1.0),
+            branch(0.0081, 0.68),
+            np.zeros((5, 7), dtype=np.float64),
+            violation_step=5,
+            controller_context=_controller_context(),
+            task_object_binding={"body_id": 77},
+            config=RepairConfig(),
+        )
+        progress = result["task_object_progress"]
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(progress["status"], "pass")
+        self.assertAlmostEqual(progress["candidate_translation_progress_fraction"], 0.81)
+        self.assertAlmostEqual(progress["candidate_joint_progress_fraction"], 0.68)
+        self.assertEqual(progress["joint_qpos_role"], "diagnostic_only_not_used_for_progress_acceptance")
+
+    def test_task_object_translation_below_70_percent_still_fails(self):
+        def branch(root_x, joint_x):
+            return {
+                "start_state": {
+                    "object_states": {
+                        "task_target": {
+                            "body_id": 77,
+                            "root_pos": [0.0, 0.0, 0.0],
+                            "joint_qpos": [0.0],
+                        }
+                    }
+                },
+                "steps": [{
+                    "state": {
+                        "object_states": {
+                            "task_target": {
+                                "body_id": 77,
+                                "root_pos": [root_x, 0.0, 0.0],
+                                "joint_qpos": [joint_x],
+                            }
+                        }
+                    }
+                }],
+            }
+
+        progress = _task_object_progress(
+            branch(0.010, 1.0),
+            branch(0.0069, 1.0),
+            {"body_id": 77},
+            RepairConfig(),
+            prefix_steps=1,
+        )
+        self.assertEqual(progress["status"], "fail")
+        self.assertAlmostEqual(progress["candidate_translation_progress_fraction"], 0.69)
+
+    def test_task_object_joint_qpos_cannot_replace_missing_translation_evidence(self):
+        baseline = {
+            "start_state": {"object_states": {"target": {
+                "body_id": 77, "root_pos": [0.0, 0.0, 0.0], "joint_qpos": [0.0],
+            }}},
+            "steps": [{"state": {"object_states": {"target": {
+                "body_id": 77, "root_pos": [0.01, 0.0, 0.0], "joint_qpos": [1.0],
+            }}}}],
+        }
+        candidate = {
+            "start_state": {"object_states": {"target": {
+                "body_id": 77, "root_pos": [0.0, 0.0, 0.0], "joint_qpos": [0.0],
+            }}},
+            "steps": [{"state": {"object_states": {"target": {
+                "body_id": 77, "joint_qpos": [1.0],
+            }}}}],
+        }
+        progress = _task_object_progress(
+            baseline, candidate, {"body_id": 77}, RepairConfig(), prefix_steps=1
+        )
+        self.assertEqual(progress["status"], "unavailable")
 
     def test_bound_task_object_state_can_supply_progress_evidence(self):
         def add_task_object(branch):
