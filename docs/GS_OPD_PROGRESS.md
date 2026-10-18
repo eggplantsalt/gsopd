@@ -1481,3 +1481,73 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 真实执行后才更新跨 Chunk 状态；动作、标签、观测及实际覆盖对应，失败路径停止发送后续动作。
 - [x] 生成离线诊断和 206 项无模型/仿真单测通过；7 项 MuJoCo 用例明确跳过。
 - [ ] 人工运行受限 Episode，核对真实安全通过数、同侧绕行、危险解除后的任务恢复、奖励成功及所有停止原因；尚不宣称真实场景 Recovery 已成功。
+
+## 独立几何轨迹 Bundle：Waypoint 与 B-Spline（2026-10-18）
+
+### 当前目标与全局路线
+
+- 新增 `research/gs_opd/repair/trajectory_bundle.py` 和 `test_trajectory_bundle.py`，实现从当前搬运物体包围球中心到已验证目标侧中心的完整三维几何候选。本阶段仅生成与初筛；后续若接入执行，仍需控制转换、Snapshot/Contact Compiler 和真实任务可行性验证。
+- 模块仅使用标准库与现有 NumPy，未导入或修改 OSC、Recovery、Near–Far、Teacher、Safety Bridge 或 On-Policy 主循环。所有报告和候选均明确 `physical_safety_verified=false`、`executable=false`，不生成训练标签或自动选定最终路径。
+- 源码审计确认，现有 Geometry Inventory 返回 Geom/Body 身份及 robot/scene 分类，未提供完整几何包围尺寸。此模块要求调用方显式提供同状态、已核验的保守包围球和目标中心来源，不从名称、VLM 描述、Body 原点或历史位置推断半径/目标。**真实任务输入的完整几何包围范围与目标中心坐标来源：[需补充]**；本轮结果来自明确标识的合成几何测试。
+
+### 输入与生成接口
+
+接口为 `generate_trajectory_bundle(scene, BundleConfig(...))`，返回可直接写入 JSON 的诊断。`scene` 的输入契约如下：
+
+| 字段 | 要求 |
+| --- | --- |
+| `frame / units / state_id` | 固定 `world / m`，非空当前状态标识 |
+| `world_up` | 有限非零三维向量，模块归一化后构造局部方向 |
+| `carried` | 搬运物体的完整保守包围球，字段见下方 |
+| `obstacles` | 至少一个障碍物包围球；与搬运物体的 `object_id` 全部唯一 |
+| 每个包围球 | `object_id, center_world_m[3], radius_m>0, state_id`；需 `binding_verified=true, enclosure_verified=true` 及非空 `binding_source, enclosure_source` |
+| `goal` | `position_world_m[3], position_semantics="carried_sphere_center", verified=true, source, state_id`；位置含义是期望搬运球中心，不自动等同于放置物体的 Body 原点 |
+
+- 全部包围球和目标的 `state_id` 必须与当前输入相同。声明及来源字段仅用于拒绝缺失、未确认或混合状态输入，模块不能独立证明调用方的物理绑定/几何来源真实可靠。
+- `sphere_from_aabb(lower_world_m, upper_world_m)` 可把调用方已核验的完整世界 AABB 转成保守球。球半径覆盖整个对角线，并处理中心舍入；不能用只有局部可见表面的 AABB 代替完整物体尺寸。
+- 默认 18 条，允许整数 12～24 条；循环分配左/右/上三类。根据起点→目标轴及 `world_up` 建立方向，选择对直线路径间隙最小的障碍物作为采样参照，同时对所有输入障碍物进行初筛。没有物体 ID/场景名称分支。
+- 分级采样偏移为膨胀半径的 1.2～2.6 倍，交替使用两种纵向展开；构造入口、绕行峰点和出口，再形成七个控制点的端点夹持三次 B-Spline。曲线端点严格为当前中心与目标中心，内部控制点不是必须经过的插值点。起终点重合或任务轴与 `world_up` 平行、无法定义左右时明确报错。
+- 每条候选记录方向及世界向量、Waypoint、B-Spline 控制点/节点、完整离散路径、近似弧长、终点目标侧投影、逐障碍间隙与拒绝原因；弧长为离散折线长度，不包含速度或时间参数。
+
+### 保守间隙初筛与可视化
+
+- 障碍物膨胀半径包含搬运球半径、障碍球半径及默认 10 mm 间隙要求。先检查起点、终点和离散曲线；没有合格路线时保留全部拒绝候选并报告通过数为零。
+- 不仅检查采样点。用三次 B-Spline 导数控制点的最大范数给出全曲线的参数导数范数上界 `L`，均匀参数采样间隔为 `Δu`，连续间隙下界为 `最小采样间隙 - L·Δu/2 - 数值余量`。只有该保守下界满足间隙要求才通过几何筛选；采样点通过但下界不足时明确标记 `curve_clearance_bound_inconclusive`。
+- 默认至少 65 个点，根据 1 mm 误差目标自适应增加，最多 4097 点；达到上限后仍使用实际误差界，不会因稀疏采样而静默放行。
+- `save_trajectory_bundle(bundle, out_dir)` 保存 `trajectory_bundle.json` 和 `trajectory_bundle.svg`。SVG 提供 XY/XZ/YZ 等比例投影，按左右/上方向着色，拒绝曲线为灰色虚线；悬停可查看候选 ID 和原因。圆表示障碍球加搬运球及余量，JSON 保留全采样，SVG 仅为显示适度抽样。
+- **局限：** 初筛只在输入保守包围成立、障碍物静止和路径参考点确为搬运球中心的条件下成立。未覆盖机器人/夹爪体积、姿态、支撑接触、动力学、可达性、动作连续性或任务成功；几何通过不能作为 MuJoCo 验证通过或可执行证明。
+
+### 测试与使用
+
+- 现有 `gsopd_teacher` CPU 环境下，新模块 **16 项 unittest 通过**；结合 Near–Far、Local Recovery 和旧 S70 Smoke 回归共 **76 项通过**。测试使用合成数据，不启动模型、Bridge 或仿真。
+- 两个新增 Python 文件的 `py_compile`、Ruff lint/格式检查，以及 `git diff --check` 通过；实际文件范围仅为新规划器、对应测试和本进度文档。
+- 测试覆盖解析三次 Bezier 对照、12～24 条预算与确定性、世界方向旋转、AABB 包围（含大坐标舍入）、搬运球半径膨胀、采样点之间穿越、连续间隙界、额外障碍物拒绝、全拒绝、状态/来源/单位/目标语义校验、ID 无关性及 JSON/SVG/CLI。
+- 基础合成场景的直线穿过障碍球，默认生成 **18 条**（左/右/上各 6），全部通过球形几何初筛；额外障碍物及非法起终点测试会产生拒绝。该数字不是当前真实搬运任务的路径通过数。
+
+运行上述轻量测试：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+/workspace/zy_workspace/envs/gsopd_teacher/bin/python -m unittest \
+  research.gs_opd.repair.test_trajectory_bundle \
+  research.gs_opd.repair.test_near_far \
+  research.gs_opd.repair.test_local_recovery \
+  research.gs_opd.smoke.test_early_repair_s70_smoke
+```
+
+调用方准备符合上表的真实核验输入后，可使用以下离线入口。`--scene-json` 文件必须由调用方提供，不应把测试夹具中的来源声明作为真实几何证据：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+/workspace/zy_workspace/envs/gsopd_teacher/bin/python \
+  -m research.gs_opd.repair.trajectory_bundle \
+  --scene-json /path/to/verified_geometry.json \
+  --out-dir logs/gs_opd/trajectory_bundle \
+  --candidate-count 18 --clearance-m 0.01
+```
+
+**检查清单（Checklist）**
+
+- [x] 独立 12～24 条三维 B-Spline 候选、保守球间隙界、JSON/SVG 及逐条拒绝原因已实现。
+- [x] 新增 16 项及相关回归 76 项通过，未修改现有控制/执行/安全判定路径。
+- [ ] 补充同状态完整包围球和目标侧中心的实际核验来源，再检查真实场景几何可行性；本轮没有仿真或物理安全结论。
