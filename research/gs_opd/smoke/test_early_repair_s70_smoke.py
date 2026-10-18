@@ -130,6 +130,15 @@ class EarlyRepairGeometryTests(unittest.TestCase):
         self.assertEqual(len(specs), 24)
         self.assertLessEqual(len(specs), smoke.MAX_CANDIDATES)
         self.assertEqual(rejected, [])
+        self.assertEqual(smoke.AMPLITUDES_M, (0.008, 0.016, 0.024, 0.032))
+        self.assertEqual(
+            [spec["amplitude_m_per_control_step"] for spec in specs],
+            list(smoke.AMPLITUDES_M) * 6,
+        )
+        self.assertEqual(smoke.PROBE_CONFIG.maximum_amplitude_m_per_step, 0.032)
+        self.assertEqual(smoke.WINDOWS, ((1, 3), (2, 2)))
+        self.assertEqual(smoke.PROBE_CONFIG.maximum_integrated_detour_m, 0.08)
+        self.assertEqual(smoke.GAP_THRESHOLDS_M, (0.005, 0.010, 0.020))
         for spec in specs:
             np.testing.assert_array_equal(spec["actions"][:, 3:], actions[:, 3:])
             self.assertEqual(spec["action_diagnostics"]["window"]["window_anchor_step"], spec["window"]["window_anchor_step"])

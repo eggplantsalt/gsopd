@@ -56,7 +56,7 @@ DEFAULT_OUT = Path("logs/gs_opd/early_repair_s70.json")
 CHUNK_LENGTH = 5
 STATE_ATOL = 1e-6
 MAX_CANDIDATES = 36
-AMPLITUDES_M = (0.004, 0.008, 0.012, 0.016)
+AMPLITUDES_M = (0.008, 0.016, 0.024, 0.032)
 WINDOWS = ((1, 3), (2, 2))  # geometry-centered smoothing envelopes; not collision times
 GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
 MIN_GAP_IMPROVEMENT_M = 1e-6
@@ -65,7 +65,7 @@ OBSTACLE_ID = "object_4"
 
 PROBE_CONFIG = RepairConfig(
     minimum_amplitude_m=0.002,
-    maximum_amplitude_m_per_step=0.016,
+    maximum_amplitude_m_per_step=0.032,
     maximum_integrated_detour_m=0.08,
     windows=WINDOWS,
     max_candidate_evaluations=MAX_CANDIDATES,

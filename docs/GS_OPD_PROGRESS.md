@@ -1280,3 +1280,16 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] Near–Far 几何集合来自 Safety IR、已校验语义绑定和当前 Geometry Inventory；复用 A⁰ 的 Branch/Compiler 结果。
 - [x] unknown、无合格候选、动作无效或恢复未确认的路径在当前 Chunk 主环境 `step` 前终止；测试及静态检查通过。
 - [ ] 人工启动 Bridge 并运行受限 On-Policy Episode，检查 Near–Far 预警、选中候选 ID、实际动作与执行后 Snapshot/任务状态。
+
+## Early Repair 受控幅度扩大配置
+
+- 仅将旧 Early Repair Smoke 的平滑 XYZ 候选幅度从 `0.004/0.008/0.012/0.016 m` 调整为 `0.008/0.016/0.024/0.032 m`，并将 `PROBE_CONFIG.maximum_amplitude_m_per_step` 从 `0.016 m` 调至 `0.032 m`。
+- 通用 `repair/early_repair.py` 在候选生成和候选评估时均传入 `probe.PROBE_CONFIG`；候选幅度网格由它调用的 `probe.generate_clearance_candidates()` 读取 `AMPLITUDES_M`。因此通用入口复用这次幅度网格及上限，无需更改通用 Repair 算法。
+- 三种几何方向、两个平滑窗口、随机选择方式、Contact Compiler、安全约束、任务进度、累计绕行上限 `0.08 m` 和 Near–Far 阈值 `5/10/20 mm` 均保持原值。没有修改 S75 Verifier-Guided Repair。
+- Early Repair 旧 Smoke 与通用接口相关单测共 23 项通过；三份 Python 文件语法检查及 `git diff --check` 通过。本次未启动模型或仿真，新的幅度配置尚待人工运行实验验证效果。
+
+**检查清单（Checklist）**
+
+- [x] 候选测试核验 24 个网格项的幅度值、两个平滑窗口、绕行上限及 Near–Far 阈值。
+- [x] 通用 Early Repair 测试核验候选生成与评估均收到同一 `PROBE_CONFIG`。
+- [ ] 人工运行 S70 Smoke，比对新旧幅度配置下安全候选数、任务进度和终点间隙；未运行前不宣称效果提升。

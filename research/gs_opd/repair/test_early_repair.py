@@ -306,7 +306,7 @@ class EarlyRepairSearchTests(unittest.TestCase):
             patch.object(probe, "derive_clearance_directions", return_value=(
                 [{"name": "away", "direction_world": [1.0, 0.0, 0.0]}], {"source": "endpoint geometry"}
             )),
-            patch.object(probe, "generate_clearance_candidates", return_value=(specs, [])),
+            patch.object(probe, "generate_clearance_candidates", return_value=(specs, [])) as generate_mock,
             patch.object(probe, "_branch_candidate", side_effect=lambda result, cid: {
                 "candidate_id": cid, "status": "ok", "steps": [],
             }),
@@ -317,7 +317,7 @@ class EarlyRepairSearchTests(unittest.TestCase):
                 "status": "complete", "main_state_restored": True,
                 "endpoint_distance": {"distance_available": True, "minimum_distance_m": 0.05},
             }),
-            patch.object(probe, "assess_candidate", side_effect=assess),
+            patch.object(probe, "assess_candidate", side_effect=assess) as assess_mock,
             patch("research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact", return_value={}),
         ):
             report = run_early_repair_search(
@@ -327,7 +327,18 @@ class EarlyRepairSearchTests(unittest.TestCase):
                 inputs["task_binding"], inputs["a0_validation"],
                 subject_object_id=SUBJECT_ID, obstacle_object_id=OBSTACLE_ID,
             )
+        self.last_generator_config = generate_mock.call_args.args[3]
+        self.last_assessment_config = assess_mock.call_args.args[6]
         return report
+
+    def test_generic_search_reuses_shared_amplitude_and_probe_configuration(self):
+        from research.gs_opd.smoke import early_repair_s70_smoke as probe
+
+        self._run_search(accepted_count=2)
+        self.assertIs(self.last_generator_config, probe.PROBE_CONFIG)
+        self.assertIs(self.last_assessment_config, probe.PROBE_CONFIG)
+        self.assertEqual(probe.AMPLITUDES_M, (0.008, 0.016, 0.024, 0.032))
+        self.assertEqual(probe.PROBE_CONFIG.maximum_amplitude_m_per_step, 0.032)
 
     def test_returns_all_qualified_candidates_without_selecting_one(self):
         report = self._run_search(accepted_count=2)
