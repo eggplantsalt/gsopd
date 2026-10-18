@@ -753,8 +753,17 @@ def _near_far_result_is_complete(
 
 def _validated_early_repair_candidates(result, expected_shape):
     """Recheck Early Repair's executable contract before any candidate can run."""
+    from research.gs_opd.smoke.early_repair_s70_smoke import MIN_GAP_IMPROVEMENT_M
+
     def invalid(reason):
-        return {"valid": False, "reason": reason, "candidates": []}
+        return {"valid": False, "reason": reason, "candidates": [], "rejected_candidates": []}
+
+    def finite_number(value):
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float, np.integer, np.floating))
+            and bool(np.isfinite(value))
+        )
 
     if not isinstance(result, dict) or result.get("executable") is not True:
         return invalid("early_repair_did_not_report_executable")
@@ -791,6 +800,8 @@ def _validated_early_repair_candidates(result, expected_shape):
             return invalid("early_repair_contains_incompletely_validated_candidate_results")
 
     validated = []
+    rejected_candidates = []
+    baseline_gaps = []
     seen = set()
     for item in qualified:
         if not isinstance(item, dict):
@@ -835,8 +846,73 @@ def _validated_early_repair_candidates(result, expected_shape):
             and candidate_result.get("accepted_for_probe") is True
         ):
             return invalid("early_repair_candidate_actions_or_acceptance_do_not_match")
-        validated.append({"candidate_id": candidate_id, "actions": actions})
-    return {"valid": True, "reason": None, "candidates": validated}
+        endpoint_gap = verification.get("endpoint_gap_m")
+        baseline_gap = verification.get("baseline_a0_endpoint_gap_m")
+        reported_improvement = verification.get("endpoint_gap_change_vs_a0_m")
+        result_gap = candidate_result.get("endpoint_gap_m")
+        result_baseline_gap = candidate_result.get("baseline_a0_endpoint_gap_m")
+        result_improvement = candidate_result.get("endpoint_gap_change_vs_a0_m")
+        if not all(finite_number(value) for value in (
+            endpoint_gap,
+            baseline_gap,
+            reported_improvement,
+            result_gap,
+            result_baseline_gap,
+            result_improvement,
+        )):
+            rejected_candidates.append({
+                "candidate_id": candidate_id,
+                "reason": "endpoint_gap_or_a0_baseline_gap_is_missing_or_non_finite",
+            })
+            continue
+        if not all(
+            np.isclose(float(verified_value), float(result_value), rtol=1e-9, atol=1e-12)
+            for verified_value, result_value in (
+                (endpoint_gap, result_gap),
+                (baseline_gap, result_baseline_gap),
+                (reported_improvement, result_improvement),
+            )
+        ):
+            rejected_candidates.append({
+                "candidate_id": candidate_id,
+                "reason": "qualified_candidate_gap_metadata_does_not_match_candidate_result",
+            })
+            continue
+        gap_improvement = float(endpoint_gap) - float(baseline_gap)
+        if (
+            not np.isclose(float(reported_improvement), gap_improvement, rtol=1e-9, atol=1e-12)
+            or gap_improvement <= MIN_GAP_IMPROVEMENT_M
+        ):
+            rejected_candidates.append({
+                "candidate_id": candidate_id,
+                "reason": "endpoint_gap_improvement_does_not_match_or_pass_existing_gate",
+            })
+            continue
+        baseline_gaps.append(float(baseline_gap))
+        validated.append({
+            "candidate_id": candidate_id,
+            "actions": actions,
+            "endpoint_gap_m": float(endpoint_gap),
+            "baseline_a0_endpoint_gap_m": float(baseline_gap),
+            "gap_improvement_m": gap_improvement,
+        })
+    if not validated:
+        return {
+            "valid": False,
+            "reason": "early_repair_has_no_candidates_with_finite_verified_gap_improvement",
+            "candidates": [],
+            "rejected_candidates": rejected_candidates,
+        }
+    baseline_gap = baseline_gaps[0]
+    if any(not np.isclose(value, baseline_gap, rtol=1e-9, atol=1e-12) for value in baseline_gaps[1:]):
+        return invalid("early_repair_candidates_disagree_on_a0_endpoint_gap")
+    return {
+        "valid": True,
+        "reason": None,
+        "candidates": validated,
+        "rejected_candidates": rejected_candidates,
+        "baseline_a0_endpoint_gap_m": baseline_gap,
+    }
 
 
 def run_on_policy_safety_collection_decision(
@@ -846,8 +922,6 @@ def run_on_policy_safety_collection_decision(
     chunk_index,
     decision_step,
     collection_context,
-    repair_rng=None,
-    repair_selection_seed=0,
 ):
     """Verify A0 from a fresh Snapshot and optionally search for a safe A+."""
     import sys
@@ -893,7 +967,15 @@ def run_on_policy_safety_collection_decision(
         "early_repair_status": None,
         "early_repair_search": None,
         "early_repair_selected_candidate_id": None,
-        "repair_selection_episode_seed": int(repair_selection_seed),
+        "selection_policy": "max_endpoint_gap_then_candidate_id_ascending",
+        "selected_candidate_id": None,
+        "selected_endpoint_gap_m": None,
+        "baseline_a0_endpoint_gap_m": None,
+        "selected_gap_improvement_m": None,
+        "qualified_candidates_min_endpoint_gap_m": None,
+        "qualified_candidates_max_endpoint_gap_m": None,
+        "qualified_candidate_endpoint_gap_count": 0,
+        "early_repair_candidate_gap_exclusions": [],
         "repaired_action_chunk_A_plus": None,
         "training_action_chunk": None,
         "training_label_valid": False,
@@ -1203,6 +1285,9 @@ def run_on_policy_safety_collection_decision(
                 and early["snapshot_restore"]["after"].get("matched") is True
             )
             validated_candidates = _validated_early_repair_candidates(early, actions.shape)
+            report["early_repair_candidate_gap_exclusions"] = validated_candidates.get(
+                "rejected_candidates", []
+            )
             if not validated_candidates.get("valid"):
                 report.update({
                     "status": (
@@ -1219,25 +1304,26 @@ def run_on_policy_safety_collection_decision(
                     add_failure(reason)
                 return report
 
-            rng = repair_rng if repair_rng is not None else np.random.default_rng(repair_selection_seed)
-            try:
-                selected_index = int(rng.integers(len(validated_candidates["candidates"])))
-            except Exception as exc:
-                report.update({
-                    "status": "early_repair_unavailable",
-                    "repair_status": "early_repair_failed",
-                    "must_abort_episode": True,
-                })
-                add_failure(f"early_repair_candidate_selection_failed:{type(exc).__name__}:{exc}")
-                return report
-            selected = validated_candidates["candidates"][selected_index]
+            eligible = sorted(
+                validated_candidates["candidates"],
+                key=lambda item: (-item["endpoint_gap_m"], item["candidate_id"]),
+            )
+            selected = eligible[0]
             plus = selected["actions"]
+            endpoint_gaps = [item["endpoint_gap_m"] for item in eligible]
+            selected_id = selected["candidate_id"]
             report.update({
                 "status": "a0_safe_early_repaired",
                 "repair_status": "early_repair_candidate_selected",
                 "early_repair_status": "qualified_candidate_selected",
-                "early_repair_selected_candidate_id": selected["candidate_id"],
-                "early_repair_selection_index": selected_index,
+                "early_repair_selected_candidate_id": selected_id,
+                "selected_candidate_id": selected_id,
+                "selected_endpoint_gap_m": selected["endpoint_gap_m"],
+                "baseline_a0_endpoint_gap_m": selected["baseline_a0_endpoint_gap_m"],
+                "selected_gap_improvement_m": selected["gap_improvement_m"],
+                "qualified_candidates_min_endpoint_gap_m": min(endpoint_gaps),
+                "qualified_candidates_max_endpoint_gap_m": max(endpoint_gaps),
+                "qualified_candidate_endpoint_gap_count": len(eligible),
                 "repaired_action_chunk_A_plus": plus.tolist(),
                 "training_action_chunk": plus.tolist(),
                 "training_label_valid": True,
@@ -1634,8 +1720,6 @@ try:
     trace_writer = None
     collection_enabled = args.on_policy_safety_collection
     trace_output_path = args.on_policy_safety_out if collection_enabled else args.trace_out
-    repair_selection_seed = 0
-    repair_selection_rng = np.random.default_rng(repair_selection_seed) if collection_enabled else None
     if trace_output_path is not None:
         import sys
 
@@ -1676,7 +1760,6 @@ try:
                     else None
                 ),
                 "task_binding_policy": "per-run Safety IR binding validated against the active fixed-task MuJoCo model",
-                "repair_selection_episode_seed": repair_selection_seed,
             })
         trace_writer = TrajectoryWriter(
             trace_output_path,
@@ -1789,8 +1872,6 @@ try:
                     chunk_index=chunk_index,
                     decision_step=steps,
                     collection_context=collection_context,
-                    repair_rng=repair_selection_rng,
-                    repair_selection_seed=repair_selection_seed,
                 )
             except Exception as exc:
                 safety_decision = {

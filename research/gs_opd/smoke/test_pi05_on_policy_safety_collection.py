@@ -300,10 +300,20 @@ def _complete_near_far_result(actions, *, risk="no_warning", restored=True, deci
     }
 
 
-def _qualified_early_result(actions_by_id, *, restored=True, executable=True):
+def _qualified_early_result(
+    actions_by_id, *, endpoint_gaps=None, baseline_gap=0.05, restored=True, executable=True
+):
     results = []
     qualified = []
-    for candidate_id, actions in actions_by_id.items():
+    endpoint_gaps = endpoint_gaps or {}
+    for index, (candidate_id, actions) in enumerate(actions_by_id.items()):
+        endpoint_gap = endpoint_gaps.get(candidate_id, baseline_gap + 0.01 * (index + 1))
+        gap_improvement = (
+            float(endpoint_gap) - baseline_gap
+            if isinstance(endpoint_gap, (int, float, np.integer, np.floating))
+            and not isinstance(endpoint_gap, bool)
+            else None
+        )
         candidate = {
             "candidate_id": candidate_id,
             "actions": np.asarray(actions, dtype=np.float32).tolist(),
@@ -315,6 +325,10 @@ def _qualified_early_result(actions_by_id, *, restored=True, executable=True):
             "action_constraints": {"status": "pass"},
             "task_progress": {"status": "pass"},
             "endpoint_replay": {"status": "complete", "main_state_restored": True},
+            "endpoint_gap_m": endpoint_gap,
+            "baseline_a0_endpoint_gap_m": baseline_gap,
+            "endpoint_gap_change_vs_a0_m": gap_improvement,
+            "minimum_required_gap_increase_m": 1e-6,
         }
         results.append(candidate)
         qualified.append({
@@ -380,7 +394,7 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
         repair.assert_not_called()
         self.assertEqual([request["op"] for request in conn.requests], ["snapshot", "branch_rollout"])
 
-    def test_safe_a0_warning_selects_only_fully_qualified_early_repair_candidate(self):
+    def test_safe_a0_warning_selects_qualified_candidate_with_largest_endpoint_gap(self):
         actions = np.zeros((5, 7), dtype=np.float32)
         candidate_a = actions.copy()
         candidate_a[:, 0] = 0.01
@@ -391,9 +405,13 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             "status": "safe",
             "candidates": [{"candidate_id": "on-policy-A0-000004", "verdict": "safe"}],
         }
-        early = _qualified_early_result({"early-left": candidate_a, "early-right": candidate_b})
+        early = _qualified_early_result(
+            {"early-left": candidate_a, "early-right": candidate_b},
+            endpoint_gaps={"early-left": 0.07, "early-right": 0.09},
+            baseline_gap=0.05,
+        )
 
-        def decide(seed):
+        def decide():
             connection = FakeConnection([
                 {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
                 _branch("on-policy-A0-000004", len(actions)),
@@ -415,8 +433,6 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
                     4,
                     17,
                     context,
-                    repair_rng=np.random.default_rng(seed),
-                    repair_selection_seed=seed,
                 )
             self.assertEqual([request["op"] for request in connection.requests], ["snapshot", "branch_rollout"])
             self.assertEqual(early_search.call_args.args[1]["snapshot_id"], "snapshot-safe")
@@ -426,19 +442,151 @@ class OnPolicySafetyCollectionTests(unittest.TestCase):
             self.assertEqual(forecast.call_args.args[3:5], ([31], [32]))
             return result
 
-        first = decide(23)
-        second = decide(23)
+        first = decide()
         self.assertEqual(first["a0_verdict"], "safe")
         self.assertEqual(first["status"], "a0_safe_early_repaired")
         self.assertEqual(first["near_far_risk_verdict"], "warning")
-        self.assertEqual(first["repair_selection_episode_seed"], 23)
         self.assertTrue(first["training_label_valid"])
-        self.assertEqual(first["early_repair_selected_candidate_id"], second["early_repair_selected_candidate_id"])
+        self.assertEqual(first["selection_policy"], "max_endpoint_gap_then_candidate_id_ascending")
+        self.assertEqual(first["selected_candidate_id"], "early-right")
+        self.assertEqual(first["selected_endpoint_gap_m"], 0.09)
+        self.assertEqual(first["baseline_a0_endpoint_gap_m"], 0.05)
+        self.assertAlmostEqual(first["selected_gap_improvement_m"], 0.04)
+        self.assertEqual(first["qualified_candidates_min_endpoint_gap_m"], 0.07)
+        self.assertEqual(first["qualified_candidates_max_endpoint_gap_m"], 0.09)
+        self.assertEqual(first["qualified_candidate_endpoint_gap_count"], 2)
         selected = self.helpers["select_verified_execution_chunk"](first, actions)
         self.assertTrue(selected["valid"])
         self.assertEqual(selected["candidate_id"], first["early_repair_selected_candidate_id"])
         self.assertEqual(selected["source"], "near_far_verified_geometry_guided_A_plus")
-        self.assertFalse(np.array_equal(selected["actions"], actions))
+        np.testing.assert_array_equal(selected["actions"], candidate_b)
+
+    def test_equal_endpoint_gaps_use_candidate_id_as_stable_tiebreaker(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        candidate_z = actions.copy()
+        candidate_z[:, 0] = 0.01
+        candidate_a = actions.copy()
+        candidate_a[:, 1] = -0.01
+        context = _near_far_context()
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000001", "verdict": "safe"}],
+        }
+        early = _qualified_early_result(
+            {"early-z": candidate_z, "early-a": candidate_a},
+            endpoint_gaps={"early-z": 0.08, "early-a": 0.08},
+            baseline_gap=0.05,
+        )
+        connection = FakeConnection([
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000001", len(actions)),
+        ])
+        with patch(
+            "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            return_value=compiled,
+        ), patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=_complete_near_far_result(actions, risk="warning", decision_step=18),
+        ), patch(
+            "research.gs_opd.repair.early_repair.run_early_repair_search",
+            return_value=early,
+        ):
+            result = self.call(connection, actions, "move the carried bowl", 1, 18, context)
+
+        self.assertEqual(result["selected_candidate_id"], "early-a")
+        selected = self.helpers["select_verified_execution_chunk"](result, actions)
+        self.assertTrue(selected["valid"])
+        np.testing.assert_array_equal(selected["actions"], candidate_a)
+
+    def test_missing_nan_and_infinite_endpoint_gaps_do_not_enter_selection(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        invalid_actions = {name: actions.copy() for name in ("missing", "nan", "infinite")}
+        invalid_actions["missing"][:, 0] = 0.01
+        invalid_actions["nan"][:, 1] = 0.01
+        invalid_actions["infinite"][:, 2] = 0.01
+        valid_actions = actions.copy()
+        valid_actions[:, 0] = -0.01
+        invalid_actions["valid"] = valid_actions
+        context = _near_far_context()
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000002", "verdict": "safe"}],
+        }
+        early = _qualified_early_result(
+            invalid_actions,
+            endpoint_gaps={
+                "missing": None,
+                "nan": float("nan"),
+                "infinite": float("inf"),
+                "valid": 0.10,
+            },
+            baseline_gap=0.05,
+        )
+        connection = FakeConnection([
+            {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+            _branch("on-policy-A0-000002", len(actions)),
+        ])
+        with patch(
+            "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+            return_value=compiled,
+        ), patch(
+            "research.gs_opd.repair.near_far.forecast_near_far_risk",
+            return_value=_complete_near_far_result(actions, risk="warning", decision_step=19),
+        ), patch(
+            "research.gs_opd.repair.early_repair.run_early_repair_search",
+            return_value=early,
+        ):
+            result = self.call(connection, actions, "move the carried bowl", 2, 19, context)
+
+        self.assertEqual(result["selected_candidate_id"], "valid")
+        self.assertEqual(result["qualified_candidate_endpoint_gap_count"], 1)
+        self.assertEqual(result["qualified_candidates_min_endpoint_gap_m"], 0.10)
+        self.assertEqual(result["qualified_candidates_max_endpoint_gap_m"], 0.10)
+        self.assertEqual(
+            {item["candidate_id"] for item in result["early_repair_candidate_gap_exclusions"]},
+            {"missing", "nan", "infinite"},
+        )
+
+    def test_all_non_finite_or_missing_gaps_abort_before_execution(self):
+        actions = np.zeros((5, 7), dtype=np.float32)
+        context = _near_far_context()
+        compiled = {
+            "status": "safe",
+            "candidates": [{"candidate_id": "on-policy-A0-000003", "verdict": "safe"}],
+        }
+        invalid_values = (None, float("nan"), float("inf"), float("-inf"))
+        for index, invalid_gap in enumerate(invalid_values):
+            with self.subTest(gap=invalid_gap):
+                bad_actions = actions.copy()
+                bad_actions[:, 0] = 0.01
+                early = _qualified_early_result(
+                    {"invalid-gap": bad_actions},
+                    endpoint_gaps={"invalid-gap": invalid_gap},
+                    baseline_gap=0.05,
+                )
+                connection = FakeConnection([
+                    {"snapshot_id": "snapshot-safe", "snapshot_state": {"qpos": [0.0]}},
+                    _branch("on-policy-A0-000003", len(actions)),
+                ])
+                with patch(
+                    "research.gs_opd.smoke.contact_safety_compiler_smoke.compile_forbid_contact",
+                    return_value=compiled,
+                ), patch(
+                    "research.gs_opd.repair.near_far.forecast_near_far_risk",
+                    return_value=_complete_near_far_result(
+                        actions, risk="warning", decision_step=20 + index
+                    ),
+                ), patch(
+                    "research.gs_opd.repair.early_repair.run_early_repair_search",
+                    return_value=early,
+                ):
+                    result = self.call(
+                        connection, actions, "move the carried bowl", 3, 20 + index, context
+                    )
+                self.assertEqual(result["status"], "early_repair_unavailable")
+                self.assertFalse(result["training_label_valid"])
+                self.assertTrue(result["must_abort_episode"])
+                self.assertFalse(any(request["op"] == "step" for request in connection.requests))
 
     def test_near_far_unknown_stops_before_early_repair_or_main_step(self):
         actions = np.zeros((5, 7), dtype=np.float32)

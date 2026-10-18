@@ -1270,13 +1270,13 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 
 - 在现有 `run_on_policy_safety_collection_decision()` 中，复用 A⁰ 的同一次 Snapshot、完整五步 Branch 与 Contact Compiler 结果。仅当 Compiler 明确判定 safe 且分支接触监测完整时，才进行 Near–Far 预警；A⁰ violation 继续走原有 Verifier-Guided Repair。
 - Near–Far 对象对必须来自 Safety IR 中唯一的 `forbid contact` object-to-object 规则，并通过现有语义绑定校验、当前 Geometry Inventory、任务物体绑定解析目标和障碍 Geom 集合。缺少唯一规则、有效绑定、完整间距样本或 Snapshot 恢复证明时，当前 Chunk 在主环境执行前终止。
-- Near–Far complete/no_warning 时选择并执行 A⁰。complete/warning 时，将同一 Snapshot、A⁰ 指纹、原始分支与 safe Compiler 候选及全部当前验证输入交给 `run_early_repair_search()`；对其 executable、全候选验证完成、分支及最终 Snapshot 恢复状态、动作形状/有限值和候选 ID/动作一致性再次 fail-closed 校验，然后从合格候选中随机选择并执行一条 A⁺。
-- 随机选择器使用每个 Episode 持续复用的 `numpy.random.default_rng(0)`，并把 Episode seed、Near–Far 完整结果、Early Repair 报告、选择索引/候选 ID、原始 A⁰ 和实际 `selected_action_chunk`/来源写入既有 decision safety record。`TrajectoryWriter` 与 NPZ Schema 未修改。Student 下一决策仍由实际执行后的新观测生成。
-- 新增单测覆盖 A⁰ safe/no-warning、warning 下多个候选与固定 seed 的可复现选择、Near–Far unknown、无 Early Repair 合格候选、Early Repair 最终恢复失败、主环境动作前的终止门控，并保留 A⁰ violation→Verifier-Guided Repair 回归。On-Policy 测试 24 项通过；Near–Far、Early Repair 和原有 Repair 相关测试共 60 项通过（5 项因需要 LIBERO-Safety MuJoCo 环境跳过）。语法检查与 `git diff --check` 通过。没有启动模型、Bridge 或仿真，真实环境下候选表现尚未验证。
+- Near–Far complete/no_warning 时选择并执行 A⁰。complete/warning 时，将同一 Snapshot、A⁰ 指纹、原始分支与 safe Compiler 候选及全部当前验证输入交给 `run_early_repair_search()`；在通过现有完整校验及终点间隙改善门槛的合格候选中，按 `verification.endpoint_gap_m` 降序选择，gap 并列时按 `candidate_id` 升序稳定选择。缺少、NaN 或非有限间隙不参加排序；若无有限且通过既有间隙改善门槛的候选则 fail-closed 终止。
+- 将 `selection_policy`、所选候选 ID/终点间隙、A⁰ 基线终点间隙、所选间隙增量，以及合格候选间隙最小值/最大值和无效间隙候选排除原因写入既有 decision safety record。实际选择的 A⁺ 与训练标签仍逐项比对；`TrajectoryWriter` 和 NPZ Schema 未修改。
+- 新增单测覆盖最大 gap 选择、相同 gap 的 ID 稳定排序、缺失/NaN/无穷 gap 排除及全部 gap 无效时主环境执行前终止，并保留 safe A⁰、Near–Far unknown、无合格候选、恢复失败和原有 A⁰ violation→Verifier-Guided Repair 回归。On-Policy 测试 27 项通过；本次未启动模型或仿真，真实环境下候选表现尚未验证。
 
 **检查清单（Checklist）**
 
-- [x] safe/no-warning 执行已验证 A⁰；safe/warning 仅执行完整验证并恢复成功的随机选择 A⁺；violation 仍使用现有 Verifier-Guided Repair。
+- [x] safe/no-warning 执行已验证 A⁰；safe/warning 仅执行完整验证并恢复成功且终点间隙最大的 A⁺；violation 仍使用现有 Verifier-Guided Repair。
 - [x] Near–Far 几何集合来自 Safety IR、已校验语义绑定和当前 Geometry Inventory；复用 A⁰ 的 Branch/Compiler 结果。
 - [x] unknown、无合格候选、动作无效或恢复未确认的路径在当前 Chunk 主环境 `step` 前终止；测试及静态检查通过。
 - [ ] 人工启动 Bridge 并运行受限 On-Policy Episode，检查 Near–Far 预警、选中候选 ID、实际动作与执行后 Snapshot/任务状态。
@@ -1293,6 +1293,19 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 候选测试核验 24 个网格项的幅度值、两个平滑窗口、绕行上限及 Near–Far 阈值。
 - [x] 通用 Early Repair 测试核验候选生成与评估均收到同一 `PROBE_CONFIG`。
 - [ ] 人工运行 S70 Smoke，比对新旧幅度配置下安全候选数、任务进度和终点间隙；未运行前不宣称效果提升。
+
+## On-Policy Early Repair 按终点间隙选择候选
+
+- 已移除 Early Repair 最终随机抽样。通过 `_validated_early_repair_candidates()` 的现有物理安全、任务进度、动作、间隙改善、Snapshot 恢复和动作一致性检查后，再要求 `verification.endpoint_gap_m`、A⁰ 基线间隙与已报告间隙增量均为有限数值且互相一致，并复核原有 `MIN_GAP_IMPROVEMENT_M` 门槛。
+- 选择终点间隙最大的有效候选；数值并列时按候选 ID 字典序升序选择。无效 gap 候选会记录排除原因，不参与排序；没有剩余合格候选时在主环境执行前 fail-closed。
+- `decision_safety_json` 顶层记录策略、所选候选/间隙、A⁰ 基线间隙、间隙增量、合格候选间隙范围、数量和 gap 排除原因。A⁺、训练标签和实际执行动作仍由现有精确一致性校验绑定。
+- On-Policy 单测 27 项通过，Python 语法检查和 `git diff --check` 通过；未启动模型或仿真。
+
+**检查清单（Checklist）**
+
+- [x] 最大间隙选择与 candidate ID 并列排序有回归测试。
+- [x] 缺失、NaN、正负无穷 gap 不进入选择；全部不可用时不会执行动作。
+- [ ] 在人工运行的 On-Policy Episode 中检查写入的 gap 统计及实际执行候选。
 
 ## Repair 任务进度：Free Joint qpos 仅作诊断
 
