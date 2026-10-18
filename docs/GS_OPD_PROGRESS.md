@@ -1784,3 +1784,53 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
 - [x] 22 项合成单元测试及 Python 语法检查通过；测试覆盖抓持、球心刚性偏移、路径时长预算、碰撞、约束、恢复和候选隔离。
 - [ ] 在真实 Student 已抓持的决策状态确认左右指面真实接触、完整候选闭环、Compiler 判定及分支/调用者状态恢复。
 - [ ] 实测 OSC 跟踪误差、控制步预算、Workspace 拒绝率和操作性抓持保持条件是否适用于真实轨迹。
+
+## 一次性真实 MuJoCo Trajectory Bundle 验收入口（2026-10-19）
+
+### Rollout 集成
+
+- `pi05_rollout.py` 新增显式参数 `--trajectory-bundle-physical-validation --trajectory-validation-out <report.json>`。需要 Safety IR v2 与完整 `--semantic-results-json`；搬运对象优先从唯一的 Object-to-Object forbid subject 解析，也可用 `--trajectory-subject-object-id` 消除规则存在多个搬运主体时的歧义。该入口不生成 Trace/NPZ 标签，也不与 probe 或 On-Policy 数据采集模式组合。
+- Student 使用既有动作推理与 `env.step()` 流程。Rollout 在每个真实控制步后通过同一个持久 `conn` 请求只读 `grasp_state`；Bridge 按当前 PandaGripper 模型的左右指面 Geom 分类、当前 MuJoCo 接触对、语义绑定对应的当前 Body/Geom 身份及 gripper close action 判断抓持。需要 **3 个连续、状态指纹不同** 的实际状态都满足夹爪闭合阈值与左右指面同时接触，才在下一个 Student 决策边界触发一次验收；绝对 rollout 步数不用于判断抓持。
+- 触发时先捕获 Snapshot，再重新读取并记录当前 Safety IR v2 和完整语义绑定文件的 SHA-256 与内容；随后从同一状态重新校验 Teacher 全部 Object-to-Object 绑定、抓持证据、完整规划几何、活动 OSC 配置和 Gripper Inventory。MuJoCo integration state、`state_id` 必须与 Snapshot/抓持样本吻合。复用 `trajectory_bundle_scene_smoke` 的局部绕行目标构造和 `trajectory_bundle.py` 默认 18 条三维出口 Bundle，再调用既有 `track_trajectory_bundle()`。几何初筛拒绝数与通过数都保留，只对初筛通过的路线运行独立 Snapshot 分支。
+- 每条实际分支保留预算、控制步、EEF/物体球心误差、root pose 与 sphere center、双指接触和夹爪状态、完整 Contact Monitor、Compiler、任务段与抓持连续性、Snapshot 起点/恢复诊断及拒绝原因。分支函数结束后 Rollout 再显式 Restore 一次并严格比较 canonical Snapshot 诊断；随后通过只读几何查询核对状态一致。Restore/绑定/规则/预算/监测等任何失败都会写为明确阻塞状态。每个候选只在 Snapshot 分支执行，绝不提交主环境，也不产生训练标签。
+- 验收结束后原 Student Rollout 继续使用同一个 Bridge 连接，按原动作生成与执行流程前进。验收候选不会影响后续 Student 动作；用于 Rollout 的 `A0` 未改写。若完整 Snapshot 恢复或恢复后几何一致性检查失败，Rollout 会在下一条 Student 主环境动作前停止；Tracker 内候选拒绝但调用者状态恢复通过时，Rollout 可继续原 Student 流程。若 Episode 步数用尽仍无稳定抓持状态，会输出 `stable_grasp_not_found_within_episode`；如果抓持样本不足、预检失败或候选均未通过，也分别保存证据与原因。
+
+### 静态回归及物理结果边界
+
+- 新增 `trajectory_bundle_acceptance.py` 与 14 项轻量测试，覆盖真实左右指面分类、单指/错误物体身份/接触 unavailable fail-closed、连续不同状态稳定性和接触丢失复位、同一 Bridge 连接的 Snapshot/几何/Tracker 调用顺序、未达到稳定抓持时不创建 Snapshot、同状态校验失败后仍执行恢复，以及恢复失败/恢复后几何查询失败的 fail-closed 结果和恢复异常后阻止下一条 Student 动作。Trajectory Bundle/Tracking/Scene/Bridge 与现有 Rollout/On-Policy/probe 回归共 117 项通过；新增 Python 文件语法检查和新模块 Ruff 检查通过，`git diff --check` 通过。
+- 这是合成协议和数值回归，不是真实 MuJoCo 结果。本次没有启动 Bridge、π₀.₅、模型或仿真；真实抓持状态、几何通过数、实际分支步数、接触与 Compiler 结果、跟踪误差和恢复结果都尚未产生。全候选被拒绝也代表分支已评估，不代表通过物理验收。
+
+### 手动运行
+
+服务端在第一个终端启动新版 Bridge。服务端初始化固定 LIBERO-Safety 环境；需要在干净的 Episode 开始前启动。不要在已有 Student 状态期间重启它：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  research/gs_opd/smoke/safety_bridge.py
+```
+
+第二个终端启动 π₀.₅。Rollout 自己只建立一个 Bridge `Client`，这个 `conn` 同时承载 reset、实际 Student step、抓持查询、Snapshot、planning geometry、分支跟踪及最终恢复：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
+  /workspace/zy_workspace/RLinf/.venv/bin/python \
+  research/gs_opd/smoke/pi05_rollout.py \
+  --max-steps 240 \
+  --trajectory-bundle-physical-validation \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --trajectory-validation-out logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance.json \
+  --video-out logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance.mp4
+```
+
+若 Teacher 中存在多个合法 forbid subject，命令需额外提供经过确认的 `--trajectory-subject-object-id <Teacher Object ID>`。输出 JSON 的 `candidate_count/geometric_screen_pass_count/branch_candidate_count`、`candidate_outcome/candidate_rejection_reason_counts`、每个候选的 `requested_steps/executed_steps`、`contact_compiler`、`task_feasibility`、`grasp_evidence`、`rejection_reasons` 和 `restore` 是实验核查依据；顶层 `main_environment_candidate_execution=false` 与 `training_label_created=false` 应保持不变。
+
+**检查清单（Checklist）**
+
+- [x] 使用主 Rollout 已有 Bridge 连接，新增只读真实抓持查询；只在连续真实双指接触且夹爪闭合后触发一次物理验收。
+- [x] 复用现有 Safety IR/绑定复核、几何 Scene Smoke、Bundle、OSC Tracker、Contact Compiler、Snapshot 分支和状态恢复逻辑。
+- [x] 117 项相关合成 unittest、语法检查和 diff 检查通过；新模块 Ruff 检查通过。
+- [ ] 在真实 π₀.₅ Episode 中确认稳定抓持被检测，并核查所有真实几何候选与分支结果、Compiler、任务段和最终主环境恢复。

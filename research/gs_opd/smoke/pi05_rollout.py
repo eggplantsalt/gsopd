@@ -46,6 +46,11 @@ def parse_args():
         action="store_true",
         help="Verify Student chunks, execute safe local recovery when needed, and collect actual transitions.",
     )
+    parser.add_argument(
+        "--trajectory-bundle-physical-validation",
+        action="store_true",
+        help="Run one Snapshot-only trajectory tracking acceptance after a live stable grasp is observed.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -59,6 +64,8 @@ def parse_args():
     parser.add_argument("--on-policy-safety-out", type=Path)
     parser.add_argument("--task-object-id")
     parser.add_argument("--task-object-semantic-result", type=Path)
+    parser.add_argument("--trajectory-subject-object-id")
+    parser.add_argument("--trajectory-validation-out", type=Path)
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
@@ -75,9 +82,37 @@ def parse_args():
         parser.error("--contact-safety-probe and --verifier-guided-repair are mutually exclusive")
     probe_enabled = args.contact_safety_probe or args.verifier_guided_repair
     collection_enabled = args.on_policy_safety_collection
-    if probe_enabled and collection_enabled:
-        parser.error("branch probe modes cannot be combined with --on-policy-safety-collection")
-    if collection_enabled:
+    trajectory_validation_enabled = args.trajectory_bundle_physical_validation
+    if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
+        parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
+    if trajectory_validation_enabled:
+        if args.teacher_json is None or args.semantic_results_json is None:
+            parser.error(
+                "--trajectory-bundle-physical-validation requires --teacher-json and --semantic-results-json"
+            )
+        if args.semantic_result is not None or args.object_id is not None:
+            parser.error("trajectory physical validation uses the full v2 semantic mapping; omit --semantic-result/--object-id")
+        if args.trajectory_validation_out is None:
+            parser.error("--trajectory-bundle-physical-validation requires --trajectory-validation-out")
+        if args.trajectory_validation_out.suffix != ".json":
+            parser.error("--trajectory-validation-out must use the .json extension")
+        if args.max_steps == 0:
+            parser.error("trajectory physical validation requires --max-steps greater than zero")
+        if args.trace_out is not None or args.on_policy_safety_out is not None:
+            parser.error("trajectory physical validation does not write rollout trace/training data")
+        if args.probe_out_dir is not None or args.repair_out_dir is not None:
+            parser.error("probe and repair output directories cannot be used for trajectory validation")
+        if args.task_object_id is not None or args.task_object_semantic_result is not None:
+            parser.error("trajectory physical validation gets task bindings from its complete semantic mapping")
+        if not args.teacher_json.is_file():
+            parser.error(f"Safety IR v2 file does not exist: {args.teacher_json}")
+        if not args.semantic_results_json.is_file():
+            parser.error(f"Semantic results mapping does not exist: {args.semantic_results_json}")
+        if args.trajectory_validation_out.exists():
+            parser.error(f"Choose a fresh trajectory validation report path: {args.trajectory_validation_out}")
+    elif collection_enabled:
+        if args.trajectory_validation_out is not None or args.trajectory_subject_object_id is not None:
+            parser.error("trajectory validation options require --trajectory-bundle-physical-validation")
         if args.teacher_json is None or args.object_id is None:
             parser.error(
                 "--on-policy-safety-collection requires --teacher-json and --object-id"
@@ -113,6 +148,8 @@ def parse_args():
         if args.task_object_semantic_result is not None and not args.task_object_semantic_result.is_file():
             parser.error(f"Task object semantic result does not exist: {args.task_object_semantic_result}")
     elif probe_enabled:
+        if args.trajectory_validation_out is not None or args.trajectory_subject_object_id is not None:
+            parser.error("trajectory validation options require --trajectory-bundle-physical-validation")
         if args.semantic_results_json is not None:
             parser.error("--semantic-results-json is currently supported only by --on-policy-safety-collection")
         if any(value is None for value in probe_inputs):
@@ -152,6 +189,8 @@ def parse_args():
             args.semantic_results_json,
             args.task_object_id,
             args.task_object_semantic_result,
+            args.trajectory_validation_out,
+            args.trajectory_subject_object_id,
         )
     ):
         parser.error(
@@ -1844,6 +1883,71 @@ try:
             collection_preflight_failure = f"{type(exc).__name__}:{exc}"
             safety_episode_summary["failure_reason_counts"][collection_preflight_failure] = 1
             print("SAFETY COLLECTION PREFLIGHT FAILED:", collection_preflight_failure, flush=True)
+    trajectory_validation_context = None
+    trajectory_grasp_monitor = None
+    trajectory_validation_report = None
+    trajectory_validation_attempted = False
+    trajectory_validation_restore_abort = False
+    trajectory_validation_preflight_failure = None
+    if args.trajectory_bundle_physical_validation:
+        try:
+            import sys
+
+            repo_root = str(Path(__file__).resolve().parents[3])
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                GraspStabilityMonitor,
+                prepare_live_acceptance_context,
+                query_live_grasp,
+            )
+            from research.gs_opd.teacher.schema_v2 import parse_teacher_output_v2
+
+            validation_teacher = parse_teacher_output_v2(
+                args.teacher_json.read_text(encoding="utf-8")
+            )
+            validation_semantics = json.loads(
+                args.semantic_results_json.read_text(encoding="utf-8")
+            )
+            trajectory_validation_context = prepare_live_acceptance_context(
+                conn,
+                validation_teacher,
+                validation_semantics,
+                data["instruction"],
+                subject_id=args.trajectory_subject_object_id,
+            )
+            trajectory_validation_context["teacher_json_path"] = str(
+                args.teacher_json.resolve()
+            )
+            trajectory_validation_context["semantic_results_json_path"] = str(
+                args.semantic_results_json.resolve()
+            )
+            trajectory_grasp_monitor = GraspStabilityMonitor()
+            initial_grasp_state = query_live_grasp(conn, trajectory_validation_context)
+            trajectory_grasp_monitor.update(initial_grasp_state, rollout_step=steps)
+            print(
+                "TRAJECTORY VALIDATION SEARCHING FOR LIVE STABLE GRASP:",
+                json.dumps(
+                    {
+                        "subject_object_id": trajectory_validation_context["subject_id"],
+                        "required_distinct_states": trajectory_grasp_monitor.required_samples,
+                        "initial_grasp_status": initial_grasp_state.get("status"),
+                        "initial_grasp_reason": initial_grasp_state.get("reason"),
+                        "bridge_connection": "same persistent connection used for Student step and Snapshot branches",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            trajectory_validation_preflight_failure = (
+                f"{type(exc).__name__}:{exc}"
+            )
+            print(
+                "TRAJECTORY VALIDATION PREFLIGHT BLOCKED:",
+                trajectory_validation_preflight_failure,
+                flush=True,
+            )
     video_frames = [] if args.video_out is not None else None
     if video_frames is not None:
         video_frames.append(get_video_frame(data))
@@ -1856,7 +1960,89 @@ try:
         and not success
         and collection_preflight_failure is None
         and collection_abort_reason is None
+        and not trajectory_validation_restore_abort
     ):
+        if (
+            args.trajectory_bundle_physical_validation
+            and not trajectory_validation_attempted
+            and trajectory_validation_preflight_failure is None
+            and trajectory_validation_context is not None
+            and trajectory_grasp_monitor is not None
+            and trajectory_grasp_monitor.stable
+        ):
+            from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                must_stop_rollout_after_acceptance,
+                run_snapshot_trajectory_acceptance,
+            )
+
+            trajectory_validation_attempted = True
+            try:
+                trajectory_validation_report = run_snapshot_trajectory_acceptance(
+                    conn,
+                    trajectory_validation_context,
+                    trajectory_grasp_monitor.samples[-1],
+                    args.trajectory_validation_out,
+                    decision_step=steps,
+                    grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                )
+            except Exception as exc:
+                trajectory_validation_report = {
+                    "operation": "one_shot_geometry_guided_trajectory_physical_acceptance",
+                    "status": "blocked",
+                    "decision_step": steps,
+                    "failure_reasons": [f"{type(exc).__name__}:{exc}"],
+                    "main_environment_actions_by_acceptance": 0,
+                    "main_environment_candidate_execution": False,
+                    "training_label_created": False,
+                }
+            print(
+                "TRAJECTORY PHYSICAL ACCEPTANCE:",
+                json.dumps(
+                    {
+                        "status": trajectory_validation_report.get("status"),
+                        "candidate_outcome": trajectory_validation_report.get(
+                            "candidate_outcome"
+                        ),
+                        "decision_step": steps,
+                        "live_grasp": trajectory_validation_report.get(
+                            "live_grasp_at_snapshot", {}
+                        ).get("status"),
+                        "geometric_candidates": trajectory_validation_report.get(
+                            "candidate_count"
+                        ),
+                        "branches_executed": trajectory_validation_report.get(
+                            "branch_candidate_count"
+                        ),
+                        "accepted_tracking_candidates": len(
+                            trajectory_validation_report.get("tracking", {}).get(
+                                "executable_safe_candidate_ids", []
+                            )
+                        ),
+                        "restore_verified": trajectory_validation_report.get(
+                            "main_state_restored"
+                        ),
+                        "failure_reasons": trajectory_validation_report.get(
+                            "failure_reasons", []
+                        ),
+                        "candidate_rejection_reason_counts": trajectory_validation_report.get(
+                            "candidate_rejection_reason_counts", {}
+                        ),
+                        "report": str(args.trajectory_validation_out),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            if must_stop_rollout_after_acceptance(trajectory_validation_report):
+                trajectory_validation_restore_abort = True
+                print(
+                    "TRAJECTORY VALIDATION STOPPED ROLLOUT BEFORE NEXT STUDENT ACTION:",
+                    trajectory_validation_report.get("status"),
+                    trajectory_validation_report.get("failure_reasons", []),
+                    flush=True,
+                )
+                break
         obs = {
             k: np.frombuffer(v["data"], dtype=v["dtype"]).reshape(v["shape"]).copy()
             for k, v in data["images"].items()
@@ -1997,6 +2183,28 @@ try:
             steps += 1
             actual_chunk_actions.append(action.copy())
             actual_chunk_post.append(data)
+            if (
+                args.trajectory_bundle_physical_validation
+                and not trajectory_validation_attempted
+                and trajectory_validation_preflight_failure is None
+                and trajectory_validation_context is not None
+                and trajectory_grasp_monitor is not None
+                and not data.get("done", False)
+            ):
+                try:
+                    from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                        query_live_grasp,
+                    )
+
+                    grasp_state = query_live_grasp(conn, trajectory_validation_context)
+                except Exception as exc:
+                    grasp_state = {
+                        "status": "unavailable",
+                        "grasp_confirmed": False,
+                        "physical_state_unchanged": False,
+                        "reason": f"{type(exc).__name__}:{exc}",
+                    }
+                trajectory_grasp_monitor.update(grasp_state, rollout_step=steps)
             if trace_writer is not None:
                 try:
                     trace_writer.add_step(
@@ -2129,6 +2337,104 @@ try:
             flush=True,
         )
 
+    trajectory_validation_summary_path = None
+    if args.trajectory_bundle_physical_validation:
+        from research.gs_opd.repair.trajectory_bundle_acceptance import _json_safe
+
+        if trajectory_validation_report is None:
+            if trajectory_validation_preflight_failure is not None:
+                trajectory_status = "blocked"
+                reasons = [trajectory_validation_preflight_failure]
+            elif trajectory_grasp_monitor is not None and trajectory_grasp_monitor.stable:
+                trajectory_status = "stable_grasp_found_without_following_decision_state"
+                reasons = ["episode_ended_before_next_student_decision"]
+            else:
+                trajectory_status = "stable_grasp_not_found_within_episode"
+                reasons = [
+                    "episode_ended_before_consecutive_live_closed_gripper_and_opposing_finger_contact_evidence"
+                ]
+            trajectory_validation_report = {
+                "operation": "one_shot_geometry_guided_trajectory_physical_acceptance",
+                "status": trajectory_status,
+                "failure_reasons": reasons,
+                "main_environment_actions_by_acceptance": 0,
+                "main_environment_candidate_execution": False,
+                "training_label_created": False,
+                "physical_safety_claim": False,
+                "preflight_failure": trajectory_validation_preflight_failure,
+                "binding_validation": (
+                    trajectory_validation_context.get("binding_validation")
+                    if trajectory_validation_context is not None
+                    else None
+                ),
+            }
+        trajectory_validation_report["episode_rollout"] = {
+            "instruction": data.get("instruction"),
+            "max_steps": args.max_steps,
+            "executed_steps": steps,
+            "decision_chunks": chunks,
+            "success": bool(success),
+            "done": bool(done),
+            "episode_end_reason": (
+                "trajectory_validation_state_integrity_failure"
+                if trajectory_validation_restore_abort
+                else
+                "success" if success else "environment_done" if done else "max_steps"
+            ),
+            "rollout_stopped_before_next_student_action": trajectory_validation_restore_abort,
+            "checkpoint_path": str(ckpt),
+            "bridge_endpoint": "127.0.0.1:38567",
+            "bridge_connection_policy": "the existing pi05_rollout Client connection was used for Student steps, grasp queries, Snapshot, geometry, and branch tracking",
+        }
+        if trajectory_grasp_monitor is not None:
+            trajectory_validation_report["grasp_stability"] = (
+                trajectory_grasp_monitor.diagnostics()
+            )
+        trajectory_validation_report["physical_safety_claim"] = False
+        trajectory_validation_report["training_label_created"] = False
+        trajectory_validation_report["main_environment_candidate_execution"] = False
+        trajectory_validation_report["main_environment_actions_by_acceptance"] = 0
+        trajectory_validation_summary_path = args.trajectory_validation_out
+        trajectory_validation_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        trajectory_validation_summary_path.write_text(
+            json.dumps(_json_safe(trajectory_validation_report), ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "TRAJECTORY VALIDATION SUMMARY:",
+            json.dumps(
+                {
+                    "status": trajectory_validation_report.get("status"),
+                    "candidate_outcome": trajectory_validation_report.get(
+                        "candidate_outcome"
+                    ),
+                    "steps": steps,
+                    "stable_grasp_observed": (
+                        trajectory_grasp_monitor.stable
+                        if trajectory_grasp_monitor is not None
+                        else False
+                    ),
+                    "branches_executed": trajectory_validation_report.get(
+                        "branch_candidate_count", 0
+                    ),
+                    "restore_verified": trajectory_validation_report.get(
+                        "main_state_restored"
+                    ),
+                    "failure_reasons": trajectory_validation_report.get(
+                        "failure_reasons", []
+                    ),
+                    "candidate_rejection_reason_counts": trajectory_validation_report.get(
+                        "candidate_rejection_reason_counts", {}
+                    ),
+                    "report": str(trajectory_validation_summary_path),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     if trace_writer is not None:
         trace_writer.save(steps=steps, chunks=chunks)
         print("TRACE:" if not collection_enabled else "SAFETY DATA:", trace_output_path, flush=True)
@@ -2153,6 +2459,14 @@ try:
             result["verifier_guided_repair"] = contact_probe_result["status"]
     if collection_enabled:
         result["on_policy_safety_collection"] = safety_episode_summary
+    if args.trajectory_bundle_physical_validation:
+        result["trajectory_bundle_physical_validation"] = {
+            "status": trajectory_validation_report.get("status"),
+            "report_path": str(trajectory_validation_summary_path),
+            "branch_candidate_count": trajectory_validation_report.get("branch_candidate_count", 0),
+            "restore_verified": trajectory_validation_report.get("main_state_restored"),
+            "failure_reasons": trajectory_validation_report.get("failure_reasons", []),
+        }
 
     with open("/tmp/gs_pi05_safety_l0t0_result.json", "w") as f:
         json.dump(result, f, indent=2)
