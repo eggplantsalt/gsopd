@@ -223,7 +223,12 @@ def _preflight(
 
 
 def _candidate_validation_complete(candidate_result: dict[str, Any]) -> bool:
-    """Whether a candidate received every required physical and task check."""
+    """Require complete physical checks and a completed task assessment.
+
+    Insufficient grasp evidence can finish a task assessment with status
+    ``unavailable``. It rejects that candidate without invalidating the other
+    candidates' checks; missing physical data or restoration still fails closed.
+    """
     endpoint = candidate_result.get("endpoint_replay")
     task_progress = candidate_result.get("task_progress")
     action_constraints = candidate_result.get("action_constraints")
@@ -232,7 +237,8 @@ def _candidate_validation_complete(candidate_result: dict[str, Any]) -> bool:
         and candidate_result.get("contact_monitoring_complete") is True
         and candidate_result.get("physical_safety_verdict") in ("safe", "violation")
         and isinstance(task_progress, dict)
-        and task_progress.get("status") in ("pass", "fail")
+        and task_progress.get("evaluation_complete") is True
+        and task_progress.get("status") in ("pass", "fail", "unavailable")
         and isinstance(action_constraints, dict)
         and action_constraints.get("status") in ("pass", "fail")
         and isinstance(endpoint, dict)
@@ -453,6 +459,8 @@ def run_early_repair_search(
                             }
                             for item in report["candidate_results"]
                             if item.get("accepted_for_probe") is True
+                            and item.get("candidate_validation_complete") is True
+                            and item.get("task_progress", {}).get("status") == "pass"
                         ]
                         if specs:
                             results_complete = len(report["candidate_results"]) == len(specs)

@@ -1335,3 +1335,31 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 五步物体/EEF 状态、任务物体绑定、终止/奖励和相对距离抓持证据 fail-closed；不自动生成任务训练标签。
 - [x] 未改共享 Verifier-Guided Repair、Contact Compiler、安全约束、Snapshot、gap 改善或最大 gap 选择逻辑。
 - [ ] 人工重跑 S40 Early Repair Smoke，检查通过的候选是否仍满足接触安全、间隙改善及抓持保持诊断；未运行前不宣称真实场景已有合格候选。
+
+## Early Repair：区分评估完成与候选合格
+
+只读审计 `logs/gs_opd/repair_detour_feasibility_45step.npz` 最后一个 decision（S35），确认整批终止来自任务状态契约不一致：`evaluate_early_repair_task_feasibility()` 返回正常的证据不足结果 `unavailable`，而 `_candidate_validation_complete()` 仅接受 pass/fail，将其误报为 `candidate_validation_incomplete`。
+
+| S35 归档检查项 | 实际结果 |
+| --- | --- |
+| 候选数量 | 24 |
+| task_progress.status / reason | 24 条均为 `unavailable / baseline_grasp_evidence_unreliable` |
+| 物体与 EEF 五步状态 | 24 条均完整 |
+| Contact Compiler / 对象间规则 | 24 条均为 safe |
+| 完整五步执行 / Contact Monitoring / 动作约束 | 24 条均通过 |
+| endpoint replay / main_state_restored | 24 条均为 complete / true |
+| 终点间隙改善 | 16 条；另 8 条同时被间隙改善门槛拒绝 |
+| 搜索前后 Snapshot 恢复 | 均匹配，最大物理数值误差为 0 |
+
+- 全部候选共享的 A⁰ 基线 EEF 路程为 **4.693110 mm**，低于现有 **5 mm** 门槛；物体路程为 3.482200 mm（门槛 2 mm），相对距离范围为 0.877623 mm（容许值 50 mm）。基线抓持证据不足的具体触发项是 EEF 路程；这次保持所有抓持条件原值，24 条仍不合格。
+- 任务判定新增 `evaluation_complete`：完整状态、有效绑定和 reward/done 输入均可读取后，正常的 pass、fail 或证据不足 unavailable 都可表示已完成评估。缺失状态、绑定或 reward/done 时仍为 false；候选保留原始具体拒绝原因。
+- 通用搜索分别检查完成性和合格性。已完成但 unavailable 的候选不能进入 `qualified_candidates`、不能执行或生成标签；它们不再单独否决其他完整合格候选。全部候选 unavailable 时返回 `no_qualified_candidates`，保持不可执行。缺少物理/接触监测、Compiler unknown、endpoint replay 不完整或 Snapshot 恢复失败仍令整批不可执行。
+- 原 NPZ 未改写；修复仅改变后续搜索的状态分类，不把 S35 的 16 条间隙改善候选视为可用。生成动作、幅度、间隙门槛、最大 gap 选择和 Violation Repair 未改。
+- Early Repair、旧 Smoke、Student Lookahead 和 On-Policy 相关单测共 **68 项通过**，覆盖混合 pass/unavailable、全部 unavailable、物理验证不完整、接触 unknown、恢复失败及状态/奖励缺失；四份修改 Python 文件语法检查与 `git diff --check` 通过。测试使用现有 `gsopd_teacher` 环境，未启动模型或仿真。
+
+**检查清单（Checklist）**
+
+- [x] S35 最后一个 decision 的 24 条真实候选已只读审计，并记录实际抓持证据不足原因。
+- [x] 评估完成不等于候选合格；unavailable 不生成执行动作或训练标签，也不污染其他合格候选。
+- [x] 真正的物理验证、接触监测和恢复不完整继续失败关闭，68 项单测及静态检查通过。
+- [ ] 人工重跑后核对：同类全部证据不足的搜索应准确报告 `no_qualified_candidates`，不期待本修复自动产生 S35 合格动作。

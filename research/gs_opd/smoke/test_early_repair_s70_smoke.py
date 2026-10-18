@@ -286,6 +286,7 @@ class EarlyRepairProgressTests(unittest.TestCase):
         self.assertTrue(report["accepted_for_probe"], report["rejection_reasons"])
         task = report["task_progress"]
         self.assertEqual(task["status"], "pass")
+        self.assertTrue(task["evaluation_complete"])
         self.assertEqual(task["grasp_evidence"]["status"], "reliable_heuristic")
         self.assertLess(
             task["original_a0_direction_70_percent_diagnostic"]["task_object_root_pos_projection"][
@@ -311,6 +312,7 @@ class EarlyRepairProgressTests(unittest.TestCase):
 
         self.assertFalse(report["accepted_for_probe"])
         self.assertEqual(report["task_progress"]["status"], "fail")
+        self.assertTrue(report["task_progress"]["evaluation_complete"])
         self.assertEqual(
             report["task_progress"]["reason"],
             "candidate_task_object_eef_relative_position_changed_abnormally",
@@ -328,6 +330,7 @@ class EarlyRepairProgressTests(unittest.TestCase):
 
         self.assertFalse(report["accepted_for_probe"])
         self.assertEqual(report["task_progress"]["status"], "unavailable")
+        self.assertFalse(report["task_progress"]["evaluation_complete"])
         self.assertEqual(
             report["task_progress"]["reason"],
             "candidate_bound_task_object_state_3_missing_or_ambiguous",
@@ -336,6 +339,28 @@ class EarlyRepairProgressTests(unittest.TestCase):
             "candidate_bound_task_object_state_3_missing_or_ambiguous",
             report["rejection_reasons"],
         )
+
+    def test_insufficient_baseline_grasp_is_a_completed_ineligible_assessment(self):
+        baseline = _candidate("baseline", 0.003482, 0.004693)
+        candidate = _candidate("candidate", 0.01, 0.01)
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "unavailable")
+        self.assertTrue(report["task_progress"]["evaluation_complete"])
+        self.assertEqual(report["task_progress"]["reason"], "baseline_grasp_evidence_unreliable")
+        self.assertFalse(report["training_label_valid"])
+
+    def test_missing_reward_is_incomplete_even_if_grasp_evidence_is_insufficient(self):
+        baseline = _candidate("baseline", 0.003482, 0.004693)
+        candidate = _candidate("candidate", 0.01, 0.01)
+        del candidate["steps"][1]["reward"]
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "unavailable")
+        self.assertFalse(report["task_progress"]["evaluation_complete"])
+        self.assertEqual(report["task_progress"]["reason"], "candidate_step_1_reward_missing_or_invalid")
 
     def test_existing_positive_task_reward_must_be_preserved(self):
         baseline = _candidate("baseline", 0.02, 0.02)

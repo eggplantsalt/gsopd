@@ -8,7 +8,11 @@ from typing import Any
 
 import numpy as np
 
-from research.gs_opd.repair.early_repair import _preflight, run_early_repair_search
+from research.gs_opd.repair.early_repair import (
+    _candidate_validation_complete,
+    _preflight,
+    run_early_repair_search,
+)
 from research.gs_opd.repair.near_far import action_chunk_fingerprint
 from research.gs_opd.teacher.schema_v2 import SCHEMA_VERSION
 from research.gs_opd.smoke.contact_safety_compiler_smoke import SAMPLING_POINT
@@ -58,9 +62,11 @@ def _bridge_candidate(candidate_id: str = "a0") -> dict[str, Any]:
     for index in range(5):
         steps.append({
             "step_index": index,
+            "reward": 0.0,
+            "done": False,
             "state": {
                 "robot_states": [{"eef_pos": [0.01 * (index + 1), 0.0, 0.2]}],
-                "object_states": {"moving": {"root_pos": [0.01 * (index + 1), 0.0, 0.2]}},
+                "object_states": {"moving": {"body_id": 10, "root_pos": [0.01 * (index + 1), 0.0, 0.2]}},
             },
         })
         control_steps.append({
@@ -78,7 +84,7 @@ def _bridge_candidate(candidate_id: str = "a0") -> dict[str, Any]:
         "executed_steps": 5,
         "start_state": {
             "robot_states": [{"eef_pos": [0.0, 0.0, 0.2]}],
-            "object_states": {"moving": {"root_pos": [0.0, 0.0, 0.2]}},
+            "object_states": {"moving": {"body_id": 10, "root_pos": [0.0, 0.0, 0.2]}},
         },
         "steps": steps,
         "contact_monitoring": {
@@ -95,6 +101,20 @@ def _bridge_candidate(candidate_id: str = "a0") -> dict[str, Any]:
             "events": [],
         },
     }
+
+
+def _task_assessment(*, grasp_evidence_sufficient: bool = True) -> dict[str, Any]:
+    from research.gs_opd.smoke import early_repair_s70_smoke as probe
+
+    baseline = _bridge_candidate("baseline")
+    if not grasp_evidence_sufficient:
+        for index, step in enumerate(baseline["steps"]):
+            fraction = (index + 1) / 5
+            step["state"]["robot_states"][0]["eef_pos"][0] = 0.004 * fraction
+            step["state"]["object_states"]["moving"]["root_pos"][0] = 0.003 * fraction
+    return probe.evaluate_early_repair_task_feasibility(
+        baseline, _bridge_candidate("candidate"), {"body_id": 10}
+    )
 
 
 def _inputs(decision_step: int = 137) -> dict[str, Any]:
@@ -259,7 +279,10 @@ class EarlyRepairPreflightTests(unittest.TestCase):
 
 class EarlyRepairSearchTests(unittest.TestCase):
     def _run_search(
-        self, *, accepted_count: int, restore_ok: bool = True, candidate_validation_complete: bool = True
+        self, *, accepted_count: int, restore_ok: bool = True,
+        candidate_validation_complete: bool = True,
+        task_assessments: list[dict[str, Any]] | None = None,
+        incomplete_candidate_ids: tuple[str, ...] = (),
     ):
         from research.gs_opd.smoke import early_repair_s70_smoke as probe
 
@@ -286,18 +309,29 @@ class EarlyRepairSearchTests(unittest.TestCase):
             return {"matched": restore_ok or restore_calls["count"] == 1}
 
         def assess(spec, *_args):
-            accepted = int(spec["candidate_id"].split("-")[-1]) <= accepted_count
+            index = int(spec["candidate_id"].split("-")[-1]) - 1
+            physical_complete = (
+                candidate_validation_complete
+                and spec["candidate_id"] not in incomplete_candidate_ids
+            )
+            task_progress = (
+                task_assessments[index] if task_assessments is not None else _task_assessment()
+            ) if physical_complete else {
+                "status": "unavailable", "evaluation_complete": False,
+                "reason": "candidate_physical_states_missing",
+            }
+            accepted = index < accepted_count and physical_complete and task_progress["status"] == "pass"
             return {
                 "candidate_id": spec["candidate_id"],
                 "actions": np.asarray(spec["actions"]).tolist(),
                 "accepted_for_probe": accepted,
-                "full_five_step_chunk": candidate_validation_complete,
-                "contact_monitoring_complete": candidate_validation_complete,
-                "physical_safety_verdict": "safe" if candidate_validation_complete else "unknown",
-                "task_progress": {"status": "pass"} if candidate_validation_complete else {"status": "unavailable"},
-                "action_constraints": {"status": "pass"} if candidate_validation_complete else {"status": "unavailable"},
-                "endpoint_replay": {"status": "complete", "main_state_restored": True} if candidate_validation_complete else None,
-                "rejection_reasons": [] if accepted else ["candidate_gate_rejected"],
+                "full_five_step_chunk": physical_complete,
+                "contact_monitoring_complete": physical_complete,
+                "physical_safety_verdict": "safe" if physical_complete else "unknown",
+                "task_progress": task_progress,
+                "action_constraints": {"status": "pass"} if physical_complete else {"status": "unavailable"},
+                "endpoint_replay": {"status": "complete", "main_state_restored": True} if physical_complete else None,
+                "rejection_reasons": [] if accepted else [task_progress.get("reason") or "candidate_gate_rejected"],
             }
 
         with (
@@ -356,6 +390,60 @@ class EarlyRepairSearchTests(unittest.TestCase):
         self.assertFalse(report["executable"])
         self.assertEqual(report["qualified_candidates"], [])
         self.assertTrue(report["verification_complete"])
+
+    def test_unavailable_task_evidence_does_not_block_a_qualified_candidate(self):
+        report = self._run_search(
+            accepted_count=2,
+            task_assessments=[_task_assessment(), _task_assessment(grasp_evidence_sufficient=False)],
+        )
+        self.assertEqual(report["status"], "qualified_candidates_available")
+        self.assertTrue(report["verification_complete"])
+        self.assertTrue(report["executable"])
+        self.assertEqual([item["candidate_id"] for item in report["qualified_candidates"]], ["early-001"])
+        unavailable = report["candidate_results"][1]
+        self.assertTrue(unavailable["candidate_validation_complete"])
+        self.assertFalse(unavailable["accepted_for_probe"])
+        self.assertEqual(unavailable["task_progress"]["status"], "unavailable")
+        self.assertEqual(unavailable["rejection_reasons"], ["baseline_grasp_evidence_unreliable"])
+        self.assertFalse(report["training_label_created"])
+
+    def test_all_unavailable_tasks_finish_search_without_qualified_actions(self):
+        report = self._run_search(
+            accepted_count=2,
+            task_assessments=[_task_assessment(grasp_evidence_sufficient=False) for _ in range(2)],
+        )
+        self.assertEqual(report["status"], "no_qualified_candidates")
+        self.assertTrue(report["verification_complete"])
+        self.assertTrue(report["candidate_validation_complete"])
+        self.assertFalse(report["executable"])
+        self.assertEqual(report["qualified_candidates"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertTrue(all(
+            item["rejection_reasons"] == ["baseline_grasp_evidence_unreliable"]
+            for item in report["candidate_results"]
+        ))
+        self.assertFalse(report["training_label_created"])
+
+    def test_incomplete_physical_validation_still_blocks_other_candidates(self):
+        report = self._run_search(accepted_count=2, incomplete_candidate_ids=("early-002",))
+        self.assertTrue(report["candidate_results"][0]["accepted_for_probe"])
+        self.assertFalse(report["candidate_results"][1]["candidate_validation_complete"])
+        self.assertEqual(report["status"], "not_executable")
+        self.assertFalse(report["verification_complete"])
+        self.assertFalse(report["executable"])
+        self.assertIn("candidate_validation_incomplete; no candidate is executable", report["errors"])
+
+    def test_contact_unknown_restore_failure_and_unfinished_task_remain_incomplete(self):
+        candidate = self._run_search(accepted_count=2)["candidate_results"][0]
+        for fields in (
+            {"contact_monitoring_complete": False},
+            {"physical_safety_verdict": "unknown"},
+            {"endpoint_replay": {"status": "complete", "main_state_restored": False}},
+            {"task_progress": {"status": "unavailable", "evaluation_complete": False}},
+            {"task_progress": {"status": "unavailable"}},
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(_candidate_validation_complete({**candidate, **fields}))
 
     def test_snapshot_restore_failure_makes_candidates_non_executable(self):
         report = self._run_search(accepted_count=2, restore_ok=False)

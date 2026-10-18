@@ -463,9 +463,14 @@ def evaluate_early_repair_task_feasibility(
     and baseline-supported EEF/object co-motion that remains within a bounded
     relative-distance change. This is a short-horizon grasp-preservation
     heuristic, not a success label.
+
+    ``evaluation_complete`` means the required states and reward/done signals
+    were available for assessment. A complete assessment may still return
+    ``unavailable`` when those observations do not establish a reliable grasp.
     """
     result: dict[str, Any] = {
         "status": "unavailable",
+        "evaluation_complete": False,
         "reason": None,
         "basis": "same_horizon_grasp_preservation_and_no_reward_loss",
         "aligned_prefix_steps_compared": CHUNK_LENGTH,
@@ -510,6 +515,16 @@ def evaluate_early_repair_task_feasibility(
         result["object_and_eef_states_complete"] = False
         return result
     result["object_and_eef_states_complete"] = True
+    baseline_signals = _candidate_reward_and_done(baseline)
+    candidate_signals = _candidate_reward_and_done(candidate)
+    if baseline_signals[0] is None or candidate_signals[0] is None:
+        result["reason"] = (
+            "baseline_" + baseline_signals[1]
+            if baseline_signals[0] is None
+            else "candidate_" + candidate_signals[1]
+        )
+        return result
+    result["evaluation_complete"] = True
     baseline_eef, baseline_object = baseline_path
     candidate_eef, candidate_object = candidate_path
     baseline_relative = np.linalg.norm(baseline_object - baseline_eef, axis=1)
@@ -546,15 +561,6 @@ def evaluate_early_repair_task_feasibility(
         result["reason"] = "candidate_task_object_eef_relative_position_changed_abnormally"
         return result
 
-    baseline_signals = _candidate_reward_and_done(baseline)
-    candidate_signals = _candidate_reward_and_done(candidate)
-    if baseline_signals[0] is None or candidate_signals[0] is None:
-        result["reason"] = (
-            "baseline_" + baseline_signals[1]
-            if baseline_signals[0] is None
-            else "candidate_" + candidate_signals[1]
-        )
-        return result
     baseline_rewards, _ = baseline_signals
     candidate_rewards, candidate_dones = candidate_signals
     baseline_total = float(sum(baseline_rewards))
