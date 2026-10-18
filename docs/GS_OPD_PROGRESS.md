@@ -1379,3 +1379,20 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] 检查完整三维相对位置，区分局部运动学可行、抓持未确认与明确脱离；不声称启发式 pass 是任务成功或高质量示范。
 - [x] 71 项单测及语法/diff 检查通过，其他安全、奖励与恢复门槛保持原值。
 - [ ] 人工重跑受限 Episode，核对真实 S35 候选的六帧相对向量、物理安全、间隙及执行后任务表现。
+
+## On-Policy Early Repair：Brake-and-Steer 候选
+
+- `generate_clearance_candidates()` 新增默认关闭的 `include_brake_and_steer=False`；旧 S70 Smoke 的默认 24 条 XYZ 偏置网格、动作数值和 ID 保持一致。当前只有 On-Policy Rollout 调用的 `run_early_repair_search()` 显式传 true，在原网格后增加最多 12 次候选生成尝试，总预算保持 36。
+- 用已有最近 Geom 的单位 away、正负侧向方向和 MuJoCo world_up 构造候选。A⁰ XYZ 按 OSC input/output 中点及 gain 换算为世界坐标位移 `d`，朝障碍物的投影为 `p = min(dot(d, away), 0)`。现有平滑窗口权重为 `w`，总修正为 `w * (-p * away + steering)`；原本远离障碍物的分量不制动。通过 gain 反算输入，不对候选做 clipping，旋转及夹爪值逐项保留。
+- 两个现有窗口各尝试六种组合：纯制动；正侧向 8/16 mm；负侧向 8/16 mm；沿 world_up 抬升 16 mm。保留原 XYZ 幅度网格和全部限值；制动与转向合成后的真实每步修正、累计修正及 slew 均须通过原门槛。越界或无有效修正的候选在物理执行前明确拒绝。
+- 新诊断包含 gain/仿射中点、A⁰ 世界位移、朝近投影、平滑权重、制动与转向分量、从实际动作差重建的完整 `physical_xyz_bias_by_step_m`、总修正幅度和各项拒绝原因。完整修正诊断已通过真实 `_candidate_constraints()` 的轻量回归测试；没有用额外侧移幅度代替制动加转向的总幅度。
+- Safety 报告新增 `candidate_generation_counts`，分别记录 XYZ 偏置与 Brake-and-Steer 的生成数及拒绝数。离线测试的朝近动作样例实际生成 **24 + 12 = 36 条**；零 XYZ 动作样例生成 **24 + 10 = 34 条**，两条纯制动因无修正被拒绝；预算设为 30 时为 **24 + 6 = 30 条**。这些数字是生成层单测结果，不是实际 Episode 的物理合格候选数量。
+- 新候选仍从同一 Snapshot 走完整五步 Branch、Contact Compiler、任务可行性、动作/Workspace、终点 gap 和恢复检查，再沿用最大 gap 选择。Near–Far、Verifier-Guided Repair、训练标签语义和 NPZ Schema 未修改；候选生成不构成安全、任务成功或高质量示范的证明。
+- 相关单测共 **80 项通过**（Early Repair 与旧 Smoke 46 项，Student Lookahead 与 On-Policy 34 项）；四份 Python 文件语法检查和 `git diff --check` 通过。未启动模型或仿真，尚未验证 S35/S40 等真实状态下新增候选的安全通过数、间隙改善及实际任务效果。
+
+**检查清单（Checklist）**
+
+- [x] 旧 24 条网格默认不变；On-Policy 显式启用额外最多 12 条，总预算不超过 36。
+- [x] 朝近分量制动、远离分量保留、侧移/抬升、完整修正诊断、OSC 仿射尺度、各项动作上限和旧路径兼容性均有单测。
+- [x] 所有物理安全、任务可行性、gap、Snapshot 恢复及最大 gap 选择门槛继续复用，静态检查和 80 项单测通过。
+- [ ] 人工运行受限 On-Policy Episode，按两类候选统计静态拒绝、物理安全、任务可行性、gap 改善及最终实际执行来源。

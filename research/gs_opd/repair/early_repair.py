@@ -279,7 +279,8 @@ def run_early_repair_search(
     Near-Far provenance must identify the same Snapshot and exact A0 chunk.
     Candidate IDs/actions are returned only after all physical, contact,
     progress, action, clearance, and restoration checks. No candidate is
-    selected and no training label is produced here.
+    selected and no training label is produced here. This On-Policy entry
+    appends Brake-and-Steer candidates; the standalone Smoke keeps its XYZ grid.
     """
     from research.gs_opd.smoke import early_repair_s70_smoke as probe
     from research.gs_opd.smoke.contact_safety_compiler_smoke import compile_forbid_contact
@@ -295,6 +296,7 @@ def run_early_repair_search(
         "candidate_selected": False,
         "original_a0_actions": actions.tolist() if actions.ndim == 2 else None,
         "candidate_limit": max_candidates,
+        "brake_and_steer_enabled": True,
         "decision_step": near_far_result.get("decision_step") if isinstance(near_far_result, dict) else None,
         "preflight": None,
         "snapshot_restore": {"before": None, "after": None},
@@ -363,6 +365,7 @@ def run_early_repair_search(
                             probe.PROBE_CONFIG,
                             max_candidates=max_candidates,
                             candidate_prefix="early",
+                            include_brake_and_steer=True,
                         )
                     except Exception as exc:
                         report["errors"].append(f"candidate_generation_failed:{type(exc).__name__}:{exc}")
@@ -370,6 +373,19 @@ def run_early_repair_search(
                         report["direction_basis"] = direction_basis
                         report["candidate_generation_rejections"] = generation_rejections
                         report["generated_candidate_count"] = len(specs)
+                        report["candidate_generation_counts"] = {
+                            family: {
+                                "generated": sum(
+                                    item.get("action_diagnostics", {}).get("candidate_family", "xyz_bias") == family
+                                    for item in specs
+                                ),
+                                "rejected": sum(
+                                    item.get("action_diagnostics", {}).get("candidate_family", "xyz_bias") == family
+                                    for item in generation_rejections
+                                ),
+                            }
+                            for family in ("xyz_bias", "brake_and_steer")
+                        }
                         if specs:
                             try:
                                 branch_result = probe._request(connection, {

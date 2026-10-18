@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -234,6 +235,188 @@ class EarlyRepairGeometryTests(unittest.TestCase):
         np.testing.assert_allclose(directions[0]["direction_world"], [-1, 0, 0])
         self.assertEqual(basis["nearest_pair"]["geom_a"]["body_id"], 23)
         self.assertEqual(basis["nearest_pair"]["geom_b"]["body_id"], 27)
+
+
+class BrakeAndSteerTests(unittest.TestCase):
+    def setUp(self):
+        self.context = _controller_context()
+        self.actions = np.zeros((5, 7), dtype=np.float64)
+        self.actions[:, 0] = -0.1
+        self.actions[:, 3:6] = 0.1
+        self.actions[:, 6] = -0.5
+        self.directions, _ = smoke.derive_clearance_directions(
+            {
+                "query_complete": True,
+                "distance_reliable": True,
+                "minimum_distance_m": 0.03,
+                "minimum_pair": {
+                    "geom_a": {"id": 10, "body_id": 23},
+                    "geom_b": {"id": 20, "body_id": 27},
+                    "closest_segment_world": [0.03, 0, 0, 0, 0, 0],
+                },
+            },
+            23, 27, self.context["world_up"],
+        )
+
+    def _generate(self, *, config=smoke.PROBE_CONFIG, max_candidates=36):
+        return smoke.generate_clearance_candidates(
+            self.actions, self.directions, self.context, config,
+            include_brake_and_steer=True, max_candidates=max_candidates,
+        )
+
+    @staticmethod
+    def _new(items):
+        return [item for item in items if item["action_diagnostics"].get("candidate_family") == "brake_and_steer"]
+
+    def test_appends_twelve_candidates_without_changing_the_original_grid(self):
+        original, old_rejected = smoke.generate_clearance_candidates(
+            self.actions, self.directions, self.context
+        )
+        combined, rejected = self._generate()
+        self.assertEqual(len(original), 24)
+        self.assertEqual(len(combined), 36)
+        self.assertEqual(old_rejected, [])
+        self.assertEqual(rejected, [])
+        for old, extended in zip(original, combined[:24]):
+            np.testing.assert_array_equal(old["actions"], extended["actions"])
+            self.assertEqual(
+                {k: v for k, v in old.items() if k != "actions"},
+                {k: v for k, v in extended.items() if k != "actions"},
+            )
+        extra = self._new(combined)
+        self.assertEqual(len(extra), 12)
+        self.assertEqual(len({item["candidate_id"] for item in combined}), 36)
+        self.assertEqual([item["direction"]["name"] for item in extra].count("brake_only"), 2)
+        for anchor in (1, 2):
+            self.assertEqual(sum(item["window"]["window_anchor_step"] == anchor for item in extra), 6)
+
+    def test_brake_cancels_approach_with_the_existing_smooth_envelope(self):
+        specs, _ = self._generate()
+        pure_brakes = [item for item in self._new(specs) if item["direction"]["name"] == "brake_only"]
+        for item in pure_brakes:
+            diagnostics = item["action_diagnostics"]
+            envelope = np.asarray(diagnostics["envelope"])
+            before = np.asarray(diagnostics["original_xyz_displacement_world_m"])
+            correction = np.asarray(diagnostics["physical_xyz_bias_by_step_m"])
+            after = before + correction
+            np.testing.assert_allclose(after[:, 0], before[:, 0] * (1.0 - envelope), atol=1e-15)
+            self.assertAlmostEqual(after[item["window"]["window_anchor_step"], 0], 0.0)
+            np.testing.assert_array_equal(item["actions"][:, 3:], self.actions[:, 3:])
+            self.assertGreater(len(diagnostics["active_action_steps"]), 1)
+
+    def test_already_away_motion_is_not_cancelled(self):
+        self.actions[:, 0] = 0.1
+        specs, rejected = self._generate()
+        for item in self._new(specs):
+            np.testing.assert_array_equal(item["actions"][:, 0], self.actions[:, 0])
+            np.testing.assert_array_equal(item["action_diagnostics"]["braking_xyz_bias_by_step_m"], np.zeros((5, 3)))
+        brake_rejections = self._new(rejected)
+        self.assertEqual(len(brake_rejections), 2)
+        self.assertTrue(all(item["reason"] == "no_brake_or_steer_correction_in_window" for item in brake_rejections))
+
+    def test_brake_lateral_and_up_diagnostics_pass_the_real_action_constraints(self):
+        specs, _ = self._generate()
+        controller, error = smoke._controller_fields(self.context)
+        self.assertIsNone(error)
+        candidate = _candidate("physical_state_fixture", 0.01, 0.01)
+        for item in self._new(specs):
+            diagnostics = item["action_diagnostics"]
+            bias = np.asarray(diagnostics["physical_xyz_bias_by_step_m"])
+            np.testing.assert_allclose(
+                bias,
+                (item["actions"][:, :3] - self.actions[:, :3]) * controller["gain_m_per_env_action"],
+            )
+            np.testing.assert_allclose(
+                bias,
+                np.asarray(diagnostics["braking_xyz_bias_by_step_m"])
+                + np.asarray(diagnostics["steering_xyz_bias_by_step_m"]),
+                atol=1e-15,
+            )
+            constraints = smoke._candidate_constraints(
+                self.actions, item["actions"], diagnostics, candidate, controller, smoke.PROBE_CONFIG
+            )
+            self.assertEqual(constraints["status"], "pass", constraints)
+            np.testing.assert_array_equal(item["actions"][:, 3:], self.actions[:, 3:])
+            peak = item["window"]["window_anchor_step"]
+            mode = item["direction"]["name"]
+            if mode == "brake_lateral_positive":
+                self.assertGreater(bias[peak, 1], 0.0)
+            elif mode == "brake_lateral_negative":
+                self.assertLess(bias[peak, 1], 0.0)
+            elif mode == "brake_up":
+                self.assertGreater(bias[peak, 2], 0.0)
+            if mode != "brake_only":
+                self.assertGreater(
+                    diagnostics["amplitude_m_per_control_step"],
+                    diagnostics["steering_amplitude_m_per_control_step"],
+                )
+
+    def test_out_of_bounds_candidates_are_rejected_without_clipping(self):
+        self.actions[:, 1:3] = 0.95
+        specs, rejected = self._generate()
+        new_rejected = self._new(rejected)
+        saturated = [item for item in new_rejected if item["reason"] == "candidate_exceeds_active_osc_input_bounds"]
+        self.assertEqual(len(saturated), 6)  # two positive lateral amplitudes + up, for each window
+        for item in saturated:
+            diagnostics = item["action_diagnostics"]
+            self.assertFalse(diagnostics["controller_input_clipping_applied"])
+            self.assertGreater(np.asarray(diagnostics["candidate_xyz_actions"]).max(), 1.0)
+            self.assertEqual(item["input_bounds_check"]["status"], "fail")
+        self.assertTrue(all(item["input_bounds_check"]["status"] == "pass" for item in self._new(specs)))
+
+    def test_total_braking_and_steering_respects_each_existing_correction_limit(self):
+        cases = (
+            (replace(smoke.PROBE_CONFIG, maximum_amplitude_m_per_step=0.004), "per_step_xyz_repair_exceeds_bound"),
+            (replace(smoke.PROBE_CONFIG, maximum_integrated_detour_m=0.001), "integrated_xyz_repair_exceeds_bound"),
+            (replace(smoke.PROBE_CONFIG, maximum_action_correction_slew_m=0.001), "xyz_repair_is_not_smooth"),
+        )
+        for config, reason in cases:
+            with self.subTest(reason=reason):
+                specs, rejected = self._generate(config=config)
+                self.assertEqual(self._new(specs), [])
+                new_rejected = self._new(rejected)
+                self.assertEqual(len(new_rejected), 12)
+                self.assertTrue(all(reason in item["action_diagnostics"]["constraint_violations"] for item in new_rejected))
+
+    def test_large_braking_component_alone_can_exceed_the_unchanged_limit(self):
+        self.actions[:, 0] = -0.9
+        _, rejected = self._generate()
+        brakes = [item for item in self._new(rejected) if item["direction"]["name"] == "brake_only"]
+        self.assertEqual(len(brakes), 2)
+        for item in brakes:
+            self.assertGreater(item["amplitude_m_per_control_step"], smoke.PROBE_CONFIG.maximum_amplitude_m_per_step)
+            self.assertIn("per_step_xyz_repair_exceeds_bound", item["action_diagnostics"]["constraint_violations"])
+
+    def test_controller_affine_offset_is_used_to_identify_approaching_motion(self):
+        fields = self.context["robots"][0]["fields"]
+        fields["input_min"][0] = -2.0
+        fields["input_max"][0] = 0.0
+        fields["output_min"][0] = -0.04
+        fields["output_max"][0] = 0.06
+        self.actions[:, 0] = -1.4
+        specs, _ = self._generate()
+        brakes = [item for item in self._new(specs) if item["direction"]["name"] == "brake_only"]
+        self.assertEqual(len(brakes), 2)
+        for item in brakes:
+            diagnostics = item["action_diagnostics"]
+            np.testing.assert_allclose(np.asarray(diagnostics["original_xyz_displacement_world_m"])[:, 0], -0.01)
+            peak = item["window"]["window_anchor_step"]
+            corrected_world = (item["actions"][peak, 0] + 1.0) * 0.05 + 0.01
+            self.assertAlmostEqual(corrected_world, 0.0)
+
+    def test_budget_includes_rejected_attempts_and_never_exceeds_36(self):
+        specs, rejected = self._generate(max_candidates=30)
+        self.assertEqual(len(specs), 30)
+        self.assertEqual(len(self._new(specs)), 6)
+        self.assertEqual(rejected, [])
+        self.actions[:, :3] = 0.0
+        specs, rejected = self._generate()
+        self.assertEqual(len(specs), 34)
+        self.assertEqual(len(self._new(specs)), 10)
+        self.assertEqual(len(rejected), 2)
+        self.assertEqual(len(specs) + len(rejected), 36)
+        with self.assertRaisesRegex(ValueError, "max_candidates"):
+            self._generate(max_candidates=37)
 
 
 class EarlyRepairProgressTests(unittest.TestCase):

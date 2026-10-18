@@ -22,6 +22,8 @@ from research.gs_opd.repair.verifier_guided_repair import (
     RepairConfig,
     _candidate_constraints,
     _controller_fields,
+    _unit,
+    _window_envelope,
     build_repair_actions,
     evaluate_task_progress,
 )
@@ -56,6 +58,7 @@ DEFAULT_OUT = Path("logs/gs_opd/early_repair_s70.json")
 CHUNK_LENGTH = 5
 STATE_ATOL = 1e-6
 MAX_CANDIDATES = 36
+MAX_BRAKE_STEER_CANDIDATES = 12
 AMPLITUDES_M = (0.008, 0.016, 0.024, 0.032)
 WINDOWS = ((1, 3), (2, 2))  # geometry-centered smoothing envelopes; not collision times
 GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
@@ -261,8 +264,9 @@ def generate_clearance_candidates(
     *,
     max_candidates: int = MAX_CANDIDATES,
     candidate_prefix: str = "early-s70",
+    include_brake_and_steer: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Use the existing smooth Repair action builder for a bounded probe grid."""
+    """Build the XYZ bias grid and optionally append bounded braking detours."""
     actions = np.asarray(original_actions, dtype=np.float64)
     if actions.shape != (CHUNK_LENGTH, 7) or not np.isfinite(actions).all():
         raise ValueError("A0 must be a finite (5,7) action chunk")
@@ -270,6 +274,8 @@ def generate_clearance_candidates(
         raise ValueError(f"max_candidates must be in [1, {MAX_CANDIDATES}]")
     if not isinstance(candidate_prefix, str) or not candidate_prefix.strip():
         raise ValueError("candidate_prefix must be a non-empty string")
+    if not isinstance(include_brake_and_steer, bool):
+        raise ValueError("include_brake_and_steer must be a bool")
     bound_check = _osc_input_bounds_check(actions, controller_context)
     if bound_check.get("status") != "pass":
         raise ValueError(f"A0 does not satisfy active OSC input bounds: {bound_check}")
@@ -341,6 +347,138 @@ def generate_clearance_candidates(
                     "action_diagnostics": diagnostics,
                     "input_bounds_check": candidate_bounds,
                 })
+    if include_brake_and_steer and counter < max_candidates:
+        braking_specs, braking_rejections = _generate_brake_and_steer_candidates(
+            actions, directions, controller_context, config,
+            candidate_prefix=candidate_prefix,
+            first_candidate_index=counter + 1,
+            max_candidates=min(MAX_BRAKE_STEER_CANDIDATES, max_candidates - counter),
+        )
+        specs.extend(braking_specs)
+        rejected.extend(braking_rejections)
+    return specs, rejected
+
+
+def _generate_brake_and_steer_candidates(
+    actions: np.ndarray,
+    directions: list[dict[str, Any]],
+    controller_context: dict[str, Any],
+    config: RepairConfig,
+    *,
+    candidate_prefix: str,
+    first_candidate_index: int,
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cancel only approaching displacement, then steer within the same envelope."""
+    controller, error = _controller_fields(controller_context)
+    if controller is None:
+        raise ValueError(error)
+    by_name = {item.get("name"): item.get("direction_world") for item in directions}
+    away = _unit(by_name.get("nearest_geom_away"), "away direction")
+    lateral_positive = _unit(by_name.get("nearest_geom_lateral_positive"), "positive lateral direction")
+    lateral_negative = _unit(by_name.get("nearest_geom_lateral_negative"), "negative lateral direction")
+    if away is None or lateral_positive is None or lateral_negative is None:
+        raise ValueError("Brake-and-Steer requires the validated away and two lateral directions")
+    gain = controller["gain_m_per_env_action"]
+    input_mid = (controller["input_min"] + controller["input_max"]) / 2.0
+    output_mid = (controller["output_min"] + controller["output_max"]) / 2.0
+    original_world_delta = (actions[:, :3] - input_mid) * gain + output_mid
+    approaching_projection = np.minimum(original_world_delta @ away, 0.0)
+    low, high = AMPLITUDES_M[:2]
+    recipes = [
+        ("brake_only", np.zeros(3), 0.0),
+        ("brake_lateral_positive", lateral_positive, low),
+        ("brake_lateral_positive", lateral_positive, high),
+        ("brake_lateral_negative", lateral_negative, low),
+        ("brake_lateral_negative", lateral_negative, high),
+        ("brake_up", controller["world_up"], high),
+    ]
+    specs: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    counter = 0
+    for anchor, (lead, tail) in zip((1, 2), WINDOWS):
+        start, end, envelope = _window_envelope(CHUNK_LENGTH, anchor, lead, tail)
+        braking_bias = -envelope[:, None] * approaching_projection[:, None] * away
+        for name, steering_direction, steering_amplitude in recipes:
+            if counter >= max_candidates:
+                return specs, rejected
+            candidate_id = f"{candidate_prefix}-{first_candidate_index + counter:03d}"
+            counter += 1
+            steering_bias = envelope[:, None] * steering_amplitude * steering_direction
+            repaired = actions.copy()
+            repaired[:, :3] += (braking_bias + steering_bias) / gain
+            # Include braking in the full proposed world-space correction;
+            # affine controller offsets cancel in the action difference.
+            physical_bias = (repaired[:, :3] - actions[:, :3]) * gain
+            magnitudes = np.linalg.norm(physical_bias, axis=1)
+            maximum_step_m = float(magnitudes.max())
+            integrated_m = float(magnitudes.sum())
+            slew_m = float(np.linalg.norm(np.diff(physical_bias, axis=0), axis=1).max())
+            active_steps = np.flatnonzero(magnitudes > 1e-8).tolist()
+            bounds = _osc_input_bounds_check(repaired, controller_context)
+            violations = []
+            if bounds.get("status") != "pass":
+                violations.append("candidate_exceeds_active_osc_input_bounds")
+            if maximum_step_m > config.maximum_amplitude_m_per_step + 1e-8:
+                violations.append("per_step_xyz_repair_exceeds_bound")
+            if integrated_m > config.maximum_integrated_detour_m + 1e-8:
+                violations.append("integrated_xyz_repair_exceeds_bound")
+            if slew_m > config.maximum_action_correction_slew_m + 1e-8:
+                violations.append("xyz_repair_is_not_smooth")
+            if not active_steps:
+                violations.append("no_brake_or_steer_correction_in_window")
+            elif len(active_steps) < 2:
+                violations.append("repair_window_must_modify_multiple_consecutive_actions")
+            only_xyz_changed = bool(np.array_equal(repaired[:, 3:], actions[:, 3:]))
+            if not only_xyz_changed:
+                violations.append("rotation_or_gripper_actions_changed")
+            window = {"start_step": start, "window_anchor_step": anchor, "end_step": end}
+            direction = {
+                "name": name,
+                "candidate_family": "brake_and_steer",
+                "away_world": away.tolist(),
+                "steering_direction_world": steering_direction.tolist(),
+                "basis_source": "validated nearest Geom away/lateral directions and MuJoCo world_up",
+            }
+            diagnostics = {
+                "valid": not violations,
+                "reason": violations[0] if violations else None,
+                "constraint_violations": violations,
+                "candidate_family": "brake_and_steer",
+                "steering_mode": name,
+                "steering_amplitude_m_per_control_step": float(steering_amplitude),
+                "amplitude_m_per_control_step": maximum_step_m,
+                "control_gain_m_per_env_action": gain.tolist(),
+                "control_input_midpoint": input_mid.tolist(),
+                "control_output_midpoint_m": output_mid.tolist(),
+                "original_xyz_displacement_world_m": original_world_delta.tolist(),
+                "original_approaching_projection_m": approaching_projection.tolist(),
+                "braking_xyz_bias_by_step_m": braking_bias.tolist(),
+                "steering_xyz_bias_by_step_m": steering_bias.tolist(),
+                "physical_xyz_bias_by_step_m": physical_bias.tolist(),
+                "candidate_xyz_actions": repaired[:, :3].tolist(),
+                "max_xyz_correction_m_per_step": maximum_step_m,
+                "integrated_detour_m": integrated_m,
+                "max_correction_slew_m": slew_m,
+                "only_xyz_changed": only_xyz_changed,
+                "active_action_steps": active_steps,
+                "window": window,
+                "envelope": envelope.tolist(),
+                "window_semantics": "smooth geometry-probe window center; it is not a collision or violation step",
+                "controller_input_clipping_applied": False,
+            }
+            spec = {
+                "candidate_id": candidate_id,
+                "direction": direction,
+                "amplitude_m_per_control_step": maximum_step_m,
+                "window": window,
+                "action_diagnostics": diagnostics,
+                "input_bounds_check": bounds,
+            }
+            if violations:
+                rejected.append({**spec, "reason": violations[0]})
+            else:
+                specs.append({**spec, "actions": repaired})
     return specs, rejected
 
 

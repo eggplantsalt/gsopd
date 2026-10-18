@@ -361,15 +361,22 @@ class EarlyRepairSearchTests(unittest.TestCase):
                 subject_object_id=SUBJECT_ID, obstacle_object_id=OBSTACLE_ID,
             )
         self.last_generator_config = generate_mock.call_args.args[3]
+        self.last_generator_kwargs = generate_mock.call_args.kwargs
         self.last_assessment_config = assess_mock.call_args.args[6]
         return report
 
     def test_generic_search_reuses_shared_amplitude_and_probe_configuration(self):
         from research.gs_opd.smoke import early_repair_s70_smoke as probe
 
-        self._run_search(accepted_count=2)
+        report = self._run_search(accepted_count=2)
         self.assertIs(self.last_generator_config, probe.PROBE_CONFIG)
         self.assertIs(self.last_assessment_config, probe.PROBE_CONFIG)
+        self.assertTrue(self.last_generator_kwargs["include_brake_and_steer"])
+        self.assertTrue(report["brake_and_steer_enabled"])
+        self.assertEqual(report["candidate_generation_counts"], {
+            "xyz_bias": {"generated": 2, "rejected": 0},
+            "brake_and_steer": {"generated": 0, "rejected": 0},
+        })
         self.assertEqual(probe.AMPLITUDES_M, (0.008, 0.016, 0.024, 0.032))
         self.assertEqual(probe.PROBE_CONFIG.maximum_amplitude_m_per_step, 0.032)
 
