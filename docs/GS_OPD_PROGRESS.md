@@ -1738,6 +1738,20 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - [x] 碰撞名称与 Geom ID 顺序严格对应；Bridge 继续复算碰撞集合并 fail-closed。
 - [ ] 在真实 Student Step 55 状态重新运行物理验收，确认候选跟踪结果。
 
+## 轨迹束控制预算改为候选级准入（2026-10-19）
+
+- 检查真实记录 `logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance_v3.json`：Step 50 报告 18/18 条几何初筛通过，但 `branch_candidate_count=0`；整批在 `trajectory_requires_498_steps_exceeding_limit_480` 处中止，尚未进入物理分支。
+- `plan_bundle_reference_paths()` 现在先为每条完整离散曲线独立计算弧长和所需控制步数。超过 480 步的候选记录具体长度、步数和 `trajectory_requires_N_steps_exceeding_limit_480` 原因；其余候选按方向分组轮询，确定性使用最多 7,200 步整束预算，超过剩余预算的候选单独记录 `trajectory_requires_N_steps_exceeding_remaining_bundle_budget_R`。不截断路径、不提高 20 Hz/0.04 m/s，也不扩大配置上限。
+- 仅预算合格候选会发送给 Bridge。客户端将每条分支结果与几何拒绝、单候选预算拒绝及整束预算拒绝按原 Candidate ID 合并，并保留原始顺序；预算拒绝记录固定为不可执行、未进行物理跟踪、无训练标签。控制预算通过不代表物理安全。若没有候选准入 Bridge，则明确记录未发送分支请求，不伪称完成 Snapshot 恢复检查。
+- 回归测试复现 18 条候选中前三条各 424 步、其后为 498 步及更长的输入：424 步候选进入 Bridge 请求，超 480 步候选独立拒绝，18 条均可追溯；另验证 18 条 424 步候选时整束准入不超 7,200 步，且左/右/上方向轮询保留多样性。
+- 相关单测、语法、Ruff 和 `git diff --check` 已通过；没有启动真实 Student 或 MuJoCo。v3 的物理分支验收仍需人工重跑，不能以预算准入测试代替物理跟踪结果。
+
+**检查清单（Checklist）**
+
+- [x] 18 条候选的预算判定与结果记录相互独立；Bridge 只接收合格项。
+- [x] 整束步数受原 7,200 默认上限约束，方向采用确定性轮询。
+- [ ] 重跑真实 Step 50 Student 物理验收，核对进入分支的候选及 Snapshot 恢复结果。
+
 ### 在 Near–Far 命中的当前决策状态调用
 
 物理验收必须从 **Student 已经真实抓住搬运物体** 的活环境决策状态开始，且调用过程中 Student 尚未执行下一动作。不要从 Bridge 冷启动后的未抓持 L0T0 初始状态运行，也不要用历史 Snapshot、RGB 或动作替代当前状态。最短入口是在持久运行的 Student/On-Policy 进程中，确认当前真实抓持后用同一 Bridge connection 依次读取 Snapshot、活动控制器/几何清单和 `repair_context`，并从这个 Snapshot 生成 `planning_geometry`、绑定和 Bundle，再调用下面接口：

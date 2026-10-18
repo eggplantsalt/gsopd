@@ -215,7 +215,9 @@ def resample_polyline_by_distance(
     total_length = float(cumulative[-1])
     if not math.isfinite(total_length) or total_length <= 1e-9:
         raise ValueError("trajectory has no finite nonzero path length")
-    requested_steps = int(math.ceil(total_length / (speed_m_s * control_timestep_s)))
+    requested_steps = _required_reference_steps(
+        total_length, speed_m_s, control_timestep_s
+    )
     if requested_steps > maximum_steps:
         raise ValueError(
             f"trajectory_requires_{requested_steps}_steps_exceeding_limit_{maximum_steps}"
@@ -238,6 +240,17 @@ def resample_polyline_by_distance(
     }
 
 
+def _required_reference_steps(
+    path_length_m: float, speed_m_s: float, control_timestep_s: float
+) -> int:
+    """Compute ceil(path / max displacement), neutralizing float-edge noise."""
+    ratio = path_length_m / (speed_m_s * control_timestep_s)
+    nearest_integer = round(ratio)
+    if math.isclose(ratio, nearest_integer, rel_tol=1e-12, abs_tol=1e-12):
+        return max(1, int(nearest_integer))
+    return max(1, int(math.ceil(ratio)))
+
+
 def plan_bundle_reference_paths(
     paths_world_m: list[Any],
     *,
@@ -245,8 +258,16 @@ def plan_bundle_reference_paths(
     control_timestep_s: float,
     maximum_steps_per_candidate: int,
     maximum_total_steps: int,
+    directions: list[Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Preflight path durations and enforce per-candidate and bundle budgets."""
+    """Plan paths independently and admit them fairly under the shared budget.
+
+    The returned list stays index-aligned with ``paths_world_m``. Over-budget
+    entries retain path length, requested steps, and a rejection reason but do
+    not contain a truncated reference path. Shared budget admission is
+    deterministic round-robin by direction, then accepted plans are returned
+    in their original input order.
+    """
     if not paths_world_m:
         raise ValueError("trajectory bundle contains no paths to plan")
     if (
@@ -255,23 +276,115 @@ def plan_bundle_reference_paths(
         or not 1 <= maximum_total_steps <= MAX_TOTAL_CONTROL_STEPS
     ):
         raise ValueError(f"maximum_total_steps must be in 1..{MAX_TOTAL_CONTROL_STEPS}")
-    plans = [
-        resample_polyline_by_distance(
-            path,
+    if (
+        isinstance(maximum_steps_per_candidate, bool)
+        or not isinstance(maximum_steps_per_candidate, int)
+        or not 1 <= maximum_steps_per_candidate <= MAX_CONTROL_STEPS_PER_CANDIDATE
+    ):
+        raise ValueError(
+            "maximum_steps_per_candidate must be in "
+            f"1..{MAX_CONTROL_STEPS_PER_CANDIDATE}"
+        )
+    if directions is not None and len(directions) != len(paths_world_m):
+        raise ValueError("directions must align with paths_world_m")
+
+    points_by_index: list[np.ndarray] = []
+    plans: list[dict[str, Any]] = []
+    eligible_by_direction: dict[str, list[int]] = {}
+    for index, path in enumerate(paths_world_m):
+        points = np.asarray(path, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) < 2:
+            raise ValueError(f"trajectory {index} must have shape (N>=2, 3)")
+        if not np.isfinite(points).all():
+            raise ValueError(f"trajectory {index} contains non-finite coordinates")
+        if (
+            not math.isfinite(float(speed_m_s))
+            or speed_m_s <= 0
+            or not math.isfinite(float(control_timestep_s))
+            or control_timestep_s <= 0
+        ):
+            raise ValueError("reference speed and control timestep must be positive")
+        path_length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        if not math.isfinite(path_length) or path_length <= 1e-9:
+            raise ValueError(f"trajectory {index} has no finite nonzero path length")
+        requested_steps = _required_reference_steps(
+            path_length, speed_m_s, control_timestep_s
+        )
+        record: dict[str, Any] = {
+            "candidate_index": index,
+            "status": "pending",
+            "budget_status": "pending",
+            "path_length_m": path_length,
+            "requested_steps": requested_steps,
+            "maximum_steps_per_candidate": maximum_steps_per_candidate,
+            "budget_rejection_reason": None,
+        }
+        points_by_index.append(points)
+        plans.append(record)
+        if requested_steps > maximum_steps_per_candidate:
+            record.update(
+                {
+                    "status": "rejected",
+                    "budget_status": "rejected",
+                    "budget_rejection_reason": (
+                        f"trajectory_requires_{requested_steps}_steps_"
+                        f"exceeding_limit_{maximum_steps_per_candidate}"
+                    ),
+                }
+            )
+            continue
+        direction = directions[index] if directions is not None else None
+        group = direction if isinstance(direction, str) and direction else "unspecified"
+        eligible_by_direction.setdefault(group, []).append(index)
+
+    remaining_steps = maximum_total_steps
+    accepted_indices: set[int] = set()
+    cursors = dict.fromkeys(eligible_by_direction, 0)
+    while True:
+        made_progress = False
+        for group, indices in eligible_by_direction.items():
+            cursor = cursors[group]
+            if cursor >= len(indices):
+                continue
+            index = indices[cursor]
+            cursors[group] = cursor + 1
+            record = plans[index]
+            required_steps = record["requested_steps"]
+            if required_steps <= remaining_steps:
+                accepted_indices.add(index)
+                remaining_steps -= required_steps
+                record.update({"status": "accepted", "budget_status": "accepted"})
+            else:
+                record.update(
+                    {
+                        "status": "rejected",
+                        "budget_status": "rejected",
+                        "budget_rejection_reason": (
+                            f"trajectory_requires_{required_steps}_steps_"
+                            "exceeding_remaining_bundle_budget_"
+                            f"{remaining_steps}"
+                        ),
+                    }
+                )
+            made_progress = True
+        if not made_progress:
+            break
+
+    for index in accepted_indices:
+        plan = resample_polyline_by_distance(
+            points_by_index[index],
             speed_m_s=speed_m_s,
             control_timestep_s=control_timestep_s,
             maximum_steps=maximum_steps_per_candidate,
         )
-        for path in paths_world_m
-    ]
-    requested_total = sum(plan["requested_steps"] for plan in plans)
-    if requested_total > maximum_total_steps:
-        raise ValueError(
-            "trajectory_bundle_requires_"
-            f"{requested_total}_control_steps_exceeding_total_budget_"
-            f"{maximum_total_steps}"
-        )
-    return plans, requested_total
+        plans[index].update(plan)
+
+    total_steps = sum(
+        plan["requested_steps"] for plan in plans if plan["budget_status"] == "accepted"
+    )
+    if total_steps > maximum_total_steps:
+        raise AssertionError("candidate-level planner exceeded the bundle budget")
+    return plans, total_steps
 
 
 def inverse_osc_world_delta(
@@ -1346,46 +1459,91 @@ def track_trajectory_bundle(
     candidates = bundle.get("candidates")
     if not isinstance(candidates, list) or not candidates or len(candidates) > 24:
         raise ValueError("trajectory bundle must contain 1 to 24 candidates")
-    geometric_candidates = [
-        candidate
-        for candidate in candidates
-        if isinstance(candidate, dict)
-        and candidate.get("passes_geometric_screen") is True
-    ]
-    if not geometric_candidates:
-        return {
-            "status": "no_geometric_candidates",
-            "snapshot_id": snapshot_id,
-            "candidate_count": len(candidates),
-            "tracked_candidate_count": 0,
-            "candidates": [],
-            "executable_safe_candidate_ids": [],
-        }
+    candidate_ids = []
+    records_by_id: dict[str, dict[str, Any]] = {}
     request_candidates = []
-    for candidate in geometric_candidates:
+    original_candidates_by_id: dict[str, dict[str, Any]] = {}
+    for original_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"trajectory candidate {original_index} must be an object")
         candidate_id = candidate.get("candidate_id")
-        points = np.asarray(candidate.get("points_world_m"), dtype=np.float64)
-        if (
-            not isinstance(candidate_id, str)
-            or not candidate_id
-            or candidate.get("executable") is not False
-            or candidate.get("physical_safety_verified") is not False
-            or points.ndim != 2
-            or points.shape[1] != 3
-            or len(points) < 2
-            or not np.isfinite(points).all()
-            or np.linalg.norm(
-                points[0] - np.asarray(scene["carried"]["center_world_m"])
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError(f"trajectory candidate {original_index} has no valid ID")
+        candidate_ids.append(candidate_id)
+        original_candidates_by_id[candidate_id] = candidate
+        if candidate.get("passes_geometric_screen") is not True:
+            reasons = candidate.get("rejection_reasons")
+            if not isinstance(reasons, list) or not reasons:
+                reasons = ["geometric_screen_not_passed"]
+            records_by_id[candidate_id] = {
+                "candidate_id": candidate_id,
+                "direction": candidate.get("direction"),
+                "path_length_m": candidate.get("length_m"),
+                "requested_steps": None,
+                "budget_status": "not_evaluated_geometry_screen_failed",
+                "status": "rejected",
+                "executable_safe": False,
+                "physical_tracking_performed": False,
+                "physical_safety_verified": False,
+                "training_label_created": False,
+                "rejection_reasons": reasons,
+                "geometric_candidate": candidate,
+            }
+            continue
+        if candidate.get("executable") is not False or candidate.get(
+            "physical_safety_verified"
+        ) is not False:
+            records_by_id[candidate_id] = {
+                "candidate_id": candidate_id,
+                "direction": candidate.get("direction"),
+                "path_length_m": candidate.get("length_m"),
+                "requested_steps": None,
+                "budget_status": "not_evaluated_invalid_candidate_claim",
+                "status": "rejected",
+                "executable_safe": False,
+                "physical_tracking_performed": False,
+                "physical_safety_verified": False,
+                "training_label_created": False,
+                "rejection_reasons": ["geometric_candidate_has_invalid_execution_claim"],
+                "geometric_candidate": candidate,
+            }
+            continue
+        try:
+            points = np.asarray(candidate.get("points_world_m"), dtype=np.float64)
+            goal = np.asarray(candidate.get("goal_world_m"), dtype=np.float64)
+            start = _finite_vector(
+                scene.get("carried", {}).get("center_world_m"),
+                3,
+                "bundle carried sphere center",
             )
-            > config.state_tolerance_m
-            or np.linalg.norm(
-                points[-1] - np.asarray(candidate.get("goal_world_m"), dtype=np.float64)
+            path_valid = (
+                points.ndim == 2
+                and points.shape[1] == 3
+                and len(points) >= 2
+                and np.isfinite(points).all()
+                and goal.shape == (3,)
+                and np.isfinite(goal).all()
+                and np.linalg.norm(points[0] - start) <= config.state_tolerance_m
+                and np.linalg.norm(points[-1] - goal) <= config.state_tolerance_m
             )
-            > config.state_tolerance_m
-        ):
-            raise ValueError(
-                f"geometric candidate {candidate_id!r} has an invalid path endpoint"
-            )
+        except (TypeError, ValueError):
+            path_valid = False
+        if not path_valid:
+            records_by_id[candidate_id] = {
+                "candidate_id": candidate_id,
+                "direction": candidate.get("direction"),
+                "path_length_m": candidate.get("length_m"),
+                "requested_steps": None,
+                "budget_status": "not_evaluated_invalid_path",
+                "status": "rejected",
+                "executable_safe": False,
+                "physical_tracking_performed": False,
+                "physical_safety_verified": False,
+                "training_label_created": False,
+                "rejection_reasons": ["geometric_candidate_has_invalid_path_or_endpoint"],
+                "geometric_candidate": candidate,
+            }
+            continue
         request_candidates.append(
             {
                 "candidate_id": candidate_id,
@@ -1396,17 +1554,99 @@ def track_trajectory_bundle(
             }
         )
 
-    reference_plans, planned_total_steps = plan_bundle_reference_paths(
-        [item["points_world_m"] for item in request_candidates],
-        speed_m_s=config.reference_speed_m_s,
-        control_timestep_s=0.05,
-        maximum_steps_per_candidate=config.max_control_steps_per_candidate,
-        maximum_total_steps=config.max_total_control_steps,
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("trajectory candidate IDs must be unique")
+
+    geometric_screen_pass_count = sum(
+        candidate.get("passes_geometric_screen") is True for candidate in candidates
     )
-    planned_steps_by_id = {
-        candidate["candidate_id"]: plan["requested_steps"]
-        for candidate, plan in zip(request_candidates, reference_plans)
-    }
+    if request_candidates:
+        reference_plans, planned_total_steps = plan_bundle_reference_paths(
+            [item["points_world_m"] for item in request_candidates],
+            speed_m_s=config.reference_speed_m_s,
+            control_timestep_s=0.05,
+            maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+            maximum_total_steps=config.max_total_control_steps,
+            directions=[item["direction"] for item in request_candidates],
+        )
+    else:
+        reference_plans, planned_total_steps = [], 0
+
+    budget_qualified_candidates = []
+    planned_steps_by_id = {}
+    for candidate, plan in zip(request_candidates, reference_plans):
+        candidate_id = candidate["candidate_id"]
+        source = original_candidates_by_id[candidate_id]
+        budget_record = {
+            "candidate_id": candidate_id,
+            "direction": candidate.get("direction"),
+            "path_length_m": plan["path_length_m"],
+            "requested_steps": plan["requested_steps"],
+            "budget_status": plan["budget_status"],
+            "budget_rejection_reason": plan["budget_rejection_reason"],
+            "geometric_candidate": source,
+        }
+        if plan["budget_status"] != "accepted":
+            records_by_id[candidate_id] = {
+                **budget_record,
+                "status": "rejected",
+                "executable_safe": False,
+                "physical_tracking_performed": False,
+                "physical_safety_verified": False,
+                "training_label_created": False,
+                "rejection_reasons": [plan["budget_rejection_reason"]],
+            }
+            continue
+        planned_steps_by_id[candidate_id] = plan["requested_steps"]
+        records_by_id[candidate_id] = {
+            **budget_record,
+            "status": "pending",
+            "executable_safe": False,
+            "physical_tracking_performed": False,
+            "physical_safety_verified": False,
+            "training_label_created": False,
+            "rejection_reasons": [],
+        }
+        budget_qualified_candidates.append({**candidate, **budget_record})
+
+    if not budget_qualified_candidates:
+        no_geometry = geometric_screen_pass_count == 0
+        no_valid_paths = no_geometry is False and not request_candidates
+        return {
+            "status": "no_geometric_candidates"
+            if no_geometry
+            else "no_valid_geometric_paths"
+            if no_valid_paths
+            else "no_budget_qualified_candidates",
+            "snapshot_id": snapshot_id,
+            "candidate_count": len(candidates),
+            "requested_candidate_count": len(candidates),
+            "geometric_screen_pass_count": geometric_screen_pass_count,
+            "budget_qualified_candidate_count": 0,
+            "tracked_candidate_count": 0,
+            "planned_total_control_steps": 0,
+            "maximum_total_control_steps": config.max_total_control_steps,
+            "main_state_restored": None,
+            "snapshot_restore_status": "not_required_no_candidate_sent_to_bridge",
+            "candidates": [records_by_id[item] for item in candidate_ids],
+            "executable_safe_candidate_ids": [],
+            "final_task_success_confirmed": False,
+            "training_label_created": False,
+        }
+
+    physical_request_candidates = [
+        {
+            key: candidate[key]
+            for key in (
+                "candidate_id",
+                "direction",
+                "goal_sphere_center_world_m",
+                "control_points_world_m",
+                "points_world_m",
+            )
+        }
+        for candidate in budget_qualified_candidates
+    ]
 
     connection.send(
         {
@@ -1432,44 +1672,39 @@ def track_trajectory_bundle(
             },
             "repair_context": repair_context,
             "options": asdict(config),
-            "candidates": request_candidates,
+            "candidates": physical_request_candidates,
         }
     )
     response = connection.recv()
-    if not isinstance(response, dict):
-        return {
-            "status": "unknown",
-            "snapshot_id": snapshot_id,
-            "error": "Safety Bridge returned a non-object trajectory tracking response",
-            "main_state_restored": False,
-            "candidates": [],
-            "executable_safe_candidate_ids": [],
-            "planned_total_control_steps": planned_total_steps,
-        }
+    response_is_dict = isinstance(response, dict)
+    if not response_is_dict:
+        response = {}
     results = response.get("candidates")
     if not isinstance(results, list):
         results = []
-    expected_ids = {item["candidate_id"] for item in request_candidates}
+    expected_ids = {item["candidate_id"] for item in physical_request_candidates}
     by_id = {
         item.get("candidate_id"): item
         for item in results
         if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
     }
     restored = response.get("main_state_restored") is True
-    assessed = []
-    for request_candidate in request_candidates:
+    assessed_by_id = dict(records_by_id)
+    for request_candidate in physical_request_candidates:
         candidate_id = request_candidate["candidate_id"]
         branch_candidate = by_id.get(candidate_id)
         if branch_candidate is None:
-            assessed.append(
-                {
-                    "candidate_id": candidate_id,
-                    "status": "rejected",
-                    "executable_safe": False,
-                    "task_success_confirmed": False,
-                    "rejection_reasons": ["bridge_candidate_result_missing"],
-                }
-            )
+            assessed_by_id[candidate_id] = {
+                **records_by_id[candidate_id],
+                "status": "rejected",
+                "executable_safe": False,
+                "physical_tracking_performed": None,
+                "physical_tracking_status": "unknown",
+                "physical_safety_verified": False,
+                "task_success_confirmed": False,
+                "training_label_created": False,
+                "rejection_reasons": ["bridge_candidate_result_missing"],
+            }
             continue
         branch_result = {
             "main_state_restored": restored,
@@ -1503,29 +1738,38 @@ def track_trajectory_bundle(
             assessment["rejection_reasons"].append(
                 "bridge_requested_steps_differ_from_preflight_path_length"
             )
-        assessed.append(
-            {
-                **branch_candidate,
-                **assessment,
-                "candidate_id": candidate_id,
-                "geometric_candidate": next(
-                    item
-                    for item in geometric_candidates
-                    if item["candidate_id"] == candidate_id
-                ),
-            }
-        )
+        assessed_by_id[candidate_id] = {
+            **branch_candidate,
+            **assessment,
+            **records_by_id[candidate_id],
+            "candidate_id": candidate_id,
+            "direction": request_candidate.get("direction"),
+            "status": assessment["status"],
+            "executable_safe": assessment["executable_safe"],
+            "physical_tracking_performed": True,
+            "physical_tracking_status": "complete"
+            if branch_candidate.get("execution_complete") is True
+            else "incomplete",
+            "physical_safety_verified": assessment["executable_safe"] is True,
+            "training_label_created": False,
+            "rejection_reasons": assessment["rejection_reasons"],
+            "geometric_candidate": original_candidates_by_id[candidate_id],
+        }
     if len(by_id) != len(results) or set(by_id) != expected_ids:
         response_errors = ["bridge_candidate_identity_or_count_mismatch"]
     else:
         response_errors = []
+    if not response_is_dict:
+        response_errors.append(
+            "bridge_returned_non_object_trajectory_tracking_response"
+        )
     fingerprints = [
         item.get("start_state_fingerprint")
         for item in results
         if isinstance(item, dict)
     ]
     if (
-        len(fingerprints) != len(request_candidates)
+        len(fingerprints) != len(physical_request_candidates)
         or any(
             not isinstance(value, str)
             or len(value) != 64
@@ -1541,17 +1785,30 @@ def track_trajectory_bundle(
         response_errors.append(str(response["error"]))
     if not restored:
         response_errors.append("main_snapshot_restore_unverified")
+    bridge_total = response.get("planned_total_control_steps", planned_total_steps)
+    if (
+        isinstance(bridge_total, bool)
+        or not isinstance(bridge_total, int)
+        or bridge_total != planned_total_steps
+        or bridge_total > config.max_total_control_steps
+    ):
+        response_errors.append("bridge_total_control_step_budget_mismatch_or_exceeded")
     if response_errors:
-        for candidate in assessed:
+        for candidate_id in expected_ids:
+            candidate = assessed_by_id[candidate_id]
             candidate["executable_safe"] = False
+            candidate["physical_safety_verified"] = False
             candidate["status"] = "rejected"
             candidate.setdefault("rejection_reasons", []).extend(response_errors)
+    assessed = [assessed_by_id[candidate_id] for candidate_id in candidate_ids]
     eligible_ids = [
         item["candidate_id"] for item in assessed if item.get("executable_safe")
     ]
     status = (
         "complete"
-        if restored and not response_errors and len(results) == len(request_candidates)
+        if restored
+        and not response_errors
+        and len(results) == len(physical_request_candidates)
         else "unknown"
     )
     return {
@@ -1560,13 +1817,23 @@ def track_trajectory_bundle(
         "trajectory_state_id": scene["state_id"],
         "carried_object_id": object_id,
         "allowed_grasp_rule_id": allow_rule_id,
-        "requested_candidate_count": len(request_candidates),
-        "planned_total_control_steps": response.get(
-            "planned_total_control_steps", planned_total_steps
+        "candidate_count": len(candidates),
+        "requested_candidate_count": len(candidates),
+        "geometric_screen_pass_count": geometric_screen_pass_count,
+        "budget_qualified_candidate_count": len(physical_request_candidates),
+        "budget_rejected_candidate_count": sum(
+            item.get("budget_status") == "rejected" for item in assessed
         ),
+        "preflight_rejected_candidate_count": sum(
+            item.get("budget_status", "").startswith("not_evaluated")
+            for item in assessed
+        ),
+        "planned_total_control_steps": bridge_total,
+        "preflight_total_control_steps": planned_total_steps,
         "maximum_total_control_steps": config.max_total_control_steps,
         "tracked_candidate_count": len(results),
         "main_state_restored": restored,
+        "snapshot_restore_status": "verified" if restored else "unverified",
         "response_errors": response_errors,
         "candidates": assessed,
         "executable_safe_candidate_ids": eligible_ids if restored else [],

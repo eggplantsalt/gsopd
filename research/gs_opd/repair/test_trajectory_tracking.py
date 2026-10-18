@@ -916,25 +916,180 @@ class TrajectoryTrackingTests(unittest.TestCase):
 
     def test_true_per_candidate_and_bundle_over_budget_paths_are_rejected(self):
         config = TrackingConfig()
-        with self.assertRaisesRegex(ValueError, "exceeding_limit_480"):
-            plan_bundle_reference_paths(
-                [[[0.0, 0.0, 0.0], [0.962, 0.0, 0.0]]],
-                speed_m_s=config.reference_speed_m_s,
-                control_timestep_s=0.05,
-                maximum_steps_per_candidate=config.max_control_steps_per_candidate,
-                maximum_total_steps=config.max_total_control_steps,
+        plans, total = plan_bundle_reference_paths(
+            [[[0.0, 0.0, 0.0], [0.962, 0.0, 0.0]]],
+            speed_m_s=config.reference_speed_m_s,
+            control_timestep_s=0.05,
+            maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+            maximum_total_steps=config.max_total_control_steps,
+        )
+        self.assertEqual(plans[0]["requested_steps"], 481)
+        self.assertEqual(plans[0]["budget_status"], "rejected")
+        self.assertEqual(
+            plans[0]["budget_rejection_reason"],
+            "trajectory_requires_481_steps_exceeding_limit_480",
+        )
+        self.assertEqual(total, 0)
+
+        plans, total = plan_bundle_reference_paths(
+            [
+                [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
+                [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
+            ],
+            speed_m_s=config.reference_speed_m_s,
+            control_timestep_s=0.05,
+            maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+            maximum_total_steps=300,
+        )
+        self.assertEqual([item["budget_status"] for item in plans], ["accepted", "rejected"])
+        self.assertEqual(plans[1]["requested_steps"], 155)
+        self.assertEqual(
+            plans[1]["budget_rejection_reason"],
+            "trajectory_requires_155_steps_exceeding_remaining_bundle_budget_145",
+        )
+        self.assertEqual(total, 155)
+        self.assertLessEqual(total, 300)
+
+    def test_bundle_budget_selection_round_robins_directions_deterministically(self):
+        config = TrackingConfig()
+        directions = ["left"] * 6 + ["right"] * 6 + ["above"] * 6
+        paths = [
+            [[0.0, 0.0, 0.0], [0.848, 0.0, 0.0]]
+            for _ in directions
+        ]
+        plans, total = plan_bundle_reference_paths(
+            paths,
+            speed_m_s=config.reference_speed_m_s,
+            control_timestep_s=0.05,
+            maximum_steps_per_candidate=config.max_control_steps_per_candidate,
+            maximum_total_steps=config.max_total_control_steps,
+            directions=directions,
+        )
+        admitted = [
+            direction
+            for direction, plan in zip(directions, plans)
+            if plan["budget_status"] == "accepted"
+        ]
+        self.assertEqual(total, 16 * 424)
+        self.assertLessEqual(total, config.max_total_control_steps)
+        self.assertEqual(
+            {direction: admitted.count(direction) for direction in set(directions)},
+            {"left": 6, "right": 5, "above": 5},
+        )
+
+    def test_v3_candidate_budget_rejection_is_independent_and_traceable(self):
+        fixtures = _fixtures(18)
+        bundle = fixtures[0]
+        directions = ("left", "right", "above")
+        step_counts = [424, 424, 424, *range(498, 513)]
+        bundle["candidates"] = []
+        for index, steps in enumerate(step_counts):
+            length = steps * 0.04 * 0.05
+            candidate_id = f"v3-{index:02d}"
+            bundle["candidates"].append(
+                {
+                    "candidate_id": candidate_id,
+                    "direction": directions[index % len(directions)],
+                    "passes_geometric_screen": True,
+                    "executable": False,
+                    "physical_safety_verified": False,
+                    "goal_world_m": [length, 0.0, 0.0],
+                    "points_world_m": [[0.0, 0.0, 0.0], [length, 0.0, 0.0]],
+                    "length_m": length,
+                }
             )
-        with self.assertRaisesRegex(ValueError, "exceeding_total_budget_300"):
-            plan_bundle_reference_paths(
-                [
-                    [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
-                    [[0.0, 0.0, 0.0], [0.31, 0.0, 0.0]],
-                ],
-                speed_m_s=config.reference_speed_m_s,
-                control_timestep_s=0.05,
-                maximum_steps_per_candidate=config.max_control_steps_per_candidate,
-                maximum_total_steps=300,
+        branch_candidates = [_bridge_candidate(f"v3-{index:02d}") for index in range(3)]
+        connection = FakeConnection(branch_candidates)
+        result = track_trajectory_bundle(connection, "snapshot-1", *fixtures)
+
+        submitted = connection.request["candidates"]
+        self.assertEqual(
+            [item["candidate_id"] for item in submitted],
+            ["v3-00", "v3-01", "v3-02"],
+        )
+        self.assertEqual({item["direction"] for item in submitted}, set(directions))
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["main_state_restored"])
+        self.assertEqual(result["requested_candidate_count"], 18)
+        self.assertEqual(result["budget_qualified_candidate_count"], 3)
+        self.assertEqual(result["budget_rejected_candidate_count"], 15)
+        self.assertEqual(result["preflight_total_control_steps"], 3 * 424)
+        self.assertLessEqual(
+            result["preflight_total_control_steps"],
+            result["maximum_total_control_steps"],
+        )
+        self.assertEqual(
+            [item["candidate_id"] for item in result["candidates"]],
+            [f"v3-{index:02d}" for index in range(18)],
+        )
+        for item in result["candidates"][:3]:
+            self.assertEqual(item["requested_steps"], 424)
+            self.assertEqual(item["budget_status"], "accepted")
+        for index, item in enumerate(result["candidates"][3:], start=3):
+            requested_steps = step_counts[index]
+            self.assertEqual(item["requested_steps"], requested_steps)
+            self.assertEqual(item["budget_status"], "rejected")
+            self.assertEqual(
+                item["budget_rejection_reason"],
+                f"trajectory_requires_{requested_steps}_steps_exceeding_limit_480",
             )
+            self.assertFalse(item["executable_safe"])
+            self.assertFalse(item["physical_safety_verified"])
+            self.assertFalse(item["training_label_created"])
+
+    def test_total_budget_caps_bridge_request_without_losing_direction_groups(self):
+        fixtures = _fixtures(18)
+        bundle = fixtures[0]
+        directions = ("left", "right", "above")
+        bundle["candidates"] = []
+        for index in range(18):
+            length = 424 * 0.04 * 0.05
+            bundle["candidates"].append(
+                {
+                    "candidate_id": f"total-{index:02d}",
+                    "direction": directions[index // 6],
+                    "passes_geometric_screen": True,
+                    "executable": False,
+                    "physical_safety_verified": False,
+                    "goal_world_m": [length, 0.0, 0.0],
+                    "points_world_m": [[0.0, 0.0, 0.0], [length, 0.0, 0.0]],
+                }
+            )
+        connection = FakeConnection(
+            [
+                _bridge_candidate(f"total-{index:02d}")
+                for index in (*range(6), *range(6, 11), *range(12, 17))
+            ]
+        )
+        result = track_trajectory_bundle(connection, "snapshot-1", *fixtures)
+
+        self.assertEqual(len(connection.request["candidates"]), 16)
+        self.assertEqual(
+            {item["direction"] for item in connection.request["candidates"]},
+            set(directions),
+        )
+        self.assertEqual(result["preflight_total_control_steps"], 16 * 424)
+        self.assertLessEqual(
+            result["preflight_total_control_steps"],
+            result["maximum_total_control_steps"],
+        )
+        self.assertEqual(result["candidate_count"], 18)
+        self.assertEqual(len(result["candidates"]), 18)
+        self.assertEqual(
+            [item["candidate_id"] for item in result["candidates"]],
+            [f"total-{index:02d}" for index in range(18)],
+        )
+        rejected = [
+            item for item in result["candidates"] if item["budget_status"] == "rejected"
+        ]
+        self.assertEqual(len(rejected), 2)
+        self.assertTrue(
+            all(
+                item["budget_rejection_reason"]
+                == "trajectory_requires_424_steps_exceeding_remaining_bundle_budget_416"
+                for item in rejected
+            )
+        )
 
     def test_reference_speed_cannot_be_increased_to_bypass_duration_budget(self):
         with self.assertRaisesRegex(ValueError, "cannot exceed 0.04 m/s"):
