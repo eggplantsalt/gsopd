@@ -35,7 +35,15 @@ def _controller_context():
     }
 
 
-def _candidate(identifier: str, object_end_x: float, eef_end_x: float, steps=5):
+def _candidate(
+    identifier: str,
+    object_end_x: float,
+    eef_end_x: float,
+    steps=5,
+    *,
+    object_end_y: float = 0.0,
+    eef_end_y: float = 0.0,
+):
     start = {
         "robot_states": [{"eef_pos": [0.0, 0.0, 0.0], "joint_qpos": [0.0, 0.0]}],
         "object_states": {
@@ -50,9 +58,13 @@ def _candidate(identifier: str, object_end_x: float, eef_end_x: float, steps=5):
             "reward": 0.0,
             "done": False,
             "state": {
-                "robot_states": [{"eef_pos": [eef_end_x * fraction, 0.0, 0.0], "joint_qpos": [0.0, 0.0]}],
+                "robot_states": [{"eef_pos": [eef_end_x * fraction, eef_end_y * fraction, 0.0], "joint_qpos": [0.0, 0.0]}],
                 "object_states": {
-                    "bowl": {"body_id": 23, "root_pos": [object_end_x * fraction, 0.0, 0.0], "joint_qpos": []}
+                    "bowl": {
+                        "body_id": 23,
+                        "root_pos": [object_end_x * fraction, object_end_y * fraction, 0.0],
+                        "joint_qpos": [],
+                    }
                 },
             },
         })
@@ -64,6 +76,36 @@ def _candidate(identifier: str, object_end_x: float, eef_end_x: float, steps=5):
         "start_state": start,
         "steps": records,
     }
+
+
+def _assess_safe_candidate(baseline, candidate):
+    context = _controller_context()
+    actions = np.zeros((5, 7), dtype=np.float64)
+    specs, _ = smoke.generate_clearance_candidates(
+        actions,
+        [{"name": "test_detour", "direction_world": [0, 1, 0]}],
+        context,
+        max_candidates=1,
+    )
+    spec = {**specs[0], "original_actions": actions}
+    baseline = _complete_monitor(baseline)
+    candidate = _complete_monitor(candidate)
+    endpoint = {
+        "status": "complete",
+        "main_state_restored": True,
+        "endpoint_distance": {"minimum_distance_m": 0.02, "distance_available": True},
+    }
+    return smoke.assess_candidate(
+        spec,
+        candidate,
+        {"verdict": "safe", "object_contact_checks": []},
+        baseline,
+        context,
+        {"body_id": 23, "object_id": "object_1", "status": "matched_by_iou"},
+        smoke.PROBE_CONFIG,
+        0.01,
+        endpoint,
+    )
 
 
 def _complete_monitor(candidate):
@@ -231,6 +273,95 @@ class EarlyRepairProgressTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["task_object_progress"]["status"], "fail")
+
+    def test_safe_detour_off_a0_direction_passes_with_preserved_grasp(self):
+        baseline = _candidate("baseline", 0.02, 0.02)
+        # Only 10% of A0's +X object displacement is retained, while the
+        # object and EEF move together around the obstacle in +Y.
+        candidate = _candidate(
+            "lateral_detour", 0.002, 0.002, object_end_y=0.012, eef_end_y=0.012
+        )
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertTrue(report["accepted_for_probe"], report["rejection_reasons"])
+        task = report["task_progress"]
+        self.assertEqual(task["status"], "pass")
+        self.assertEqual(task["grasp_evidence"]["status"], "reliable_heuristic")
+        self.assertLess(
+            task["original_a0_direction_70_percent_diagnostic"]["task_object_root_pos_projection"][
+                "candidate_translation_progress_fraction"
+            ],
+            0.70,
+        )
+        self.assertFalse(task["original_a0_direction_70_percent_diagnostic"]["used_as_hard_gate"])
+        self.assertFalse(task["high_quality_training_label_created"])
+        self.assertFalse(report["training_label_valid"])
+
+    def test_lost_task_object_fails_relative_grasp_check(self):
+        baseline = _candidate("baseline", 0.02, 0.02)
+        candidate = _candidate("object_lost", 0.002, 0.002)
+        for index, step in enumerate(candidate["steps"]):
+            fraction = (index + 1) / smoke.CHUNK_LENGTH
+            step["state"]["object_states"]["bowl"]["root_pos"] = [
+                0.002 * fraction,
+                0.2 * fraction,
+                0.0,
+            ]
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "fail")
+        self.assertEqual(
+            report["task_progress"]["reason"],
+            "candidate_task_object_eef_relative_position_changed_abnormally",
+        )
+        self.assertIn(
+            "candidate_task_object_eef_relative_position_changed_abnormally",
+            report["rejection_reasons"],
+        )
+
+    def test_missing_task_object_state_fails_closed(self):
+        baseline = _candidate("baseline", 0.02, 0.02)
+        candidate = _candidate("missing_object_state", 0.01, 0.01)
+        candidate["steps"][2]["state"]["object_states"] = {}
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "unavailable")
+        self.assertEqual(
+            report["task_progress"]["reason"],
+            "candidate_bound_task_object_state_3_missing_or_ambiguous",
+        )
+        self.assertIn(
+            "candidate_bound_task_object_state_3_missing_or_ambiguous",
+            report["rejection_reasons"],
+        )
+
+    def test_existing_positive_task_reward_must_be_preserved(self):
+        baseline = _candidate("baseline", 0.02, 0.02)
+        candidate = _candidate("candidate", 0.01, 0.01)
+        baseline["steps"][0]["reward"] = 1.0
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "fail")
+        self.assertEqual(
+            report["task_progress"]["reason"],
+            "candidate_did_not_preserve_existing_positive_task_reward",
+        )
+
+    def test_early_termination_without_positive_reward_fails(self):
+        baseline = _candidate("baseline", 0.02, 0.02)
+        candidate = _candidate("candidate", 0.01, 0.01)
+        candidate["steps"][2]["done"] = True
+        report = _assess_safe_candidate(baseline, candidate)
+
+        self.assertFalse(report["accepted_for_probe"])
+        self.assertEqual(report["task_progress"]["status"], "fail")
+        self.assertEqual(
+            report["task_progress"]["reason"],
+            "candidate_terminated_without_positive_success_reward",
+        )
 
     def test_clearance_counts_are_separate_from_safe_progress_candidates(self):
         candidates = [

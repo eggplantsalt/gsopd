@@ -1319,3 +1319,19 @@ PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
 - [x] Joint qpos 变化仅作为 JSON 诊断字段，不参与 `_task_object_progress()` 的通过判定。
 - [x] Verifier-Guided Repair、通用 Early Repair 和旧 S70 Smoke 相关单测通过。
 - [ ] 人工复核 S40 实验的任务进度报告，确认平移及 qpos 诊断字段符合预期。
+
+## Early Repair 任务可行性：绕行与抓持保持
+
+- 仅调整 `research/gs_opd/smoke/early_repair_s70_smoke.py::assess_candidate()` 使用的 Early Repair 专用判定；共享 `verifier_guided_repair.py::evaluate_task_progress()` 和 Violation Repair 均未修改。
+- 原 A⁰ 方向的 70% `root_pos` 平移投影仍写入 `task_progress.original_a0_direction_70_percent_diagnostic`，并明确标记 `used_as_hard_gate=false`。候选可偏离 A⁰ 原方向，不再仅因此被否决。
+- 新判定要求 A⁰ 与候选完整执行五步，起始及五个后置状态都含有效绑定任务物体 `root_pos` 和 EEF 位置；同时检查 `done`、奖励缺失/非有限值及对既有正奖励的逐前缀保持。没有正向奖励的终止会拒绝候选。
+- 抓持保持使用 A⁰ 五步中物体与 EEF 的相对距离稳定性及共同运动作为启发式证据；最大相对距离偏差容许值为 0.05 m。基线抓持证据不足时返回 `unavailable`，候选物体相对 EEF 明显偏离时返回失败。该运动学启发式不能证明真实接触抓持；报告保留其局限，且 `training_label_valid` 与 `high_quality_training_label_created` 均保持 false。
+- Contact Compiler、完整接触监测、动作/工作空间约束、Snapshot 恢复、间隙改善门槛及最大 gap 候选选择未改变。轻量测试覆盖偏离 A⁰ 方向但保持相对距离的安全绕行、物体丢失、任务物体状态缺失、正奖励丢失和无成功奖励的提前终止。
+- Early Repair、通用 Early Repair 与 Student Lookahead 相关测试共 35 项通过；Python 语法检查和 `git diff --check` 通过。未启动模型或仿真，因此尚未用真实 S40 候选验证新的可行性门槛。
+
+**检查清单（Checklist）**
+
+- [x] 70% A⁰ 方向平移投影仅作为诊断记录，不再单独否决 Early Repair 候选。
+- [x] 五步物体/EEF 状态、任务物体绑定、终止/奖励和相对距离抓持证据 fail-closed；不自动生成任务训练标签。
+- [x] 未改共享 Verifier-Guided Repair、Contact Compiler、安全约束、Snapshot、gap 改善或最大 gap 选择逻辑。
+- [ ] 人工重跑 S40 Early Repair Smoke，检查通过的候选是否仍满足接触安全、间隙改善及抓持保持诊断；未运行前不宣称真实场景已有合格候选。

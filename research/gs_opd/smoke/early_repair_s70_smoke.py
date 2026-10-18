@@ -60,6 +60,10 @@ AMPLITUDES_M = (0.008, 0.016, 0.024, 0.032)
 WINDOWS = ((1, 3), (2, 2))  # geometry-centered smoothing envelopes; not collision times
 GAP_THRESHOLDS_M = (0.005, 0.010, 0.020)
 MIN_GAP_IMPROVEMENT_M = 1e-6
+# This is a conservative heuristic for preserving an already demonstrated
+# grasp across a short detour. It is evidence for task continuity, not a
+# gripper-contact or task-success proof.
+MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M = 0.05
 OBJECT_ID = "object_1"
 OBSTACLE_ID = "object_4"
 
@@ -384,6 +388,218 @@ def evaluate_same_horizon_progress(
     return result
 
 
+def _task_object_eef_path(
+    candidate: dict[str, Any], body_id: int
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, str]:
+    """Read the bound object's and EEF's start plus five post-action states."""
+    if not _complete_five_steps(candidate):
+        return None, "candidate_did_not_complete_five_steps"
+    start = candidate.get("start_state")
+    steps = candidate.get("steps")
+    checkpoints = [start, *[step.get("state") if isinstance(step, dict) else None for step in steps]]
+    eef_positions: list[np.ndarray] = []
+    object_positions: list[np.ndarray] = []
+    for index, state in enumerate(checkpoints):
+        if not isinstance(state, dict):
+            return None, f"state_{index}_missing"
+        robot_states = state.get("robot_states")
+        object_states = state.get("object_states")
+        if not isinstance(robot_states, list) or not robot_states or not isinstance(robot_states[0], dict):
+            return None, f"eef_state_{index}_missing"
+        if not isinstance(object_states, dict):
+            return None, f"object_states_{index}_missing"
+        matching_objects = [
+            item
+            for item in object_states.values()
+            if isinstance(item, dict)
+            and isinstance(item.get("body_id"), (int, np.integer))
+            and not isinstance(item.get("body_id"), (bool, np.bool_))
+            and int(item["body_id"]) == body_id
+        ]
+        if len(matching_objects) != 1:
+            return None, f"bound_task_object_state_{index}_missing_or_ambiguous"
+        try:
+            eef = np.asarray(robot_states[0]["eef_pos"], dtype=np.float64)
+            obj = np.asarray(matching_objects[0]["root_pos"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError):
+            return None, f"eef_or_task_object_position_{index}_missing_or_invalid"
+        if eef.shape != (3,) or obj.shape != (3,) or not np.isfinite(eef).all() or not np.isfinite(obj).all():
+            return None, f"eef_or_task_object_position_{index}_missing_or_invalid"
+        eef_positions.append(eef)
+        object_positions.append(obj)
+    return np.stack(eef_positions), np.stack(object_positions)
+
+
+def _candidate_reward_and_done(candidate: dict[str, Any]) -> tuple[list[float], list[bool]] | tuple[None, str]:
+    rewards: list[float] = []
+    dones: list[bool] = []
+    for index, step in enumerate(candidate["steps"]):
+        if not isinstance(step, dict):
+            return None, f"step_{index}_record_missing"
+        try:
+            reward = float(step["reward"])
+        except (KeyError, TypeError, ValueError):
+            return None, f"step_{index}_reward_missing_or_invalid"
+        done = step.get("done")
+        if not np.isfinite(reward) or not isinstance(done, (bool, np.bool_)):
+            return None, f"step_{index}_reward_or_done_invalid"
+        rewards.append(reward)
+        dones.append(bool(done))
+    return rewards, dones
+
+
+def evaluate_early_repair_task_feasibility(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    task_object_binding: dict[str, Any],
+    config: RepairConfig = PROBE_CONFIG,
+    *,
+    original_direction_diagnostic: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Check same-horizon detour feasibility without requiring A0-direction progress.
+
+    The former 70% root-position projection remains diagnostic only. Passing
+    requires complete states, a bound task object, reward/termination checks,
+    and baseline-supported EEF/object co-motion that remains within a bounded
+    relative-distance change. This is a short-horizon grasp-preservation
+    heuristic, not a success label.
+    """
+    result: dict[str, Any] = {
+        "status": "unavailable",
+        "reason": None,
+        "basis": "same_horizon_grasp_preservation_and_no_reward_loss",
+        "aligned_prefix_steps_compared": CHUNK_LENGTH,
+        "comparison_horizon_steps": CHUNK_LENGTH,
+        "high_quality_training_label_created": False,
+        "original_a0_direction_70_percent_diagnostic": {
+            **(original_direction_diagnostic or {}),
+            "used_as_hard_gate": False,
+        },
+        "grasp_evidence": {
+            "status": "unavailable",
+            "relative_distance_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
+            "limitation": "EEF/object kinematic co-motion is heuristic evidence and does not prove a physical grasp.",
+        },
+    }
+    if not _complete_five_steps(baseline) or not _complete_five_steps(candidate):
+        result["reason"] = "A0_and_candidate_must_both_complete_the_same_five_action_horizon"
+        return result
+    if (
+        not isinstance(task_object_binding, dict)
+        or isinstance(task_object_binding.get("body_id"), (bool, np.bool_))
+        or not isinstance(task_object_binding.get("body_id"), (int, np.integer))
+        or int(task_object_binding["body_id"]) < 0
+        or task_object_binding.get("status") not in (None, "matched_by_iou")
+    ):
+        result["reason"] = "task_object_physical_binding_missing_or_invalid"
+        return result
+    body_id = int(task_object_binding["body_id"])
+    result["task_object_binding"] = {
+        "body_id": body_id,
+        "object_id": task_object_binding.get("object_id"),
+        "validation_status": task_object_binding.get("status"),
+    }
+    baseline_path = _task_object_eef_path(baseline, body_id)
+    candidate_path = _task_object_eef_path(candidate, body_id)
+    if baseline_path[0] is None or candidate_path[0] is None:
+        result["reason"] = (
+            "baseline_" + baseline_path[1]
+            if baseline_path[0] is None
+            else "candidate_" + candidate_path[1]
+        )
+        result["object_and_eef_states_complete"] = False
+        return result
+    result["object_and_eef_states_complete"] = True
+    baseline_eef, baseline_object = baseline_path
+    candidate_eef, candidate_object = candidate_path
+    baseline_relative = np.linalg.norm(baseline_object - baseline_eef, axis=1)
+    candidate_relative = np.linalg.norm(candidate_object - candidate_eef, axis=1)
+    baseline_object_path_m = float(np.linalg.norm(np.diff(baseline_object, axis=0), axis=1).sum())
+    baseline_eef_path_m = float(np.linalg.norm(np.diff(baseline_eef, axis=0), axis=1).sum())
+    baseline_relative_range_m = float(np.max(baseline_relative) - np.min(baseline_relative))
+    relative_error = np.abs(candidate_relative - baseline_relative)
+    max_relative_error_m = float(np.max(relative_error))
+    grasp_reliable = bool(
+        baseline_object_path_m >= config.minimum_object_motion_m
+        and baseline_eef_path_m >= config.minimum_eef_progress_m
+        and baseline_relative_range_m <= MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M
+    )
+    result["grasp_evidence"] = {
+        "status": "reliable_heuristic" if grasp_reliable else "unreliable",
+        "method": "same_horizon_baseline_object_eef_co_motion_and_relative_distance",
+        "baseline_object_path_length_m": baseline_object_path_m,
+        "baseline_eef_path_length_m": baseline_eef_path_m,
+        "baseline_relative_distance_range_m": baseline_relative_range_m,
+        "candidate_max_aligned_relative_distance_error_m": max_relative_error_m,
+        "relative_distance_tolerance_m": MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M,
+        "baseline_motion_thresholds_m": {
+            "task_object": config.minimum_object_motion_m,
+            "eef": config.minimum_eef_progress_m,
+        },
+        "limitation": "This kinematic heuristic cannot distinguish every supported-object configuration from a grasp.",
+    }
+    if not grasp_reliable:
+        result["reason"] = "baseline_grasp_evidence_unreliable"
+        return result
+    if max_relative_error_m > MAX_GRASP_RELATIVE_DISTANCE_CHANGE_M:
+        result["status"] = "fail"
+        result["reason"] = "candidate_task_object_eef_relative_position_changed_abnormally"
+        return result
+
+    baseline_signals = _candidate_reward_and_done(baseline)
+    candidate_signals = _candidate_reward_and_done(candidate)
+    if baseline_signals[0] is None or candidate_signals[0] is None:
+        result["reason"] = (
+            "baseline_" + baseline_signals[1]
+            if baseline_signals[0] is None
+            else "candidate_" + candidate_signals[1]
+        )
+        return result
+    baseline_rewards, _ = baseline_signals
+    candidate_rewards, candidate_dones = candidate_signals
+    baseline_total = float(sum(baseline_rewards))
+    candidate_total = float(sum(candidate_rewards))
+    baseline_prefix = np.cumsum(baseline_rewards)
+    candidate_prefix = np.cumsum(candidate_rewards)
+    reward_loss_steps = [
+        index
+        for index, (base_reward, candidate_reward) in enumerate(zip(baseline_prefix, candidate_prefix))
+        if base_reward > 0.0 and candidate_reward + 1e-9 < base_reward
+    ]
+    baseline_positive_reward_preserved = bool(
+        baseline_total <= 0.0 or candidate_total + 1e-9 >= baseline_total
+    ) and not reward_loss_steps
+    result["reward_preservation"] = {
+        "status": "pass" if baseline_positive_reward_preserved else "fail",
+        "baseline_reward_sum": baseline_total,
+        "candidate_reward_sum": candidate_total,
+        "baseline_positive_reward_exists": any(reward > 0.0 for reward in baseline_rewards),
+        "aligned_prefix_reward_loss_steps": reward_loss_steps,
+        "preserved": baseline_positive_reward_preserved,
+    }
+    first_done = next((index for index, done in enumerate(candidate_dones) if done), None)
+    if first_done is not None:
+        reward_through_done = float(sum(candidate_rewards[: first_done + 1]))
+        result["termination"] = {
+            "first_done_step": first_done,
+            "reward_through_done": reward_through_done,
+            "positive_success_reward_present": reward_through_done > 0.0,
+        }
+        if reward_through_done <= 0.0:
+            result["status"] = "fail"
+            result["reason"] = "candidate_terminated_without_positive_success_reward"
+            return result
+    else:
+        result["termination"] = {"first_done_step": None, "positive_success_reward_present": False}
+    if not baseline_positive_reward_preserved:
+        result["status"] = "fail"
+        result["reason"] = "candidate_did_not_preserve_existing_positive_task_reward"
+        return result
+    result["status"] = "pass"
+    result["reason"] = None
+    return result
+
+
 def _restore_and_compare(connection: Any, snapshot_id: str, snapshot_state: dict[str, Any]) -> dict[str, Any]:
     response = _request(connection, {"op": "restore", "snapshot_id": snapshot_id})
     if response.get("error"):
@@ -645,13 +861,25 @@ def assess_candidate(
                     result["action_constraints"].update({"status": range_result.get("status"), "reason": "candidate_osc_input_bounds_invalid"})
             if result.get("action_constraints", {}).get("status") != "pass":
                 result["rejection_reasons"].append(result.get("action_constraints", {}).get("reason", "action_constraints_not_passed"))
-            result["task_progress"] = evaluate_same_horizon_progress(
+            original_direction_progress = evaluate_same_horizon_progress(
                 baseline_candidate,
                 branch_candidate,
                 np.asarray(spec["original_actions"], dtype=np.float64),
                 controller_context,
                 task_object_binding,
                 config,
+            )
+            legacy_object_progress = original_direction_progress.get("task_object_progress")
+            result["task_progress"] = evaluate_early_repair_task_feasibility(
+                baseline_candidate,
+                branch_candidate,
+                task_object_binding,
+                config,
+                original_direction_diagnostic={
+                    "legacy_evaluator_status": original_direction_progress.get("status"),
+                    "task_object_root_pos_projection": legacy_object_progress,
+                    "required_progress_fraction": config.required_object_progress_fraction,
+                },
             )
             if result["task_progress"].get("status") != "pass":
                 result["rejection_reasons"].append(result["task_progress"].get("reason", "task_progress_not_passed"))
@@ -688,7 +916,7 @@ def assess_candidate(
     result["minimum_required_gap_increase_m"] = MIN_GAP_IMPROVEMENT_M
     result["accepted_for_probe"] = not result["rejection_reasons"]
     if result["accepted_for_probe"]:
-        result["acceptance_reason"] = "complete_contact_monitoring_safe_same_horizon_progress_and_constraints_pass"
+        result["acceptance_reason"] = "complete_contact_monitoring_safe_detour_feasibility_and_constraints_pass"
     return result
 
 
