@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from research.gs_opd.repair.trajectory_bundle import generate_trajectory_bundle
 from research.gs_opd.smoke import trajectory_bundle_scene_smoke as smoke
 from research.gs_opd.smoke.test_pi05_on_policy_safety_collection import (
     _semantic_binding,
@@ -356,7 +357,7 @@ class PlanningGeometryTests(unittest.TestCase):
             ["geometry_inventory", "planning_geometry", "planning_geometry"],
         )
 
-    def test_local_bypass_uses_bddl_body_only_for_forward_direction(self):
+    def test_local_bypass_direction_uses_carried_to_obstacle_vector(self):
         query = self.query()
         scene = smoke._build_local_bypass_scene(query, self.payload)
         start = np.asarray(scene["carried"]["center_world_m"])
@@ -365,7 +366,6 @@ class PlanningGeometryTests(unittest.TestCase):
                 "body_origin_world_m"
             ]
         )
-        forward = (target - start) / np.linalg.norm(target - start)
         construction = scene["goal"]["construction"]
         obstacle = np.asarray(construction["obstacle_center_world_m"])
         endpoint = np.asarray(scene["goal"]["position_world_m"])
@@ -376,6 +376,7 @@ class PlanningGeometryTests(unittest.TestCase):
         self.assertFalse(
             construction["placement_target_direction_reference"]["used_as_final_goal"]
         )
+        forward = (obstacle - start) / np.linalg.norm(obstacle - start)
         np.testing.assert_allclose(construction["forward_world"], forward, atol=1e-12)
         self.assertGreater(float(np.dot(endpoint - obstacle, forward)), 0)
         self.assertGreaterEqual(
@@ -388,8 +389,59 @@ class PlanningGeometryTests(unittest.TestCase):
         self.assertEqual(construction["exit_clearance_m"], 0.02)
         self.assertNotEqual(endpoint.tolist(), target.tolist())
 
-    def test_exit_clearance_is_configurable_and_target_space_is_required(self):
+    def test_real_diagnostic_noncollinear_exit_past_target_projection_is_accepted(self):
         query = self.query()
+        start = np.asarray(query["objects"]["object_1"]["center_world_m"])
+        query["objects"]["object_1"]["radius_m"] = 0.09
+        query["objects"]["object_2"].update(
+            center_world_m=(start + np.asarray([0.262936, 0.210115, 0.0])).tolist(),
+            radius_m=0.110447,
+        )
+        # Mirrors the diagnosed projections: 0.262936 m forward,
+        # 0.210115 m lateral, and 0.230447 m required center separation.
+        query["goal"]["targets"][0]["body_origin_world_m_diagnostic_only"] = [
+            -0.05,
+            0.0,
+            0.5,
+        ]
+        scene = smoke._build_local_bypass_scene(
+            query, self.payload, exit_clearance_m=0.02
+        )
+        construction = scene["goal"]["construction"]
+        target = np.asarray(
+            construction["placement_target_direction_reference"]["body_origin_world_m"]
+        )
+        target_direction = (target - start) / np.linalg.norm(target - start)
+        goal = np.asarray(scene["goal"]["position_world_m"])
+        goal_projection = float(np.dot(goal - start, target_direction))
+        target_distance = float(np.linalg.norm(target - start))
+        self.assertAlmostEqual(construction["obstacle_projection_from_start_m"], 0.262936)
+        self.assertAlmostEqual(construction["obstacle_lateral_distance_m"], 0.210115)
+        self.assertAlmostEqual(
+            construction["required_sphere_center_separation_m"], 0.230447
+        )
+        self.assertGreater(goal_projection, target_distance)
+        self.assertEqual(
+            construction["direction_source"],
+            "same_state_carried_sphere_center_to_obstacle_sphere_center",
+        )
+        self.assertFalse(
+            construction["placement_target_direction_reference"]["used_as_final_goal"]
+        )
+        bundle = generate_trajectory_bundle(scene)
+        self.assertEqual(bundle["candidate_count"], 18)
+        self.assertEqual(bundle["screen_pass_count"], 18)
+        self.assertFalse(bundle["physical_safety_verified"])
+
+    def test_exit_clearance_is_configurable_without_target_projection_limit(self):
+        query = self.query()
+        start = np.asarray(query["objects"]["object_1"]["center_world_m"])
+        query["objects"]["object_2"]["center_world_m"] = (start + [0.3, 0, 0]).tolist()
+        query["goal"]["targets"][0]["body_origin_world_m_diagnostic_only"] = [
+            -0.05,
+            0.0,
+            0.5,
+        ]
         scene = smoke._build_local_bypass_scene(
             query, self.payload, exit_clearance_m=0.03
         )
@@ -398,26 +450,31 @@ class PlanningGeometryTests(unittest.TestCase):
         self.assertGreaterEqual(
             construction["endpoint_conservative_sphere_gap_m"], 0.04
         )
+        target = np.asarray(
+            construction["placement_target_direction_reference"]["body_origin_world_m"]
+        )
+        target_direction = (target - start) / np.linalg.norm(target - start)
+        self.assertGreater(
+            float(
+                np.dot(
+                    np.asarray(scene["goal"]["position_world_m"]) - start,
+                    target_direction,
+                )
+            ),
+            float(np.linalg.norm(target - start)),
+        )
 
-        insufficient_space = copy.deepcopy(query)
-        insufficient_space["goal"]["targets"][0][
-            "body_origin_world_m_diagnostic_only"
-        ] = [0.05, 0, 0.45]
-        with self.assertRaisesRegex(
-            smoke._LocalGoalUnavailable,
-            "no_forbidden_obstacle_in_forward_corridor",
-        ):
-            smoke._build_local_bypass_scene(insufficient_space, self.payload)
-
-        wrong_target_direction = copy.deepcopy(query)
-        wrong_target_direction["goal"]["targets"][0][
-            "body_origin_world_m_diagnostic_only"
-        ] = [-0.8, 0, 0.45]
-        with self.assertRaisesRegex(
-            smoke._LocalGoalUnavailable,
-            "no_forbidden_obstacle_in_forward_corridor",
-        ):
-            smoke._build_local_bypass_scene(wrong_target_direction, self.payload)
+    def test_local_bypass_rejects_coincident_start_and_obstacle_centers(self):
+        query = self.query()
+        query["objects"]["object_2"]["center_world_m"] = copy.deepcopy(
+            query["objects"]["object_1"]["center_world_m"]
+        )
+        with self.assertRaises(smoke._LocalGoalUnavailable) as context:
+            smoke._build_local_bypass_scene(query, self.payload)
+        self.assertIn(
+            "carried_and_obstacle_centers_coincident",
+            context.exception.diagnostics[0]["rejection_reasons"],
+        )
 
     def test_local_bypass_reports_degenerate_missing_and_misdirected_geometry(self):
         query = self.query()

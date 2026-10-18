@@ -1625,15 +1625,15 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 
 ### 变更
 
-- `trajectory_bundle_scene_smoke.py` 现在从同一次 `planning_geometry` 响应构造 `local_bypass_goal`。起点 S 是搬运物体完整碰撞包围球中心；障碍 O 来自已校验的 forbid-contact 对象包围球；前进单位方向是 `(当前 BDDL On 目标 Body 世界坐标 - S)` 的归一化结果。
-- 目标 Body 原点仅用来确定方向，并在输出中标记 `used_as_final_goal=false`。局部终点由当前几何计算：`G = O + D × (r_carried + r_obstacle + safety_clearance + exit_clearance + numeric_pad)`。原安全间隙仍为 10 mm；独立出口余量 `exit_clearance_m` 默认 20 mm，可由函数参数或 CLI `--exit-clearance-m` 配置。Smoke 选择沿前进方向最近、位于 S 与目标方向参考之间、且落在搬运球/障碍球合并前向通道内的禁止接触障碍；如果出口空间不足、没有合格障碍、目标方向退化、G 会到达/越过方向参考，或保守球间隙不足，则返回 `goal_unavailable` 并写明原因。
-- `trajectory_bundle.py::_scene_input()` 区分 `placement_goal` 与 `local_bypass_goal`。局部 Goal 必须带当前 `state_id`、完整的目标障碍身份、单位方向、活动 BDDL `On` 关系、目标 Body 仅作方向参考的声明及同一包围球间隙证明；生成器重新核验声明的安全间隙与配置值一致，并核验 G 至少保留“原安全间隙 + 出口余量”，且仍在放置方向参考之前。缺少出口余量或安全间隙声明不匹配会拒绝输入。旧的 placement Goal 输入仍兼容。
+- `trajectory_bundle_scene_smoke.py` 从同一次 `planning_geometry` 响应构造 `local_bypass_goal`。起点 S 是搬运物体完整碰撞包围球中心；障碍 O 来自已校验的 forbid-contact 对象包围球。BDDL `On` 目标保留为任务语义参考，并用于定位任务方向上的候选障碍；局部绕行单位方向改为 `D = (O - S) / |O - S|`。
+- 局部终点按当前几何计算：`G = O + D × (r_carried + r_obstacle + safety_clearance + exit_clearance + numeric_pad)`。原安全间隙仍为 10 mm；独立出口余量 `exit_clearance_m` 默认 20 mm，可由函数参数或 CLI `--exit-clearance-m` 配置。G 必须越过 O 到达相对 S 的另一侧，并保留两球半径、安全间隙和出口余量；盘子位置不再限制 G 是否越过障碍。旧错误条件正是导致真实日志被拦截的原因：障碍物任务方向投影 0.262936 m、横向 0.210115 m，所需中心距 0.230447 m，G 的任务方向投影越过盘子参考点。
+- `trajectory_bundle.py::_scene_input()` 区分 `placement_goal` 与 `local_bypass_goal`。局部 Goal 必须带当前状态下的搬运/障碍球绑定、目标 BDDL `On` 身份与状态、S→O 单位方向及包围球间隙证明；生成器重算并验证 S–O 非退化、方向一致、G 位于障碍另一侧，并保留“原安全间隙 + 出口余量”。不要求局部方向与盘子方向相同，也不要求 G 位于盘子投影之前。旧的 `placement_goal` 输入路径未修改。
 - 局部 G 仅表示“越过障碍后的几何采样终点”，不是最终盘面放置位置，也不表示碰撞安全或动作可执行。原有 18 条左右/右侧/上方 B-Spline 与连续曲线保守间隙初筛未改变；JSON/SVG 均显式写明 `local_bypass_goal`。每条候选和 Bundle 仍为 `physical_safety_verified=false`、`executable=false`。
 - 成功时输出目录包含前后只读查询 `planning_geometry.json` / `planning_geometry_after.json`、含真实查询球体与局部 G 的 `scene.json`、18 条完整候选及拒绝原因的 `trajectory_bundle.json`、三视图 `trajectory_bundle.svg` 和带几何通过数、拒绝统计、状态一致性及非可执行声明的 `scene_smoke_report.json`。
 
 ### 验证与限制
 
-- 轨迹生成器、Scene Smoke、Near–Far 几何 API 和 OSC 控制器相关单测共 **49 项通过**。典型合成绕障场景中 18/18 条候选通过原连续几何初筛；不安全起点和不安全终点场景分别 18/18 条候选被拒绝。测试还覆盖默认/自定义出口余量、目标空间不足、目标方向错误、最低间隙与来源、目标缺失/退化/逆向障碍/通道外障碍、非法局部 Goal、全部候选拒绝以及查询前后状态不一致阻止写入 Bundle。
+- 轨迹生成器、Scene Smoke、Near–Far 几何 API 和 OSC 控制器相关单测共 **54 项通过**。本次日志数值构成的非共线合成场景中，18/18 条候选通过原连续几何初筛，且 G 的任务方向投影超过盘子参考投影；起点/终点不安全场景保持全拒绝。测试还覆盖 S 与 O 重合、非法方向/状态来源、球形间隙不足、默认/自定义出口余量及全部候选拒绝。
 - B-Spline `_screen_curve()` 的采样间误差界与 10 mm 安全下界没有变化；20 mm 出口余量是额外空间，不能视为物理安全证明。
 - Python 语法检查、Ruff lint 和 `git diff --check` 通过。`ruff format --check` 指出文件中本次修改区域以外的历史格式差异；为避免无关重排，保留原格式。
 - 本轮没有启动 Bridge、连接真实 L0T0 状态或执行环境动作。单测使用小型合成 MuJoCo 模型；真实包围球查询、现场 BDDL 目标解析和真实 18 条候选通过数仍待下方手动 Smoke。静态通过不代表真实轨迹可执行或安全。
@@ -1651,14 +1651,14 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
   --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
   --expected-instruction "pick up the akita black bowl on the stove and place it on the plate" \
   --exit-clearance-m 0.02 \
-  --out-dir logs/gs_opd/trajectory_bundle_scene_local_bypass_l0t0_v2
+  --out-dir logs/gs_opd/trajectory_bundle_scene_local_bypass_l0t0_v3
 ```
 
 命令中的 Teacher、语义绑定和任务指令只用于当前已有 L0T0 检查；Smoke 仍会将 Body/Geom 绑定与当前 Inventory、任务指令与 Bridge 活动任务、前后积分状态与几何指纹逐项核对。真实候选数量、球间隙初筛通过数和拒绝原因以这次运行生成的 JSON 为准，运行前不预设结果。
 
 **检查清单（Checklist）**
 
-- [x] 局部绕行目标从同状态包围球和活动 BDDL `On` 目标方向构造；目标 Body 原点没有被当作 G。
-- [x] 49 项相关单测、语法检查、Ruff lint 和 diff 检查通过；典型合成场景候选通过数 18/18，不安全起点/终点场景各拒绝 18/18。
+- [x] 局部绕行方向由同状态搬运球心指向所选障碍球心确定；BDDL `On` 目标保留为任务参考，目标 Body 原点没有被当作 G。
+- [x] 54 项相关单测、语法检查、Ruff lint 和 diff 检查通过；日志数值合成场景候选通过数 18/18，不安全起点/终点场景各拒绝 18/18。
 - [ ] 在当前真实 L0T0 Bridge 上运行上面的只读 Smoke，检查实际几何包围球、18 条候选的通过/拒绝情况和查询前后状态。
 - [ ] 后续仍需用独立 OSC/MuJoCo 完整接触验证确认任何候选的物理安全与可执行性。

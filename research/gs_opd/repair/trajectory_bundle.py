@@ -214,6 +214,10 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             target.get("body_origin_world_m"),
             "goal.construction.placement_target_direction_reference.body_origin_world_m",
         )
+        if target.get("state_id") != state_id:
+            raise ValueError(
+                "local_bypass_goal BDDL target reference does not match the current scene state"
+            )
         target_body_id = target.get("body_id")
         if (
             isinstance(target_body_id, bool)
@@ -227,10 +231,17 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
         )
         if (
             construction.get("direction_source")
-            != "active_bddl_on_target_body_origin_direction_only"
+            != "same_state_carried_sphere_center_to_obstacle_sphere_center"
         ):
             raise ValueError(
-                "local_bypass_goal direction source is not the active BDDL On target"
+                "local_bypass_goal direction must be derived from the carried and obstacle sphere centers"
+            )
+        if (
+            construction.get("task_reference_source")
+            != "active_bddl_on_target_body_origin_semantic_reference_only"
+        ):
+            raise ValueError(
+                "local_bypass_goal must retain the active BDDL target as semantic context"
             )
         carried_task_object = _text(
             construction.get("carried_registered_task_object"),
@@ -254,21 +265,19 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             or target.get("used_as_final_goal") is not False
         ):
             raise ValueError(
-                "local_bypass_goal direction reference must match the active BDDL On relation"
+                "local_bypass_goal target reference must match the active BDDL On relation"
             )
         start = np.asarray(carried["center_world_m"], dtype=float)
-        target_vector = target_position - start
-        target_distance = float(np.linalg.norm(target_vector))
-        if not math.isfinite(target_distance) or target_distance <= 1e-9:
-            raise ValueError("local_bypass_goal BDDL target direction is degenerate")
-        if not np.allclose(target_vector / target_distance, forward, atol=1e-9, rtol=0):
+        carried_to_obstacle = obstacle_center - start
+        obstacle_distance = float(np.linalg.norm(carried_to_obstacle))
+        if not math.isfinite(obstacle_distance) or obstacle_distance <= 1e-9:
             raise ValueError(
-                "local_bypass_goal forward direction conflicts with BDDL target"
+                "local_bypass_goal carried and obstacle centers are coincident"
             )
-        obstacle_projection = float(np.dot(obstacle_center - start, forward))
-        if not 0 < obstacle_projection < target_distance:
+        expected_forward = carried_to_obstacle / obstacle_distance
+        if not np.allclose(expected_forward, forward, atol=1e-9, rtol=0):
             raise ValueError(
-                "local_bypass_goal obstacle is not between start and target"
+                "local_bypass_goal forward direction conflicts with same-state sphere centers"
             )
         safety_clearance = _number(
             construction.get("safety_clearance_m"),
@@ -297,10 +306,9 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
         if (
             np.linalg.norm(lateral_offset) > numeric_margin
             or projected_offset < required_separation
-            or projected_offset + obstacle_projection >= target_distance
         ):
             raise ValueError(
-                "local_bypass_goal must lie behind its obstacle with the configured conservative sphere clearance and before the placement target"
+                "local_bypass_goal must lie on the far side of its obstacle with the configured conservative sphere clearance and exit margin"
             )
         normalized_goal["construction"] = {
             "obstacle_object_id": obstacle_id,
@@ -311,8 +319,10 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
                 "body_name": target_body_name,
                 "body_origin_world_m": target_position.tolist(),
                 "used_as_final_goal": False,
+                "state_id": state_id,
             },
             "direction_source": construction["direction_source"],
+            "task_reference_source": construction["task_reference_source"],
             "native_bddl_on_predicate": predicate,
             "carried_registered_task_object": carried_task_object,
             "placement_target_registered_task_object": target_task_object,

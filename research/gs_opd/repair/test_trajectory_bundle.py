@@ -62,7 +62,13 @@ def local_bypass_scene():
     value = scene()
     carried = value["carried"]
     obstacle = value["obstacles"][0]
-    forward = np.asarray([1.0, 0.0, 0.0])
+    obstacle["center_world_m"] = [-0.137064, 0.210115, 0.5]
+    carried["radius_m"] = 0.09
+    obstacle["radius_m"] = 0.110447
+    forward = np.asarray(obstacle["center_world_m"]) - np.asarray(
+        carried["center_world_m"]
+    )
+    forward /= np.linalg.norm(forward)
     safety_clearance = 0.01
     exit_clearance = 0.02
     required = (
@@ -88,14 +94,16 @@ def local_bypass_scene():
             "placement_target_direction_reference": {
                 "body_id": 5,
                 "body_name": "arbitrary-receiver",
-                "body_origin_world_m": [0.8, 0, 0.5],
+                "body_origin_world_m": [-0.05, 0, 0.5],
                 "used_as_final_goal": False,
+                "state_id": "synthetic-state",
                 "registered_task_object": "receiver",
                 "native_target_key": "receiver",
                 "native_predicate": ["on", "payload", "receiver"],
             },
             "carried_registered_task_object": "payload",
-            "direction_source": "active_bddl_on_target_body_origin_direction_only",
+            "direction_source": "same_state_carried_sphere_center_to_obstacle_sphere_center",
+            "task_reference_source": "active_bddl_on_target_body_origin_semantic_reference_only",
             "safety_clearance_m": safety_clearance,
             "exit_clearance_m": exit_clearance,
         },
@@ -177,7 +185,7 @@ class TrajectoryBundleTests(unittest.TestCase):
             np.asarray(goal["position_world_m"]),
         )
 
-    def test_local_bypass_goal_rejects_invalid_origin_direction_and_clearance(self):
+    def test_local_bypass_goal_rejects_invalid_direction_evidence_and_clearance(self):
         mutations = (
             lambda s: s["goal"].update(position_world_m=[0.2, 0.01, 0.5]),
             lambda s: s["goal"]["construction"].update(
@@ -189,13 +197,17 @@ class TrajectoryBundleTests(unittest.TestCase):
             lambda s: s["goal"]["construction"][
                 "placement_target_direction_reference"
             ].update(used_as_final_goal=True),
+            lambda s: s["goal"]["construction"][
+                "placement_target_direction_reference"
+            ].update(state_id="different-state"),
             lambda s: s["goal"].update(
                 position_world_m=[0.1, 0, 0.5]
             ),  # does not include the configured exit margin
             lambda s: s["goal"]["construction"].pop("exit_clearance_m"),
             lambda s: s["goal"]["construction"].update(safety_clearance_m=0.02),
+            lambda s: s["goal"]["construction"].update(forward_world=[1, 0, 0]),
             lambda s: s["goal"]["construction"].update(
-                forward_world=[0.0, 1.0, 0.0]
+                task_reference_source="invented_final_goal"
             ),
         )
         for index, mutate in enumerate(mutations):
@@ -204,6 +216,62 @@ class TrajectoryBundleTests(unittest.TestCase):
                 mutate(input_scene)
                 with self.assertRaises(ValueError):
                     planner.generate_trajectory_bundle(input_scene)
+
+    def test_local_bypass_endpoint_can_extend_beyond_task_target_projection(self):
+        input_scene = local_bypass_scene()
+        result = planner.generate_trajectory_bundle(input_scene)
+        goal = result["scene"]["goal"]
+        construction = goal["construction"]
+        start = np.asarray(input_scene["carried"]["center_world_m"])
+        obstacle = np.asarray(input_scene["obstacles"][0]["center_world_m"])
+        target = np.asarray(
+            construction["placement_target_direction_reference"]["body_origin_world_m"]
+        )
+        task_direction = (target - start) / np.linalg.norm(target - start)
+        goal_projection = float(
+            np.dot(np.asarray(goal["position_world_m"]) - start, task_direction)
+        )
+        task_target_distance = float(np.linalg.norm(target - start))
+        self.assertGreater(goal_projection, task_target_distance)
+        self.assertEqual(result["candidate_count"], 18)
+        self.assertEqual(result["screen_pass_count"], 18)
+        self.assertFalse(result["physical_safety_verified"])
+        self.assertFalse(result["executable"])
+        np.testing.assert_allclose(
+            construction["forward_world"],
+            (obstacle - start) / np.linalg.norm(obstacle - start),
+            atol=1e-12,
+            rtol=0,
+        )
+
+    def test_local_bypass_rejects_coincident_carried_and_obstacle_centers(self):
+        input_scene = local_bypass_scene()
+        input_scene["obstacles"][0]["center_world_m"] = copy.deepcopy(
+            input_scene["carried"]["center_world_m"]
+        )
+        input_scene["goal"]["construction"]["obstacle_center_world_m"] = copy.deepcopy(
+            input_scene["carried"]["center_world_m"]
+        )
+        with self.assertRaisesRegex(ValueError, "centers are coincident"):
+            planner.generate_trajectory_bundle(input_scene)
+
+    def test_local_bypass_rejects_insufficient_sphere_gap(self):
+        input_scene = local_bypass_scene()
+        construction = input_scene["goal"]["construction"]
+        obstacle = np.asarray(input_scene["obstacles"][0]["center_world_m"])
+        direction = np.asarray(construction["forward_world"])
+        insufficient_distance = (
+            input_scene["carried"]["radius_m"]
+            + input_scene["obstacles"][0]["radius_m"]
+            + construction["safety_clearance_m"]
+            + construction["exit_clearance_m"]
+            - 1e-6
+        )
+        input_scene["goal"]["position_world_m"] = (
+            obstacle + direction * insufficient_distance
+        ).tolist()
+        with self.assertRaisesRegex(ValueError, "conservative sphere clearance"):
+            planner.generate_trajectory_bundle(input_scene)
 
     def test_local_bypass_bundle_can_report_all_candidates_rejected(self):
         input_scene = local_bypass_scene()

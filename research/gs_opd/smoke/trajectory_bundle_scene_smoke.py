@@ -330,11 +330,11 @@ def _build_local_bypass_scene(
 
     start = np.asarray(carried["center_world_m"], dtype=np.float64)
     carried_radius = float(carried["radius_m"])
-    target_vector = target_position - start
-    target_distance = float(np.linalg.norm(target_vector))
-    if not math.isfinite(target_distance) or target_distance <= 1e-9:
+    task_target_vector = target_position - start
+    task_target_distance = float(np.linalg.norm(task_target_vector))
+    if not math.isfinite(task_target_distance) or task_target_distance <= 1e-9:
         raise ValueError("local_bypass_goal_unavailable:placement_direction_degenerate")
-    forward = target_vector / target_distance
+    task_forward = task_target_vector / task_target_distance
 
     obstacle_candidates = []
     diagnostics = []
@@ -343,18 +343,18 @@ def _build_local_bypass_scene(
         center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
         radius = float(obstacle["radius_m"])
         offset = center - start
-        along = float(np.dot(offset, forward))
-        lateral = float(np.linalg.norm(offset - along * forward))
+        center_distance = float(np.linalg.norm(offset))
+        along = float(np.dot(offset, task_forward))
+        lateral = float(np.linalg.norm(offset - along * task_forward))
         minimum_separation = carried_radius + radius + clearance_m
         required_separation = minimum_separation + exit_clearance_m
-        endpoint_along = along + required_separation
         reasons = []
-        if not (0 < along < target_distance):
+        if not math.isfinite(center_distance) or center_distance <= 1e-9:
+            reasons.append("carried_and_obstacle_centers_coincident")
+        if not (0 < along < task_target_distance):
             reasons.append("obstacle_not_between_carried_state_and_bddl_target")
         if lateral > required_separation:
             reasons.append("obstacle_outside_forward_carried_sphere_corridor")
-        if endpoint_along >= target_distance:
-            reasons.append("clearance_endpoint_would_reach_or_pass_placement_target")
         diagnostics.append(
             {
                 "obstacle_object_id": binding["object_id"],
@@ -374,18 +374,25 @@ def _build_local_bypass_scene(
             "local_bypass_goal_unavailable:no_forbidden_obstacle_in_forward_corridor",
             diagnostics,
         )
-    # The first physically relevant obstacle along the BDDL task direction is
-    # the local bypass reference; ties retain the validated binding order.
+    # Select the nearest eligible obstacle along the BDDL task direction, then
+    # define the local bypass from the carried sphere center toward that obstacle.
     obstacle_projection, obstacle, required_separation = min(
         obstacle_candidates, key=lambda item: item[0]
     )
+    obstacle_center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
+    obstacle_vector = obstacle_center - start
+    obstacle_distance = float(np.linalg.norm(obstacle_vector))
+    if not math.isfinite(obstacle_distance) or obstacle_distance <= 1e-9:
+        raise ValueError(
+            "local_bypass_goal_unavailable:carried_and_obstacle_centers_coincident"
+        )
+    bypass_forward = obstacle_vector / obstacle_distance
     scale = max(
         1.0, required_separation, float(np.abs(obstacle["center_world_m"]).max())
     )
     numeric_pad = 1e-8 * scale
     endpoint_separation = required_separation + numeric_pad
-    obstacle_center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
-    local_goal_position = obstacle_center + forward * endpoint_separation
+    local_goal_position = obstacle_center + bypass_forward * endpoint_separation
     conservative_gap = (
         float(np.linalg.norm(local_goal_position - obstacle_center))
         - carried_radius
@@ -394,7 +401,6 @@ def _build_local_bypass_scene(
     if (
         not np.isfinite(local_goal_position).all()
         or conservative_gap < clearance_m + exit_clearance_m
-        or obstacle_projection + endpoint_separation >= target_distance
     ):
         raise ValueError(
             "local_bypass_goal_unavailable:computed_endpoint_geometry_is_invalid"
@@ -406,30 +412,34 @@ def _build_local_bypass_scene(
         "position_semantics": "carried_sphere_center",
         "verified": True,
         "verification_scope": "same_state_geometry_derived_waypoint_only_not_final_placement_or_physical_safety",
-        "source": "same-state conservative carried/obstacle spheres; direction from active BDDL On target Body origin only",
+        "source": "same-state conservative spheres; local bypass direction from carried center toward selected obstacle center",
         "state_id": state_id,
         "construction": {
             "obstacle_object_id": obstacle["object_id"],
             "obstacle_center_world_m": obstacle_center.tolist(),
-            "forward_world": forward.tolist(),
+            "forward_world": bypass_forward.tolist(),
+            "task_direction_world": task_forward.tolist(),
             "placement_target_direction_reference": {
                 "body_id": target_body_id,
                 "body_name": target_body_name,
                 "body_origin_world_m": target_position.tolist(),
                 "used_as_final_goal": False,
+                "state_id": state_id,
                 "registered_task_object": target_registered_key,
                 "native_target_key": target_key,
                 "native_predicate": predicate,
             },
             "carried_registered_task_object": carried_task_key,
-            "direction_source": "active_bddl_on_target_body_origin_direction_only",
+            "direction_source": "same_state_carried_sphere_center_to_obstacle_sphere_center",
+            "task_reference_source": "active_bddl_on_target_body_origin_semantic_reference_only",
             "obstacle_projection_from_start_m": obstacle_projection,
+            "obstacle_center_distance_from_start_m": obstacle_distance,
             "obstacle_lateral_distance_m": next(
                 item["lateral_distance_from_task_direction_m"]
                 for item in diagnostics
                 if item["obstacle_object_id"] == obstacle["object_id"]
             ),
-            "obstacle_selection_rule": "nearest_eligible_forbidden_obstacle_along_task_direction",
+            "obstacle_selection_rule": "nearest_eligible_forbidden_obstacle_along_bddl_task_direction",
             "required_sphere_center_separation_m": required_separation,
             "safety_clearance_m": clearance_m,
             "endpoint_sphere_center_separation_m": endpoint_separation,
