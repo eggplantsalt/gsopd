@@ -5,13 +5,20 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 from multiprocessing.connection import Listener
 import copy
+import hashlib
+import json
+import math
 import numpy as np
 import random
 import mujoco
+from pathlib import Path
+import sys
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
-
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 # This checkpoint was trained and is normally evaluated with the upstream
 # robosuite v1.4.0 OSC_POSE ranges. The vendored LIBERO-Safety copy has a
 # modified osc_pose.json (all six outputs are +/-2), so apply the upstream
@@ -521,6 +528,888 @@ def _repair_context():
     }
 
 
+def _tracking_value_equal(left, right):
+    """Exact equality for captured Snapshot state, including nested arrays."""
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        try:
+            return (
+                isinstance(left, np.ndarray)
+                and isinstance(right, np.ndarray)
+                and left.shape == right.shape
+                and left.dtype == right.dtype
+                and np.array_equal(left, right)
+            )
+        except Exception:
+            return False
+    if isinstance(left, _PythonObjectState) or isinstance(right, _PythonObjectState):
+        return (
+            isinstance(left, _PythonObjectState)
+            and isinstance(right, _PythonObjectState)
+            and left.module == right.module
+            and left.qualname == right.qualname
+            and _tracking_value_equal(left.attributes, right.attributes)
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.keys() == right.keys()
+            and all(_tracking_value_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        return (
+            type(left) is type(right)
+            and len(left) == len(right)
+            and all(_tracking_value_equal(a, b) for a, b in zip(left, right))
+        )
+    if left is right:
+        return True
+    try:
+        value = left == right
+        return bool(value) if np.ndim(value) == 0 else False
+    except Exception:
+        return False
+
+
+def _tracking_snapshot_state_id(snapshot):
+    model = env.sim.model._model
+    instruction = task.language
+    digest = hashlib.sha256()
+    digest.update(_planning_model_signature(model).encode())
+    digest.update(np.asarray(snapshot["mujoco_state"], dtype=np.float64).tobytes())
+    digest.update(instruction.encode())
+    return digest.hexdigest()
+
+
+def _tracking_state_object(diagnostic, body_id):
+    matches = [
+        value
+        for value in diagnostic.get("object_states", {}).values()
+        if value.get("body_id") == body_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("carried object root state is missing or ambiguous")
+    result = matches[0]
+    position = np.asarray(result.get("root_pos"), dtype=np.float64)
+    quaternion = np.asarray(result.get("root_quat"), dtype=np.float64)
+    if (
+        position.shape != (3,)
+        or quaternion.shape != (4,)
+        or not np.isfinite(position).all()
+        or not np.isfinite(quaternion).all()
+    ):
+        raise ValueError("carried object root pose is incomplete")
+    return position, quaternion / np.linalg.norm(quaternion)
+
+
+def _tracking_body_is_ancestor(model, ancestor, body):
+    current = int(body)
+    while current > 0:
+        if current == int(ancestor):
+            return True
+        current = int(model.body_parentid[current])
+    return current == int(ancestor)
+
+
+def _tracking_validate_binding(binding, expected_state_id):
+    sim = env.sim
+    model = sim.model._model
+    if not isinstance(binding, dict) or binding.get("state_id") != expected_state_id:
+        raise ValueError("carried binding state does not match the requested trajectory state")
+    body_id = binding.get("body_id")
+    body_name = binding.get("body_name")
+    geom_ids = binding.get("geom_ids")
+    body_ids = binding.get("body_ids")
+    geom_names = binding.get("geom_names")
+    semantic_geom_ids = binding.get("semantic_binding_geom_ids")
+    if (
+        not isinstance(body_ids, list)
+        or not body_ids
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in body_ids)
+        or len(set(body_ids)) != len(body_ids)
+        or not isinstance(geom_ids, list)
+        or not geom_ids
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in geom_ids)
+        or len(set(geom_ids)) != len(geom_ids)
+        or not isinstance(semantic_geom_ids, list)
+        or not semantic_geom_ids
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in semantic_geom_ids)
+        or len(set(semantic_geom_ids)) != len(semantic_geom_ids)
+    ):
+        raise ValueError("carried Body/Geom ID arrays are malformed")
+    if (
+        isinstance(body_id, bool)
+        or not isinstance(body_id, int)
+        or not 0 < body_id < int(model.nbody)
+        or sim.model.body_id2name(body_id) != body_name
+        or not isinstance(body_name, str)
+        or not isinstance(geom_ids, list)
+        or not geom_ids
+        or not isinstance(body_ids, list)
+        or not body_ids
+        or not isinstance(geom_names, list)
+        or len(geom_names) != len(geom_ids)
+        or not isinstance(semantic_geom_ids, list)
+        or not set(semantic_geom_ids).issubset(set(geom_ids))
+        or any(value < 0 or value >= int(model.ngeom) for value in geom_ids + semantic_geom_ids)
+        or any(value < 0 or value >= int(model.nbody) for value in body_ids)
+        or binding.get("binding_verified") is not True
+        or binding.get("covers_all_associated_collision_geoms") is not True
+    ):
+        raise ValueError("carried Body/Geom binding declaration is incomplete")
+    registered = _planning_registered_objects(sim.model, env.env)
+    if body_id not in registered or registered[body_id]["body_name"] != body_name:
+        raise ValueError("carried Body is not a current registered task-object root")
+    subtree = _planning_body_subtree(model, body_id)
+    if set(body_ids) != subtree:
+        raise ValueError("carried Body subtree differs from the verified binding")
+    inventory = _geometry_inventory()
+    if inventory.get("status") != "complete":
+        raise ValueError("current Geometry Inventory is incomplete")
+    inventory_by_id = {item["geom_id"]: item for item in inventory["geometries"]}
+    pair_geoms = set()
+    for pair_index in range(int(model.npair)):
+        pair_geoms.add(int(model.pair_geom1[pair_index]))
+        pair_geoms.add(int(model.pair_geom2[pair_index]))
+    collision_ids = {
+        geom_id
+        for geom_id in range(int(model.ngeom))
+        if int(model.geom_bodyid[geom_id]) in subtree
+        and (
+            int(model.geom_contype[geom_id]) != 0
+            or int(model.geom_conaffinity[geom_id]) != 0
+            or geom_id in pair_geoms
+        )
+    }
+    if set(geom_ids) != collision_ids:
+        raise ValueError("carried collision Geoms do not cover the complete current Body subtree")
+    for geom_id, geom_name in zip(geom_ids, geom_names):
+        item = inventory_by_id.get(geom_id)
+        if (
+            item is None
+            or item.get("geom_name") != geom_name
+            or item.get("body_id") != body_id
+            or item.get("body_name") != body_name
+            or item.get("category") != "scene"
+        ):
+            raise ValueError("carried collision Geom identity conflicts with current model")
+    # The existing Contact Compiler binds contact events to a root Body ID. Do
+    # not claim complete object-contact checking for articulated child Bodies.
+    if any(int(model.geom_bodyid[geom_id]) != body_id for geom_id in geom_ids):
+        raise ValueError("carried_collision_geoms_span_child_bodies_not_supported_by_compiler")
+    joint_start = int(model.body_jntadr[body_id])
+    joint_count = int(model.body_jntnum[body_id])
+    if joint_count != 1 or int(model.jnt_type[joint_start]) != int(mujoco.mjtJoint.mjJNT_FREE):
+        raise ValueError("carried object root must expose one free joint")
+    if any(int(model.body_jntnum[child]) for child in subtree if child != body_id):
+        raise ValueError("articulated carried-object subtree is not supported")
+    return inventory, subtree
+
+
+def _tracking_workspace(robot, diagnostic_data):
+    """Compute a model-derived conservative reach sphere for the active Panda."""
+    sim = env.sim
+    model = sim.model._model
+    root_name = getattr(getattr(robot, "robot_model", None), "root_body", None)
+    if not isinstance(root_name, str):
+        raise ValueError("Panda base Body is unavailable")
+    base_id = int(sim.model.body_name2id(root_name))
+    joint_ids = np.asarray(getattr(robot, "_ref_joint_indexes", []), dtype=np.int64)
+    if joint_ids.ndim != 1 or not len(joint_ids):
+        raise ValueError("Panda arm joint inventory is unavailable")
+    if np.any(model.jnt_type[joint_ids] != int(mujoco.mjtJoint.mjJNT_HINGE)):
+        raise ValueError("workspace reach bound only supports revolute Panda arm joints")
+    if np.any(model.jnt_limited[joint_ids] == 0):
+        raise ValueError("Panda arm joint limits are incomplete")
+    joint_bodies = np.asarray(model.jnt_bodyid[joint_ids], dtype=np.int64)
+    prior = base_id
+    for body_id in joint_bodies:
+        if not _tracking_body_is_ancestor(model, prior, int(body_id)):
+            raise ValueError("Panda arm joint order is not a verified kinematic chain")
+        prior = int(body_id)
+    anchors = np.asarray(diagnostic_data.xanchor[joint_ids], dtype=np.float64)
+    base = np.asarray(diagnostic_data.xpos[base_id], dtype=np.float64)
+    eef = np.asarray(diagnostic_data.site_xpos[robot.eef_site_id], dtype=np.float64)
+    chain = np.vstack((base, anchors, eef))
+    if not np.isfinite(chain).all():
+        raise ValueError("Panda reach-chain points are non-finite")
+    reach = float(np.linalg.norm(np.diff(chain, axis=0), axis=1).sum())
+    if not np.isfinite(reach) or reach <= 0:
+        raise ValueError("Panda model-derived reach bound is invalid")
+    fields = {name: _json_value(getattr(robot.controller, name, None)) for name in (
+        "position_limits", "output_min", "output_max", "input_min", "input_max"
+    )}
+    limits = fields["position_limits"]
+    if limits is not None:
+        bounds = np.asarray(limits, dtype=np.float64)
+        if bounds.shape != (2, 3) or not np.isfinite(bounds).all() or np.any(bounds[0] > bounds[1]):
+            raise ValueError("active OSC Cartesian workspace bounds are malformed")
+    return {
+        "status": "available",
+        "source": "conservative sphere from compiled Panda joint-anchor chain and EEF site",
+        "base_body_id": base_id,
+        "base_world_m": base.tolist(),
+        "maximum_reach_radius_m": reach,
+        "controller_position_limits": limits,
+    }
+
+
+def _tracking_workspace_check(position, workspace):
+    from research.gs_opd.repair.trajectory_tracking import check_workspace_target
+
+    return check_workspace_target(
+        position,
+        workspace.get("base_world_m"),
+        workspace.get("maximum_reach_radius_m"),
+        workspace.get("controller_position_limits"),
+    )
+
+
+def _tracking_joint_limit_check(robot):
+    sim = env.sim
+    model = sim.model._model
+    arm_joint_ids = [int(item) for item in robot._ref_joint_indexes]
+    gripper_joint_names = list(getattr(robot, "gripper_joints", []))
+    gripper_joint_ids = [int(sim.model.joint_name2id(name)) for name in gripper_joint_names]
+    joint_ids = np.asarray(arm_joint_ids + gripper_joint_ids, dtype=np.int64)
+    qpos_indices = list(robot._ref_joint_pos_indexes) + list(robot._ref_gripper_joint_pos_indexes)
+    if len(joint_ids) == 0 or len(joint_ids) != len(qpos_indices):
+        raise ValueError("Panda arm/gripper joint limit indexes are incomplete")
+    ranges = np.asarray(model.jnt_range[joint_ids], dtype=np.float64)
+    limited = np.asarray(model.jnt_limited[joint_ids], dtype=bool)
+    qpos = np.asarray(sim.data.qpos[qpos_indices], dtype=np.float64)
+    if (
+        ranges.shape != (len(joint_ids), 2)
+        or qpos.shape != (len(joint_ids),)
+        or not np.isfinite(ranges).all()
+        or not np.isfinite(qpos).all()
+        or np.any(ranges[:, 0] > ranges[:, 1])
+        or not limited.all()
+    ):
+        raise ValueError("Panda active arm/gripper joint limits are unavailable")
+    outside = (qpos < ranges[:, 0] - 1e-8) | (qpos > ranges[:, 1] + 1e-8)
+    return {
+        "status": "fail" if outside.any() else "pass",
+        "joint_names": [sim.model.joint_id2name(int(joint_id)) for joint_id in joint_ids],
+        "qpos": qpos.tolist(),
+        "ranges": ranges.tolist(),
+        "limited": limited.tolist(),
+        "violating_joint_names": [
+            sim.model.joint_id2name(int(joint_ids[index]))
+            for index in np.flatnonzero(outside)
+        ],
+    }
+
+
+def _tracking_gripper_sides(robot):
+    gripper = getattr(robot, "gripper", None)
+    if gripper is None or type(gripper).__name__ != "PandaGripper":
+        raise ValueError("closed-loop grasp evidence requires the active PandaGripper model")
+    important = getattr(gripper, "_important_geoms", None)
+    if not isinstance(important, dict):
+        raise ValueError("PandaGripper important Geom groups are unavailable")
+    groups = {}
+    for side, keys in (
+        ("left", ("left_finger", "left_fingerpad")),
+        ("right", ("right_finger", "right_fingerpad")),
+    ):
+        names = [name for key in keys for name in important.get(key, [])]
+        if not names:
+            raise ValueError(f"PandaGripper {side} finger Geoms are unavailable")
+        adjusted = gripper.correct_naming(names)
+        ids = {int(env.sim.model.geom_name2id(name)) for name in adjusted}
+        if not ids or any(
+            geom_id < 0 or geom_id >= int(env.sim.model._model.ngeom)
+            for geom_id in ids
+        ):
+            raise ValueError(f"PandaGripper {side} Geom IDs do not resolve in the active model")
+        groups[side] = ids
+    current_action = np.asarray(getattr(gripper, "current_action", []), dtype=np.float64)
+    if current_action.shape != (1,) or not np.isfinite(current_action).all():
+        raise ValueError("PandaGripper current close action is unavailable")
+    return groups, current_action
+
+
+def _tracking_contact_sides(contact_result, carried_binding, gripper_groups):
+    if not isinstance(contact_result, dict) or contact_result.get("status") == "unavailable":
+        return {"status": "unavailable", "left": False, "right": False, "contact_count": 0}
+    contacts = contact_result.get("contacts")
+    if not isinstance(contacts, list):
+        return {"status": "unavailable", "left": False, "right": False, "contact_count": 0}
+    object_geoms = set(carried_binding["geom_ids"])
+    object_bodies = set(carried_binding["body_ids"])
+    sides = {"left": False, "right": False}
+    count = 0
+    for contact in contacts:
+        try:
+            pair_geoms = [int(contact["geom1"]["id"]), int(contact["geom2"]["id"])]
+            pair_bodies = [int(contact["body1"]["id"]), int(contact["body2"]["id"])]
+        except Exception:
+            return {"status": "unavailable", **sides, "contact_count": count}
+        for side, gripper_geoms in gripper_groups.items():
+            for index in (0, 1):
+                other = 1 - index
+                if (
+                    pair_geoms[index] in gripper_geoms
+                    and pair_geoms[other] in object_geoms
+                    and pair_bodies[other] in object_bodies
+                ):
+                    sides[side] = True
+                    count += 1
+    return {
+        "status": "pass" if all(sides.values()) else "fail",
+        **sides,
+        "contact_count": count,
+        "basis": "active_PandaGripper_important_geom_groups_contact_object_collision_geoms",
+    }
+
+
+def _tracking_relative_pose(position, quaternion, eef_position, eef_quaternion):
+    from research.gs_opd.repair.trajectory_tracking import (
+        quaternion_conjugate,
+        quaternion_multiply,
+        quaternion_to_matrix,
+    )
+
+    object_quat = np.asarray(quaternion, dtype=np.float64)
+    eef_quat = np.asarray(eef_quaternion, dtype=np.float64)
+    rotation = quaternion_to_matrix(object_quat)
+    relative_position_local = rotation.T @ (
+        np.asarray(eef_position, dtype=np.float64) - np.asarray(position, dtype=np.float64)
+    )
+    relative_quaternion_local = quaternion_multiply(
+        quaternion_conjugate(object_quat), eef_quat
+    )
+    return relative_position_local, relative_quaternion_local
+
+
+def _track_trajectory_candidate(candidate, snapshot, binding, options, candidate_index):
+    from research.gs_opd.repair.trajectory_tracking import (
+        quaternion_conjugate,
+        quaternion_multiply,
+        quaternion_to_matrix,
+        quaternion_to_rotation_vector,
+        resample_polyline_by_distance,
+        world_pose_tracking_action,
+    )
+
+    sim = env.sim
+    robot = env.robots[0]
+    candidate_id = candidate["candidate_id"]
+    result = {
+        "candidate_id": candidate_id,
+        "direction": candidate.get("direction"),
+        "goal_world_m": candidate.get("goal_world_m"),
+        "control_points_world_m": candidate.get("control_points_world_m"),
+        "geometric_points_world_m": candidate.get("points_world_m"),
+        "status": "error",
+        "requested_steps": 0,
+        "executed_steps": 0,
+        "execution_complete": False,
+        "snapshot_start_state_match": False,
+        "steps": [],
+        "failure_reason": None,
+        "task_feasibility": {
+            "status": "unavailable",
+            "scope": "local carried-object path only; no final task-success claim",
+            "final_task_success_confirmed": False,
+        },
+    }
+    monitor = _new_contact_monitor()
+    try:
+        _restore_snapshot(snapshot)
+        restore_matches = _tracking_value_equal(snapshot, _capture_snapshot())
+        result["snapshot_start_state_match"] = bool(restore_matches)
+        diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+        result["start_state"] = diagnostic
+        result["start_state_fingerprint"] = hashlib.sha256(
+            np.asarray(diagnostic["mujoco_integration_state"], dtype=np.float64).tobytes()
+        ).hexdigest()
+        if not restore_matches:
+            raise RuntimeError("candidate Snapshot restore did not reproduce full captured state")
+        object_position, object_quaternion = _tracking_state_object(
+            diagnostic, binding["body_id"]
+        )
+        points = np.asarray(candidate["points_world_m"], dtype=np.float64)
+        center_start = np.asarray(binding["center_world_m"], dtype=np.float64)
+        if (
+            np.linalg.norm(object_position - center_start) > options["state_tolerance_m"]
+            or np.linalg.norm(points[0] - object_position) > options["state_tolerance_m"]
+        ):
+            raise ValueError("trajectory_start_does_not_match_snapshot_object_center")
+        if len(env.robots) != 1 or int(getattr(robot, "action_dim", 0)) != 7:
+            raise ValueError("closed-loop tracker requires one 7-D Panda OSC_POSE action")
+        if getattr(robot.controller, "name", type(robot.controller).__name__) != "OSC_POSE":
+            raise ValueError("active Panda controller is not OSC_POSE")
+        control_timestep = float(env.env.control_timestep)
+        if not math.isclose(control_timestep, 0.05, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("active environment is not configured for 20 Hz OSC control")
+        sampled = resample_polyline_by_distance(
+            points,
+            speed_m_s=options["reference_speed_m_s"],
+            control_timestep_s=control_timestep,
+            maximum_steps=options["max_control_steps_per_candidate"],
+        )
+        references = sampled["reference_points_world_m"]
+        result.update({
+            "requested_steps": sampled["requested_steps"],
+            "reference_path": references.tolist(),
+            "path_length_m": sampled["path_length_m"],
+            "reference_speed_limit_m_s": options["reference_speed_m_s"],
+            "control_timestep_s": control_timestep,
+        })
+        result["start_contacts"] = _collect_contacts()
+        gripper_groups, current_gripper_action = _tracking_gripper_sides(robot)
+        start_sides = _tracking_contact_sides(
+            result["start_contacts"], binding, gripper_groups
+        )
+        grasp = {
+            "status": "unavailable",
+            "reason": None,
+            "initial_gripper_current_action": current_gripper_action.tolist(),
+            "initial_finger_contacts": start_sides,
+            "per_step": [],
+            "maximum_relative_position_error_m": 0.0,
+            "maximum_relative_rotation_error_rad": 0.0,
+            "physical_grasp_confirmed_by_distance_only": False,
+        }
+        if current_gripper_action[0] < 0.9:
+            grasp.update({"status": "fail", "reason": "initial_Panda_gripper_is_not_closed"})
+            result["grasp_evidence"] = grasp
+            raise RuntimeError("initial_grasp_evidence_unavailable: gripper is not closed")
+        if start_sides.get("status") != "pass":
+            grasp.update({"status": start_sides.get("status", "unavailable"), "reason": "initial_opposing_finger_contacts_missing"})
+            result["grasp_evidence"] = grasp
+            raise RuntimeError("initial_grasp_evidence_unavailable: both Panda fingers do not contact the carried object")
+        robot_state = diagnostic["robot_states"][0]
+        relative_position_local, relative_quaternion_local = _tracking_relative_pose(
+            object_position,
+            object_quaternion,
+            robot_state["eef_pos"],
+            robot_state["eef_quat"],
+        )
+        grasp["initial_eef_object_relative_position_local_m"] = relative_position_local.tolist()
+        grasp["initial_eef_object_relative_quaternion_local_wxyz"] = relative_quaternion_local.tolist()
+        grasp["status"] = "pass"
+        workspace = _tracking_workspace(robot, _diagnostic_data_from_integration_state(sim))
+        result["workspace_envelope"] = workspace
+        initial_eef = np.asarray(robot_state["eef_pos"], dtype=np.float64)
+        initial_workspace_check = _tracking_workspace_check(initial_eef, workspace)
+        if initial_workspace_check["status"] != "pass":
+            raise ValueError(
+                initial_workspace_check.get("reason", "initial_EEF_workspace_unavailable")
+            )
+        initial_joint_check = _tracking_joint_limit_check(robot)
+        if initial_joint_check["status"] != "pass":
+            raise ValueError("initial_Panda_joint_limit_check_failed")
+        initial_object_rotation = quaternion_to_matrix(object_quaternion)
+        for value in references[1:]:
+            target_eef = value + initial_object_rotation @ relative_position_local
+            workspace_check = _tracking_workspace_check(target_eef, workspace)
+            if workspace_check["status"] != "pass":
+                raise ValueError(workspace_check.get("reason", "trajectory_target_workspace_unavailable"))
+        fields = _repair_context()["robots"][0]["fields"]
+        if fields.get("input_ref_frame") not in (None, "world"):
+            raise ValueError("active OSC input is not world-frame")
+        orientation_limits = fields.get("orientation_limits")
+        if orientation_limits is not None:
+            bounds = np.asarray(orientation_limits, dtype=np.float64)
+            if (
+                bounds.shape != (2, 3)
+                or not np.isfinite(bounds).all()
+                or np.any(bounds != 0)
+            ):
+                raise ValueError("active OSC orientation clipping cannot be proven inactive")
+        tracking_status = "pass"
+        tracking_reason = None
+        for step_index in range(sampled["requested_steps"]):
+            live_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+            object_position, object_quaternion = _tracking_state_object(
+                live_diagnostic, binding["body_id"]
+            )
+            robot_state = live_diagnostic["robot_states"][0]
+            actual_eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
+            actual_eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
+            reference_position = np.asarray(references[step_index + 1], dtype=np.float64)
+            object_rotation = quaternion_to_matrix(object_quaternion)
+            target_eef_position = reference_position + object_rotation @ relative_position_local
+            target_eef_quaternion = quaternion_multiply(object_quaternion, relative_quaternion_local)
+            target_workspace_before_action = _tracking_workspace_check(
+                target_eef_position, workspace
+            )
+            if target_workspace_before_action["status"] != "pass":
+                raise ValueError(
+                    target_workspace_before_action.get(
+                        "reason", "trajectory_target_workspace_unavailable"
+                    )
+                )
+            action = world_pose_tracking_action(
+                actual_eef_position,
+                actual_eef_quaternion,
+                target_eef_position,
+                target_eef_quaternion,
+                fields,
+                gripper_action=1.0,
+            )
+            try:
+                action_low, action_high = env.action_spec
+                action_low = np.asarray(action_low, dtype=np.float64)
+                action_high = np.asarray(action_high, dtype=np.float64)
+            except Exception as exc:
+                raise ValueError(f"active environment action bounds unavailable: {exc}") from exc
+            if (
+                action_low.shape != (7,)
+                or action_high.shape != (7,)
+                or np.any(action < action_low - 1e-10)
+                or np.any(action > action_high + 1e-10)
+            ):
+                raise ValueError("computed_action_outside_active_environment_bounds")
+            desired_output = np.concatenate((target_eef_position - actual_eef_position,
+                quaternion_to_rotation_vector(quaternion_multiply(
+                    target_eef_quaternion, quaternion_conjugate(actual_eef_quaternion)
+                )))
+            )
+            actual_output = np.asarray(robot.controller.scale_action(action[:6]), dtype=np.float64)
+            if (
+                actual_output.shape != (6,)
+                or not np.isfinite(actual_output).all()
+                or not np.allclose(actual_output, desired_output, rtol=0.0, atol=1e-9)
+            ):
+                raise ValueError("active OSC scaling differs from the requested world pose delta")
+            step_contacts = None
+            try:
+                obs, reward, done, _info = _run_env_step_with_contact_monitor(
+                    action.astype(np.float64), step_index, monitor
+                )
+                last_reward = reward  # noqa: F841  # Preserve branch Snapshot bookkeeping.
+                last_done = done  # noqa: F841  # Preserve branch Snapshot bookkeeping.
+                diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+                object_position, object_quaternion = _tracking_state_object(
+                    diagnostic, binding["body_id"]
+                )
+                robot_state = diagnostic["robot_states"][0]
+                eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
+                eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
+                object_error = float(np.linalg.norm(object_position - reference_position))
+                eef_error = float(np.linalg.norm(eef_position - target_eef_position))
+                current_rel_pos, current_rel_quat = _tracking_relative_pose(
+                    object_position, object_quaternion, eef_position, eef_quaternion
+                )
+                relative_pos_error = float(np.linalg.norm(current_rel_pos - relative_position_local))
+                relative_rot_delta = quaternion_multiply(
+                    current_rel_quat, quaternion_conjugate(relative_quaternion_local)
+                )
+                relative_rot_error = float(np.linalg.norm(
+                    quaternion_to_rotation_vector(relative_rot_delta)
+                ))
+                step_contacts = _collect_contacts()
+                finger_sides = _tracking_contact_sides(step_contacts, binding, gripper_groups)
+                joint_limits = _tracking_joint_limit_check(robot)
+                target_workspace = _tracking_workspace_check(target_eef_position, workspace)
+                actual_workspace = _tracking_workspace_check(eef_position, workspace)
+                grasp_step = {
+                    **finger_sides,
+                    "eef_object_relative_position_local_m": current_rel_pos.tolist(),
+                    "eef_object_relative_quaternion_local_wxyz": current_rel_quat.tolist(),
+                    "relative_position_error_m": relative_pos_error,
+                    "relative_rotation_error_rad": relative_rot_error,
+                    "gripper_current_action": np.asarray(
+                        getattr(robot.gripper, "current_action", []), dtype=np.float64
+                    ).tolist(),
+                }
+                grasp["per_step"].append(grasp_step)
+                grasp["maximum_relative_position_error_m"] = max(
+                    grasp["maximum_relative_position_error_m"], relative_pos_error
+                )
+                grasp["maximum_relative_rotation_error_rad"] = max(
+                    grasp["maximum_relative_rotation_error_rad"], relative_rot_error
+                )
+                workspace_status = (
+                    "pass"
+                    if target_workspace["status"] == "pass" and actual_workspace["status"] == "pass"
+                    else "fail"
+                )
+                reason = None
+                if joint_limits["status"] != "pass":
+                    reason = "active_Panda_joint_limit_violated"
+                elif workspace_status != "pass":
+                    reason = "Panda_EEF_left_conservative_workspace"
+                elif object_error > options["maximum_object_tracking_error_m"]:
+                    reason = "carried_object_path_tracking_error_exceeded"
+                elif eef_error > options["maximum_eef_tracking_error_m"]:
+                    reason = "EEF_pose_tracking_error_exceeded"
+                elif finger_sides.get("status") != "pass":
+                    reason = "Panda_opposing_finger_grasp_contact_lost"
+                elif np.asarray(getattr(robot.gripper, "current_action", []), dtype=np.float64).shape != (1,) or float(np.asarray(robot.gripper.current_action, dtype=np.float64)[0]) < 0.9:
+                    reason = "Panda_gripper_close_command_was_not_maintained"
+                elif relative_pos_error > options["maximum_grasp_relative_position_error_m"]:
+                    reason = "gripper_object_relative_position_changed_beyond_limit"
+                elif relative_rot_error > options["maximum_grasp_relative_rotation_error_rad"]:
+                    reason = "gripper_object_relative_rotation_changed_beyond_limit"
+                if reason is not None:
+                    tracking_status = "fail"
+                    tracking_reason = reason
+                    grasp["status"] = "fail"
+                    grasp["reason"] = reason
+                step = {
+                    "step_index": step_index,
+                    "reference_object_center_world_m": reference_position.tolist(),
+                    "actual_object_center_world_m": object_position.tolist(),
+                    "actual_object_quaternion_world_wxyz": object_quaternion.tolist(),
+                    "actual_eef_position_world_m": eef_position.tolist(),
+                    "actual_eef_quaternion_world_wxyz": eef_quaternion.tolist(),
+                    "target_eef_position_world_m": target_eef_position.tolist(),
+                    "target_eef_quaternion_world_wxyz": target_eef_quaternion.tolist(),
+                    "object_tracking_error_m": object_error,
+                    "eef_tracking_error_m": eef_error,
+                    "grasp_relative_position_error_m": relative_pos_error,
+                    "grasp_relative_rotation_error_rad": relative_rot_error,
+                    "action": action.tolist(),
+                    "requested_osc_output_world_delta": desired_output.tolist(),
+                    "controller_scaled_osc_output": actual_output.tolist(),
+                    "reward": float(reward),
+                    "done": bool(done),
+                    "state": diagnostic,
+                    "contacts": step_contacts,
+                    "substep_contact_coverage": monitor["control_steps"][-1],
+                    "joint_limits": joint_limits,
+                    "workspace": {
+                        "status": workspace_status,
+                        "target": target_workspace,
+                        "actual": actual_workspace,
+                    },
+                    "grasp_contacts": finger_sides,
+                    "tracking_status": "fail" if reason is not None else "pass",
+                    "tracking_failure_reason": reason,
+                }
+                result["steps"].append(step)
+                result["executed_steps"] += 1
+                if bool(done):
+                    tracking_status = "fail"
+                    tracking_reason = "environment_terminated_during_trajectory_tracking"
+                    grasp["status"] = "fail"
+                    grasp["reason"] = tracking_reason
+                    break
+                if reason is not None:
+                    break
+            except Exception:
+                raise
+        result["execution_complete"] = (
+            result["executed_steps"] == result["requested_steps"]
+            and tracking_status == "pass"
+            and all(not step["done"] for step in result["steps"])
+        )
+        endpoint_error = (
+            result["steps"][-1]["object_tracking_error_m"]
+            if result["steps"]
+            else None
+        )
+        finite_rewards = all(
+            isinstance(step.get("reward"), (int, float))
+            and np.isfinite(float(step["reward"]))
+            for step in result["steps"]
+        )
+        no_terminal_state = all(not step.get("done", True) for step in result["steps"])
+        grasp_held = grasp.get("status") == "pass" and len(grasp["per_step"]) == len(result["steps"])
+        endpoint_reached = (
+            endpoint_error is not None
+            and np.isfinite(endpoint_error)
+            and endpoint_error <= options["maximum_object_tracking_error_m"]
+        )
+        result["task_feasibility"] = {
+            "status": (
+                "pass"
+                if result["execution_complete"]
+                and finite_rewards
+                and no_terminal_state
+                and grasp_held
+                and endpoint_reached
+                else "fail"
+            ),
+            "scope": "complete local carried-object path only; no final task-success claim",
+            "final_task_success_confirmed": False,
+            "complete_path_executed": result["execution_complete"],
+            "no_terminal_done": no_terminal_state,
+            "finite_reward_trace": finite_rewards,
+            "opposing_finger_grasp_maintained": grasp_held,
+            "endpoint_object_tracking_error_m": endpoint_error,
+            "endpoint_within_tracking_tolerance": endpoint_reached,
+        }
+        result["closed_loop_tracking"] = {
+            "status": "pass" if result["execution_complete"] else "fail",
+            "reason": tracking_reason,
+            "maximum_object_tracking_error_m": max(
+                (step["object_tracking_error_m"] for step in result["steps"]), default=None
+            ),
+            "maximum_eef_tracking_error_m": max(
+                (step["eef_tracking_error_m"] for step in result["steps"]), default=None
+            ),
+            "workspace_envelope": workspace,
+        }
+        result["grasp_evidence"] = grasp
+        result["status"] = "ok"
+        if not result["execution_complete"] and result["failure_reason"] is None:
+            result["failure_reason"] = tracking_reason or "trajectory_tracking_incomplete"
+    except Exception as exc:
+        result["status"] = "error"
+        result["failure_reason"] = f"{type(exc).__name__}: {exc}"
+        if "grasp_evidence" not in result:
+            result["grasp_evidence"] = {
+                "status": "unavailable",
+                "reason": result["failure_reason"],
+                "physical_grasp_confirmed_by_distance_only": False,
+            }
+        result["closed_loop_tracking"] = {
+            "status": "fail",
+            "reason": result["failure_reason"],
+        }
+    finally:
+        result["contact_monitoring"] = _contact_monitor_result(monitor)
+    return result
+
+
+def _track_trajectory_bundle(request):
+    global obs, last_reward, last_done
+    snapshot_id = request.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or snapshot_id not in snapshots:
+        return {
+            "status": "unavailable",
+            "error": "unknown_or_expired_snapshot_id",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    target_snapshot = snapshots[snapshot_id]
+    candidates = request.get("candidates")
+    binding = request.get("carried_binding")
+    options = request.get("options")
+    if not isinstance(candidates, list) or not candidates or len(candidates) > 24:
+        return {
+            "status": "unavailable",
+            "error": "candidate_count_must_be_in_1_to_24",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    if not isinstance(options, dict):
+        return {
+            "status": "unavailable",
+            "error": "tracking_options_are_missing",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    expected_context = request.get("repair_context")
+    try:
+        active_context = _repair_context()
+        if (
+            not isinstance(expected_context, dict)
+            or expected_context.get("status") != "available"
+            or json.dumps(expected_context, sort_keys=True, allow_nan=False)
+            != json.dumps(active_context, sort_keys=True, allow_nan=False)
+        ):
+            raise ValueError("active_repair_context_changed_since_request")
+        if len(env.robots) != 1:
+            raise ValueError("only one active Panda arm is supported by this tracker")
+        if not math.isclose(float(env.env.control_timestep), 0.05, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("active_environment_control_rate_is_not_20_Hz")
+        if request.get("trajectory_state_id") != _tracking_snapshot_state_id(target_snapshot):
+            raise ValueError("trajectory_bundle_and_snapshot_state_id_mismatch")
+        if not _tracking_value_equal(_capture_snapshot(), target_snapshot):
+            raise ValueError("active_main_state_does_not_match_the_decision_snapshot")
+        _tracking_validate_binding(binding, request["trajectory_state_id"])
+        max_steps = options.get("max_control_steps_per_candidate")
+        if (
+            isinstance(max_steps, bool)
+            or not isinstance(max_steps, int)
+            or max_steps not in range(1, 241)
+        ):
+            raise ValueError("max_control_steps_per_candidate_must_be_in_1_to_240")
+        for field in (
+            "reference_speed_m_s",
+            "maximum_object_tracking_error_m",
+            "maximum_eef_tracking_error_m",
+            "maximum_grasp_relative_position_error_m",
+            "maximum_grasp_relative_rotation_error_rad",
+            "state_tolerance_m",
+            "rotation_tolerance_rad",
+        ):
+            value = options.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"tracking option {field} must be finite and positive")
+        if len({item.get("candidate_id") for item in candidates if isinstance(item, dict)}) != len(candidates):
+            raise ValueError("candidate_ids_are_missing_or_duplicated")
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "error": f"Trajectory tracking preflight failed: {type(exc).__name__}: {exc}",
+            "main_state_restored": True,
+            "candidates": [],
+        }
+
+    caller_snapshot = _capture_snapshot()
+    caller_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+    result = {
+        "operation": "track_trajectory_bundle",
+        "status": "incomplete",
+        "snapshot_id": snapshot_id,
+        "trajectory_state_id": request["trajectory_state_id"],
+        "candidates": [],
+        "main_state_restored": False,
+        "main_restore_verified": False,
+    }
+    try:
+        for candidate_index, candidate in enumerate(candidates):
+            item = {
+                "candidate_id": candidate.get("candidate_id") if isinstance(candidate, dict) else None,
+                "status": "error",
+                "requested_steps": 0,
+                "executed_steps": 0,
+                "execution_complete": False,
+                "snapshot_start_state_match": False,
+                "steps": [],
+            }
+            try:
+                if not isinstance(candidate, dict) or not isinstance(candidate.get("candidate_id"), str):
+                    raise ValueError("candidate identity is malformed")
+                if candidate.get("status") not in (None, "geometric_candidate"):
+                    raise ValueError("candidate has an unsupported execution status")
+                item = _track_trajectory_candidate(
+                    candidate, target_snapshot, binding, options, candidate_index
+                )
+            except Exception as exc:
+                item["status"] = "error"
+                item["failure_reason"] = f"{type(exc).__name__}: {exc}"
+                item.setdefault("steps", [])
+            result["candidates"].append(item)
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            _restore_snapshot(caller_snapshot)
+            restored_snapshot = _capture_snapshot()
+            restored_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+            state_equal = _tracking_value_equal(caller_snapshot, restored_snapshot)
+            diagnostic_equal = _tracking_value_equal(caller_diagnostic, restored_diagnostic)
+            result["main_restore_verified"] = bool(state_equal and diagnostic_equal)
+            result["main_state_restored"] = bool(state_equal and diagnostic_equal)
+            if not result["main_state_restored"]:
+                result["main_restore_error"] = "complete_snapshot_or_canonical_diagnostic_mismatch"
+        except Exception as exc:
+            result["main_state_restored"] = False
+            result["main_restore_verified"] = False
+            result["main_restore_error"] = f"{type(exc).__name__}: {exc}"
+    result["status"] = (
+        "complete"
+        if result["main_state_restored"]
+        and len(result["candidates"]) == len(candidates)
+        else "incomplete"
+    )
+    return result
+
+
 def _snapshot_diagnostics(canonicalize_kinematics=False):
     sim = env.sim
     task_env = env.env
@@ -543,6 +1432,12 @@ def _snapshot_diagnostics(canonicalize_kinematics=False):
             "joint_qvel": np.asarray(sim.data.qvel[robot._ref_joint_vel_indexes]).tolist(),
             "eef_pos": np.asarray(diagnostic_data.site_xpos[robot.eef_site_id]).tolist(),
         }
+        eef_rotation = np.asarray(
+            diagnostic_data.site_xmat[robot.eef_site_id], dtype=np.float64
+        ).reshape(3, 3)
+        eef_quaternion = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(eef_quaternion, eef_rotation.reshape(-1))
+        robot_state["eef_quat"] = eef_quaternion.tolist()
         if getattr(robot, "has_gripper", False):
             robot_state["gripper_qpos"] = np.asarray(
                 sim.data.qpos[robot._ref_gripper_joint_pos_indexes]
@@ -2327,6 +3222,21 @@ try:
                         result = {
                             "error": f"Branch rollout failed: {type(exc).__name__}: {exc}",
                             "main_state_restored": None,
+                        }
+                elif request["op"] == "track_trajectory_bundle":
+                    try:
+                        result = _track_trajectory_bundle(request)
+                    except Exception as exc:
+                        result = {
+                            "operation": "track_trajectory_bundle",
+                            "status": "incomplete",
+                            "error": (
+                                "Trajectory tracking failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            "main_state_restored": False,
+                            "main_restore_verified": False,
+                            "candidates": [],
                         }
                 elif request["op"] == "geometry_inventory":
                     try:
