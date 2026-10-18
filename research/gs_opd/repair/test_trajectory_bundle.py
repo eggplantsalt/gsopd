@@ -58,6 +58,42 @@ def scene():
     }
 
 
+def local_bypass_scene():
+    value = scene()
+    carried = value["carried"]
+    obstacle = value["obstacles"][0]
+    forward = np.asarray([1.0, 0.0, 0.0])
+    required = carried["radius_m"] + obstacle["radius_m"] + 0.01
+    separation = required + 1e-6
+    obstacle_center = np.asarray(obstacle["center_world_m"], dtype=float)
+    value["goal"] = {
+        "goal_type": "local_bypass_goal",
+        "position_world_m": (obstacle_center + forward * separation).tolist(),
+        "position_semantics": "carried_sphere_center",
+        "verified": True,
+        "verification_scope": "same_state_geometry_derived_waypoint_only_not_final_placement_or_physical_safety",
+        "source": "synthetic test local bypass construction",
+        "state_id": "synthetic-state",
+        "construction": {
+            "obstacle_object_id": obstacle["object_id"],
+            "obstacle_center_world_m": obstacle_center.tolist(),
+            "forward_world": forward.tolist(),
+            "placement_target_direction_reference": {
+                "body_id": 5,
+                "body_name": "arbitrary-receiver",
+                "body_origin_world_m": [0.8, 0, 0.5],
+                "used_as_final_goal": False,
+                "registered_task_object": "receiver",
+                "native_target_key": "receiver",
+                "native_predicate": ["on", "payload", "receiver"],
+            },
+            "carried_registered_task_object": "payload",
+            "direction_source": "active_bddl_on_target_body_origin_direction_only",
+        },
+    }
+    return value
+
+
 class TrajectoryBundleTests(unittest.TestCase):
     def test_four_control_points_match_analytic_cubic_bezier(self):
         controls = np.asarray([[0, 0, 0], [1, 2, 0], [2, 1, 1], [3, 0, 2]], dtype=float)
@@ -101,6 +137,68 @@ class TrajectoryBundleTests(unittest.TestCase):
             self.assertFalse(candidate["physical_safety_verified"])
             self.assertFalse(candidate["executable"])
         self.assertLess(result["straight_line_minimum_gap_m"], 0)
+
+    def test_local_bypass_goal_is_explicit_and_keeps_physical_flags_false(self):
+        input_scene = local_bypass_scene()
+        result = planner.generate_trajectory_bundle(input_scene)
+        goal = result["scene"]["goal"]
+        self.assertEqual(result["goal_type"], "local_bypass_goal")
+        self.assertFalse(goal["final_placement_goal_verified"])
+        self.assertEqual(
+            goal["verification_scope"],
+            "same_state_geometry_derived_waypoint_only_not_final_placement_or_physical_safety",
+        )
+        self.assertFalse(result["physical_safety_verified"])
+        self.assertFalse(result["executable"])
+        expected_gap = (
+            goal["construction"]["actual_sphere_center_separation_m"]
+            - input_scene["carried"]["radius_m"]
+            - input_scene["obstacles"][0]["radius_m"]
+        )
+        self.assertGreaterEqual(expected_gap, result["config"]["clearance_m"])
+        np.testing.assert_array_equal(
+            np.asarray(result["candidates"][0]["points_world_m"])[-1],
+            np.asarray(goal["position_world_m"]),
+        )
+
+    def test_local_bypass_goal_rejects_invalid_origin_direction_and_clearance(self):
+        mutations = (
+            lambda s: s["goal"].update(position_world_m=[0.2, 0.01, 0.5]),
+            lambda s: s["goal"]["construction"].update(
+                direction_source="invented_offset"
+            ),
+            lambda s: s["goal"]["construction"][
+                "placement_target_direction_reference"
+            ].update(native_predicate=["in", "payload", "receiver"]),
+            lambda s: s["goal"]["construction"][
+                "placement_target_direction_reference"
+            ].update(used_as_final_goal=True),
+            lambda s: s["goal"].update(
+                position_world_m=[0.1, 0, 0.5]
+            ),  # too close to the obstacle for the configured clearance
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                input_scene = local_bypass_scene()
+                mutate(input_scene)
+                with self.assertRaises(ValueError):
+                    planner.generate_trajectory_bundle(input_scene)
+
+    def test_local_bypass_bundle_can_report_all_candidates_rejected(self):
+        input_scene = local_bypass_scene()
+        input_scene["obstacles"].append(
+            sphere("other-verified-obstacle", [-0.4, 0, 0.5], 0.5)
+        )
+        result = planner.generate_trajectory_bundle(input_scene)
+        self.assertEqual(result["candidate_count"], 18)
+        self.assertEqual(result["screen_pass_count"], 0)
+        self.assertEqual(result["screen_rejected_count"], 18)
+        self.assertTrue(
+            all(
+                not candidate["passes_geometric_screen"]
+                for candidate in result["candidates"]
+            )
+        )
 
     def test_all_allowed_bundle_sizes_stay_within_budget(self):
         for count in range(12, 25):

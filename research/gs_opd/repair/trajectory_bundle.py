@@ -99,7 +99,7 @@ def sphere_from_aabb(lower_world_m: Any, upper_world_m: Any) -> dict[str, Any]:
     }
 
 
-def _scene_input(scene: Any) -> dict[str, Any]:
+def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
     if (
         not isinstance(scene, dict)
         or scene.get("frame") != "world"
@@ -160,15 +160,158 @@ def _scene_input(scene: Any) -> dict[str, Any]:
         raise ValueError(
             "goal.position_semantics must be carried_sphere_center; a target Body origin is not inferred"
         )
-    goal = {
-        "position_world_m": _vector(
-            goal.get("position_world_m"), "goal.position_world_m"
-        ).tolist(),
+    goal_type = goal.get("goal_type", "placement_goal")
+    if goal_type not in ("placement_goal", "local_bypass_goal"):
+        raise ValueError("goal.goal_type must be placement_goal or local_bypass_goal")
+    position = _vector(goal.get("position_world_m"), "goal.position_world_m")
+    normalized_goal = {
+        "goal_type": goal_type,
+        "position_world_m": position.tolist(),
         "position_semantics": "carried_sphere_center",
         "source": _text(goal.get("source"), "goal.source"),
         "state_id": state_id,
         "verified": True,
     }
+    if goal_type == "local_bypass_goal":
+        verification_scope = goal.get("verification_scope")
+        if (
+            verification_scope
+            != "same_state_geometry_derived_waypoint_only_not_final_placement_or_physical_safety"
+        ):
+            raise ValueError("local_bypass_goal verification scope is not explicit")
+        construction = goal.get("construction")
+        if not isinstance(construction, dict):
+            raise ValueError("local_bypass_goal requires construction evidence")
+        obstacle_id = _text(
+            construction.get("obstacle_object_id"),
+            "goal.construction.obstacle_object_id",
+        )
+        obstacle = next(
+            (item for item in obstacles if item["object_id"] == obstacle_id), None
+        )
+        if obstacle is None:
+            raise ValueError("local_bypass_goal obstacle is not in the verified scene")
+        obstacle_center = _vector(
+            construction.get("obstacle_center_world_m"),
+            "goal.construction.obstacle_center_world_m",
+        )
+        if not np.array_equal(
+            obstacle_center, np.asarray(obstacle["center_world_m"], dtype=float)
+        ):
+            raise ValueError("local_bypass_goal obstacle center conflicts with scene")
+        forward = _vector(
+            construction.get("forward_world"), "goal.construction.forward_world"
+        )
+        forward_norm = float(np.linalg.norm(forward))
+        if not math.isfinite(forward_norm) or abs(forward_norm - 1.0) > 1e-9:
+            raise ValueError("local_bypass_goal forward_world must be a unit vector")
+        target = construction.get("placement_target_direction_reference")
+        if not isinstance(target, dict):
+            raise ValueError(
+                "local_bypass_goal requires a BDDL placement direction reference"
+            )
+        target_position = _vector(
+            target.get("body_origin_world_m"),
+            "goal.construction.placement_target_direction_reference.body_origin_world_m",
+        )
+        target_body_id = target.get("body_id")
+        if (
+            isinstance(target_body_id, bool)
+            or not isinstance(target_body_id, int)
+            or target_body_id < 0
+        ):
+            raise ValueError("local_bypass_goal placement target Body ID is invalid")
+        target_body_name = _text(
+            target.get("body_name"),
+            "goal.construction.placement_target_direction_reference.body_name",
+        )
+        if (
+            construction.get("direction_source")
+            != "active_bddl_on_target_body_origin_direction_only"
+        ):
+            raise ValueError(
+                "local_bypass_goal direction source is not the active BDDL On target"
+            )
+        carried_task_object = _text(
+            construction.get("carried_registered_task_object"),
+            "goal.construction.carried_registered_task_object",
+        )
+        target_task_object = _text(
+            target.get("registered_task_object"),
+            "goal.construction.placement_target_direction_reference.registered_task_object",
+        )
+        native_target_key = _text(
+            target.get("native_target_key"),
+            "goal.construction.placement_target_direction_reference.native_target_key",
+        )
+        predicate = target.get("native_predicate")
+        if (
+            not isinstance(predicate, list)
+            or len(predicate) != 3
+            or str(predicate[0]).lower() != "on"
+            or predicate[1] != carried_task_object
+            or predicate[2] != native_target_key
+            or target.get("used_as_final_goal") is not False
+        ):
+            raise ValueError(
+                "local_bypass_goal direction reference must match the active BDDL On relation"
+            )
+        start = np.asarray(carried["center_world_m"], dtype=float)
+        target_vector = target_position - start
+        target_distance = float(np.linalg.norm(target_vector))
+        if not math.isfinite(target_distance) or target_distance <= 1e-9:
+            raise ValueError("local_bypass_goal BDDL target direction is degenerate")
+        if not np.allclose(target_vector / target_distance, forward, atol=1e-9, rtol=0):
+            raise ValueError(
+                "local_bypass_goal forward direction conflicts with BDDL target"
+            )
+        obstacle_projection = float(np.dot(obstacle_center - start, forward))
+        if not 0 < obstacle_projection < target_distance:
+            raise ValueError(
+                "local_bypass_goal obstacle is not between start and target"
+            )
+        required_separation = (
+            carried["radius_m"] + obstacle["radius_m"] + config.clearance_m
+        )
+        goal_offset = position - obstacle_center
+        projected_offset = float(np.dot(goal_offset, forward))
+        lateral_offset = goal_offset - projected_offset * forward
+        numeric_margin = 1e-9 * max(1.0, required_separation)
+        if (
+            np.linalg.norm(lateral_offset) > numeric_margin
+            or projected_offset < required_separation
+            or projected_offset + obstacle_projection >= target_distance
+        ):
+            raise ValueError(
+                "local_bypass_goal must lie behind its obstacle with the configured conservative sphere clearance and before the placement target"
+            )
+        normalized_goal["construction"] = {
+            "obstacle_object_id": obstacle_id,
+            "obstacle_center_world_m": obstacle_center.tolist(),
+            "forward_world": forward.tolist(),
+            "placement_target_direction_reference": {
+                "body_id": target_body_id,
+                "body_name": target_body_name,
+                "body_origin_world_m": target_position.tolist(),
+                "used_as_final_goal": False,
+            },
+            "direction_source": construction["direction_source"],
+            "native_bddl_on_predicate": predicate,
+            "carried_registered_task_object": carried_task_object,
+            "placement_target_registered_task_object": target_task_object,
+            "native_target_key": native_target_key,
+            "required_sphere_center_separation_m": required_separation,
+            "actual_sphere_center_separation_m": float(np.linalg.norm(goal_offset)),
+            "actual_conservative_sphere_gap_m": float(
+                np.linalg.norm(goal_offset) - carried["radius_m"] - obstacle["radius_m"]
+            ),
+        }
+        normalized_goal["verification_scope"] = verification_scope
+    normalized_goal["final_placement_goal_verified"] = (
+        goal_type == "placement_goal"
+        and goal.get("safe_center_region_verified") is True
+    )
+    goal = normalized_goal
     up = _vector(scene.get("world_up"), "world_up")
     norm = float(np.linalg.norm(up))
     if not math.isfinite(norm) or norm < 1e-12:
@@ -333,8 +476,9 @@ def generate_trajectory_bundle(
     """Generate 12–24 object-center paths with explicit geometry-only screening.
 
     Args:
-        scene: Same-state world/meter carried sphere, obstacle spheres, verified
-            desired carried-center goal, and world-up vector. Each sphere needs
+        scene: Same-state world/meter carried sphere, obstacle spheres, a verified
+            placement or explicitly constructed local bypass carried-center goal,
+            and world-up vector. Each sphere needs
             binding/enclosure verification declarations and their source strings.
         config: Deterministic bundle size, clearance and discretization settings.
 
@@ -347,7 +491,7 @@ def generate_trajectory_bundle(
         ValueError: Geometry, provenance, coordinate frame or settings are invalid.
     """
     _configuration(config)
-    scene = _scene_input(scene)
+    scene = _scene_input(scene, config)
     carried, obstacles = scene["carried"], scene["obstacles"]
     start = np.asarray(carried["center_world_m"])
     goal = np.asarray(scene["goal"]["position_world_m"])
@@ -468,6 +612,7 @@ def generate_trajectory_bundle(
             "left": lateral.tolist(),
             "above": above.tolist(),
         },
+        "goal_type": scene["goal"]["goal_type"],
         "straight_line_minimum_gap_m": min(item[0] for item in straight),
         "candidate_count": len(candidates),
         "screen_pass_count": passed,
@@ -482,7 +627,7 @@ def generate_trajectory_bundle(
         "executable": False,
         "limitations": [
             "Caller must supply conservative enclosures of the entire carried object and every relevant obstacle in the same state.",
-            "Goal is a verified desired carried-sphere center, not an inferred receptacle/body origin.",
+            "A local_bypass_goal is a geometry-derived waypoint behind an obstacle using the BDDL On target Body origin for direction only; it is not a final placement location or proof of task completion.",
             "B-spline control waypoints are not interpolation constraints; the sampled curve and its bound are screened.",
             "Static sphere geometry omits the robot/gripper, orientation, support contacts, dynamics and task feasibility.",
             "No control, time parameterization, Snapshot, contact verification or action execution is performed.",
@@ -510,7 +655,11 @@ def _bundle_svg(bundle):
         root,
         18,
         20,
-        "Geometry-only B-spline proposals; sphere screen is not physical safety",
+        (
+            "Local bypass waypoint; not final placement or physical safety"
+            if bundle.get("goal_type") == "local_bypass_goal"
+            else "Geometry-only B-spline proposals; sphere screen is not physical safety"
+        ),
     )
     scene = bundle["scene"]
     colors = {"left": "#1677b8", "right": "#8558ad", "above": "#c87415"}
@@ -588,9 +737,14 @@ def _bundle_svg(bundle):
             ET.SubElement(
                 line, "title"
             ).text = f"{candidate['candidate_id']} {candidate['direction']}: {candidate['rejection_reasons'] or 'passes geometric screen only'}"
+        goal_label = (
+            "local bypass"
+            if bundle.get("goal_type") == "local_bypass_goal"
+            else "goal"
+        )
         for point, text, color in (
             (start, "start", "#111111"),
-            (goal, "goal", "#188237"),
+            (goal, goal_label, "#188237"),
         ):
             x, y = pixel(point)
             ET.SubElement(

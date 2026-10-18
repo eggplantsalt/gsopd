@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Read actual planning geometry; generate curves only with a proven center goal."""
+"""Read actual planning geometry and screen locally derived bypass paths."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from multiprocessing.connection import Client
 from pathlib import Path
@@ -223,37 +224,211 @@ def _compare_queries(before, after):
     }
 
 
-def _verified_scene(query, payload):
-    goal = query.get("goal", {})
+class _LocalGoalUnavailable(ValueError):
+    def __init__(self, reason, diagnostics=None):
+        super().__init__(reason)
+        self.diagnostics = diagnostics or []
+
+
+def _build_local_bypass_scene(query, payload, *, clearance_m=0.01):
+    """Build a local endpoint from same-state spheres and the active BDDL On target."""
+    state_id = query["state_id"]
+    objects = query["objects"]
+    carried = objects[payload["carried_binding"]["object_id"]]
+    carried_task_key = carried.get("registered_task_object")
+    if not isinstance(carried_task_key, str) or not carried_task_key:
+        raise ValueError("local_bypass_goal_unavailable:carried_bddl_object_missing")
+
+    goal_diagnostics = query.get("goal", {})
+    native_goals = goal_diagnostics.get("native_goal_predicates")
+    if not isinstance(native_goals, list):
+        raise ValueError("local_bypass_goal_unavailable:active_bddl_goals_missing")
+    on_goals = [
+        item
+        for item in native_goals
+        if isinstance(item, (list, tuple))
+        and len(item) == 3
+        and str(item[0]).lower() == "on"
+        and item[1] == carried_task_key
+    ]
+    if len(on_goals) != 1:
+        raise ValueError(
+            "local_bypass_goal_unavailable:active_bddl_on_target_missing_or_ambiguous"
+        )
+    predicate = list(on_goals[0])
+    target_key = predicate[2]
+    target_diagnostics = [
+        item
+        for item in goal_diagnostics.get("targets", [])
+        if isinstance(item, dict)
+        and item.get("predicate") == predicate
+        and (
+            item.get("registered_task_object") == target_key
+            or item.get("native_target_site_key") == target_key
+        )
+    ]
+    if len(target_diagnostics) != 1:
+        raise ValueError(
+            "local_bypass_goal_unavailable:compiled_bddl_target_body_missing_or_ambiguous"
+        )
+    target = target_diagnostics[0]
+    target_registered_key = target.get("registered_task_object")
+    target_body_id, target_body_name = target.get("body_id"), target.get("body_name")
+    target_position = np.asarray(
+        target.get("body_origin_world_m_diagnostic_only"), dtype=np.float64
+    )
     if (
-        goal.get("status") != "complete"
-        or goal.get("verified") is not True
-        or goal.get("safe_center_region_verified") is not True
-        or goal.get("state_id") != query["state_id"]
-        or goal.get("position_semantics") != "carried_sphere_center"
-        or not isinstance(goal.get("source"), str)
-        or not goal["source"]
+        isinstance(target_body_id, bool)
+        or not isinstance(target_body_id, int)
+        or target_body_id < 0
+        or not isinstance(target_body_name, str)
+        or not target_body_name
+        or target_position.shape != (3,)
+        or not np.isfinite(target_position).all()
+        or target.get("body_origin_is_carried_center_goal") is not False
     ):
-        return None
-    target = goal.get("placement_target", {})
+        raise ValueError("local_bypass_goal_unavailable:target_body_diagnostic_invalid")
+    inventory_geometries = query.get("geometry_inventory", {}).get("geometries", [])
     if not any(
-        entry.get("body_id") == target.get("body_id")
-        and entry.get("body_name") == target.get("body_name")
+        entry.get("body_id") == target_body_id
+        and entry.get("body_name") == target_body_name
         and entry.get("category") == "scene"
-        for entry in query["geometry_inventory"]["geometries"]
+        for entry in inventory_geometries
     ):
-        raise ValueError("verified_goal_target_body_not_in_current_geometry_inventory")
-    return {
+        raise ValueError(
+            "local_bypass_goal_unavailable:target_body_not_in_current_geometry_inventory"
+        )
+    bound_body_ids = {
+        carried.get("body_id"),
+        *(
+            objects[item["object_id"]].get("body_id")
+            for item in payload["obstacle_bindings"]
+        ),
+    }
+    if target_body_id in bound_body_ids:
+        raise ValueError(
+            "local_bypass_goal_unavailable:target_body_conflicts_with_bound_object"
+        )
+
+    start = np.asarray(carried["center_world_m"], dtype=np.float64)
+    carried_radius = float(carried["radius_m"])
+    target_vector = target_position - start
+    target_distance = float(np.linalg.norm(target_vector))
+    if not math.isfinite(target_distance) or target_distance <= 1e-9:
+        raise ValueError("local_bypass_goal_unavailable:placement_direction_degenerate")
+    forward = target_vector / target_distance
+
+    obstacle_candidates = []
+    diagnostics = []
+    for binding in payload["obstacle_bindings"]:
+        obstacle = objects[binding["object_id"]]
+        center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
+        radius = float(obstacle["radius_m"])
+        offset = center - start
+        along = float(np.dot(offset, forward))
+        lateral = float(np.linalg.norm(offset - along * forward))
+        required_separation = carried_radius + radius + clearance_m
+        endpoint_along = along + required_separation
+        reasons = []
+        if not (0 < along < target_distance):
+            reasons.append("obstacle_not_between_carried_state_and_bddl_target")
+        if lateral > required_separation:
+            reasons.append("obstacle_outside_forward_carried_sphere_corridor")
+        if endpoint_along >= target_distance:
+            reasons.append("clearance_endpoint_would_reach_or_pass_placement_target")
+        diagnostics.append(
+            {
+                "obstacle_object_id": binding["object_id"],
+                "obstacle_center_world_m": center.tolist(),
+                "projection_from_start_m": along,
+                "lateral_distance_from_task_direction_m": lateral,
+                "required_center_separation_m": required_separation,
+                "rejection_reasons": reasons,
+            }
+        )
+        if not reasons:
+            obstacle_candidates.append((along, obstacle, required_separation))
+    if not obstacle_candidates:
+        raise _LocalGoalUnavailable(
+            "local_bypass_goal_unavailable:no_forbidden_obstacle_in_forward_corridor",
+            diagnostics,
+        )
+    # The first physically relevant obstacle along the BDDL task direction is
+    # the local bypass reference; ties retain the validated binding order.
+    obstacle_projection, obstacle, required_separation = min(
+        obstacle_candidates, key=lambda item: item[0]
+    )
+    scale = max(
+        1.0, required_separation, float(np.abs(obstacle["center_world_m"]).max())
+    )
+    numeric_pad = 1e-8 * scale
+    endpoint_separation = required_separation + numeric_pad
+    obstacle_center = np.asarray(obstacle["center_world_m"], dtype=np.float64)
+    local_goal_position = obstacle_center + forward * endpoint_separation
+    conservative_gap = (
+        float(np.linalg.norm(local_goal_position - obstacle_center))
+        - carried_radius
+        - float(obstacle["radius_m"])
+    )
+    if (
+        not np.isfinite(local_goal_position).all()
+        or conservative_gap < clearance_m
+        or obstacle_projection + endpoint_separation >= target_distance
+    ):
+        raise ValueError(
+            "local_bypass_goal_unavailable:computed_endpoint_geometry_is_invalid"
+        )
+
+    goal = {
+        "goal_type": "local_bypass_goal",
+        "position_world_m": local_goal_position.tolist(),
+        "position_semantics": "carried_sphere_center",
+        "verified": True,
+        "verification_scope": "same_state_geometry_derived_waypoint_only_not_final_placement_or_physical_safety",
+        "source": "same-state conservative carried/obstacle spheres; direction from active BDDL On target Body origin only",
+        "state_id": state_id,
+        "construction": {
+            "obstacle_object_id": obstacle["object_id"],
+            "obstacle_center_world_m": obstacle_center.tolist(),
+            "forward_world": forward.tolist(),
+            "placement_target_direction_reference": {
+                "body_id": target_body_id,
+                "body_name": target_body_name,
+                "body_origin_world_m": target_position.tolist(),
+                "used_as_final_goal": False,
+                "registered_task_object": target_registered_key,
+                "native_target_key": target_key,
+                "native_predicate": predicate,
+            },
+            "carried_registered_task_object": carried_task_key,
+            "direction_source": "active_bddl_on_target_body_origin_direction_only",
+            "obstacle_projection_from_start_m": obstacle_projection,
+            "obstacle_lateral_distance_m": next(
+                item["lateral_distance_from_task_direction_m"]
+                for item in diagnostics
+                if item["obstacle_object_id"] == obstacle["object_id"]
+            ),
+            "obstacle_selection_rule": "nearest_eligible_forbidden_obstacle_along_task_direction",
+            "required_sphere_center_separation_m": required_separation,
+            "endpoint_sphere_center_separation_m": endpoint_separation,
+            "endpoint_conservative_sphere_gap_m": conservative_gap,
+            "clearance_margin_m": clearance_m,
+            "numeric_padding_m": numeric_pad,
+            "all_obstacle_forward_checks": diagnostics,
+        },
+    }
+    scene = {
         "frame": "world",
         "units": "m",
-        "state_id": query["state_id"],
+        "state_id": state_id,
         "world_up": query["world_up"],
-        "carried": query["objects"][payload["carried_binding"]["object_id"]],
+        "carried": carried,
         "obstacles": [
-            query["objects"][item["object_id"]] for item in payload["obstacle_bindings"]
+            objects[item["object_id"]] for item in payload["obstacle_bindings"]
         ],
         "goal": goal,
     }
+    return scene
 
 
 def run_scene_smoke(
@@ -265,7 +440,7 @@ def run_scene_smoke(
     subject_id: str | None = None,
     expected_instruction: str | None = None,
 ) -> dict[str, Any]:
-    """Query twice without reset/step; save bounds even if the native goal is unknown."""
+    """Query twice without reset/step; screen local bypass proposals if derivable."""
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     reserved = (
@@ -285,6 +460,8 @@ def run_scene_smoke(
         "geometry_query_succeeded": False,
         "physical_safety_verified": False,
         "trajectory_executability_verified": False,
+        "final_placement_goal_verified": False,
+        "goal_status": "unavailable",
         "requested_candidate_count": 18,
         "candidate_count": 0,
         "screen_pass_count": None,
@@ -307,18 +484,36 @@ def run_scene_smoke(
             first, teacher, semantic_results, payload
         )
         first_valid = True
-        scene = _verified_scene(first, payload)
-        if scene is None:
-            report.update({
-                "status": "goal_unavailable",
-                "reason": first.get("goal", {}).get(
-                    "reason", "No proven safe carried-center goal region"
-                ),
-            })
+        bundle_config = BundleConfig(candidate_count=18)
+        try:
+            scene = _build_local_bypass_scene(
+                first, payload, clearance_m=bundle_config.clearance_m
+            )
+        except ValueError as exc:
+            report.update(
+                {
+                    "status": "goal_unavailable",
+                    "goal_status": "goal_unavailable",
+                    "goal_diagnostics": first.get("goal", {}),
+                    "goal_construction_diagnostics": getattr(
+                        exc, "diagnostics", []
+                    ),
+                    "reason": str(exc),
+                }
+            )
         else:
             report["scene"] = scene
-            bundle = generate_trajectory_bundle(scene, BundleConfig(candidate_count=18))
-            report["status"] = "complete"
+            bundle = generate_trajectory_bundle(scene, bundle_config)
+            report.update(
+                {
+                    "status": "complete",
+                    "goal_status": "local_bypass_goal_constructed",
+                    "final_placement_goal_verified": False,
+                    "physical_safety_verified": False,
+                    "trajectory_executability_verified": False,
+                    "trajectory_bundle_generated": True,
+                }
+            )
     except Exception as exc:
         report.update({
             "status": "unavailable",
@@ -415,10 +610,14 @@ def main(argv: list[str] | None = None) -> int:
                     "geometry_query_succeeded",
                     "candidate_count",
                     "screen_pass_count",
+                    "screen_rejected_count",
                     "reason",
+                    "rejection_reason_counts",
                     "error",
                     "state_consistency_error",
                     "trajectory_executability_verified",
+                    "goal_status",
+                    "final_placement_goal_verified",
                 )
             },
             ensure_ascii=False,

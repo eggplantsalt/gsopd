@@ -1554,6 +1554,8 @@ cd /workspace/zy_workspace/RLinf
 
 ## 真实规划几何只读查询与 Scene Smoke（2026-10-18）
 
+> 历史实现记录：本节记录只读 Bridge 几何查询及最初依赖最终放置 Goal 的 Scene Smoke。局部绕行目标及当前 Smoke 行为以文档后面的“局部绕障 Trajectory Bundle 终点”一节为准。
+
 ### 实现与几何来源审计
 
 - `safety_bridge.py` 新增只读 `planning_geometry` 操作；新增独立 `trajectory_bundle_scene_smoke.py` 和对应测试。当前局部目标是将已核验的语义物体绑定转换为同一真实状态下的完整碰撞包围球；全局路线中的控制转换、Snapshot 轨迹验证与实际任务执行仍是后续阶段。
@@ -1567,9 +1569,9 @@ cd /workspace/zy_workspace/RLinf
 
 - 静态审计当前固定任务 BDDL，目标为 `On(搬运物体, 放置目标)`；活动任务注册表可将其关联到实际目标 Body 和附属编译 Site。接口返回这些物理 ID、Body 原点、Site 位置/尺寸及原生谓词，全部标记为诊断信息。
 - 审计 `LIBERO-Safety/libero/libero/envs/predicates/base_predicates.py::On` 和 `object_states/base_object_states.py::ObjectState.check_ontop()`：当前实现依赖接触与相对高度，没有给出经验证的、对完整搬运物体球心安全的目标区域。因此**本轮没有可靠依据从目标 Body 原点或 Site 中心生成 G**，也没有加入半径/高度虚构偏移。
-- 当前 Bridge 的原生目标审计会返回 `goal.status="goal_unavailable"`、`verified=false`、`position_world_m=null`。这并不否认几何包围球查询本身可以成功。Scene Smoke 保存真实查询和目标诊断，但不调用生成器冒充 18 条真实候选：`candidate_count=0`，`screen_pass_count=null` 表示未生成/未初筛。
+- 当前 Bridge 的原生目标审计会返回 `goal.status="goal_unavailable"`、`verified=false`、`position_world_m=null`。这并不否认几何包围球查询本身可以成功。最初的 Scene Smoke 因依赖最终安全放置区域而不生成候选；当前版本已改为依据同状态障碍球和 BDDL `On` 方向构造受限的局部绕行 Goal，详见后续章节。
 - 客户端仅在收到同状态、带明确物理目标 Body、`carried_sphere_center` 语义及已验证安全区域声明的目标后，才会调用**原有** `generate_trajectory_bundle(..., candidate_count=18)`。当前原生 `On` 路径没有这样的目标证明。该条件分支的测试使用明确标识的合成协议夹具，不能作为真实目标、18 条真实轨迹或任务成功的证据。
-- 下一步先补充并独立验证放置目标的安全球心区域定义，再运行真实几何轨迹初筛；通过初筛后仍需要独立控制/物理/任务验证。本轮不修改 B-Spline 算法、Near–Far、Local Recovery、OSC、Student、Compiler 或训练链路。
+- 局部绕行 Smoke 不再要求最终放置安全球心区域，但通过初筛后仍需要独立控制/物理/任务验证；最终放置区域仍未由本轮证明。本轮不修改 B-Spline 算法、Near–Far、Local Recovery、OSC、Student、Compiler 或训练链路。
 
 ### Scene Smoke 的验证与输出
 
@@ -1610,11 +1612,51 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
   --out-dir logs/gs_opd/trajectory_bundle_scene_v1
 ```
 
-若前置绑定与几何检查成功，但目标仍是当前原生 `On` 关系，预期终端报告 `geometry_query_succeeded=true / status=goal_unavailable`，并保存诊断、不生成伪造目标轨迹；这是假设前置检查成功后的**预期行为，尚非真实实验结果**。
+当时旧版客户端若遇到原生 `On` 关系，会报告 `goal_unavailable`；该行为已由后续局部绕行版本替代。该历史判断不是当前 Smoke 的预期结果。
 
 **检查清单（Checklist）**
 
 - [x] 完整碰撞 Geom 的保守包围球、状态/来源信息及只读 Scene Smoke 已实现；15 项新增及相关回归 43 项通过。
 - [x] 放置目标 Body/Site 只作物理诊断，无法证明安全球心目标时明确 goal_unavailable。
 - [ ] 人工确认真实 L0T0 包围球查询成功和前后状态完全一致；本轮未运行服务端或真实查询。
-- [ ] 定义并物理核验安全目标区域，再生成真实 18 条轨迹；可执行性及任务可行性仍待后续验证。
+- [ ] 真实局部绕行几何及其物理/任务可行性待后续验证；最终放置安全球心区域也仍未被证明。
+
+## 局部绕障 Trajectory Bundle 终点（2026-10-18）
+
+### 变更
+
+- `trajectory_bundle_scene_smoke.py` 现在从同一次 `planning_geometry` 响应构造 `local_bypass_goal`。起点 S 是搬运物体完整碰撞包围球中心；障碍 O 来自已校验的 forbid-contact 对象包围球；前进单位方向是 `(当前 BDDL On 目标 Body 世界坐标 - S)` 的归一化结果。
+- 目标 Body 原点仅用来确定方向，并在输出中标记 `used_as_final_goal=false`。局部终点由当前几何计算：`G = O + D × (r_carried + r_obstacle + clearance + numeric_pad)`。Smoke 选择沿前进方向最近、位于 S 与目标方向参考之间、且落在搬运球/障碍球合并前向通道内的禁止接触障碍；如果没有合格障碍、目标方向退化、G 会到达/越过方向参考，或保守球间隙不足，则返回 `goal_unavailable` 并写明原因。
+- `trajectory_bundle.py::_scene_input()` 区分 `placement_goal` 与 `local_bypass_goal`。局部 Goal 必须带当前 `state_id`、完整的目标障碍身份、单位方向、活动 BDDL `On` 关系、目标 Body 仅作方向参考的声明及同一包围球间隙证明；生成器再次校验 G 位于 O 后方、保持配置间隙并处于放置方向参考之前。旧的 placement Goal 输入仍兼容。
+- 局部 G 仅表示“越过障碍后的几何采样终点”，不是最终盘面放置位置，也不表示碰撞安全或动作可执行。原有 18 条左右/右侧/上方 B-Spline 与连续曲线保守间隙初筛未改变；JSON/SVG 均显式写明 `local_bypass_goal`。每条候选和 Bundle 仍为 `physical_safety_verified=false`、`executable=false`。
+- 成功时输出目录包含前后只读查询 `planning_geometry.json` / `planning_geometry_after.json`、含真实查询球体与局部 G 的 `scene.json`、18 条完整候选及拒绝原因的 `trajectory_bundle.json`、三视图 `trajectory_bundle.svg` 和带几何通过数、拒绝统计、状态一致性及非可执行声明的 `scene_smoke_report.json`。
+
+### 验证与限制
+
+- 轨迹生成器、Scene Smoke、Near–Far 几何 API 和 OSC 控制器相关单测共 **47 项通过**，包括当前协议目标/球体字段构造 G、方向与障碍后侧、保守终点间隙、目标缺失/退化/逆向障碍/通道外障碍、非法局部 Goal、18 条全部拒绝以及查询前后状态不一致阻止写入 Bundle。
+- Python 语法检查、Ruff lint 和 `git diff --check` 通过。`ruff format --check` 指出文件中本次修改区域以外的历史格式差异；为避免无关重排，保留原格式。
+- 本轮没有启动 Bridge、连接真实 L0T0 状态或执行环境动作。单测使用小型合成 MuJoCo 模型；真实包围球查询、现场 BDDL 目标解析和真实 18 条候选通过数仍待下方手动 Smoke。静态通过不代表真实轨迹可执行或安全。
+
+### 当前 L0T0 手动 Smoke 命令
+
+在已经处于目标 L0T0 状态的 Bridge 上运行客户端；不要为了本次查询重启或重置正在使用的 Bridge。客户端只发送 `geometry_inventory` 与两次只读 `planning_geometry` 请求，不发送 reset/step。每次使用新的输出目录：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+PYTHONPATH=/workspace/zy_workspace/RLinf \
+  /workspace/zy_workspace/LIBERO-Safety/.venv/bin/python \
+  -m research.gs_opd.smoke.trajectory_bundle_scene_smoke \
+  --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
+  --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
+  --expected-instruction "pick up the akita black bowl on the stove and place it on the plate" \
+  --out-dir logs/gs_opd/trajectory_bundle_scene_local_bypass_l0t0_v1
+```
+
+命令中的 Teacher、语义绑定和任务指令只用于当前已有 L0T0 检查；Smoke 仍会将 Body/Geom 绑定与当前 Inventory、任务指令与 Bridge 活动任务、前后积分状态与几何指纹逐项核对。真实候选数量、球间隙初筛通过数和拒绝原因以这次运行生成的 JSON 为准，运行前不预设结果。
+
+**检查清单（Checklist）**
+
+- [x] 局部绕行目标从同状态包围球和活动 BDDL `On` 目标方向构造；目标 Body 原点没有被当作 G。
+- [x] 47 项相关单测、语法检查、Ruff lint 和 diff 检查通过。
+- [ ] 在当前真实 L0T0 Bridge 上运行上面的只读 Smoke，检查实际几何包围球、18 条候选的通过/拒绝情况和查询前后状态。
+- [ ] 后续仍需用独立 OSC/MuJoCo 完整接触验证确认任何候选的物理安全与可执行性。

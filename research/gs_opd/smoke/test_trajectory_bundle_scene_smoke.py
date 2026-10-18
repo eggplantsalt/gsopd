@@ -75,7 +75,6 @@ class ReadOnlyBridge:
         self.requests = []
         self.pending = None
         self.change_after_first = False
-        self.synthetic_goal = False
         self.query_count = 0
 
     def send(self, request):
@@ -97,22 +96,6 @@ class ReadOnlyBridge:
             self.pending["obstacle_bindings"],
             self.pending["expected_instruction"],
         )
-        if self.synthetic_goal and result["status"] == "complete":
-            # Test only: exercise the client's future verified-goal branch.
-            # The actual Bridge never promotes On/Body origins to verified goals.
-            target = result["goal"]["targets"][0]
-            result["goal"] = {
-                "status": "complete",
-                "verified": True,
-                "safe_center_region_verified": True,
-                "state_id": result["state_id"],
-                "position_semantics": "carried_sphere_center",
-                "position_world_m": [0.5, 0, 0.5],
-                "source": "synthetic protocol fixture, not a real goal verification",
-                "placement_target": {
-                    key: target[key] for key in ("body_id", "body_name")
-                },
-            }
         return result
 
 
@@ -345,19 +328,23 @@ class PlanningGeometryTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertFalse(result["physical_state_unchanged"])
 
-    def test_scene_smoke_saves_real_query_diagnostics_when_goal_unavailable(self):
+    def test_scene_smoke_generates_local_bypass_bundle_from_current_query(self):
         bridge = ReadOnlyBridge(self.h)
         with tempfile.TemporaryDirectory() as directory:
             result = smoke.run_scene_smoke(
                 bridge, self.teacher, self.semantic, directory
             )
-            self.assertEqual(result["status"], "goal_unavailable", result)
+            self.assertEqual(result["status"], "complete", result)
+            self.assertEqual(result["goal_status"], "local_bypass_goal_constructed")
+            self.assertFalse(result["final_placement_goal_verified"])
             self.assertTrue(result["geometry_query_succeeded"])
             self.assertTrue(result["state_consistency"]["matched"])
-            self.assertEqual(result["candidate_count"], 0)
-            self.assertIsNone(result["screen_pass_count"])
+            self.assertEqual(result["candidate_count"], 18)
             self.assertTrue((Path(directory) / "planning_geometry.json").is_file())
-            self.assertFalse((Path(directory) / "trajectory_bundle.svg").exists())
+            self.assertTrue((Path(directory) / "scene.json").is_file())
+            self.assertTrue((Path(directory) / "trajectory_bundle.json").is_file())
+            self.assertTrue((Path(directory) / "trajectory_bundle.svg").is_file())
+            self.assertEqual(result["scene"]["goal"]["goal_type"], "local_bypass_goal")
             saved = json.loads(
                 (Path(directory) / "scene_smoke_report.json").read_text()
             )
@@ -367,26 +354,66 @@ class PlanningGeometryTests(unittest.TestCase):
             ["geometry_inventory", "planning_geometry", "planning_geometry"],
         )
 
-    def test_client_can_use_verified_goal_protocol_without_treating_fixture_as_real(
-        self,
-    ):
-        bridge = ReadOnlyBridge(self.h)
-        bridge.synthetic_goal = True
-        with tempfile.TemporaryDirectory() as directory:
-            result = smoke.run_scene_smoke(
-                bridge, self.teacher, self.semantic, directory
-            )
-            self.assertEqual(result["status"], "complete", result)
-            self.assertEqual(result["candidate_count"], 18)
-            self.assertTrue((Path(directory) / "trajectory_bundle.svg").is_file())
-            self.assertIn(
-                "synthetic protocol fixture", result["scene"]["goal"]["source"]
-            )
-            self.assertFalse(result["trajectory_executability_verified"])
+    def test_local_bypass_uses_bddl_body_only_for_forward_direction(self):
+        query = self.query()
+        scene = smoke._build_local_bypass_scene(query, self.payload)
+        start = np.asarray(scene["carried"]["center_world_m"])
+        target = np.asarray(
+            scene["goal"]["construction"]["placement_target_direction_reference"][
+                "body_origin_world_m"
+            ]
+        )
+        forward = (target - start) / np.linalg.norm(target - start)
+        construction = scene["goal"]["construction"]
+        obstacle = np.asarray(construction["obstacle_center_world_m"])
+        endpoint = np.asarray(scene["goal"]["position_world_m"])
+        self.assertEqual(
+            construction["placement_target_direction_reference"]["native_predicate"],
+            ["on", "payload", "receiver"],
+        )
+        self.assertFalse(
+            construction["placement_target_direction_reference"]["used_as_final_goal"]
+        )
+        np.testing.assert_allclose(construction["forward_world"], forward, atol=1e-12)
+        self.assertGreater(float(np.dot(endpoint - obstacle, forward)), 0)
+        self.assertGreaterEqual(
+            np.linalg.norm(endpoint - obstacle)
+            - scene["carried"]["radius_m"]
+            - query["objects"][construction["obstacle_object_id"]]["radius_m"],
+            0.01,
+        )
+        self.assertNotEqual(endpoint.tolist(), target.tolist())
+
+    def test_local_bypass_reports_degenerate_missing_and_misdirected_geometry(self):
+        query = self.query()
+        cases = []
+        degenerate = copy.deepcopy(query)
+        degenerate["goal"]["targets"][0]["body_origin_world_m_diagnostic_only"] = (
+            degenerate["objects"]["object_1"]["center_world_m"]
+        )
+        cases.append(("placement_direction_degenerate", degenerate))
+        missing = copy.deepcopy(query)
+        missing["goal"]["targets"] = []
+        cases.append(("compiled_bddl_target_body_missing_or_ambiguous", missing))
+        wrong_direction = copy.deepcopy(query)
+        wrong_direction["objects"]["object_2"]["center_world_m"] = [-0.8, 0, 0.5]
+        cases.append(("no_forbidden_obstacle_in_forward_corridor", wrong_direction))
+        outside_corridor = copy.deepcopy(query)
+        outside_corridor["objects"]["object_2"]["center_world_m"] = [0, 0.5, 0.5]
+        cases.append(("no_forbidden_obstacle_in_forward_corridor", outside_corridor))
+        for expected, value in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(ValueError, expected):
+                    smoke._build_local_bypass_scene(value, self.payload)
+        with self.assertRaises(smoke._LocalGoalUnavailable) as context:
+            smoke._build_local_bypass_scene(wrong_direction, self.payload)
+        self.assertIn(
+            "obstacle_not_between_carried_state_and_bddl_target",
+            context.exception.diagnostics[0]["rejection_reasons"],
+        )
 
     def test_scene_change_prevents_saving_any_candidate_bundle(self):
         bridge = ReadOnlyBridge(self.h)
-        bridge.synthetic_goal = True
         bridge.change_after_first = True
         with tempfile.TemporaryDirectory() as directory:
             result = smoke.run_scene_smoke(
@@ -429,7 +456,7 @@ class PlanningGeometryTests(unittest.TestCase):
                 directory,
                 expected_instruction=self.payload["expected_instruction"],
             )
-            self.assertEqual(result["status"], "goal_unavailable")
+            self.assertEqual(result["status"], "complete")
             self.assertTrue(result["geometry_query_succeeded"])
 
     def test_preexisting_outputs_are_preserved_and_not_reused(self):
