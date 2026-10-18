@@ -22,6 +22,7 @@ import numpy as np
 from research.gs_opd.repair.panda_gripper_state import parse_panda_gripper_closure
 from research.gs_opd.repair.trajectory_tracking import (
     TrackingConfig,
+    _validate_carried_binding,
     body_local_offset_from_world_point,
     body_local_point_to_world,
     check_workspace_target,
@@ -108,7 +109,7 @@ def _semantic_result(object_id, body_id, body_name, geom_id, geom_name):
 
 def _fixtures(candidate_count=1):
     semantic_results = {
-        "carry": _semantic_result("carry", 10, "carry_body", 0, "carry_geom"),
+        "carry": _semantic_result("carry", 10, "carry_body", 3, "carry_visual"),
         "obstacle": _semantic_result(
             "obstacle", 20, "obstacle_body", 1, "obstacle_geom"
         ),
@@ -116,7 +117,7 @@ def _fixtures(candidate_count=1):
     geometry_inventory = {
         "status": "complete",
         "robot_classification_status": "available",
-        "geom_count": 3,
+        "geom_count": 5,
         "model_body_count": 30,
         "robot_body_ids": [1],
         "geometries": [
@@ -141,6 +142,20 @@ def _fixtures(candidate_count=1):
                 "body_name": "robot_body",
                 "category": "robot",
             },
+            {
+                "geom_id": 3,
+                "geom_name": "carry_visual",
+                "body_id": 10,
+                "body_name": "carry_body",
+                "category": "scene",
+            },
+            {
+                "geom_id": 4,
+                "geom_name": "carry_geom_2",
+                "body_id": 10,
+                "body_name": "carry_body",
+                "category": "scene",
+            },
         ],
     }
     gripper_inventory = {
@@ -162,9 +177,24 @@ def _fixtures(candidate_count=1):
         "body_id": 10,
         "body_name": "carry_body",
         "body_ids": [10],
-        "geom_ids": [0],
-        "geom_names": ["carry_geom"],
-        "semantic_binding_geom_ids": [0],
+        "geom_ids": [0, 4],
+        "geom_names": ["carry_geom", "carry_geom_2"],
+        "semantic_binding_geom_ids": [3],
+        "semantic_binding_geom_names": ["carry_visual"],
+        "components": [
+            {
+                "geom_id": 0,
+                "geom_name": "carry_geom",
+                "body_id": 10,
+                "body_name": "carry_body",
+            },
+            {
+                "geom_id": 4,
+                "geom_name": "carry_geom_2",
+                "body_id": 10,
+                "body_name": "carry_body",
+            },
+        ],
         "center_world_m": [0.0, 0.0, 0.0],
         "state_id": STATE_ID,
         "binding_verified": True,
@@ -506,7 +536,16 @@ class TrajectoryTrackingTests(unittest.TestCase):
         self.assertEqual(categories, {"allowed_grasp_contact"})
         self.assertEqual(connection.request["op"], "track_trajectory_bundle")
         self.assertEqual(
-            connection.request["carried_binding"]["semantic_binding_geom_ids"], [0]
+            connection.request["carried_binding"]["semantic_binding_geom_ids"], [3]
+        )
+        self.assertEqual(connection.request["carried_binding"]["geom_ids"], [0, 4])
+        self.assertEqual(
+            connection.request["carried_binding"]["geom_names"],
+            ["carry_geom", "carry_geom_2"],
+        )
+        self.assertEqual(
+            connection.request["carried_binding"]["semantic_binding_geom_names"],
+            ["carry_visual"],
         )
         self.assertEqual(
             connection.request["options"]["max_control_steps_per_candidate"], 480
@@ -520,6 +559,68 @@ class TrajectoryTrackingTests(unittest.TestCase):
             "initial_opposing_finger_contact_evidence_missing",
             result["candidates"][0]["rejection_reasons"],
         )
+
+    def test_visual_only_semantic_geom_is_independent_of_collision_coverage(self):
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        self.assertEqual(binding["semantic_binding_geom_ids"], [3])
+        self.assertNotIn(3, binding["geom_ids"])
+        self.assertEqual(_validate_carried_binding(bundle, binding, semantic, inventory), ("carry", [0, 4]))
+
+    def test_semantic_geom_can_also_be_a_collision_geom(self):
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        binding["semantic_binding_geom_ids"] = [0]
+        binding["semantic_binding_geom_names"] = ["carry_geom"]
+        semantic["carry"]["selected_candidate"]["geom_ids"] = [0]
+        semantic["carry"]["physical_association"]["geom_ids"] = [0]
+        semantic["carry"]["physical_association"]["geom_names"] = ["carry_geom"]
+        self.assertEqual(_validate_carried_binding(bundle, binding, semantic, inventory), ("carry", [0, 4]))
+
+    def test_binding_rejects_missing_or_reordered_collision_geom_names(self):
+        for mutation in ("missing", "reordered"):
+            with self.subTest(mutation=mutation):
+                fixtures = _fixtures(1)
+                bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+                if mutation == "missing":
+                    binding["geom_names"] = []
+                else:
+                    binding["geom_names"] = list(reversed(binding["geom_names"]))
+                with self.assertRaises(ValueError):
+                    _validate_carried_binding(bundle, binding, semantic, inventory)
+
+    def test_binding_rejects_cross_object_semantic_geom_and_incomplete_coverage(self):
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        binding["semantic_binding_geom_ids"] = [1]
+        binding["semantic_binding_geom_names"] = ["obstacle_geom"]
+        semantic["carry"]["selected_candidate"]["geom_ids"] = [1]
+        semantic["carry"]["physical_association"]["geom_ids"] = [1]
+        semantic["carry"]["physical_association"]["geom_names"] = ["obstacle_geom"]
+        with self.assertRaises(ValueError):
+            _validate_carried_binding(bundle, binding, semantic, inventory)
+
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        binding["geom_ids"] = [0]
+        binding["geom_names"] = ["carry_geom"]
+        with self.assertRaises(ValueError):
+            _validate_carried_binding(bundle, binding, semantic, inventory)
+
+    def test_binding_rejects_candidate_identity_conflicting_with_semantic_binding(self):
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        semantic["carry"]["selected_candidate"]["geom_ids"] = [4]
+        with self.assertRaisesRegex(ValueError, "semantic binding"):
+            _validate_carried_binding(bundle, binding, semantic, inventory)
+
+    def test_binding_rejects_unsupported_child_body_geometry(self):
+        fixtures = _fixtures(1)
+        bundle, binding, _context, _teacher_data, semantic, inventory, _gripper = fixtures
+        inventory["geometries"][4]["body_id"] = 11
+        inventory["geometries"][4]["body_name"] = "carry_child"
+        with self.assertRaisesRegex(ValueError, "active root Body"):
+            _validate_carried_binding(bundle, binding, semantic, inventory)
 
     def test_bundle_and_verified_binding_sphere_centers_must_match(self):
         fixtures = _fixtures(1)
@@ -642,10 +743,10 @@ class TrajectoryTrackingTests(unittest.TestCase):
     def test_unclassified_other_contact_is_not_treated_as_safe(self):
         fixtures = _fixtures(1)
         geometry_inventory = fixtures[5]
-        geometry_inventory["geom_count"] = 4
+        geometry_inventory["geom_count"] = 6
         geometry_inventory["geometries"].append(
             {
-                "geom_id": 3,
+                "geom_id": 5,
                 "geom_name": "other_scene_geom",
                 "body_id": 30,
                 "body_name": "other_scene_body",

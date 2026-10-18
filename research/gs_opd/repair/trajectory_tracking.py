@@ -522,16 +522,32 @@ def _validate_carried_binding(
     semantic_geom_ids = _valid_id_list(
         binding.get("semantic_binding_geom_ids"), "semantic_binding_geom_ids"
     )
-    if (
-        body_id not in body_ids
-        or not set(semantic_geom_ids).issubset(geom_ids)
-        or any(value < 0 for value in body_ids + geom_ids + semantic_geom_ids)
+    if body_id not in body_ids or any(
+        value < 0 for value in body_ids + geom_ids + semantic_geom_ids
     ):
         raise ValueError("carried Body/Geom binding coverage is inconsistent")
-    if not isinstance(binding.get("geom_names"), list) or len(
-        binding["geom_names"]
-    ) != len(geom_ids):
+    collision_geom_names = binding.get("geom_names")
+    semantic_geom_names = binding.get("semantic_binding_geom_names")
+    components = binding.get("components")
+    if (
+        not isinstance(collision_geom_names, list)
+        or len(collision_geom_names) != len(geom_ids)
+        or any(not isinstance(name, str) or not name for name in collision_geom_names)
+    ):
         raise ValueError("carried collision Geom names are incomplete")
+    if (
+        not isinstance(semantic_geom_names, list)
+        or len(semantic_geom_names) != len(semantic_geom_ids)
+        or any(not isinstance(name, str) or not name for name in semantic_geom_names)
+    ):
+        raise ValueError("carried semantic Geom names are incomplete")
+    if (
+        not isinstance(components, list)
+        or len(components) != len(geom_ids)
+        or [item.get("geom_id") for item in components if isinstance(item, dict)]
+        != geom_ids
+    ):
+        raise ValueError("carried collision component coverage is incomplete or reordered")
 
     semantic = (
         semantic_results.get(object_id) if isinstance(semantic_results, dict) else None
@@ -540,13 +556,21 @@ def _validate_carried_binding(
         semantic.get("physical_association") if isinstance(semantic, dict) else None
     )
     decision = semantic.get("semantic_decision") if isinstance(semantic, dict) else None
+    selected_candidate = (
+        semantic.get("selected_candidate") if isinstance(semantic, dict) else None
+    )
     if (
         not isinstance(association, dict)
         or association.get("status") != "matched_by_iou"
         or association.get("body_id") != body_id
+        or not isinstance(decision, dict)
         or decision.get("object_id") != object_id
         or decision.get("status") != "resolved"
         or association.get("geom_ids") != semantic_geom_ids
+        or association.get("geom_names") != semantic_geom_names
+        or not isinstance(selected_candidate, dict)
+        or selected_candidate.get("body_id") not in (None, body_id)
+        or selected_candidate.get("geom_ids") not in (None, semantic_geom_ids)
     ):
         raise ValueError(
             "carried semantic binding is unresolved or conflicts with geometry"
@@ -567,7 +591,9 @@ def _validate_carried_binding(
         raise ValueError(
             "current Geometry Inventory has duplicate or malformed Geom IDs"
         )
-    for geom_id, geom_name in zip(geom_ids, binding["geom_names"]):
+    for geom_id, geom_name, component in zip(
+        geom_ids, collision_geom_names, components
+    ):
         item = by_id.get(geom_id)
         # The current Compiler identifies objects by root Body ID. Until it can
         # compile articulated object subtrees, fail closed on child-body geoms.
@@ -577,11 +603,23 @@ def _validate_carried_binding(
             or item.get("body_name") != body_name
             or item.get("geom_name") != geom_name
             or item.get("category") != "scene"
+            or component.get("geom_name") != geom_name
+            or component.get("body_id") != body_id
+            or component.get("body_name") != body_name
         ):
             raise ValueError("carried collision Geom differs from the active root Body")
-    for geom_id in semantic_geom_ids:
-        if geom_id not in geom_ids:
-            raise ValueError("semantic Geom binding is not covered by collision Geoms")
+    for geom_id, geom_name in zip(semantic_geom_ids, semantic_geom_names):
+        item = by_id.get(geom_id)
+        if (
+            item is None
+            or item.get("geom_name") != geom_name
+            or item.get("body_id") != body_id
+            or item.get("body_name") != body_name
+            or item.get("category") != "scene"
+        ):
+            raise ValueError(
+                "carried semantic Geom differs from the active root Body"
+            )
     if carried.get("state_id") != scene.get("state_id"):
         raise ValueError("carried sphere and trajectory bundle states differ")
     return object_id, geom_ids
@@ -1278,6 +1316,8 @@ def track_trajectory_bundle(
     object_id, geom_ids = _validate_carried_binding(
         bundle, carried_binding, semantic_results, geometry_inventory
     )
+    collision_geom_names = carried_binding["geom_names"]
+    semantic_geom_names = carried_binding["semantic_binding_geom_names"]
     allow_rule_id = _validate_grasp_rule(teacher, object_id)
     if (
         not isinstance(repair_context, dict)
@@ -1379,10 +1419,11 @@ def track_trajectory_bundle(
                 "body_name": carried_binding["body_name"],
                 "body_ids": carried_binding["body_ids"],
                 "geom_ids": geom_ids,
-                "geom_names": carried_binding["geom_names"],
+                "geom_names": collision_geom_names,
                 "semantic_binding_geom_ids": carried_binding[
                     "semantic_binding_geom_ids"
                 ],
+                "semantic_binding_geom_names": semantic_geom_names,
                 "center_world_m": scene["carried"]["center_world_m"],
                 "radius_m": scene["carried"]["radius_m"],
                 "state_id": scene["state_id"],

@@ -151,11 +151,13 @@ def _check_query(query, teacher, semantic_results, payload):
             or item.get("enclosure_verified") is not True
             or item.get("covers_all_associated_collision_geoms") is not True
             or item.get("semantic_binding_geom_ids") != binding["geom_ids"]
+            or item.get("semantic_binding_geom_names") != binding["geom_names"]
         ):
             raise ValueError(
                 "planning_geometry_full_object_identity_or_enclosure_unconfirmed"
             )
         geom_ids, components = item.get("geom_ids"), item.get("components")
+        geom_names = item.get("geom_names")
         center = np.asarray(item.get("center_world_m"), dtype=float)
         radius = item.get("radius_m")
         if (
@@ -168,8 +170,12 @@ def _check_query(query, teacher, semantic_results, payload):
             or not isinstance(geom_ids, list)
             or not geom_ids
             or len(set(geom_ids)) != len(geom_ids)
+            or not isinstance(geom_names, list)
+            or len(geom_names) != len(geom_ids)
+            or any(not isinstance(name, str) or not name for name in geom_names)
             or not isinstance(components, list)
             or len(components) != len(geom_ids)
+            or [component.get("geom_id") for component in components if isinstance(component, dict)] != geom_ids
             or {component.get("geom_id") for component in components} != set(geom_ids)
         ):
             raise ValueError("planning_geometry_sphere_or_component_coverage_invalid")
@@ -177,12 +183,17 @@ def _check_query(query, teacher, semantic_results, payload):
             entry["geom_id"]: entry
             for entry in query["geometry_inventory"]["geometries"]
         }
-        for component in components:
-            geom_id = component["geom_id"]
+        for geom_id, geom_name, component in zip(geom_ids, geom_names, components):
             entry = inventory.get(geom_id, {})
-            for name in ("geom_name", "body_id", "body_name"):
-                if component.get(name) != entry.get(name):
-                    raise ValueError("planning_geometry_component_identity_mismatch")
+            if (
+                geom_id != component.get("geom_id")
+                or geom_name != component.get("geom_name")
+                or any(
+                    component.get(name) != entry.get(name)
+                    for name in ("geom_name", "body_id", "body_name")
+                )
+            ):
+                raise ValueError("planning_geometry_component_identity_mismatch")
             position = np.asarray(component.get("center_world_m"), dtype=float)
             component_radius = component.get("radius_m")
             if (

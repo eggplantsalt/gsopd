@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from research.gs_opd.repair.trajectory_bundle import generate_trajectory_bundle
+from research.gs_opd.repair.trajectory_tracking import _validate_carried_binding
 from research.gs_opd.smoke import trajectory_bundle_scene_smoke as smoke
 from research.gs_opd.smoke.test_pi05_on_policy_safety_collection import (
     _semantic_binding,
@@ -47,6 +48,7 @@ def _helpers(sim, task_env, robot_body):
         "_build_geometry_inventory",
         "_geometry_inventory",
         "_validated_geom_id_list",
+        "_tracking_validate_binding",
     }
     nodes = [
         node
@@ -118,6 +120,12 @@ class PlanningGeometryTests(unittest.TestCase):
                 <geom name="pair_only" type="sphere" size=".01" pos=".05 0 0" contype="0" conaffinity="0"/>
               </body>
             </body>
+            <body name="payload_root_only" pos="-.35 .2 .5"><freejoint/>
+              <geom name="root_only_collision" type="box" size=".025 .02 .015"/>
+              <geom name="root_only_collision_2" type="sphere" size=".01" pos=".04 0 0"/>
+              <geom name="root_only_visual" type="sphere" size=".04" pos=".04 0 0"
+                contype="0" conaffinity="0" mass=".001"/>
+            </body>
             <body name="blocker" pos="0 0 .5">
               <geom name="blocker_collision" type="capsule" size=".03 .04"/>
               <geom name="blocker_mesh" type="mesh" mesh="tiny_mesh" pos="0 .06 0"/>
@@ -158,6 +166,7 @@ class PlanningGeometryTests(unittest.TestCase):
                 key: SimpleNamespace(root_body=key, contact_geoms=geoms)
                 for key, geoms in (
                     ("payload", ["payload_collision", "child_collision", "pair_only"]),
+                ("payload_root_only", ["root_only_collision", "root_only_collision_2"]),
                     ("blocker", ["blocker_collision", "blocker_mesh"]),
                     ("receiver", ["receiver_collision"]),
                 )
@@ -304,6 +313,198 @@ class PlanningGeometryTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "unavailable")
         self.assertTrue(result["physical_state_unchanged"])
+
+    def _root_only_planning_query(self):
+        semantic = copy.deepcopy(self.semantic)
+        body_id = self.sim.model.body_name2id("payload_root_only")
+        visual_id = self.sim.model.geom_name2id("root_only_visual")
+        visual_name = self.sim.model.geom_id2name(visual_id)
+        selected = semantic["object_1"]["selected_candidate"]
+        selected.update({"body_id": body_id, "geom_ids": [visual_id]})
+        association = semantic["object_1"]["physical_association"]
+        association.update(
+            {
+                "body_id": body_id,
+                "body_name": "payload_root_only",
+                "geom_ids": [visual_id],
+                "geom_names": [visual_name],
+            }
+        )
+        inventory = self.h["_geometry_inventory"]()
+        payload, _ = smoke._selected_bindings(
+            self.teacher, semantic, inventory, None, None
+        )
+        query = self.h["_planning_geometry"](
+            payload["carried_binding"],
+            payload["obstacle_bindings"],
+            payload["expected_instruction"],
+        )
+        return query, payload, semantic, inventory
+
+    def test_visual_only_semantic_geom_flows_through_client_and_bridge(self):
+        query, payload, semantic, _inventory = self._root_only_planning_query()
+        self.assertEqual(query["status"], "complete", query.get("error"))
+        carried = query["objects"]["object_1"]
+        collision_ids = carried["geom_ids"]
+        collision_names = carried["geom_names"]
+        semantic_ids = carried["semantic_binding_geom_ids"]
+        semantic_names = carried["semantic_binding_geom_names"]
+        self.assertNotIn(semantic_ids[0], collision_ids)
+        self.assertEqual(len(collision_ids), len(collision_names))
+        self.assertEqual(
+            [item["geom_id"] for item in carried["components"]], collision_ids
+        )
+        self.assertEqual(
+            [item["geom_name"] for item in carried["components"]], collision_names
+        )
+        self.assertEqual(semantic_names, ["root_only_visual"])
+
+        self.assertTrue(
+            smoke._check_query(query, self.teacher, semantic, payload)["valid"]
+        )
+        bundle = {
+            "scene": {
+                "state_id": query["state_id"],
+                "carried": {
+                    "object_id": "object_1",
+                    "center_world_m": carried["center_world_m"],
+                    "radius_m": carried["radius_m"],
+                    "state_id": query["state_id"],
+                },
+            }
+        }
+        self.assertEqual(
+            _validate_carried_binding(bundle, carried, semantic, query["geometry_inventory"]),
+            ("object_1", collision_ids),
+        )
+        bridge_binding = {
+            key: carried[key]
+            for key in (
+                "object_id",
+                "body_id",
+                "body_name",
+                "body_ids",
+                "geom_ids",
+                "geom_names",
+                "semantic_binding_geom_ids",
+                "semantic_binding_geom_names",
+                "state_id",
+                "binding_verified",
+                "covers_all_associated_collision_geoms",
+            )
+        }
+        self.h["_tracking_validate_binding"](bridge_binding, query["state_id"])
+
+    def test_root_only_interface_rejects_bad_coverage_names_and_cross_body(self):
+        query, payload, semantic, _inventory = self._root_only_planning_query()
+        carried = query["objects"]["object_1"]
+        bundle = {
+            "scene": {
+                "state_id": query["state_id"],
+                "carried": {
+                    "object_id": "object_1",
+                    "center_world_m": carried["center_world_m"],
+                    "state_id": query["state_id"],
+                },
+            }
+        }
+        for mutation in (
+            "missing_names",
+            "reordered_names",
+            "incomplete_coverage",
+            "cross_object_geom",
+        ):
+            with self.subTest(mutation=mutation):
+                bad = copy.deepcopy(carried)
+                if mutation == "missing_names":
+                    bad["geom_names"] = []
+                elif mutation == "reordered_names":
+                    bad["geom_names"] = list(reversed(bad["geom_names"]))
+                elif mutation == "incomplete_coverage":
+                    bad["geom_ids"] = bad["geom_ids"][:-1]
+                    bad["geom_names"] = bad["geom_names"][:-1]
+                else:
+                    blocker_id = self.sim.model.geom_name2id("blocker_collision")
+                    bad["geom_ids"] = [blocker_id, *bad["geom_ids"][1:]]
+                    bad["geom_names"] = [
+                        "blocker_collision",
+                        *bad["geom_names"][1:],
+                    ]
+                with self.assertRaises(ValueError):
+                    _validate_carried_binding(
+                        bundle, bad, semantic, query["geometry_inventory"]
+                    )
+                bridge_binding = {
+                    key: copy.deepcopy(bad[key])
+                    for key in (
+                        "object_id",
+                        "body_id",
+                        "body_name",
+                        "body_ids",
+                        "geom_ids",
+                        "geom_names",
+                        "semantic_binding_geom_ids",
+                        "semantic_binding_geom_names",
+                        "state_id",
+                        "binding_verified",
+                        "covers_all_associated_collision_geoms",
+                    )
+                }
+                with self.assertRaises(ValueError):
+                    self.h["_tracking_validate_binding"](
+                        bridge_binding, query["state_id"]
+                    )
+
+        bad = copy.deepcopy(carried)
+        obstacle_id = self.sim.model.geom_name2id("blocker_visual")
+        bad["semantic_binding_geom_ids"] = [obstacle_id]
+        bad["semantic_binding_geom_names"] = ["blocker_visual"]
+        with self.assertRaises(ValueError):
+            _validate_carried_binding(bundle, bad, semantic, query["geometry_inventory"])
+        bridge_binding = {
+            key: bad[key]
+            for key in (
+                "object_id",
+                "body_id",
+                "body_name",
+                "body_ids",
+                "geom_ids",
+                "geom_names",
+                "semantic_binding_geom_ids",
+                "semantic_binding_geom_names",
+                "state_id",
+                "binding_verified",
+                "covers_all_associated_collision_geoms",
+            )
+        }
+        with self.assertRaises(ValueError):
+            self.h["_tracking_validate_binding"](bridge_binding, query["state_id"])
+
+        # The original synthetic payload includes a collision Geom on a child
+        # Body. The current Contact Compiler only supports one root Body, so
+        # the real planning output must remain explicitly unsupported.
+        child_query = self.query()
+        child_carried = child_query["objects"]["object_1"]
+        child_bridge_binding = {
+            key: child_carried[key]
+            for key in (
+                "object_id",
+                "body_id",
+                "body_name",
+                "body_ids",
+                "geom_ids",
+                "geom_names",
+                "semantic_binding_geom_ids",
+                "semantic_binding_geom_names",
+                "state_id",
+                "binding_verified",
+                "covers_all_associated_collision_geoms",
+            )
+        }
+        with self.assertRaises(ValueError):
+            self.h["_tracking_validate_binding"](
+                child_bridge_binding, child_query["state_id"]
+            )
 
     def test_nonfinite_and_unsupported_geom_bounds_are_rejected(self):
         geom_id = self.sim.model.geom_name2id("payload_collision")

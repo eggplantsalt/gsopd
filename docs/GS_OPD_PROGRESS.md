@@ -1724,6 +1724,20 @@ PYTHONPATH=/workspace/zy_workspace/RLinf \
 - 2026-10-19 定点修复将规划包围球 `sphere_center` 与 MuJoCo Body `root_pos` 分开处理：从决策 Snapshot 的球心和 Body root 位姿计算刚性局部偏移，后续按实时 Body 四元数更新球心；路径起点、EEF 目标、误差、终点和报告统一按球心比较。轨迹弧长按完整离散 B-Spline 点列求和，步数以速度上限 0.04 m/s 和实际已校验 20 Hz 周期计算，并受 480/7,200 默认及 600/12,000 硬上限约束。静态回归覆盖 0.567 m 路径需 284 步、单条与整束超预算以及禁止提高参考速度绕过预算。新增代码仍未在真实 MuJoCo 执行。
 - Workspace 约束使用活动控制器笛卡尔限制（若有）、模型关节锚点链给出的保守外包半径、实际 EEF 路径检查和关节 qpos limits。外包半径不是完整逆运动学可达性证明；无法跟踪时由每步真实反馈误差拒绝。指面持续接触和相对位姿阈值是操作性保持证据，不证明任意摩擦/载荷下的抓持裕量。mesh/几何候选初筛仍不构成物理安全证明。
 
+## 轨迹跟踪 Body/Geom 绑定契约修复（2026-10-19）
+
+- 检查了真实记录 `logs/gs_opd/trajectory_bundle_l0t0_physical_acceptance_v2.json`：黑碗根 Body 为 `akita_black_bowl_1_main`，语义识别 Geom 与规划查询列出的碰撞 Geom 集分离，且记录中的 `body_ids` 只含根 Body。旧 `planning_geometry.objects.*` 缺少 `semantic_binding_geom_names` 和碰撞 `geom_names`；候选在跟踪前报 `carried Body/Geom binding coverage is inconsistent`。旧记录未改写。
+- 统一字段语义：`semantic_binding_geom_ids/names` 保留当前 SAM3/IoU 语义绑定的 Geom；`geom_ids/names` 仅表示完整碰撞 Geom 集。Safety Bridge `planning_geometry` 从当前 Geometry Inventory 返回两组独立 ID/名称，并为每个碰撞 Geom 返回同序 `components`。语义 Geom 可以是 visual-only，也可以同时属于碰撞集合。
+- Scene Smoke 的 `_check_query()` 分别核验语义绑定、碰撞 ID/名称顺序、组件和 Inventory 身份。Tracker 客户端分别按 Inventory 核验语义与碰撞 Geom、组件顺序，并确认所选 Candidate 与语义关联一致。Bridge 在跟踪前按活动模型重新核验根 Body/子树、完整有效碰撞 Geom 集、名称和语义 Geom 身份。Contact Compiler 仍只支持碰撞 Geom 位于单一根 Body；跨对象、跨 Body、覆盖不全及不支持的 child-body 碰撞均拒绝，没有增加关节物体支持。
+- 新增合成 MuJoCo 接口链回归：从 `planning_geometry` 响应经过 `_check_query()`、Tracker 客户端校验到 Bridge 前置校验；覆盖语义/碰撞 Geom 分离、两者重合、缺失或错序名称、跨对象 Geom、不完整碰撞覆盖及 child Body 拒绝。
+- 本次只完成单元与静态验证；未启动 Student、真实 Safety Bridge 或真实物理验收。Step 55 物理结果仍待人工重跑确认。
+
+**检查清单（Checklist）**
+
+- [x] 语义 Geom 与完整碰撞 Geom 使用独立字段并分别校验当前 Inventory 身份。
+- [x] 碰撞名称与 Geom ID 顺序严格对应；Bridge 继续复算碰撞集合并 fail-closed。
+- [ ] 在真实 Student Step 55 状态重新运行物理验收，确认候选跟踪结果。
+
 ### 在 Near–Far 命中的当前决策状态调用
 
 物理验收必须从 **Student 已经真实抓住搬运物体** 的活环境决策状态开始，且调用过程中 Student 尚未执行下一动作。不要从 Bridge 冷启动后的未抓持 L0T0 初始状态运行，也不要用历史 Snapshot、RGB 或动作替代当前状态。最短入口是在持久运行的 Student/On-Policy 进程中，确认当前真实抓持后用同一 Bridge connection 依次读取 Snapshot、活动控制器/几何清单和 `repair_context`，并从这个 Snapshot 生成 `planning_geometry`、绑定和 Bundle，再调用下面接口：

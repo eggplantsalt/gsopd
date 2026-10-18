@@ -626,6 +626,7 @@ def _tracking_validate_binding(binding, expected_state_id):
     body_ids = binding.get("body_ids")
     geom_names = binding.get("geom_names")
     semantic_geom_ids = binding.get("semantic_binding_geom_ids")
+    semantic_geom_names = binding.get("semantic_binding_geom_names")
     if (
         not isinstance(body_ids, list)
         or not body_ids
@@ -639,6 +640,9 @@ def _tracking_validate_binding(binding, expected_state_id):
         or not semantic_geom_ids
         or any(isinstance(value, bool) or not isinstance(value, int) for value in semantic_geom_ids)
         or len(set(semantic_geom_ids)) != len(semantic_geom_ids)
+        or not isinstance(semantic_geom_names, list)
+        or len(semantic_geom_names) != len(semantic_geom_ids)
+        or any(not isinstance(value, str) or not value for value in semantic_geom_names)
     ):
         raise ValueError("carried Body/Geom ID arrays are malformed")
     if (
@@ -653,8 +657,10 @@ def _tracking_validate_binding(binding, expected_state_id):
         or not body_ids
         or not isinstance(geom_names, list)
         or len(geom_names) != len(geom_ids)
+        or any(not isinstance(value, str) or not value for value in geom_names)
         or not isinstance(semantic_geom_ids, list)
-        or not set(semantic_geom_ids).issubset(set(geom_ids))
+        or not isinstance(semantic_geom_names, list)
+        or len(semantic_geom_names) != len(semantic_geom_ids)
         or any(value < 0 or value >= int(model.ngeom) for value in geom_ids + semantic_geom_ids)
         or any(value < 0 or value >= int(model.nbody) for value in body_ids)
         or binding.get("binding_verified") is not True
@@ -668,9 +674,21 @@ def _tracking_validate_binding(binding, expected_state_id):
     if set(body_ids) != subtree:
         raise ValueError("carried Body subtree differs from the verified binding")
     inventory = _geometry_inventory()
-    if inventory.get("status") != "complete":
+    if (
+        inventory.get("status") != "complete"
+        or inventory.get("robot_classification_status") != "available"
+    ):
         raise ValueError("current Geometry Inventory is incomplete")
-    inventory_by_id = {item["geom_id"]: item for item in inventory["geometries"]}
+    inventory_entries = inventory.get("geometries")
+    if not isinstance(inventory_entries, list):
+        raise ValueError("current Geometry Inventory is malformed")
+    inventory_by_id = {
+        item.get("geom_id"): item
+        for item in inventory_entries
+        if isinstance(item, dict)
+    }
+    if len(inventory_by_id) != len(inventory_entries):
+        raise ValueError("current Geometry Inventory has duplicate or malformed Geom IDs")
     pair_geoms = set()
     for pair_index in range(int(model.npair)):
         pair_geoms.add(int(model.pair_geom1[pair_index]))
@@ -697,6 +715,18 @@ def _tracking_validate_binding(binding, expected_state_id):
             or item.get("category") != "scene"
         ):
             raise ValueError("carried collision Geom identity conflicts with current model")
+    for geom_id, geom_name in zip(semantic_geom_ids, semantic_geom_names):
+        item = inventory_by_id.get(geom_id)
+        if (
+            item is None
+            or item.get("geom_name") != geom_name
+            or item.get("body_id") != body_id
+            or item.get("body_name") != body_name
+            or item.get("category") != "scene"
+        ):
+            raise ValueError(
+                "carried semantic Geom identity is outside the verified root Body"
+            )
     # The existing Contact Compiler binds contact events to a root Body ID. Do
     # not claim complete object-contact checking for articulated child Bodies.
     if any(int(model.geom_bodyid[geom_id]) != body_id for geom_id in geom_ids):
@@ -2272,7 +2302,9 @@ def _planning_object_sphere(
         "registered_task_object": registered[body]["key"],
         "body_ids": sorted(subtree),
         "semantic_binding_geom_ids": bound_ids,
+        "semantic_binding_geom_names": names,
         "geom_ids": collision_ids,
+        "geom_names": [by_id[g]["geom_name"] for g in collision_ids],
         "excluded_visual_only_geom_ids": sorted(set(all_ids) - set(collision_ids)),
         "components": components,
         "center_world_m": center.tolist(),
