@@ -2036,3 +2036,26 @@ KeyError: 'eef_quaternion_world_wxyz'
 - [x] 回归测试真实调用 `plan_route()` 并检查四类轨迹长度一致。
 - [x] 用上次保存的 live input 和当前模型独立运行左绕 Mink worker；规划 850 步完成，所有四类轨迹各 851 点。
 - [ ] 用新 Student Snapshot 在正常 Bridge 上运行左绕 Mink→OSC 分支，并记录实际控制、跟踪、Compiler 与 branch 后 Snapshot 恢复证据。
+
+## 真实 Student → Mink → 原生 OSC_POSE 左绕 Snapshot Smoke（attempt4，2026-10-19）
+
+- 使用独立的新 Safety Bridge（日志显示 `SAFETY BRIDGE READY`）与现有 `mink_osc_snapshot_smoke.py` 入口；能力握手通过显式 EEF pose、子步接触监测与完整 Snapshot 恢复检查。一次过早连接在 Bridge 监听就绪前返回 `ConnectionRefusedError`，保存在 `bridge_startup_race.log`；Bridge ready 后原入口重跑成功。输出目录为 `logs/gs_opd/mink_panda_physical_v3/live_left_osc_snapshot_smoke_20261019_attempt4/`，没有覆盖前次报告。
+- Student 实际运行 50 步，在当前抓持状态触发唯一左绕分支。实时抓持通过：闭合比例 1.0，黑碗 `akita_black_bowl_1_main` 左右指都接触，Snapshot 时 7 个匹配接触。新鲜当前状态下 Mink 规划完成 **847 步**，四类轨迹均 **848 点**；与上一次已保存 Snapshot 的 850 步不同，这是本次 Student Snapshot 的实时路径。
+- 原生 `OSC_POSE` 使用显式 Mink FK EEF 参考执行 **108/847 步**。首次拒绝在 0-based 控制索引 107：`gripper_object_relative_rotation_changed_beyond_limit`，抓持相对旋转误差 **0.204605 rad**，超过 0.20 rad 限制。拒绝时左右指仍接触（6 个接触），闭合命令保持 1.0；抓持相对位置误差 0.008205 m。OSC EEF 跟踪误差全段最大 **0.003352 m**，黑碗球心跟踪误差最大 **0.012877 m**；首次拒绝步的 EEF 误差为 0.002956 m，黑碗球心误差为 0.012877 m。接触子步监测完整：108 控制步的 2700/2700 个物理子步均被采样。
+- Contact Compiler 总 verdict 为 **`unknown`**：`object_1` 的 Teacher 明确允许夹爪—目标物接触，结果为 `safe`；`object_3` 因 `semantic_disambiguation_result_is_not_an_object` 返回 `unknown`。接触分类记录 101 个事件，其中 19 个 `allowed`、82 个 `unknown`。分支因此拒绝，不能报告为安全通过。
+- Snapshot 恢复通过：分支前完整状态与 OSC controller context 的比较均匹配，最大数值误差为 0；108 步分支后恢复 `snapshot-000001`，完整状态比较 0 个 mismatch、最大数值误差 0，恢复后的抓持复核也通过（闭合比例 1.0，左右指接触，7 个匹配接触）。这次完成了真实 branch 后恢复验证。
+
+真实产物：
+
+- 完整 JSON（含每步状态与错误）：`logs/gs_opd/mink_panda_physical_v3/live_left_osc_snapshot_smoke_20261019_attempt4/live_left_osc_snapshot_report.json`
+- 真实控制台日志：同目录 `smoke_console.log`；Bridge 日志：`safety_bridge.log`
+- Mink 规划：`live_mink_plan.json`；Student 视频：`student_grasp_search.mp4`
+- Mink／OSC EEF／黑碗球心轨迹对比：`live_left_osc_snapshot_report.svg`；场景参考轨迹：`current_state_scene/trajectory_bundle.svg`
+
+本次未修改规划算法、Student、Snapshot 或训练接口；没有运行其他路线、重放历史 Step 55、接管主环境或 Push。该左绕分支真实执行并在抓持旋转误差限制处拒绝，Compiler 结果保持 `unknown`，但完整 Snapshot 恢复验证通过。
+
+**检查清单（Checklist）**
+
+- [x] 新 Safety Bridge 与 Student 实际运行；使用一个当前状态左绕路线进入原生 OSC_POSE Snapshot 分支。
+- [x] 记录 108/847 OSC 步、首个失败、EEF/黑碗误差、双指抓持、Compiler 和分支后完整 Snapshot 恢复。
+- [x] 保存完整 JSON、控制台/Bridge 日志、Student 视频与轨迹 SVG；未自动 Push。
