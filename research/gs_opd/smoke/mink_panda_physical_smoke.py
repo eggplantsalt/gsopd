@@ -456,7 +456,9 @@ def plan_route(model, initial, route, ctx, args):
     pool = collision_pair_pool(model, ctx)
     result["potential_robot_collision_pair_count"] = len(pool)
     result["joint_trajectory_rad"].append(config.q[ctx["qidx"]].tolist())
-    result["eef_trajectory_world_m"].append(data.site_xpos[ctx["site"]].tolist())
+    initial_eef_pos, initial_eef_quat = pose(config.data, ctx["site"])
+    result["eef_trajectory_world_m"].append(initial_eef_pos.tolist())
+    result["eef_quaternion_world_wxyz"].append(initial_eef_quat.tolist())
     result["sphere_trajectory_world_m"].append(guides[0].tolist())
     if len(guides) > args.max_steps + 1:
         result.update(status="rejected", failure_reason="planning_step_budget_exceeded")
@@ -506,9 +508,9 @@ def plan_route(model, initial, route, ctx, args):
             max_pos_error = max(max_pos_error, pos_error)
             max_ori_error = max(max_ori_error, ori_error)
             result["joint_trajectory_rad"].append(config.q[ctx["qidx"]].tolist())
-            result["eef_trajectory_world_m"].append(
-                config.data.site_xpos[ctx["site"]].tolist()
-            )
+            eef_position, eef_quaternion = pose(config.data, ctx["site"])
+            result["eef_trajectory_world_m"].append(eef_position.tolist())
+            result["eef_quaternion_world_wxyz"].append(eef_quaternion.tolist())
             result["sphere_trajectory_world_m"].append(center.tolist())
             result["guide_world_m"].append(guide.tolist())
             if pos_error <= 0.008 or (
@@ -1080,8 +1082,76 @@ def run(args):
         return report
 
 
+def run_live_plan(args):
+    """Plan a current Bridge grasp route; never executes simulator actions."""
+    from types import SimpleNamespace
+
+    from research.gs_opd.smoke.mink_panda_model import compute_model_signature
+
+    source = json.loads(args.live_plan_input.read_text(encoding="utf-8"))
+    archive = source["planning_archive"]
+    model = mujoco.MjModel.from_binary_path(str(args.model_binary))
+    state = np.asarray(source["mujoco_integration_state"], dtype=np.float64)
+    expected_state_size = int(mujoco.mj_stateSize(model, STATE))
+    if state.shape != (expected_state_size,) or not np.isfinite(state).all():
+        raise ValueError("live_Snapshot_integration_state_is_incompatible_with_Mink_model")
+    initial = state.copy()
+    data = restore(model, initial)
+    ctx = make_context(model, archive, json.loads(args.model_metadata.read_text()))
+    ctx["obstacle_definitions"] = archive["scene"]["obstacles"]
+    ctx["primary_obstacle_id"] = archive["trajectory_bundle"]["primary_obstacle_id"]
+    records, finger_sides = scan_contacts(model, data, ctx)
+    plan_args = SimpleNamespace(
+        speed=args.speed,
+        max_steps=args.max_steps,
+        guide_tolerance=args.guide_tolerance,
+        orientation_cost=args.orientation_cost,
+        joint_reference_speed=args.joint_reference_speed,
+        joint_reference_acceleration=args.joint_reference_acceleration,
+    )
+    route = source["route"]
+    report = {
+        "operation": "live_snapshot_mink_left_route_plan",
+        "status": "blocked",
+        "snapshot_state_id": source.get("snapshot_state_id"),
+        "model_geometry_signature": compute_model_signature(model),
+        "model_fingerprint_comparison": source.get("model_fingerprint_comparison"),
+        "mujoco_integration_state_size": expected_state_size,
+        "initial_grasp_contacts": finger_sides,
+        "initial_contacts": records,
+        "mink_planning_performed": False,
+        "physics_actions_executed": 0,
+        "joint_plan_executed": False,
+        "candidate_id": route.get("candidate_id"),
+        "direction": route.get("direction"),
+    }
+    if not all(finger_sides.values()):
+        report["failure_reason"] = "Mink_model_snapshot_lacks_opposing_finger_contacts"
+    elif dangerous(records):
+        report["failure_reason"] = (
+            "Mink_model_snapshot_contains_forbidden_contact:"
+            + dangerous(records)["experiment_classification"]
+        )
+    else:
+        plan = plan_route(model, initial, route, ctx, plan_args)
+        report["plan"] = plan
+        report["mink_planning_performed"] = True
+        report["status"] = plan.get("status")
+        report["failure_reason"] = plan.get("failure_reason")
+    args.live_plan_output.parent.mkdir(parents=True, exist_ok=True)
+    args.live_plan_output.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--live-plan-input", type=Path)
+    p.add_argument("--live-plan-output", type=Path)
+    p.add_argument("--model-binary", type=Path)
+    p.add_argument("--model-metadata", type=Path)
     p.add_argument("--archive", default=str(DEFAULT_ARCHIVE))
     p.add_argument("--out-dir", default="logs/gs_opd/mink_panda_physical_v1")
     p.add_argument("--speed", type=float, default=0.02)
@@ -1100,7 +1170,12 @@ def main():
         or not 0.0 < args.joint_reference_acceleration <= 5.0
     ):
         p.error("invalid bounded planning configuration")
-    report = run(args)
+    if args.live_plan_input is not None:
+        if not all((args.live_plan_output, args.model_binary, args.model_metadata)):
+            p.error("live planning requires --live-plan-output, --model-binary and --model-metadata")
+        report = run_live_plan(args)
+    else:
+        report = run(args)
     print(
         json.dumps(
             {

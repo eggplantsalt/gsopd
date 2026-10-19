@@ -1967,3 +1967,45 @@ cd /workspace/zy_workspace/RLinf
 - [x] 保留右绕规划碰撞拒绝和上绕抓持丢失拒绝；没有强行宣布三条均成功。
 - [x] 检查完整监测、Compiler、关节限制、抓持相对运动、终点/家族方向以及隔离恢复；保存 JSON/SVG。
 - [ ] 扩展到更多真实抓持状态与完整任务，确定正式关节执行接口；尚未接入 On-Policy 主链路或宣称最终安全绕障任务成功。
+
+## 实时 Student → Mink → OSC Snapshot Smoke（2026-10-19）
+
+### 本次范围与必要实现调整
+
+- 本次使用新启动的独立 Safety Bridge 和 π₀.₅ Student Episode；没有加载或重放历史 Step 55 Snapshot、动作或 RGB。Student 通过同一个 Bridge 连接执行 rollout、实时抓持查询、Snapshot 和左绕分支请求。只选中一个左绕几何路线 `trajectory-001`；没有执行右绕、上绕或其他物理候选，没有修改训练目标、生成训练标签或 Push。
+- 842 步 Mink 参考的 OSC 分支原先存在 600 步硬上限，通用 `TrackingConfig` 默认值为 480。保留通用默认 480，仅将单候选硬上限和本 Smoke 的 Mink 步数预算设为 1200；实际分支按 Mink 返回的明确步数设置请求预算。OSC 参考速度对齐 Mink 的 0.02 m/s，避免用 0.04 m/s 重采样后与显式 EEF 参考点数不一致。语法及接口探针确认 842 步、0.02 m/s 参考可通过 Tracker 配置和预算接口；本次实时 Mink 规划未成功返回轨迹，因此没有声称当前 Episode 的路线实际为 842 步。
+- LIBERO MJB 导出改用既有 Safety Python，Mink worker 继续使用 `/workspace/zy_workspace/envs/gsopd_mink/bin/python`。传递 Mink Python 参数时保留 venv 符号链接，避免解析到不含 Mink 包的基础解释器。当前 `scene.carried` 与 obstacle 条目从同一 Snapshot 的 Geometry 查询补入经验证的 Body/Geom 身份。
+
+### 真实运行结果与首要阻塞
+
+三次 Student Episode 均在线运行到真实双指抓持并在下一个决策边界停止；执行步数分别为 45、50、50。第三次运行在决策步 50 选中左绕 `trajectory-001`，其现场 B-Spline 路径长度为 0.850178531 m。没有旧 Step 55 数据参与。
+
+最终报告：`logs/gs_opd/mink_panda_physical_v3/live_left_osc_snapshot_smoke_20261019_attempt3/live_left_osc_snapshot_report.json`；完整终端输出：同目录 `smoke_console.log`。本次唯一首要阻塞发生在 Mink worker `plan_route()`：
+
+```text
+KeyError: 'eef_quaternion_world_wxyz'
+  research/gs_opd/smoke/mink_panda_physical_smoke.py:461
+```
+
+因此 Mink 规划没有产生可用轨迹，OSC Snapshot 分支实际执行 **0 步**。真实 EEF/黑碗跟踪误差没有样本，记为 unavailable；Contact Compiler 未运行，没有 Compiler verdict。更早的启动错误已定位并绕过：Mink Python 被 `.resolve()` 解析后报告 `No module named 'mink'`；此前 LIBERO 导出误用 Mink 环境时也曾报告 `No module named 'yaml'`。这些不再是最终阻塞。没有继续扩展或尝试其他路线。
+
+| 项目 | 实测结果 |
+| --- | --- |
+| 最终 Student 执行步数 | 50；在决策步 50 触发当前状态验收并停止下一条 Student 动作 |
+| 实时抓持 | 通过；闭合命令比例 1.0，左右指均接触当前黑碗 Body `akita_black_bowl_1_main`，9 个匹配接触 |
+| 左绕 Mink 规划 | worker 已启动但在 `plan_route()` 抛 KeyError；未返回 Mink 轨迹 |
+| OSC Snapshot 分支步数 | 0/未开始 |
+| EEF/黑碗跟踪误差 | unavailable（没有执行 OSC 控制步） |
+| Contact Compiler | not run（没有分支步） |
+| Snapshot 恢复 | 初始 Snapshot→Restore 最大状态误差 0.0；OSC `repair_context` 完全匹配；收尾 Restore verified。由于分支未执行，这不代表分支后的控制器恢复验证 |
+
+### Snapshot 覆盖审计与验证边界
+
+- `_capture_snapshot()` 保存活动控制器除 `sim` 外的全部实例字段、机器人状态缓冲、夹爪 `current_action`、MuJoCo integration state、任务/观测缓存、RNG 和任务对象属性；不支持的可变对象会使 Snapshot 失败，不会静默略过。Smoke 实时抓持状态下的 Snapshot→Restore 成功，物理诊断最大误差为 0.0，`repair_context` 中 OSC_POSE 配置比较完全匹配，收尾 Restore 也通过。
+- Tracker 在 branch 前会将当前完整 `_capture_snapshot()` 与决策 Snapshot 精确比较；但本次未进入 `track_trajectory_bundle()`，所以不能声称真实 OSC branch 修改控制器状态后已完成完整往返验证。当前控制器状态覆盖的实现与 Snapshot 捕获已运行验证，branch 后恢复仍待修复 Mink 规划错误后在同一入口验证。
+
+### 验证与继续条件
+
+- 相关 Python 文件 `py_compile` 通过；842 步规划预算接口探针通过；Mink venv import 与启动参数接口通过。所有这些只验证语法/接口，不代替物理结果。
+- Bridge 曾以 PID 151675 从当前工作树启动，运行时能力握手报告 native OSC_POSE、显式 EEF reference、子步 Contact Monitoring 与 full Snapshot restore；Student 退出后已关闭该独立 Bridge。三次报告均记录最终状态 Restore verified。
+- 当前继续的唯一条件：修复或确认 `plan_route()` 初始化结果缺少 `eef_quaternion_world_wxyz` 的原因，再用同一条实时左绕入口完成真实分支；在此之前不要扩展候选或据此报告 OSC 跟踪、Contact Compiler 或 branch 恢复通过。

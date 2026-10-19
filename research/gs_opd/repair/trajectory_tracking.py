@@ -38,7 +38,7 @@ from research.gs_opd.smoke.contact_safety_compiler_smoke import (
 )
 from research.gs_opd.teacher.schema_v2 import validate_teacher_output_v2
 
-MAX_CONTROL_STEPS_PER_CANDIDATE = 600
+MAX_CONTROL_STEPS_PER_CANDIDATE = 1200
 MAX_TOTAL_CONTROL_STEPS = 12_000
 MAX_REFERENCE_SPEED_M_S = 0.04
 
@@ -113,6 +113,23 @@ def _unit_quaternion(value: Any, name: str) -> np.ndarray:
     if norm <= 1e-12:
         raise ValueError(f"{name} has no rotation")
     return quaternion / norm
+
+
+def _parse_eef_reference_poses(value: Any, *, expected_count: int) -> np.ndarray:
+    """Validate an explicit N x 7 [position, quaternion-wxyz] reference."""
+    poses = np.asarray(value, dtype=np.float64)
+    if (
+        poses.shape != (expected_count, 7)
+        or expected_count < 2
+        or not np.isfinite(poses).all()
+    ):
+        raise ValueError("eef_reference_poses_world_must_be_finite_N_by_7")
+    norms = np.linalg.norm(poses[:, 3:], axis=1)
+    if np.any(norms < 1e-12) or np.any(np.abs(norms - 1.0) > 1e-5):
+        raise ValueError("eef_reference_quaternions_must_be_unit_wxyz")
+    poses = poses.copy()
+    poses[:, 3:] /= norms[:, None]
+    return poses
 
 
 def quaternion_conjugate(value: Any) -> np.ndarray:
@@ -1544,6 +1561,11 @@ def track_trajectory_bundle(
                 "geometric_candidate": candidate,
             }
             continue
+        eef_reference_poses = candidate.get("eef_reference_poses_world")
+        if eef_reference_poses is not None:
+            parsed_poses = _parse_eef_reference_poses(
+                eef_reference_poses, expected_count=len(points)
+            )
         request_candidates.append(
             {
                 "candidate_id": candidate_id,
@@ -1551,6 +1573,11 @@ def track_trajectory_bundle(
                 "goal_sphere_center_world_m": candidate["goal_world_m"],
                 "control_points_world_m": candidate.get("control_points_world_m"),
                 "points_world_m": points.tolist(),
+                **(
+                    {"eef_reference_poses_world": parsed_poses.tolist()}
+                    if eef_reference_poses is not None
+                    else {}
+                ),
             }
         )
 
@@ -1560,7 +1587,39 @@ def track_trajectory_bundle(
     geometric_screen_pass_count = sum(
         candidate.get("passes_geometric_screen") is True for candidate in candidates
     )
-    if request_candidates:
+    if request_candidates and all(
+        "eef_reference_poses_world" in item for item in request_candidates
+    ):
+        reference_plans = []
+        planned_total_steps = 0
+        for item in request_candidates:
+            references = np.asarray(item["points_world_m"], dtype=np.float64)
+            requested_steps = len(references) - 1
+            status = "accepted"
+            reason = None
+            if requested_steps > config.max_control_steps_per_candidate:
+                status, reason = "rejected", "explicit_reference_exceeds_candidate_step_budget"
+            elif planned_total_steps + requested_steps > config.max_total_control_steps:
+                status, reason = "rejected", "explicit_reference_exceeds_total_step_budget"
+            accepted = status == "accepted"
+            reference_plans.append(
+                {
+                    "reference_points_world_m": references,
+                    "eef_reference_poses_world": (
+                        item["eef_reference_poses_world"] if accepted else None
+                    ),
+                    "path_length_m": float(np.linalg.norm(np.diff(references, axis=0), axis=1).sum()),
+                    "requested_steps": requested_steps,
+                    "budget_status": status,
+                    "budget_rejection_reason": reason,
+                    "maximum_reference_displacement_m": float(np.linalg.norm(np.diff(references, axis=0), axis=1).max()),
+                    "reference_speed_limit_m_s": None,
+                    "control_timestep_s": 0.05,
+                }
+            )
+            if status == "accepted":
+                planned_total_steps += requested_steps
+    elif request_candidates:
         reference_plans, planned_total_steps = plan_bundle_reference_paths(
             [item["points_world_m"] for item in request_candidates],
             speed_m_s=config.reference_speed_m_s,
@@ -1643,7 +1702,9 @@ def track_trajectory_bundle(
                 "goal_sphere_center_world_m",
                 "control_points_world_m",
                 "points_world_m",
+                "eef_reference_poses_world",
             )
+            if key in candidate
         }
         for candidate in budget_qualified_candidates
     ]

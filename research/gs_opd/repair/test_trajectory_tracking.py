@@ -22,6 +22,7 @@ import numpy as np
 from research.gs_opd.repair.panda_gripper_state import parse_panda_gripper_closure
 from research.gs_opd.repair.trajectory_tracking import (
     TrackingConfig,
+    _parse_eef_reference_poses,
     _validate_carried_binding,
     body_local_offset_from_world_point,
     body_local_point_to_world,
@@ -502,6 +503,19 @@ class FakeConnection:
 
 
 class TrajectoryTrackingTests(unittest.TestCase):
+    def test_explicit_mink_eef_reference_requires_finite_unit_full_poses(self):
+        valid = [[0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0], [0.2, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]]
+        parsed = _parse_eef_reference_poses(valid, expected_count=2)
+        self.assertEqual(parsed.shape, (2, 7))
+        np.testing.assert_allclose(parsed[1, 3:], [0.0, 0.0, 0.0, 1.0])
+        with self.assertRaisesRegex(ValueError, "finite_N_by_7"):
+            _parse_eef_reference_poses(valid[:1], expected_count=2)
+        with self.assertRaisesRegex(ValueError, "unit_wxyz"):
+            _parse_eef_reference_poses(
+                [[0, 0, 0, 2, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]],
+                expected_count=2,
+            )
+
     def _run(self, candidates, *, restored=True):
         fixtures = _fixtures(len(candidates))
         fixtures[0]["candidates"] = [

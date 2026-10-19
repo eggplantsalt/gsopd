@@ -1243,6 +1243,11 @@ def _track_trajectory_candidate(
         if not math.isclose(control_timestep, 0.05, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("active environment is not configured for 20 Hz OSC control")
         sampled = reference_plan
+        result["eef_reference_pose_source"] = (
+            "explicit_Mink_FK_world_pose_trajectory"
+            if sampled.get("eef_reference_poses_world") is not None
+            else "carried_sphere_and_live_grasp_transform"
+        )
         if not math.isclose(
             float(sampled.get("control_timestep_s", float("nan"))),
             control_timestep,
@@ -1297,6 +1302,31 @@ def _track_trajectory_candidate(
             result["grasp_evidence"] = grasp
             raise RuntimeError("initial_grasp_evidence_unavailable: both Panda fingers do not contact the carried object")
         robot_state = diagnostic["robot_states"][0]
+        explicit_eef_poses = sampled.get("eef_reference_poses_world")
+        if explicit_eef_poses is not None:
+            explicit_eef_poses = np.asarray(explicit_eef_poses, dtype=np.float64)
+            if (
+                explicit_eef_poses.shape != (sampled["requested_steps"] + 1, 7)
+                or not np.isfinite(explicit_eef_poses).all()
+                or np.linalg.norm(
+                    explicit_eef_poses[0, :3]
+                    - np.asarray(robot_state["eef_pos"], dtype=np.float64)
+                ) > options["state_tolerance_m"]
+                or np.linalg.norm(
+                    quaternion_to_rotation_vector(
+                        quaternion_multiply(
+                            explicit_eef_poses[0, 3:],
+                            quaternion_conjugate(robot_state["eef_quat"]),
+                        )
+                    )
+                ) > options["rotation_tolerance_rad"]
+            ):
+                raise ValueError("explicit_EEF_reference_start_does_not_match_Snapshot")
+            quat_norms = np.linalg.norm(explicit_eef_poses[:, 3:], axis=1)
+            if np.any(quat_norms < 1e-12) or np.any(np.abs(quat_norms - 1.0) > 1e-5):
+                raise ValueError("explicit_EEF_reference_quaternions_are_invalid")
+            explicit_eef_poses = explicit_eef_poses.copy()
+            explicit_eef_poses[:, 3:] /= quat_norms[:, None]
         relative_position_local, relative_quaternion_local = _tracking_relative_pose(
             reconstructed_sphere_center,
             object_quaternion,
@@ -1322,8 +1352,15 @@ def _track_trajectory_candidate(
         if initial_joint_check["status"] != "pass":
             raise ValueError("initial_Panda_joint_limit_check_failed")
         initial_object_rotation = quaternion_to_matrix(object_quaternion)
-        for value in references[1:]:
-            target_eef = value + initial_object_rotation @ relative_position_local
+        workspace_targets = (
+            explicit_eef_poses[1:, :3]
+            if explicit_eef_poses is not None
+            else np.stack(
+                [value + initial_object_rotation @ relative_position_local for value in references[1:]],
+                axis=0,
+            )
+        )
+        for target_eef in workspace_targets:
             workspace_check = _tracking_workspace_check(target_eef, workspace)
             if workspace_check["status"] != "pass":
                 raise ValueError(workspace_check.get("reason", "trajectory_target_workspace_unavailable"))
@@ -1354,8 +1391,12 @@ def _track_trajectory_candidate(
             actual_eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
             reference_position = np.asarray(references[step_index + 1], dtype=np.float64)
             object_rotation = quaternion_to_matrix(object_quaternion)
-            target_eef_position = reference_position + object_rotation @ relative_position_local
-            target_eef_quaternion = quaternion_multiply(object_quaternion, relative_quaternion_local)
+            if explicit_eef_poses is not None:
+                target_eef_position = explicit_eef_poses[step_index + 1, :3]
+                target_eef_quaternion = explicit_eef_poses[step_index + 1, 3:]
+            else:
+                target_eef_position = reference_position + object_rotation @ relative_position_local
+                target_eef_quaternion = quaternion_multiply(object_quaternion, relative_quaternion_local)
             target_workspace_before_action = _tracking_workspace_check(
                 target_eef_position, workspace
             )
@@ -1720,13 +1761,56 @@ def _track_trajectory_bundle(request):
             candidate_paths.append(points)
         if len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError("candidate_ids_are_missing_or_duplicated")
-        reference_plans, planned_total_steps = plan_bundle_reference_paths(
-            candidate_paths,
-            speed_m_s=float(options["reference_speed_m_s"]),
-            control_timestep_s=float(env.env.control_timestep),
-            maximum_steps_per_candidate=max_steps,
-            maximum_total_steps=max_total_steps,
-        )
+        if all(
+            candidate.get("eef_reference_poses_world") is not None
+            for candidate in candidates
+        ):
+            reference_plans = []
+            planned_total_steps = 0
+            for candidate, points in zip(candidates, candidate_paths):
+                from research.gs_opd.repair.trajectory_tracking import (
+                    _parse_eef_reference_poses,
+                )
+
+                eef_poses = _parse_eef_reference_poses(
+                    candidate["eef_reference_poses_world"],
+                    expected_count=len(points),
+                )
+                steps = len(points) - 1
+                reason = None
+                if steps > max_steps:
+                    reason = "explicit_EEF_reference_exceeds_candidate_step_budget"
+                elif planned_total_steps + steps > max_total_steps:
+                    reason = "explicit_EEF_reference_exceeds_total_step_budget"
+                accepted = reason is None
+                reference_plans.append(
+                    {
+                        "reference_points_world_m": points,
+                        "eef_reference_poses_world": eef_poses if accepted else None,
+                        "path_length_m": float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()),
+                        "requested_steps": steps,
+                        "budget_status": "accepted" if accepted else "rejected",
+                        "budget_rejection_reason": reason,
+                        "maximum_reference_displacement_m": float(np.linalg.norm(np.diff(points, axis=0), axis=1).max()),
+                        "reference_speed_limit_m_s": None,
+                        "control_timestep_s": float(env.env.control_timestep),
+                    }
+                )
+                if accepted:
+                    planned_total_steps += steps
+        else:
+            if any(
+                candidate.get("eef_reference_poses_world") is not None
+                for candidate in candidates
+            ):
+                raise ValueError("explicit_EEF_references_must_be_supplied_for_all_candidates")
+            reference_plans, planned_total_steps = plan_bundle_reference_paths(
+                candidate_paths,
+                speed_m_s=float(options["reference_speed_m_s"]),
+                control_timestep_s=float(env.env.control_timestep),
+                maximum_steps_per_candidate=max_steps,
+                maximum_total_steps=max_total_steps,
+            )
         reference_plans_by_id = dict(zip(candidate_ids, reference_plans))
     except Exception as exc:
         return {
@@ -3634,6 +3718,14 @@ try:
                             "main_restore_verified": False,
                             "candidates": [],
                         }
+                elif request["op"] == "trajectory_tracking_capabilities":
+                    result = {
+                        "status": "available",
+                        "native_osc_pose_tracking": True,
+                        "explicit_eef_reference_poses_world": True,
+                        "substep_contact_monitoring": True,
+                        "full_snapshot_restore_verification": True,
+                    }
                 elif request["op"] == "geometry_inventory":
                     try:
                         result = _geometry_inventory()

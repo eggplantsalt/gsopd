@@ -66,6 +66,14 @@ def parse_args():
     parser.add_argument("--task-object-semantic-result", type=Path)
     parser.add_argument("--trajectory-subject-object-id")
     parser.add_argument("--trajectory-validation-out", type=Path)
+    parser.add_argument(
+        "--mink-osc-left",
+        action="store_true",
+        help="Plan one current-state left route with Mink and verify native OSC in a Snapshot branch after stable grasp.",
+    )
+    parser.add_argument("--mink-python", type=Path)
+    parser.add_argument("--mink-model-binary", type=Path)
+    parser.add_argument("--mink-model-metadata", type=Path)
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
@@ -83,8 +91,11 @@ def parse_args():
     probe_enabled = args.contact_safety_probe or args.verifier_guided_repair
     collection_enabled = args.on_policy_safety_collection
     trajectory_validation_enabled = args.trajectory_bundle_physical_validation
+    mink_osc_enabled = args.mink_osc_left
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
         parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
+    if mink_osc_enabled and not trajectory_validation_enabled:
+        parser.error("--mink-osc-left requires --trajectory-bundle-physical-validation")
     if trajectory_validation_enabled:
         if args.teacher_json is None or args.semantic_results_json is None:
             parser.error(
@@ -98,6 +109,18 @@ def parse_args():
             parser.error("--trajectory-validation-out must use the .json extension")
         if args.max_steps == 0:
             parser.error("trajectory physical validation requires --max-steps greater than zero")
+        if mink_osc_enabled:
+            if any(
+                value is None
+                for value in (
+                    args.mink_python,
+                    args.mink_model_binary,
+                    args.mink_model_metadata,
+                )
+            ):
+                parser.error("--mink-osc-left requires --mink-python, --mink-model-binary, and --mink-model-metadata")
+            if not args.mink_python.is_file() or not args.mink_model_binary.is_file() or not args.mink_model_metadata.is_file():
+                parser.error("Mink Python and current-model export files must exist")
         if args.trace_out is not None or args.on_policy_safety_out is not None:
             parser.error("trajectory physical validation does not write rollout trace/training data")
         if args.probe_out_dir is not None or args.repair_out_dir is not None:
@@ -148,6 +171,11 @@ def parse_args():
         if args.task_object_semantic_result is not None and not args.task_object_semantic_result.is_file():
             parser.error(f"Task object semantic result does not exist: {args.task_object_semantic_result}")
     elif probe_enabled:
+        if mink_osc_enabled or any(
+            value is not None
+            for value in (args.mink_python, args.mink_model_binary, args.mink_model_metadata)
+        ):
+            parser.error("Mink OSC options require --trajectory-bundle-physical-validation")
         if args.trajectory_validation_out is not None or args.trajectory_subject_object_id is not None:
             parser.error("trajectory validation options require --trajectory-bundle-physical-validation")
         if args.semantic_results_json is not None:
@@ -191,11 +219,23 @@ def parse_args():
             args.task_object_semantic_result,
             args.trajectory_validation_out,
             args.trajectory_subject_object_id,
+            args.mink_python,
+            args.mink_model_binary,
+            args.mink_model_metadata,
+            True if args.mink_osc_left else None,
         )
     ):
         parser.error(
             "Teacher, binding, and output arguments require a probe mode"
         )
+    if not trajectory_validation_enabled and (
+        mink_osc_enabled
+        or any(
+            value is not None
+            for value in (args.mink_python, args.mink_model_binary, args.mink_model_metadata)
+        )
+    ):
+        parser.error("Mink OSC options require --trajectory-bundle-physical-validation")
     return args
 
 
@@ -1970,21 +2010,37 @@ try:
             and trajectory_grasp_monitor is not None
             and trajectory_grasp_monitor.stable
         ):
-            from research.gs_opd.repair.trajectory_bundle_acceptance import (
-                must_stop_rollout_after_acceptance,
-                run_snapshot_trajectory_acceptance,
-            )
-
             trajectory_validation_attempted = True
             try:
-                trajectory_validation_report = run_snapshot_trajectory_acceptance(
-                    conn,
-                    trajectory_validation_context,
-                    trajectory_grasp_monitor.samples[-1],
-                    args.trajectory_validation_out,
-                    decision_step=steps,
-                    grasp_stability=trajectory_grasp_monitor.diagnostics(),
-                )
+                if args.mink_osc_left:
+                    from research.gs_opd.smoke.mink_osc_snapshot_smoke import (
+                        run_live_snapshot_mink_osc_smoke,
+                    )
+
+                    trajectory_validation_report = run_live_snapshot_mink_osc_smoke(
+                        conn,
+                        trajectory_validation_context,
+                        trajectory_grasp_monitor.samples[-1],
+                        decision_step=steps,
+                        grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                        output_json=args.trajectory_validation_out,
+                        mink_python=args.mink_python,
+                        model_binary=args.mink_model_binary,
+                        model_metadata=args.mink_model_metadata,
+                    )
+                else:
+                    from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                        run_snapshot_trajectory_acceptance,
+                    )
+
+                    trajectory_validation_report = run_snapshot_trajectory_acceptance(
+                        conn,
+                        trajectory_validation_context,
+                        trajectory_grasp_monitor.samples[-1],
+                        args.trajectory_validation_out,
+                        decision_step=steps,
+                        grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                    )
             except Exception as exc:
                 trajectory_validation_report = {
                     "operation": "one_shot_geometry_guided_trajectory_physical_acceptance",
@@ -2034,7 +2090,10 @@ try:
                 ),
                 flush=True,
             )
-            if must_stop_rollout_after_acceptance(trajectory_validation_report):
+            from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                must_stop_rollout_after_acceptance,
+            )
+            if args.mink_osc_left or must_stop_rollout_after_acceptance(trajectory_validation_report):
                 trajectory_validation_restore_abort = True
                 print(
                     "TRAJECTORY VALIDATION STOPPED ROLLOUT BEFORE NEXT STUDENT ACTION:",
