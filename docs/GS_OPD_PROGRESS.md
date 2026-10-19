@@ -1913,3 +1913,57 @@ Checklist:
 - [x] Make the Bridge read bounds from the nested robosuite environment and validate against active Panda limits.
 - [x] Preserve fail-closed action shape, finite-value, bounds, and OSC-scale checks.
 - [ ] Re-run v5 physical acceptance and inspect executed steps, grasp retention, tracking errors, and contacts.
+
+## Mink 引导关节轨迹与隔离物理执行（2026-10-19）
+
+本轮目标已从固定曲线运动学检查改为：复用 v5 Step 55 的三条原始球心曲线和真实抓持状态，生成 Panda 关节轨迹，并在当前真实场景模型的隔离 `MjData` 中通过力矩执行器逐步执行。当前已完成一条左绕局部轨迹，另外两条保留独立失败结果。没有接入 Student 或正常 Bridge 的执行路径。
+
+### 实现与控制接口
+
+- `research/gs_opd/smoke/mink_panda_model.py` 从当前 LIBERO-Safety 的 `OffScreenRenderEnv` 编译完整真实场景并临时导出 MJB，核对归档任务、452 项积分状态、Panda 七关节名/位置范围、EEF 起点及当前 Body/Geom 名称和归属；从活动 PandaGripper 的 `important_geoms` 读取左右指面，未使用示例机器人或硬编码物体 ID。
+- 归档模型指纹 `085817d1…b2e840` 与当前模型 `40fd3ac3…408d2` 不同。该差异单独保留；本轮关节、速度及 EEF 起点在 `1e-6` 内吻合，所有归档 Geom ID/名称/Body 归属与当前模型核对后，使用**当前模型**的碰撞和动力学继续实验。
+- `research/gs_opd/smoke/mink_panda_physical_smoke.py` 直接读取 v5 预算合格的 `trajectory-001/left`、`trajectory-002/right`、`trajectory-003/above`。保持原球心 B-Spline 引导，沿采样曲线按 0.02 m/s、20 Hz 重新离散；使用 v5 真实物体姿态、球心—EEF 局部偏移和相对四元数构造 EEF 目标。Mink `FrameTask + PostureTask` 在位置目标优先、姿态误差不超过原 0.20 rad 的条件下调整实际跟踪位置与冗余关节构型。曲线生成器未修改。
+- 使用实际编译模型的 `ConfigurationLimit`、经核验的 Panda `VelocityLimit`，固定非手臂自由度；通过 Mink `CollisionAvoidanceLimit` 检查当前机器人自碰撞和机器人—场景 Geom，并在规划 scratch data 中按照刚性抓持假设变换完整搬运物体，对真实 Geom 做接触检查。该 scratch 的物体 qpos 设置仅用于规划检查；物理执行只在初始恢复时设置归档状态，之后通过 `mj_step` 推进，未通过设置 qpos 伪造执行。
+- 第一轮完整左/上 IK 路线在真实执行中分别于 771/656 步后因请求力矩超出实际执行器范围被拒绝，没有裁剪继续。最终加入保守的关节参考速度预算 0.6 rad/s、相邻 20 Hz 参考速度变化预算 2.0 rad/s²，并在必要时暂停引导点推进；这些是独立实验的参考整形预算，不是放宽机器人限制。每条轨迹默认最多 1200 个控制步。
+- 独立关节执行器使用 robosuite v1.4 `joint_pos.py` 同类质量矩阵 PD 控制，并加入目标关节速度前馈：`tau = M_arm @ (50*(q_ref-q) + 2*sqrt(50)*(dq_ref-dq)) + qfrc_bias_arm`。控制在真实 0.002 s 物理周期更新，位置参考在 20 Hz 关节路径节点之间连续插值。验证真实执行器为单位传动比力矩 motor，并按模型 `actuator_ctrlrange` 检查每次请求；没有把关节角伪装成 OSC 动作、改变控制器配置或静默裁剪力矩。夹爪保持归档中的真实位置控制值 `[0,0]`。
+- 每个 `mj_step` 后读取真实接触、力、位置/法向并汇总；区分 Teacher 明确允许的 gripper—payload 抓取接触、禁止的 payload—obstacle 接触、机器人自碰撞、其他机器人—场景碰撞和其他场景物体支撑接触。局部搬运段中的其他 payload 接触保守拒绝。复用现有 `compile_forbid_contact()` 对已绑定搬运物体及全部 Object-to-Object 规则编译，其他机器人接触另外保守拒绝；没有改 Compiler 语义。抓持保持在每个 20 Hz 控制结束状态检查双指真实接触和相对位姿，接触监测本身覆盖所有 500 Hz 子步。
+- 每条路线使用同一积分状态新建独立数据，结束后重新恢复并逐项比较完整积分状态。输出保留全部关节参考、实际关节状态、球心/EEF、抓持相对位姿、接触事件、首次拒绝原因及恢复结果。完整结束的路线还需确认从对应家族方向越过障碍物平面并到达远侧；这项方向检查本身不作为碰撞安全证明。
+
+### 已运行的真实结果
+
+实际运行命令（复用已安装的独立环境，任务变更后未再安装依赖）：
+
+```bash
+cd /workspace/zy_workspace/RLinf
+/workspace/zy_workspace/envs/gsopd_mink/bin/python \
+  research/gs_opd/smoke/mink_panda_physical_smoke.py \
+  --out-dir logs/gs_opd/mink_panda_physical_v3
+```
+
+| 路线 | 完整关节规划 | 真实控制步 | 物理结果 |
+| --- | --- | --- | --- |
+| `trajectory-001` 左绕 | 842 步 | **842/842** | 局部物理段通过；Compiler safe；21,050/21,050 物理子步完整监测；主状态恢复误差 0 |
+| `trajectory-002` 右绕 | 第 127 个引导点拒绝 | 0 | 当前真实 Geom 检出黑碗与木柜接触（动态读取的 `akita_black_bowl_1_g23` / `wooden_cabinet_1_g1`）；未执行 |
+| `trajectory-003` 上绕 | 842 步 | 64/842 | 双指接触丢失，立即拒绝；恢复误差 0；已执行前缀的 Compiler safe 不能解释为整条轨迹通过 |
+
+左绕实测指标：球心终点/最大引导误差 **0.0116642 m**；最大 EEF 相对关节计划位置误差 **0.00841391 m**；实际 EEF 相对起点姿态最大偏差 **0.122619 rad**（低于 0.20 rad）；抓持相对位置最大变化 **0.00456042 m**，相对姿态最大变化 **0.139331 rad**；所有控制结束状态均保有左右指接触。实际物理子步的关节速度最大占允许上限 **28.10%**；控制结束状态下 joint5 最小位置余量 **2.67982 rad**。监测事件只有允许的抓取接触与其他场景物体支撑接触，未记录禁止的黑碗—障碍物、机械臂自碰撞或其他机械臂—场景碰撞。
+
+- 原始实验完整报告：`logs/gs_opd/mink_panda_physical_v3/report.json`；各候选的 `*_joint_plan.json` 保存完整七关节参考，`*_physical.json` 保存真实执行状态和接触证据。
+- 可比较简洁结果：`logs/gs_opd/mink_panda_physical_v3/experiment_summary.json`。它在原始真实记录上追加方向/出口检查和指标汇总，保留原报告 SHA256 与执行源码 SHA256；这一步没有重新仿真。左绕实测轨迹在障碍物平面上的家族方向投影为 0.255186 m，终点前向投影为 0.221156 m，方向/远侧检查通过。此报告不篡改原始执行记录。
+- 可查看三视图：`logs/gs_opd/mink_panda_physical_v3/trajectory-001.svg`（灰：几何引导；蓝：Mink 规划球心；红：真实 `mj_step` 球心轨迹）。另外两条也有独立 SVG。
+- 当前代码已把方向/远侧检查和主要指标合并入之后运行的路线结果；已有 v3 的同项结果来自真实轨迹的离线追加检查。完整左绕耗时是 42.1 秒仿真时间，不能解释为真实机器人墙钟耗时或最终放置成功。
+
+### 环境、验证与后续
+
+- 复用 `/workspace/zy_workspace/envs/gsopd_mink`：Python 3.11.16、Mink 0.0.5、MuJoCo 3.3.2、NumPy 1.26.4、qpsolvers 4.13.0、quadprog 0.1.13。此前使用 `uv` 与清华源创建；本轮任务变更后没有重装依赖。真实场景导出使用原 LIBERO Python 3.10.21 / robosuite 1.4.0，未改两个原有虚拟环境或任何锁文件。
+- 位置范围来自当前编译模型；Panda 关节速度来自已经核对位置范围的 [Franka 官方 Panda joint limits](https://github.com/frankarobotics/franka_ros/blob/develop/franka_description/robots/panda/joint_limits.yaml)：前四轴 2.175 rad/s、后三轴 2.610 rad/s。没有用 OSC XYZ 范围替代关节速度限制。
+- 13 项标准库 unittest 覆盖坐标与刚性偏移、归档路线筛选、接触分类、逐子步汇总、关节参考加速度约束、真实 motor 步进、力矩越界拒绝、完整积分状态恢复和指定绕行侧/远侧检查。它们是合成接口回归，不能替代上述真实场景结果。
+- 当前只证明**此 Step 55 状态下的一条独立关节力矩控制局部绕障段**通过了所列检查。没有在正常 OSC Bridge 上执行该轨迹，没有验证最终放置奖励或 Episode 成功，没有生成训练标签。20 Hz 双指/相对位姿证据不等价于证明任意瞬间的刚性无滑移抓持。正式接入仍需在更多 Student 真实抓持 Snapshot 上复验，并明确正常系统的关节轨迹执行入口；不可把本结果直接当成七维 OSC Action Chunk。
+
+**检查清单（Checklist）**
+
+- [x] 当前真实模型及 Step 55 积分状态驱动 Mink 规划，模型指纹差异作为独立诊断保留。
+- [x] 完成一条七关节轨迹，并通过真实力矩执行器完整运行 842 步、21,050 个物理子步。
+- [x] 保留右绕规划碰撞拒绝和上绕抓持丢失拒绝；没有强行宣布三条均成功。
+- [x] 检查完整监测、Compiler、关节限制、抓持相对运动、终点/家族方向以及隔离恢复；保存 JSON/SVG。
+- [ ] 扩展到更多真实抓持状态与完整任务，确定正式关节执行接口；尚未接入 On-Policy 主链路或宣称最终安全绕障任务成功。
