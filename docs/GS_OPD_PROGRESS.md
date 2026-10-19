@@ -2253,3 +2253,35 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 - 原始 MuJoCo 状态轨迹显示目标 `akita_black_bowl_1_main` 从 `[-0.27027,-0.14337,0.92891] m` 移至 `[0.04123,0.21814,0.91234] m`，终点距 plate body 20.3 mm。目标碗与夹爪首次接触为 step 30；step 40–119 共 80 个 post-step 样本同时观察到两个真实 finger geom 与该碗接触。每个真实控制步都保存了 7D Action、双相机 post Observation、物理状态和原始接触枚举；12 个决策点保存了双相机输入和 10×7 预测 Action。此记录是逐控制步末端接触采样，没有使用 Contact Compiler、生成语义绑定或给出安全 verdict。
 - 完整 NPZ 为 `(120,7)` actions、`(120,256,256,3)` 双相机 post images、120 项物理状态与接触记录；MP4 解码验证为 121 帧（含初始帧），分辨率 256×256。产物目录：`logs/gs_opd/eval/pi05_libero_full_trajectory_lora_20261019_attempt1/`，简明结果在 `evaluation_diagnostics.json`。
 - 本次真实任务成功仅确认该 checkpoint 在这一固定初始状态完成该任务；不代表多初始状态泛化或安全证明。没有再训练、连续重试、批量采集或 Push。初始 Student Checkpoint、原始成功轨迹及原 749 步数据保持原样；`object_3` 语义绑定没有被伪造或修改。
+
+## 完整示范轨迹与 LoRA 的离线动作拟合诊断（2026-10-20）
+
+严格离线读取完整 845 步示范、原始 π₀.₅ Checkpoint、rank-32 Action Expert LoRA 及此前保存的 120 步纯 Student 轨迹；没有重新训练、启动 Student 或 MuJoCo，也没有更改模型、Loss、安全阈值、Checkpoint 或语义绑定。诊断脚本为 `research/gs_opd/data/offline_action_fit_diagnostic.py`；官方 `pi05_libero` OpenPI LeRobot Loader 读取 48 个与既有训练固定评估一致的完整窗口（抓取、OSC 搬运、放置各 16 个）。对每个窗口起点，原始模型和 LoRA 模型使用同一真实 observation、同一固定的 10×32 初始噪声和 Flow 时间（随机种子 `20261020`）、3 步 Euler 推理及 Checkpoint 原有输出反归一化。动作归一化统计沿用 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/physical-intelligence/libero/norm_stats.json`（SHA-256 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`）。解码后的 Loader 目标动作与原始 NPZ 对齐，最大绝对误差 **1.27×10⁻⁷**；动作比较是在原始七维环境动作空间，不新建归一化。
+
+第一控制动作的七维 MAE（越低表示在这些示范 observation 上越接近记录动作）：
+
+| 阶段 | 原始 π₀.₅ | LoRA | LoRA 误差变化 |
+| --- | ---: | ---: | ---: |
+| Student 抓取 | 0.01371 | 0.01944 | 增加 41.8% |
+| B-Spline OSC 搬运 | 0.19029 | 0.15728 | 降低 17.3% |
+| Student 放置 | 0.02248 | 0.02735 | 增加 21.6% |
+
+完整 10×7 Action Chunk MAE 分别为抓取 `0.05071→0.04957`、搬运 `0.18300→0.15879`、放置 `0.03274→0.03585`。分阶段按窗口起始索引归类，与训练报告相同；起始索引 46–54 和 795–803 的窗口跨越阶段边界，所以完整 Chunk 与 Flow Loss 会包含下一阶段动作，而首动作误差只比较锚点本身的动作。因此，LoRA 在本次固定搬运状态样本上确实更接近记录的 B-Spline OSC 动作；当前状态的第一动作在抓取和放置样本上反而更远，不能说模型已在三个阶段一致地向示范动作靠近。以上只是对训练轨迹状态的动作模仿度比较。
+
+固定条件下按 Flow Matching 每元素 MSE 分开报告真实动作 7 维、Padding 25 维及默认 32 维总均值：
+
+| 阶段 | 原始 π₀.₅：7D / 25D / 32D | LoRA：7D / 25D / 32D |
+| --- | ---: | ---: |
+| Student 抓取 | `0.085162 / 0.00004486 / 0.018664` | `0.066697 / 0.00012466 / 0.014687` |
+| B-Spline OSC 搬运 | `0.343255 / 0.00003908 / 0.075118` | `0.240867 / 0.00020731 / 0.052852` |
+| Student 放置 | `0.062630 / 0.00006022 / 0.013747` | `0.062073 / 0.00017225 / 0.013713` |
+
+`Pi0.sft_forward()` 的 `use_action_chunk_loss` 默认是 `False`，`SFTRunner` 的 SFT 调用也没有覆盖该参数；`_reduce_sft_loss()` 因而直接对 `[B,10,32]` 全部元素求均值。Loader 中 Padding 目标维度 7–31 均严格为零，仍参加该均值；这次计算中其实际加权损失占比各阶段均低于 1%（LoRA 约 `0.31%–0.98%`），故不能把 Padding 维当作未参与训练。训练与本次闭环推理都使用 Action Horizon 10、Action Chunk 10、原始环境动作 7 维和模型动作 32 维；`pi05_rollout.py` 显式将评测配置的 `openpi.action_chunk` 覆盖为 10。实现位置见 `rlinf/models/embodiment/openpi/pi0.py:754-775,826-838` 和 `rlinf/workers/sft/fsdp_vla_sft_worker.py:86-88`。
+
+轨迹可视化 `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/spatial_paths_comparison.png` 并排显示：完整成功示范与纯 Student 的 EEF 路径；成功示范中 749 步 OSC 搬运段的实际碗心球路径与 Student 评测保存的碗 body 位置路径。示范 EEF 路径 845 点 / 1.449 m，Student EEF 120 点 / 1.047 m；B-Spline 碗心路径 749 点 / 0.748 m，Student 碗路径 120 点 / 0.756 m。Carry 段以外的示范碗位置没有伪造补齐。图中没有障碍物/碰撞判定；原始接触记录也没有重新归类。`object_3` 缺少可靠语义绑定，Compiler unknown 仍是 unknown，因此这些动作拟合指标不能解释成安全性证明。
+
+完整逐阶段数值、通道误差、模型输入维度、固定窗口索引和原始预测数组保存在 `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/offline_action_fit_diagnostic.json` 与 `paired_action_predictions.npz`。此次只新增离线诊断脚本、报告和图，未 Push。
+
+### 暂停指令到达时的评测队列状态
+
+处理“暂停训练和 MuJoCo 评测”的消息时，先前已经运行的 10 回合 Student 评测队列在停止信号生效前完成了剩余回合。保存记录显示 **10/10 成功**（每回合 reward `1.0`、`done=True`），实际步数为 `121, 123, 129, 124, 126, 120, 118, 124, 120, 120`；种子为 `20261020–20261029`，每回合的 MP4、NPZ、JSON 和日志均保留在 `logs/gs_opd/eval/pi05_full_trajectory_lora_obstacle_avoidance_l0t0_10runs_20261020_attempt1/`。随后已停止 Safety Bridge；这组固定状态重复率结果不构成安全证明，也没有在暂停后再次运行 Student 或 MuJoCo。
