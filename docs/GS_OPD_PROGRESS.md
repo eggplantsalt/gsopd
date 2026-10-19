@@ -2059,3 +2059,62 @@ KeyError: 'eef_quaternion_world_wxyz'
 - [x] 新 Safety Bridge 与 Student 实际运行；使用一个当前状态左绕路线进入原生 OSC_POSE Snapshot 分支。
 - [x] 记录 108/847 OSC 步、首个失败、EEF/黑碗误差、双指抓持、Compiler 和分支后完整 Snapshot 恢复。
 - [x] 保存完整 JSON、控制台/Bridge 日志、Student 视频与轨迹 SVG；未自动 Push。
+
+### Attempt4 离线误差与 Compiler 绑定诊断（只读）
+
+数据源为 attempt4 的 `live_left_osc_snapshot_report.json`，共 108 条真实 OSC 控制步记录（索引 0–107）。表中 EEF 姿态误差由日志里的实际/目标 WXYZ 四元数按 `2*acos(abs(dot(q_actual,q_target)))` 计算；黑碗姿态变化是实际根 Body 四元数相对 Snapshot 起始根姿态的角距离。每个样本均来自控制步后的真实状态。
+
+| 控制步索引 | 夹爪—碗相对旋转误差 rad | 相对位置误差 m | EEF 位置跟踪误差 m | EEF 姿态跟踪误差 rad | 黑碗相对起始姿态变化 rad | 左/右指接触 | 接触数 |
+| ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: |
+| 0 | 0.0080 | 0.0006 | 0.0022 | 0.0019 | 0.0065 | 是/是 | 8 |
+| 10 | 0.0488 | 0.0041 | 0.0033 | 0.0026 | 0.0490 | 是/是 | 9 |
+| 20 | 0.0533 | 0.0055 | 0.0031 | 0.0011 | 0.0535 | 是/是 | 10 |
+| 30 | 0.0572 | 0.0062 | 0.0031 | 0.0007 | 0.0574 | 是/是 | 12 |
+| 40 | 0.0611 | 0.0066 | 0.0030 | 0.0007 | 0.0613 | 是/是 | 12 |
+| 50 | 0.0651 | 0.0070 | 0.0030 | 0.0006 | 0.0652 | 是/是 | 14 |
+| 60 | 0.0691 | 0.0072 | 0.0030 | 0.0006 | 0.0693 | 是/是 | 14 |
+| 70 | 0.0731 | 0.0074 | 0.0030 | 0.0006 | 0.0733 | 是/是 | 14 |
+| 80 | 0.0781 | 0.0075 | 0.0030 | 0.0006 | 0.0782 | 是/是 | 11 |
+| 90 | 0.0849 | 0.0076 | 0.0030 | 0.0009 | 0.0848 | 是/是 | 11 |
+| 100 | 0.1022 | 0.0077 | 0.0030 | 0.0013 | 0.1019 | 是/是 | 10 |
+| 107 | 0.2046 | 0.0082 | 0.0030 | 0.0013 | 0.2042 | 是/是 | 6 |
+
+- 相对旋转误差在第一条记录已为 0.008037 rad，控制步索引 1 增至 0.015799 rad；前段持续上升，索引 13 首次超过 0.05 rad。索引 100 为 0.102245 rad，索引 106 为 0.120545 rad。触发拒绝的索引 107 单步增加 **0.084060 rad** 至 0.204605 rad；黑碗根姿态在同一步也增加 **0.083958 rad**（0.120200→0.204158 rad）。因此误差从早期已开始累积，最终一控制步出现明显跳变。
+- 108/108 步都记录到左右指接触，闭合比例均为 1.0；接触数范围 6–14。全段 EEF 位置跟踪误差最大 0.003352 m，EEF 姿态误差最大 0.007318 rad（索引 4）；触发拒绝的索引 107 EEF 姿态误差为 0.001259 rad。相较之下，黑碗姿态变化和夹爪—碗相对旋转误差几乎相同，并在拒绝步同时跃升。现有数据更支持**夹持相对转动逐步累积，最后出现一次突增**，不支持持续的 OSC EEF 姿态跟踪偏差。它与保持接触下的滚转/滑移相符，但不能单凭这些日志确认具体摩擦滑移机制：接触标志和计数不是切向速度或接触点微滑测量，姿态也只按 20 Hz 控制步记录，无法确定突变发生在该步的哪个 500 Hz 子步。
+- `object_3` 的输入诊断：attempt4 `launch.json` 指向 `/workspace/zy_workspace/RLinf/logs/gs_opd/semantic_bindings_l0t0.json`；`pi05_rollout.py:1949` 从该文件加载映射，`prepare_live_acceptance_context()` 原样保留 `semantic_results`（`trajectory_bundle_acceptance.py:216`）。该文件根节点是字典，只有 `object_1`、`object_4` 两项，二者值都是对象；`semantic_results.get("object_3")` 的实际值为 **`None`**（`NoneType`）。Teacher 中 `object_3` 是 red-rimmed plate，`rule_2` 明确允许 gripper 与 `object_3` 接触；`object_4` 是 small ridged cylinder，且其 `semantic_decision.object_id` 与键一致，不能作为 `object_3` 的绑定。`trajectory_tracking.py:951` 按 Teacher 目标 ID 查映射并把缺失值传入 Compiler；`_resolve_target_binding()` 在 `contact_safety_compiler_smoke.py:62-68` 因输入非对象返回 `semantic_disambiguation_result_is_not_an_object`。这是**缺失 `object_3` 绑定**，不是根映射数据结构错误，也没有证据表明存在嵌套对象 ID 不匹配。此前 `binding_validation.valid=true` 仅表示当前已提供并检查的 `object_1`/`object_4` 几何绑定一致，并不证明 Teacher 的 `object_3` 也有绑定。
+- 因此 `object_3` 的 gripper-contact Compiler verdict 保持 `unknown`；另一个 object-object 检查（`object_1`→`object_4`）在完整监测下为 `safe`。本诊断没有补造 red-rimmed plate 的物理绑定、把 `object_4` 重映射给 `object_3`、放宽规则或改变 0.20 rad 抓持阈值。
+
+## 原生 OSC 抓持稳定性 A/B 物理实验（2026-10-19）
+
+本次只运行一次 Student→稳定抓持→当前态 Mink 左绕→原生 OSC A/B；不修改 Mink、B-Spline、Student、训练目标或 0.20 rad 安全阈值。输出使用新目录 `logs/gs_opd/mink_panda_physical_v3/osc_grasp_stability_ab_20261019_attempt1/`。新 Safety Bridge 能力握手通过。Student 从现有 checkpoint 实际执行 50 步，在决策步 50 达到三次不同状态的稳定双指抓持后进入当前态分支；没有确认任务完成，分支后按该 smoke 的行为停止下一条 Student 动作。
+
+两支都使用完整 `snapshot-000001`。本次左绕 Mink 计划为 850 控制步、851 个关节/EEF 位置/EEF 四元数/球心点；B 只把前 108 个控制步交给原生 OSC_POSE 跟踪。A 使用原生七维动作 `[0,0,0,0,0,0,+1]`，每步六轴零位姿增量并保持闭合夹爪，共 108 步。未把这段前缀视为完整绕障。
+
+| 观测 | A：零位姿增量、闭合保持 | B：Mink 左绕前 108 步 |
+| --- | ---: | ---: |
+| OSC 实际执行 | 108/108；Bridge 分支无执行异常、环境未 done | 108/108；在 0-based 索引 107 首次拒绝：`gripper_object_relative_rotation_changed_beyond_limit`，0.223795 rad > 0.20 rad |
+| 夹爪—黑碗最大相对旋转误差 | 0.181326 rad（未超过阈值） | 0.223795 rad |
+| 夹爪—黑碗最大相对位置误差 | 0.007516 m | 0.009629 m |
+| 黑碗根姿态相对 Snapshot 最大变化 | 0.178879 rad | 0.222904 rad |
+| EEF 位置跟踪误差最大值 | 0.004510 m（相对 A 的固定 Snapshot 起始位姿） | 0.003401 m（相对 B 的 Mink FK 参考） |
+| EEF 姿态跟踪误差最大值 | 0.012984 rad（相对 A 的固定 Snapshot 起始姿态） | 0.005200 rad（相对 B 的 Mink FK 姿态参考） |
+| 左/右指逐步接触 | 左指 108/108；右指在索引 107 的控制步后采样丢失 | 左/右指均 108/108；首次拒绝时仍双指接触 |
+| Contact Compiler | 总 verdict `unknown` | 总 verdict `unknown` |
+| 分支与完整 Snapshot 恢复 | branch main state restore 成功；显式恢复 `snapshot-000001` 最大数值误差 0、0 mismatch；恢复后抓持闭合比例 1.0、双指接触、11 个匹配接触 | tracker main state restore 与收尾完整 Snapshot restore 均通过，最大数值误差 0、0 mismatch；恢复后抓持复核通过 |
+
+A 的零增量静止对照同样发生显著夹爪—黑碗相对旋转漂移：误差从索引 106 的 0.092967 rad 跳到索引 107 的 0.181326 rad；同一步黑碗姿态变化从 0.088290 跳到 0.178879 rad，且末步只剩左指与黑碗两处匹配接触，右指接触丢失。B 也在索引 107 出现相对旋转从 0.115264 跳到 0.223795 rad 的末步突增，但两侧指仍接触，触发既有 0.20 rad 限制。两支早段误差轨迹接近；A 的静止对照已经漂移，且 B 的 EEF 跟踪误差较小，因此问题不能只归因于 Mink 姿态参考跟踪偏差。现有证据更符合夹持保持/接触下的旋转漂移，并在末步突增；控制步日志不能确认造成突增的具体 500 Hz 子步或微观摩擦机制。A 的逐步接触和原始接触列表均保存在 JSON；Bridge 子步采样完整（2700/2700），该总接触采样不等同于每个子步都存在左右指接触。
+
+### `object_3` 语义绑定单独记录
+
+A、B 的 Compiler 总 verdict 均保持 `unknown`。实际语义 JSON `logs/gs_opd/semantic_bindings_l0t0.json` 是根对象，但键只有 `object_1` 和 `object_4`；`semantic_results.get("object_3")` 为 `None`。两支都对 `object_3` 返回 `semantic_disambiguation_result_is_not_an_object`；`object_1` 的明确夹爪允许规则与 `object_1`→`object_4` 完整监测结果仍各自为 `safe`。这是缺少 `object_3` 绑定；没有伪造映射，也没有把 Compiler unknown 改成 safe。
+
+真实产物：
+
+- 完整 Student/B 及合并结果：`logs/gs_opd/mink_panda_physical_v3/osc_grasp_stability_ab_20261019_attempt1/live_left_osc_snapshot_report.json`
+- A 原始 108 步、接触与恢复记录：`A_zero_pose_native_osc_full_report.json`
+- B Mink 前缀完整跟踪记录：`B_mink_left_first108_full_report.json`
+- A/B 同索引逐步对照：`osc_grasp_stability_ab_per_step.json`；汇总：`osc_grasp_stability_ab_summary.json`
+- 原生 OSC 跟踪可视化：`live_left_osc_snapshot_report.svg`；Student 视频：`student_grasp_search.mp4`
+- Student 控制台日志、Mink 输入/输出、当前态场景和启动参数均保存在上述新目录。
+
+本次没有修改训练或生产控制代码，没有 Push，也没有运行其他路线；这 108 步对照不是完整绕障成功。
