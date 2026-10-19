@@ -2164,3 +2164,21 @@ A、B 的 Compiler 总 verdict 均保持 `unknown`。实际语义 JSON `logs/gs_
 唯一一次转换与 PyTorch `DataLoader` Smoke 结果：得到 **168 个** `(Observation, 5×7 Action Chunk)` 样本，含两张 `256×256×3` 相机图像，状态键形状为 EEF 位置 `(3,)`、四元数 `(4,)`、夹爪 `(2,)`。来源动作统计为 Student **96 步**（前段 55、后段 41；19 个完整样本）和 B-Spline OSC **749 步**（149 个完整样本）；共纳入 Chunk 840 个动作，余下 4 个 OSC 尾步及 1 个 Student 终止尾步未进入固定长度样本。档案中奖励和结束标记总计 `1.0` 与一个终止转移。随机读取样本索引 57 对应 B-Spline OSC 步 285–289，Loader 返回输入双相机/状态、原始动作标签、奖励/结束序列、来源和成功标签，形状均正确。
 
 转换文件：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/gsopd_episode_chunks_v1.npz`（51 MB）；Smoke 结构及随机样本记录：同目录 `gsopd_episode_chunks_v1_smoke.json`。原始 `direct_bspline_osc_trajectory.npz` 保持不变；未启动训练、未修改执行链路，也未 Push。
+
+## 成功 Episode 的 B-Spline OSC LeRobot 离线转换（2026-10-19）
+
+确认运行环境安装 `lerobot==0.3.3`，实际 `LeRobotDatasetWriter` 接口为 `create(repo_id, robot_type, fps, features, ...)`、`add_episode(frames)`、`finalize()`；RLinf 兼容层按 0.3.x 的 `add_frame(frame, task=...)` 接口写入。LeRobot 元数据实际格式版本为 **v2.1**。初次帧接口尝试发现 0.3.3 要求向量 feature 的 shape 用 tuple；修正后完成唯一一次正式写入，失败尝试未写入帧，生成的临时元数据目录已清理。
+
+新增离线入口 `research/gs_opd/data/npz_to_lerobot.py`。它只读取 `direct_bspline_osc_trajectory.npz` 原始轨迹及对应报告，校验原始成功回合的奖励总和为 `1.0`、终止转移为全局步 `844`，然后截取连续 OSC 控制步 **55–803（749 帧）**，作为一个独立 LeRobot Episode。来源没有使用预切分的 `(5,7)` 样本文件。每帧写入：
+
+| LeRobot 字段 | 存储格式 | 内容 |
+| --- | --- | --- |
+| `image` | image, `256×256×3`, uint8 图像 | agentview，按 `pi05_rollout.py` 旋转 180° |
+| `wrist_image` | image, `256×256×3`, uint8 图像 | eye-in-hand，按 `pi05_rollout.py` 旋转 180° |
+| `state` | float32, `8` | EEF 位置 3 + 四元数转 axis-angle 3 + 双夹爪位置 2，沿用 LIBERO 状态转换 |
+| `actions` | float32, `7` | 原始 `executed_actions`，不归一化、不改序 |
+| `task` | Episode 任务文本 | `pick up the akita black bowl on the stove and place it on the plate`；`pi05_libero` 的 `prompt_from_task=True` 将 task 作为 prompt 输入 |
+
+唯一一次转换后直接用 LeRobot 0.3.3 Reader 重开数据集验证：**1 Episode、749 帧、20 Hz**，Episode 边界 `[0,749)`。首帧对应原始步 55 的 OSC 接管决策 Observation，末帧对应步 803 的执行前 Observation；首尾双相机图像、8D 状态、7D 动作和任务文本均与原始 NPZ 精确对齐。LeRobot Reader 返回的图像张量为 CHW float32 `[0,1]`；按 Reader 表示还原到 uint8 HWC 后，两端图像逐像素一致。所选 OSC 片段自身奖励和 done 均为 0；完整来源 Episode 的成功奖励/终止仍留在步 844，没有错误标成 OSC 段终止或额外模型监督标签。没有应用 OpenPI 动作归一化或计算单轨迹模型归一化统计量。
+
+数据集：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/lerobot_bspline_osc_v21/`；转换与读回结果：同目录旁 `lerobot_bspline_osc_v21_conversion_report.json`。原始 NPZ、Checkpoint、已有 Chunk 档案和 LeRobot/OpenPI 依赖保持不变；未启动 Student、MuJoCo 或训练，也未 Push。
