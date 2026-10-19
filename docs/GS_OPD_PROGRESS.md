@@ -1,5 +1,7 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
+
 ## 当前环境与基线
 
 - 仓库：`/workspace/zy_workspace/RLinf`；本次修改时 HEAD 为 `61e2401f50eac200b18da2bbcd15b88813f0ac85`。
@@ -2203,3 +2205,17 @@ Batch 实际类型和形状：
 末尾窗口行为按官方 Loader 和 LeRobot 0.3.3 代码确认：10 个动作按 20 Hz 在同一 Episode 内查询；超出 Episode 的索引被 LeRobot 截到最后一帧，并生成 `actions_is_pad`。`pi05_libero` repack 只保留 `actions`、不传递该 pad mask，因此末尾锚点仍保留在 Loader 数据集中，缺少的未来槽位用本 Episode 最后一个真实动作重复到长度 10。
 
 Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/openpi_sft_loader_smoke_report.json`。记录中的最终有效 Smoke 读取 1 个 Batch。第一次读取后，Smoke 报告器的 NumPy-backed `NormStats` 比较代码抛出 `ValueError`，随后修复比较逻辑并成功完成最终记录；因此过程里实际发生两次单 Batch 读取，失败尝试未更改 Loader 或数据集。没有启动 Student、MuJoCo 或训练，没有修改 Writer、数据集、模型或执行链路，也未 Push。
+
+## 单轨迹 π₀.₅ OpenPI SFT 过拟合（2026-10-19）
+
+基于当前 RLinf 官方 OpenPI SFT DataLoader、`SFTRunner`、Pi0.5 `pi05_libero` 配置及原生 Flow Matching Loss，从 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 启动了单 GPU 有界训练。原始 LeRobot 数据集仍为 **1 Episode、749 帧、20 Hz**；官方 Reader 在索引 739 的 10 动作窗口全为真实动作，索引 740 首次出现 `actions_is_pad=True`，所以训练只选择索引 **0–739**，每个窗口均有完整 10 步真实动作。9 个末尾 padding 窗口未进入训练。保留原始 7D OSC 动作、双相机/状态、任务文本及 Checkpoint 的 quantile norm stats；模型内部动作仍为 32 维，Loader 原有变换负责把 7D 动作归一化并补齐。
+
+最终训练使用 batch size 2、单卡 RTX 4090、no-shard FSDP、冻结 VLM、训练 Action Expert。共冻结 477 个 VLM 参数张量，训练 430,098,464 个参数；每 Epoch 完整遍历 740 个窗口，即 370 个 optimizer step，连续训练 **3 Epoch / 1110 Step**。余弦学习率从 `1e-5` 起步，10 步 warmup，计划长度为 1110 步。没有增加 Loss、改模型、重算归一化统计或修改原始轨迹。
+
+同一组固定 32 个 Episode 窗口（含首尾、索引和顺序写入报告；评估种子 `20261019`）在训练前后使用原生 Flow Matching Loss 评估：归一化模型空间 MSE **0.108403 → 0.000176912**，对应 RMSE **0.329246 → 0.013301**。这是训练轨迹拟合度，不是物理动作单位误差，也不是留出集泛化指标。三个 Epoch 的逐步 Loss 均值分别为 **0.0214884、0.00113900、0.000407166**；每个 optimizer step 的 Loss、梯度范数、学习率和显存记录在 `step_metrics.jsonl`。
+
+实际耗时（worker 计时）**946.8 s**。PyTorch 峰值 allocated 为 **17,483,085,824 bytes（16.28 GiB）**，峰值 reserved 为 **24,123,539,456 bytes（22.46 GiB）**。RLinf 保存独立 Checkpoint：`logs/gs_opd/sft/pi05_libero_lerobot_bspline_osc_v21_overfit_20261019_attempt4/checkpoints/global_step_1110/actor/`。其中 `model_state_dict/full_weights.pt` 为 6,946,527,306 bytes，no-shard FSDP `dcp_checkpoint` 也随 Runner 保存。随后用 RLinf `get_model()` 从该目录实际重新加载了 3,353,433,872 参数 Pi0.5；Action Expert 参数 `llm.layers.0.attn.q_proj.1.weight` 的已训练与重载签名完全一致，差值 **0**。原始初始 Checkpoint 和 LeRobot Episode 未覆盖。
+
+运行过程中的阻塞和处置均留在对应输出目录：无后缀的首次尝试在 Dataset 子集化后遇到 `DistributedSampler.total_size` 仍为 749，尚未反向传播；`attempt2` 的 batch 4 在注意力 Softmax 处 OOM，尝试额外申请 60 MiB 时 GPU 只剩约 58 MiB；`attempt3` 虽运行 1110 个批次，但余弦计划误设为 555 步，后半程学习率为 0，因此不作为最终结果。随后只同步 sampler 长度、把 batch 降到 2、修正计划长度并增加一致性断言，最终 `attempt4` 完整通过。最终报告和固定评估结果在 `.../attempt4/report.json`，Checkpoint 重载签名在 `.../attempt4/checkpoint_reload.json`，逐步曲线在 `.../attempt4/step_metrics.jsonl`，完整 Runner 日志在 `.../attempt4/run.log`。
+
+训练配置与最小 Runner 适配分别为 `examples/sft/config/gs_opd_single_episode_pi05.yaml`、`research/gs_opd/data/run_single_episode_sft.py`。本轮没有运行 Student、MuJoCo、评测或批量采集，没有改写训练目标或安全阈值，也未 Push。
