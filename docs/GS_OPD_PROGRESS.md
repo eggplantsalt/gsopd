@@ -2154,3 +2154,13 @@ A、B 的 Compiler 总 verdict 均保持 `unknown`。实际语义 JSON `logs/gs_
 左绕到达安全出口后，Student 从末步实时双相机 Observation 和 MuJoCo 状态恢复推理，继续执行 41 步并得到真实任务奖励 `1.0`、`done=True`；总回合 845 步。Student 的后续动作来自 π₀.₅ 当前状态推理，不由 B-Spline 坐标构造。未运行 Mink，没有修改物理参数、动作空间、归一化或安全硬阈值，也未 Push。
 
 保留产物：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/live_left_bspline_osc_report.json`（749 步状态、7D 动作、误差和接触记录）、`direct_bspline_osc_trajectory.npz`（845 条真实环境转移；执行动作 `(845, 7)`，双相机下一 Observation `(845, 256, 256, 3)`）、`student_and_direct_osc.mp4`、`direct_bspline_osc_execution.svg` 和启动记录 `launch.json`。完整绕障/任务成功仅对应这次真实 MuJoCo 运行；没有额外路线或重试。
+
+## 成功 Episode 的离线 π₀.₅ Chunk 数据（2026-10-19）
+
+只读取上述成功回合，未启动 Student、MuJoCo 或训练，也未改写原始 NPZ。`trajectory_writer` 的主要字段映射为：`metadata_json`/`decision_instructions` 提供任务、相机/状态键及来源元数据；`decision_chunk_indices`、`decision_step_indices` 与 `predicted_action_offsets` 将 `decision_*` Observation 对齐 Student 决策，OSC 接管时也有一条输入 Observation；`predicted_actions` 保存 Student 原预测块（OSC 接管块为空）；`executed_actions` `(845,7)` 与 `step_indices`、`step_chunk_indices`、`step_action_indices` 对应真实执行动作；`post_agentview_image`、`post_robot0_eye_in_hand_image` 和 `post_robot0_*` 是每步 Next Observation；`step_rewards`、`step_dones` 保存实际奖励和结束标记。可选的 `decision_safety_json` 是决策级原始附加记录，本转换不把它解释为逐动作安全修正标签。报告中的决策步 55、OSC 749 步定义阶段边界 `[55,804)`，得到 Student 前段 55 步、原生 B-Spline OSC 749 步、Student 接续 41 步；任务指令为 “pick up the akita black bowl on the stove and place it on the plate”。
+
+新增最小格式 `gsopd_episode_action_chunks` v1，入口为 `research/gs_opd/data/episode_dataset.py`。Episode 元数据保留唯一 Episode ID、任务、成功标签、原始文件来源、来源统计和监督语义；每个样本包含起始 Observation（两相机及 EEF/夹爪状态）、原样七维 `float32` `action_chunk`、五步奖励/结束标记、动作来源/阶段、步索引，以及 Chunk 末尾 Next Observation。图像保留 `uint8` HWC，不做图像或动作归一化。Student 窗口沿用原始决策块边界，OSC 窗口只在连续的 OSC 阶段内切分；不跨阶段、决策块或不连续步拼接。五步以下尾段不补齐为 Chunk，仍完整留在原始 NPZ 中。监督类型记为成功 Episode 行为克隆，`safety_correction_label=not_assigned`；未把 Student 或 OSC 动作伪标为安全修正。
+
+唯一一次转换与 PyTorch `DataLoader` Smoke 结果：得到 **168 个** `(Observation, 5×7 Action Chunk)` 样本，含两张 `256×256×3` 相机图像，状态键形状为 EEF 位置 `(3,)`、四元数 `(4,)`、夹爪 `(2,)`。来源动作统计为 Student **96 步**（前段 55、后段 41；19 个完整样本）和 B-Spline OSC **749 步**（149 个完整样本）；共纳入 Chunk 840 个动作，余下 4 个 OSC 尾步及 1 个 Student 终止尾步未进入固定长度样本。档案中奖励和结束标记总计 `1.0` 与一个终止转移。随机读取样本索引 57 对应 B-Spline OSC 步 285–289，Loader 返回输入双相机/状态、原始动作标签、奖励/结束序列、来源和成功标签，形状均正确。
+
+转换文件：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/gsopd_episode_chunks_v1.npz`（51 MB）；Smoke 结构及随机样本记录：同目录 `gsopd_episode_chunks_v1_smoke.json`。原始 `direct_bspline_osc_trajectory.npz` 保持不变；未启动训练、未修改执行链路，也未 Push。
