@@ -13,6 +13,7 @@ from research.gs_opd.smoke.mink_panda_physical_smoke import (
     aggregate_contacts,
     assess_bypass_intent,
     classify_contact,
+    plan_route,
     resample_guide,
     restore,
     state_vector,
@@ -131,6 +132,91 @@ class IsolatedPhysicsContracts(unittest.TestCase):
             mujoco.mj_step(model, data)
         restored = restore(model, initial)
         np.testing.assert_array_equal(state_vector(model, restored), initial)
+
+    def test_plan_route_emits_aligned_pose_and_joint_trajectories(self):
+        from unittest.mock import patch
+
+        import research.gs_opd.smoke.mink_panda_physical_smoke as smoke
+
+        model = mujoco.MjModel.from_xml_string(
+            f"""<mujoco><worldbody>
+              <body name="arm">
+                <joint name="arm_joint" type="hinge" axis="0 0 1" range="-3 3"/>
+                <geom type="sphere" size="0.01" mass="0.01"/>
+                <site name="{smoke.FRAME_NAME}" pos="0 0 0.5"/>
+              </body>
+              <body name="payload" pos="0 0 0.5">
+                <freejoint name="payload_free"/>
+                <geom type="sphere" size="0.005" mass="0.01"/>
+              </body>
+              <body name="primary_obstacle" pos="0.0005 0 0.5">
+                <geom type="sphere" size="0.001"/>
+              </body>
+            </worldbody></mujoco>"""
+        )
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        initial = state_vector(model, data)
+        route = {
+            "candidate_id": "left-regression-route",
+            "direction": "left",
+            "reference_path": [[0.0, 0.0, 0.5], [0.001, 0.005, 0.5]],
+            "grasp_evidence": {
+                "initial_eef_sphere_center_relative_position_body_local_m": [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                "initial_eef_body_relative_quaternion_local_wxyz": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+            },
+            "sphere_center_body_local_offset_m": [0.0, 0.0, 0.0],
+            "geometric_candidate": {"direction_world": [0.0, 1.0, 0.0]},
+        }
+        obstacle_id = model.body("primary_obstacle").id
+        ctx = {
+            "model": model,
+            "site": model.site(smoke.FRAME_NAME).id,
+            "carried_id": model.body("payload").id,
+            "carried_qadr": int(model.jnt_qposadr[model.joint("payload_free").id]),
+            "didx": np.array([int(model.jnt_dofadr[model.joint("arm_joint").id])]),
+            "qidx": np.array([int(model.jnt_qposadr[model.joint("arm_joint").id])]),
+            "names": ["arm_joint"],
+            "vmax": np.array([2.0]),
+            "joint_ranges": np.array([[-3.0, 3.0]]),
+            "obstacle_definitions": [
+                {"object_id": "primary", "body_id": obstacle_id}
+            ],
+            "primary_obstacle_id": "primary",
+        }
+        args = SimpleNamespace(
+            speed=10.0,
+            max_steps=1,
+            guide_tolerance=0.02,
+            orientation_cost=0.0,
+            joint_reference_speed=2.0,
+            joint_reference_acceleration=10.0,
+        )
+        with (
+            patch.object(smoke, "_make_mink_limits", return_value=[None, None]),
+            patch.object(smoke, "collision_pair_pool", return_value=np.empty((0, 2), dtype=int)),
+            patch.object(smoke, "active_collision_limit", return_value=None),
+            patch.object(smoke, "scan_contacts", return_value=([], {})),
+            patch.object(smoke.mink, "solve_ik", return_value=np.zeros(model.nv)),
+        ):
+            plan = plan_route(model, initial, route, ctx, args)
+
+        trajectory_lengths = [
+            len(plan["joint_trajectory_rad"]),
+            len(plan["eef_trajectory_world_m"]),
+            len(plan["eef_quaternion_world_wxyz"]),
+            len(plan["sphere_trajectory_world_m"]),
+        ]
+        self.assertEqual(trajectory_lengths, [2, 2, 2, 2])
 
 
 if __name__ == "__main__":

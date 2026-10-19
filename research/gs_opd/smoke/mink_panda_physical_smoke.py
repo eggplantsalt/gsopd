@@ -402,6 +402,7 @@ def plan_route(model, initial, route, ctx, args):
         "requested_guide_steps": len(guides) - 1,
         "joint_trajectory_rad": [],
         "eef_trajectory_world_m": [],
+        "eef_quaternion_world_wxyz": [],
         "sphere_trajectory_world_m": [],
         "failure_reason": None,
         "first_failure": None,

@@ -2009,3 +2009,30 @@ KeyError: 'eef_quaternion_world_wxyz'
 - 相关 Python 文件 `py_compile` 通过；842 步规划预算接口探针通过；Mink venv import 与启动参数接口通过。所有这些只验证语法/接口，不代替物理结果。
 - Bridge 曾以 PID 151675 从当前工作树启动，运行时能力握手报告 native OSC_POSE、显式 EEF reference、子步 Contact Monitoring 与 full Snapshot restore；Student 退出后已关闭该独立 Bridge。三次报告均记录最终状态 Restore verified。
 - 当前继续的唯一条件：修复或确认 `plan_route()` 初始化结果缺少 `eef_quaternion_world_wxyz` 的原因，再用同一条实时左绕入口完成真实分支；在此之前不要扩展候选或据此报告 OSC 跟踪、Contact Compiler 或 branch 恢复通过。
+
+## Mink live-plan 四元数初始化回归修复（2026-10-19）
+
+- 修复前记录：上节 `attempt3` 的真实 Student 抓持正常，但 Mink worker 在 `plan_route()` 第 461 行 append `eef_quaternion_world_wxyz` 时因结果字典未初始化该字段而抛 `KeyError`；Mink 规划未完成，OSC 实际执行 **0 步**，跟踪误差无样本，Contact Compiler 未运行。
+- 最小生产修复仅在 `plan_route()` 的 `result` 初始化中加入 `"eef_quaternion_world_wxyz": []`。新增回归测试直接调用真实 `plan_route()`，使用小型 MuJoCo 模型运行到一个规划控制步，并核对关节、EEF 位置、EEF 四元数及球心轨迹长度均为 2；没有手工构造消费端 plan，也没有改 B-Spline、Snapshot 或训练接口。
+- 验证：Mink 环境下该 `plan_route()` 回归测试通过；两个 Python 文件的语法编译通过。没有安装依赖。
+- 复用 `attempt3` 的 `live_mink_plan_input.json`、MJB 和 metadata，未启动 Student 或 Bridge，独立重跑当前左绕 Mink worker。worker 越过第 461 行并正常完成规划：`trajectory-001/left`，850 个控制步，四类轨迹长度各 **851**（含初始状态），`first_failure=null`，绕行方向/远侧检查 `pass`；worker 自身物理动作数为 0。结果保存在同目录 `live_mink_plan_after_quaternion_fix.json`。当前 live 参考为 850 步，规划预算 1200；旧 480 Tracker 默认值不会限制该 worker 的规划，但本次没有重启 Student，因此没有宣称 OSC Tracker 消费端已执行这条 850 步参考。
+
+| 结果项 | 修复前真实 Smoke | 修复后本次独立 worker |
+| --- | --- | --- |
+| 第一次失败原因 | `KeyError: 'eef_quaternion_world_wxyz'`，`plan_route()` 第 461 行 | 无；规划完成，`failure_reason=null` |
+| Mink 轨迹 | 未返回 | 850 控制步；关节/EEF 位置/EEF 四元数/球心各 851 点 |
+| OSC 实际执行步数 | 0 | 0（本次只运行 Mink worker，未启动 Student/Bridge/OSC） |
+| EEF/黑碗跟踪误差 | 无 OSC 样本 | 未运行 OSC，故无新样本 |
+| 双指抓持 | Student 在线状态通过：闭合比例 1.0，左右指均接触黑碗，9 个匹配接触 | 复用同一 Snapshot 输入；worker 报告规划初始双指接触检查通过 |
+| Contact Compiler | 未运行 | 未运行（无 OSC/物理分支） |
+| Snapshot 恢复 | 初始 Snapshot→Restore 最大状态误差 0.0，`repair_context` 完全匹配，收尾 Restore verified；分支未开始 | worker 未执行物理动作或修改 Snapshot；没有 branch 后控制器恢复数据 |
+
+- 本轮唯一生产代码改动和真实 worker 输出解决了当前首要规划阻塞；没有用单测代替 MuJoCo 规划。OSC 分支实际控制步数、跟踪误差、Compiler 和 branch 后恢复仍沿用上表所述的未执行状态，不据规划成功推断通过。
+- 未启动 Student 是本轮有意采用的验证顺序：上次失败实验的模型文件仍在，先按要求以保存输入单独复跑 Mink worker。没有新增路线、重放历史 Step 55、接管主环境或 Push。
+
+**检查清单（Checklist）**
+
+- [x] 只补齐 `plan_route()` 的 EEF 四元数列表初始化。
+- [x] 回归测试真实调用 `plan_route()` 并检查四类轨迹长度一致。
+- [x] 用上次保存的 live input 和当前模型独立运行左绕 Mink worker；规划 850 步完成，所有四类轨迹各 851 点。
+- [ ] 用新 Student Snapshot 在正常 Bridge 上运行左绕 Mink→OSC 分支，并记录实际控制、跟踪、Compiler 与 branch 后 Snapshot 恢复证据。
