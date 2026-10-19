@@ -2182,3 +2182,24 @@ A、B 的 Compiler 总 verdict 均保持 `unknown`。实际语义 JSON `logs/gs_
 唯一一次转换后直接用 LeRobot 0.3.3 Reader 重开数据集验证：**1 Episode、749 帧、20 Hz**，Episode 边界 `[0,749)`。首帧对应原始步 55 的 OSC 接管决策 Observation，末帧对应步 803 的执行前 Observation；首尾双相机图像、8D 状态、7D 动作和任务文本均与原始 NPZ 精确对齐。LeRobot Reader 返回的图像张量为 CHW float32 `[0,1]`；按 Reader 表示还原到 uint8 HWC 后，两端图像逐像素一致。所选 OSC 片段自身奖励和 done 均为 0；完整来源 Episode 的成功奖励/终止仍留在步 844，没有错误标成 OSC 段终止或额外模型监督标签。没有应用 OpenPI 动作归一化或计算单轨迹模型归一化统计量。
 
 数据集：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/lerobot_bspline_osc_v21/`；转换与读回结果：同目录旁 `lerobot_bspline_osc_v21_conversion_report.json`。原始 NPZ、Checkpoint、已有 Chunk 档案和 LeRobot/OpenPI 依赖保持不变；未启动 Student、MuJoCo 或训练，也未 Push。
+
+## 官方 OpenPI SFT DataLoader 本地数据读取 Smoke（2026-10-19）
+
+直接把成功 Episode 的 `lerobot_bspline_osc_v21` 本地路径交给 RLinf 的 `build_official_openpi_sft_dataloader()`；配置字段取自 Student 使用的 `evaluations/libero/libero_spatial_openpi_pi05_smoke.yaml`（`model_path` 指向实际 Student Checkpoint），官方配置名为 `pi05_libero`。DataLoader 在 `world_size=1`、`num_workers=0` 下取训练 Batch。`pi05_libero` OpenPI `TrainConfig` 确认 `action_horizon=10`、内部 `action_dim=32`，返回动作形状 `[1,10,32]`。
+
+Batch 实际类型和形状：
+
+| 内容 | 实际键/形状 | 类型 |
+| --- | --- | --- |
+| 主相机 | `base_0_rgb` `[1,3,224,224]` | `torch.float32` |
+| 腕部相机 | `left_wrist_0_rgb` `[1,3,224,224]` | `torch.float32` |
+| Pi0.5 右腕占位图 | `right_wrist_0_rgb` `[1,3,224,224]` | `torch.float32` |
+| 状态 | `[1,32]`（按模型维度补齐） | `torch.float64` |
+| 任务 Token / mask | `[1,200]` / `[1,200]` | `torch.int64` / `torch.bool` |
+| Action | `[1,10,32]`（7 维实际动作经归一化后补齐） | `torch.float64` |
+
+数据集图像已在转换时按 Student 预处理旋转 180°；`pi05_libero` 的后续图像变换只做布局转换和 224×224 resize，没有再次旋转。动作归一化从实际 Checkpoint 的 `physical-intelligence/libero/norm_stats.json` 读取，SHA-256 为 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`；官方 SFT Loader 与 Student 推理 `build_openpi_transforms()` 的 norm stats 树逐字段完全相同，且两者均启用相同的 quantile 归一化。Batch 中的 7D 动作因此按 Checkpoint 的 q01/q99 处理，再由 OpenPI `PadStatesAndActions` 补到 32 维；未另建归一化流程。
+
+末尾窗口行为按官方 Loader 和 LeRobot 0.3.3 代码确认：10 个动作按 20 Hz 在同一 Episode 内查询；超出 Episode 的索引被 LeRobot 截到最后一帧，并生成 `actions_is_pad`。`pi05_libero` repack 只保留 `actions`、不传递该 pad mask，因此末尾锚点仍保留在 Loader 数据集中，缺少的未来槽位用本 Episode 最后一个真实动作重复到长度 10。
+
+Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/openpi_sft_loader_smoke_report.json`。记录中的最终有效 Smoke 读取 1 个 Batch。第一次读取后，Smoke 报告器的 NumPy-backed `NormStats` 比较代码抛出 `ValueError`，随后修复比较逻辑并成功完成最终记录；因此过程里实际发生两次单 Batch 读取，失败尝试未更改 Loader 或数据集。没有启动 Student、MuJoCo 或训练，没有修改 Writer、数据集、模型或执行链路，也未 Push。
