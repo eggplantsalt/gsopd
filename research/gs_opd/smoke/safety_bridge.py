@@ -3665,6 +3665,20 @@ try:
                         done,
                         include_snapshot_state=bool(request.get("include_snapshot_state", False)),
                     )
+                elif request["op"] == "step_monitored":
+                    action = np.asarray(request["action"], dtype=np.float32)
+                    assert action.shape == (7,)
+                    start_contacts = _collect_contacts()
+                    monitor = _new_contact_monitor()
+                    obs, reward, done, info = _run_env_step_with_contact_monitor(
+                        action, int(request.get("action_index", 0)), monitor
+                    )
+                    last_reward = reward
+                    last_done = done
+                    result = pack(obs, reward, done, include_snapshot_state=True)
+                    result["contact_monitoring"] = _contact_monitor_result(monitor)
+                    result["contacts"] = _collect_contacts()
+                    result["start_contacts"] = start_contacts
                 elif request["op"] == "snapshot":
                     try:
                         snapshot_id = f"snapshot-{next_snapshot_id:06d}"

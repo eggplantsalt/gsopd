@@ -71,6 +71,11 @@ def parse_args():
         action="store_true",
         help="Plan one current-state left route with Mink and verify native OSC in a Snapshot branch after stable grasp.",
     )
+    parser.add_argument(
+        "--direct-bspline-osc-left",
+        action="store_true",
+        help="Execute one current-state left B-Spline sphere-center route directly with closed-loop native OSC_POSE after stable grasp.",
+    )
     parser.add_argument("--mink-python", type=Path)
     parser.add_argument("--mink-model-binary", type=Path)
     parser.add_argument("--mink-model-metadata", type=Path)
@@ -92,10 +97,15 @@ def parse_args():
     collection_enabled = args.on_policy_safety_collection
     trajectory_validation_enabled = args.trajectory_bundle_physical_validation
     mink_osc_enabled = args.mink_osc_left
+    direct_osc_enabled = args.direct_bspline_osc_left
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
         parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
+    if mink_osc_enabled and direct_osc_enabled:
+        parser.error("--mink-osc-left and --direct-bspline-osc-left are mutually exclusive")
     if mink_osc_enabled and not trajectory_validation_enabled:
         parser.error("--mink-osc-left requires --trajectory-bundle-physical-validation")
+    if direct_osc_enabled and not trajectory_validation_enabled:
+        parser.error("--direct-bspline-osc-left requires --trajectory-bundle-physical-validation")
     if trajectory_validation_enabled:
         if args.teacher_json is None or args.semantic_results_json is None:
             parser.error(
@@ -121,8 +131,10 @@ def parse_args():
                 parser.error("--mink-osc-left requires --mink-python, --mink-model-binary, and --mink-model-metadata")
             if not args.mink_python.is_file() or not args.mink_model_binary.is_file() or not args.mink_model_metadata.is_file():
                 parser.error("Mink Python and current-model export files must exist")
-        if args.trace_out is not None or args.on_policy_safety_out is not None:
-            parser.error("trajectory physical validation does not write rollout trace/training data")
+        if (args.trace_out is not None and not direct_osc_enabled) or args.on_policy_safety_out is not None:
+            parser.error("trajectory physical validation does not write rollout trace/training data unless direct OSC execution is enabled")
+        if direct_osc_enabled and (args.trace_out is None or args.video_out is None):
+            parser.error("--direct-bspline-osc-left requires --trace-out and --video-out for real action/observation recording")
         if args.probe_out_dir is not None or args.repair_out_dir is not None:
             parser.error("probe and repair output directories cannot be used for trajectory validation")
         if args.task_object_id is not None or args.task_object_semantic_result is not None:
@@ -223,6 +235,7 @@ def parse_args():
             args.mink_model_binary,
             args.mink_model_metadata,
             True if args.mink_osc_left else None,
+            True if args.direct_bspline_osc_left else None,
         )
     ):
         parser.error(
@@ -1928,6 +1941,7 @@ try:
     trajectory_validation_report = None
     trajectory_validation_attempted = False
     trajectory_validation_restore_abort = False
+    direct_execution_stop = False
     trajectory_validation_preflight_failure = None
     if args.trajectory_bundle_physical_validation:
         try:
@@ -2001,6 +2015,7 @@ try:
         and collection_preflight_failure is None
         and collection_abort_reason is None
         and not trajectory_validation_restore_abort
+        and not direct_execution_stop
     ):
         if (
             args.trajectory_bundle_physical_validation
@@ -2011,6 +2026,7 @@ try:
             and trajectory_grasp_monitor.stable
         ):
             trajectory_validation_attempted = True
+            direct_latest_data = data
             try:
                 if args.mink_osc_left:
                     from research.gs_opd.smoke.mink_osc_snapshot_smoke import (
@@ -2027,6 +2043,25 @@ try:
                         mink_python=args.mink_python,
                         model_binary=args.mink_model_binary,
                         model_metadata=args.mink_model_metadata,
+                    )
+                elif args.direct_bspline_osc_left:
+                    from research.gs_opd.smoke.direct_bspline_osc_smoke import (
+                        run_live_direct_bspline_osc_smoke,
+                    )
+
+                    trajectory_validation_report, direct_latest_data = run_live_direct_bspline_osc_smoke(
+                        conn,
+                        trajectory_validation_context,
+                        trajectory_grasp_monitor.samples[-1],
+                        decision_step=steps,
+                        grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                        output_json=args.trajectory_validation_out,
+                        trace_writer=trace_writer,
+                        chunk_index=chunks,
+                        step_index=steps,
+                        initial_bridge_data=data,
+                        video_frames=video_frames,
+                        video_frame_encoder=get_video_frame,
                     )
                 else:
                     from research.gs_opd.repair.trajectory_bundle_acceptance import (
@@ -2093,6 +2128,33 @@ try:
             from research.gs_opd.repair.trajectory_bundle_acceptance import (
                 must_stop_rollout_after_acceptance,
             )
+            if args.direct_bspline_osc_left:
+                direct_count = int((trajectory_validation_report or {}).get("real_execution_steps", 0))
+                steps += direct_count
+                route_completed = bool(
+                    trajectory_validation_report
+                    and trajectory_validation_report.get("route_completed") is True
+                )
+                if route_completed and isinstance(direct_latest_data, dict):
+                    data = direct_latest_data
+                if trajectory_validation_report and trajectory_validation_report.get("steps"):
+                    last_transition = trajectory_validation_report["steps"][-1]
+                    success = success or bool(last_transition.get("reward", 0.0) > 0)
+                    done = bool(last_transition.get("done", False))
+                direct_execution_stop = not route_completed
+                print(
+                    "DIRECT B-SPLINE→OSC ROUTE:",
+                    (trajectory_validation_report or {}).get("status"),
+                    (trajectory_validation_report or {}).get("failure_reason"),
+                    "REAL OSC STEPS:",
+                    direct_count,
+                    "STUDENT_CONTINUATION:",
+                    bool(route_completed and not done and not success),
+                    flush=True,
+                )
+                if not route_completed or done or success:
+                    break
+                continue
             if args.mink_osc_left or must_stop_rollout_after_acceptance(trajectory_validation_report):
                 trajectory_validation_restore_abort = True
                 print(
@@ -2435,12 +2497,33 @@ try:
             "success": bool(success),
             "done": bool(done),
             "episode_end_reason": (
+                "direct_B_Spline_OSC_route_failed"
+                if direct_execution_stop
+                else
                 "trajectory_validation_state_integrity_failure"
                 if trajectory_validation_restore_abort
                 else
                 "success" if success else "environment_done" if done else "max_steps"
             ),
-            "rollout_stopped_before_next_student_action": trajectory_validation_restore_abort,
+            "rollout_stopped_before_next_student_action": (
+                trajectory_validation_restore_abort or direct_execution_stop
+            ),
+            "direct_route_student_continuation": {
+                "route_completed": bool(trajectory_validation_report.get("route_completed")),
+                "student_steps_after_route": max(
+                    0,
+                    steps
+                    - int(trajectory_validation_report.get("decision_step", 0))
+                    - int(trajectory_validation_report.get("real_execution_steps", 0)),
+                ),
+                "student_continued_from_latest_live_observation": bool(
+                    trajectory_validation_report.get("route_completed")
+                    and not direct_execution_stop
+                    and steps
+                    > int(trajectory_validation_report.get("decision_step", 0))
+                    + int(trajectory_validation_report.get("real_execution_steps", 0))
+                ),
+            },
             "checkpoint_path": str(ckpt),
             "bridge_endpoint": "127.0.0.1:38567",
             "bridge_connection_policy": "the existing pi05_rollout Client connection was used for Student steps, grasp queries, Snapshot, geometry, and branch tracking",
@@ -2451,8 +2534,13 @@ try:
             )
         trajectory_validation_report["physical_safety_claim"] = False
         trajectory_validation_report["training_label_created"] = False
-        trajectory_validation_report["main_environment_candidate_execution"] = False
-        trajectory_validation_report["main_environment_actions_by_acceptance"] = 0
+        trajectory_validation_report["main_environment_candidate_execution"] = bool(
+            args.direct_bspline_osc_left
+            and trajectory_validation_report.get("real_execution_steps", 0) > 0
+        )
+        trajectory_validation_report["main_environment_actions_by_acceptance"] = int(
+            trajectory_validation_report.get("real_execution_steps", 0)
+        )
         trajectory_validation_summary_path = args.trajectory_validation_out
         trajectory_validation_summary_path.parent.mkdir(parents=True, exist_ok=True)
         trajectory_validation_summary_path.write_text(
@@ -2524,6 +2612,9 @@ try:
             "report_path": str(trajectory_validation_summary_path),
             "branch_candidate_count": trajectory_validation_report.get("branch_candidate_count", 0),
             "restore_verified": trajectory_validation_report.get("main_state_restored"),
+            "real_execution_steps": trajectory_validation_report.get("real_execution_steps", 0),
+            "route_completed": trajectory_validation_report.get("route_completed", False),
+            "first_failure_reason": trajectory_validation_report.get("failure_reason"),
             "failure_reasons": trajectory_validation_report.get("failure_reasons", []),
         }
 

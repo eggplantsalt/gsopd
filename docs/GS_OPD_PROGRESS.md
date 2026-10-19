@@ -2118,3 +2118,39 @@ A、B 的 Compiler 总 verdict 均保持 `unknown`。实际语义 JSON `logs/gs_
 - Student 控制台日志、Mink 输入/输出、当前态场景和启动参数均保存在上述新目录。
 
 本次没有修改训练或生产控制代码，没有 Push，也没有运行其他路线；这 108 步对照不是完整绕障成功。
+
+## 直接 B-Spline → OSC 左绕真实执行（2026-10-19）
+
+按“只跑左绕、优先直接 B-Spline→原生 OSC_POSE”的目标，新增最小主环境闭环入口：Student 在三次不同状态的双指稳定抓持后，读取当前态 Scene Smoke 生成的左绕 B-Spline；每 50 ms 用当前 EEF/碗相对位姿把球心参考映射为 EEF 世界目标，经现有 `world_pose_tracking_action()` 生成 7 维 OSC action。Safety Bridge 对每个动作返回双相机 Observation、下一状态和逐物理子步接触；Student 继续使用现有 `trajectory_writer.py` 保存 NPZ。未加载 Mink、未走分支回滚、未修改 π₀.₅、训练目标、动作维度、归一化、物理参数或 0.20 rad 抓持阈值。
+
+真实运行结果：
+
+| 新输出目录 | 左绕 OSC 实际执行 | 首次停止原因与末步证据 |
+| --- | ---: | --- |
+| `live_left_bspline_osc_direct_20261019_attempt1/` | 1 步（规划 847 步） | 接触筛选误把全场景静态接触及抓持时已有的 palm—碗接触当成新碰撞；该步抓持旋转误差 0.00830 rad、球心误差 2.58 mm。逐步记录显示接触从本控制步第 0 子步即存在。保留原报告和录像；随后仅修正筛选：只停止于相对本步起始接触集合新增、且涉及机器人或黑碗的接触。 |
+| `live_left_bspline_osc_direct_20261019_attempt2/` | **839 步**（规划 840 步） | 第 839 步球心跟踪误差 **0.025199 m**，略超既有 0.025 m 上限，立即停止。EEF 位置误差 0.019631 m；夹爪—碗相对位置误差 0.004719 m、旋转误差 0.156222 rad；末步双指仍通过，未出现新增接触碰撞。未执行最后参考步，不能算完成绕障。 |
+| `live_left_bspline_osc_direct_20261019_attempt3/` | 126 步（规划 1124 步） | 唯一调整是速度从 0.020 降至 0.015 m/s。第 126 步后左右指接触均缺失，抓持状态 `not_grasped`；同一采样下相对旋转误差为 **0.232886 rad**、相对位置误差 0.010688 m，停止原因为“双指抓持失效”。控制步采样无法判断抓持先失效还是旋转误差先越线；两者都在该步结束时已成立。未观察到新增碰撞事件。 |
+
+最长真实连续执行段为 839 个 OSC 步，未完成最后一个 B-Spline 参考步；Student 任务没有收到成功奖励，未确认放置完成。关键残差是**实时抓持相对位姿与球心轨迹跟踪不能在全程同时稳定**：0.020 m/s 时到路线末段球心误差刚超过原限制；减速后更早失持且相对旋转超过原限制。没有绕过这两个失败条件继续动作。第 3 次的前 50 步球心误差 3.1 mm、相对旋转误差 0.0648 rad；第 2 次在 800 步为 15.6 mm/0.1536 rad，最后 39 步误差增至上限外。
+
+接触监测按 Bridge 返回的逐子步证据执行，所有已完成控制步采样完整；第 2、3 次未报告新的机器人—环境或黑碗—环境接触。Contact Compiler 本次没有运行，也没有声称其给出 `safe`；`object_3` 语义绑定缺失及其 `unknown` 结果保持此前记录，未伪造映射。
+
+动作与视频产物：
+
+- 最长段报告、每步 OSC 七维动作、EEF/黑碗状态误差与接触记录：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_direct_20261019_attempt2/live_left_bspline_osc_report.json`
+- 最长段轨迹 NPZ：`.../live_left_bspline_osc_direct_20261019_attempt2/direct_bspline_osc_trajectory.npz`；含 894 条总环境转移，其中 839 条为直接 OSC，Observation/Next Observation 均包含 agentview 与 eye-in-hand 相机，动作维度为 7。
+- 最长段视频与实际/规划球心 XY 可视化：`.../live_left_bspline_osc_direct_20261019_attempt2/student_and_direct_osc.mp4`、`.../direct_bspline_osc_execution.svg`
+- 减速失持报告、NPZ、视频和轨迹图保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_direct_20261019_attempt3/`。
+- 首次接触筛选误报的原始报告和视频保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_direct_20261019_attempt1/`。
+
+语法与接口导入检查通过；已在真实 MuJoCo 中运行 Student 和原生 OSC，共进行三次左绕执行尝试（没有其他路线）。停止并保留失败状态与原始证据；没有继续追加重构或 Push。
+
+## 自适应 B-Spline→OSC 左绕与 Student 接续（2026-10-19）
+
+按本轮限定只调整直接跟踪器的参考索引推进：B-Spline 参考速度恢复为 `0.020 m/s`；球心相对当前目标误差不高于 `12 mm` 才推进下一个 Waypoint，超过时保留该目标并由原生闭环 OSC 追赶。单点追赶上限 32 步、累计追赶上限 240 步、总 OSC 执行预算 1079 步。原有球心 `25 mm`、EEF `25 mm`、抓持相对位置 `12 mm`、旋转 `0.20 rad` 限制及碰撞/失持停止条件均保持。路线完成由真实黑碗球心进入同一轨迹包的 `bounded_plane_behind_obstacle` 出口区域判定，不依据执行步数或计划完成比例。
+
+唯一一次真实运行结果：Student 在第 55 步触发后，原生七维 `OSC_POSE` 左绕执行 **749 步**，没有首次失败（`failure_reason=null`），球心进入几何出口区域后停止 B-Spline。实际出口坐标为法向 `-12.98 mm`、侧向 `115.13 mm`、上向 `-3.47 mm`；区域侧向边界为 `±115.22 mm`，球心在区域内。最大球心跟踪误差 `8.995 mm`，EEF 位置误差 `5.256 mm`、姿态误差 `0.01070 rad`，抓持相对位置误差 `4.389 mm`、旋转误差 `0.13373 rad`；双指抓持每步通过，749/749 次子步接触监测完整，未报告禁止碰撞。追赶步数为 0，最大球心误差始终低于 12 mm 软阈值。
+
+左绕到达安全出口后，Student 从末步实时双相机 Observation 和 MuJoCo 状态恢复推理，继续执行 41 步并得到真实任务奖励 `1.0`、`done=True`；总回合 845 步。Student 的后续动作来自 π₀.₅ 当前状态推理，不由 B-Spline 坐标构造。未运行 Mink，没有修改物理参数、动作空间、归一化或安全硬阈值，也未 Push。
+
+保留产物：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/live_left_bspline_osc_report.json`（749 步状态、7D 动作、误差和接触记录）、`direct_bspline_osc_trajectory.npz`（845 条真实环境转移；执行动作 `(845, 7)`，双相机下一 Observation `(845, 256, 256, 3)`）、`student_and_direct_osc.mp4`、`direct_bspline_osc_execution.svg` 和启动记录 `launch.json`。完整绕障/任务成功仅对应这次真实 MuJoCo 运行；没有额外路线或重试。

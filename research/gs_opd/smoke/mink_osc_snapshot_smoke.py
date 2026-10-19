@@ -773,20 +773,27 @@ def main() -> int:
     parser.add_argument("--mink-python", type=Path, default=DEFAULT_MINK_PYTHON)
     parser.add_argument("--libero-python", type=Path, default=DEFAULT_LIBERO_PYTHON)
     parser.add_argument("--rollout-python", type=Path, default=DEFAULT_ROLLOUT_PYTHON)
-    parser.add_argument("--max-steps", type=int, default=240)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--direct-bspline-osc-left",
+        action="store_true",
+        help="Execute the existing left B-Spline route directly through native OSC_POSE; do not export or launch Mink.",
+    )
     parser.add_argument("--bridge-host", default="127.0.0.1")
     parser.add_argument("--bridge-port", type=int, default=38567)
     args = parser.parse_args()
+    if args.max_steps is None:
+        args.max_steps = 1600 if args.direct_bspline_osc_left else 240
     for required in (args.teacher_json, args.semantic_results_json):
         if not required.is_file():
             parser.error(f"required input file does not exist: {required}")
     if (
-        not args.mink_python.is_file()
+        (not args.direct_bspline_osc_left and not args.mink_python.is_file())
         or not args.libero_python.is_file()
         or not args.rollout_python.is_file()
     ):
         parser.error(
-            "the existing Mink and RLinf Python environments must be available"
+            "the required RLinf and LIBERO-Safety Python environments must be available"
         )
     if args.max_steps <= 0:
         parser.error("--max-steps must be positive")
@@ -822,35 +829,53 @@ def main() -> int:
         )
     model_path = args.out_dir / "current_libero_safety_model.mjb"
     metadata_path = args.out_dir / "current_libero_safety_model.json"
-    report_path = args.out_dir / "live_left_osc_snapshot_report.json"
+    report_path = args.out_dir / (
+        "live_left_bspline_osc_report.json"
+        if args.direct_bspline_osc_left
+        else "live_left_osc_snapshot_report.json"
+    )
     if report_path.exists():
         parser.error(
             f"Choose a fresh --out-dir; report already exists: {report_path}"
         )
-    _export_current_model(args, model_path, metadata_path)
-    video_path = args.out_dir / "student_grasp_search.mp4"
+    if not args.direct_bspline_osc_left:
+        _export_current_model(args, model_path, metadata_path)
+    video_path = args.out_dir / (
+        "student_and_direct_osc.mp4"
+        if args.direct_bspline_osc_left
+        else "student_grasp_search.mp4"
+    )
     command = [
         str(args.rollout_python),
         str(REPO_ROOT / "research/gs_opd/smoke/pi05_rollout.py"),
         "--max-steps",
         str(args.max_steps),
         "--trajectory-bundle-physical-validation",
-        "--mink-osc-left",
         "--teacher-json",
         str(args.teacher_json.resolve()),
         "--semantic-results-json",
         str(args.semantic_results_json.resolve()),
         "--trajectory-validation-out",
         str(report_path.resolve()),
-        "--mink-python",
-        str(args.mink_python),
-        "--mink-model-binary",
-        str(model_path.resolve()),
-        "--mink-model-metadata",
-        str(metadata_path.resolve()),
         "--video-out",
         str(video_path.resolve()),
     ]
+    if args.direct_bspline_osc_left:
+        command.extend([
+            "--direct-bspline-osc-left",
+            "--trace-out",
+            str((args.out_dir / "direct_bspline_osc_trajectory.npz").resolve()),
+        ])
+    else:
+        command.extend([
+            "--mink-osc-left",
+            "--mink-python",
+            str(args.mink_python),
+            "--mink-model-binary",
+            str(model_path.resolve()),
+            "--mink-model-metadata",
+            str(metadata_path.resolve()),
+        ])
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
         (
@@ -869,8 +894,9 @@ def main() -> int:
             "geometry_count": inventory.get("geom_count"),
             "trajectory_tracking_capabilities": tracker_capabilities,
         },
-        "exported_model": str(model_path.resolve()),
-        "model_metadata": str(metadata_path.resolve()),
+        "execution_mode": "direct_B_Spline_to_native_OSC_POSE" if args.direct_bspline_osc_left else "Mink_snapshot_native_OSC_POSE",
+        "exported_model": None if args.direct_bspline_osc_left else str(model_path.resolve()),
+        "model_metadata": None if args.direct_bspline_osc_left else str(metadata_path.resolve()),
         "output_report": str(report_path.resolve()),
         "video_path": str(video_path.resolve()),
         "main_environment_candidate_actions": 0,
@@ -880,7 +906,7 @@ def main() -> int:
         json.dumps(launch_record, indent=2) + "\n", encoding="utf-8"
     )
     print(
-        "Starting Student rollout; current-state B-Spline/Mink/OSC branch runs only after three stable dual-finger grasp states.",
+        "Starting Student rollout; direct B-Spline/OSC execution begins after three stable dual-finger grasp states." if args.direct_bspline_osc_left else "Starting Student rollout; current-state B-Spline/Mink/OSC branch runs only after three stable dual-finger grasp states.",
         flush=True,
     )
     completed = subprocess.run(command, cwd=REPO_ROOT, env=env, check=False)
@@ -902,7 +928,11 @@ def main() -> int:
             {
             "status": report.get("status"),
             "decision_step": report.get("decision_step"),
-            "executed_steps": (report.get("branch") or {}).get("executed_steps"),
+                "executed_steps": (
+                    report.get("real_execution_steps")
+                    if args.direct_bspline_osc_left
+                    else (report.get("branch") or {}).get("executed_steps")
+                ),
                 "failure_reasons": report.get("failure_reasons"),
                 "compiler_verdict": (
                 (report.get("branch") or {}).get("contact_compiler") or {}
