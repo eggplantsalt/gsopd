@@ -203,7 +203,13 @@ def load_base_safetensors(model, safetensors_path) -> None:
         raise RuntimeError(
             f"Unexpected keys loading {safetensors_path}: {unexpected[:8]}"
         )
-    missing_pi0 = _missing_pi0_keys(incompatible.missing_keys)
+    # A base checkpoint intentionally has no adapter tensors. Keep those LoRA
+    # parameters at their module initialization while still requiring every
+    # original Pi0 weight to load.
+    missing_pi0 = [
+        key for key in _missing_pi0_keys(incompatible.missing_keys)
+        if "lora_" not in key
+    ]
     if missing_pi0:
         raise RuntimeError(
             f"Pi0 tensors missing from {safetensors_path}: {missing_pi0[:8]}"

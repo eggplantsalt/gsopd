@@ -3665,6 +3665,8 @@ try:
                         done,
                         include_snapshot_state=bool(request.get("include_snapshot_state", False)),
                     )
+                    if request.get("include_contacts", False):
+                        result["contacts"] = _collect_contacts()
                 elif request["op"] == "step_monitored":
                     action = np.asarray(request["action"], dtype=np.float32)
                     assert action.shape == (7,)

@@ -36,6 +36,7 @@ import torch.utils.checkpoint
 
 from . import lora
 from .lora import FeedForward as LoRAFeedForward
+from .lora import LinearLoRA
 from .utils import _str_to_dtype, gelu_glu, torch_compile_enabled
 
 PALIGEMMA_VOCAB_SIZE = 257_152
@@ -223,12 +224,13 @@ class Attention(nn.Module):
         self.k_proj = nn.ModuleList()
         self.v_proj = nn.ModuleList()
         self.o_proj = nn.ModuleList()
+        self.q_proj_lora = nn.ModuleList()
+        self.k_proj_lora = nn.ModuleList()
+        self.v_proj_lora = nn.ModuleList()
+        self.o_proj_lora = nn.ModuleList()
 
         for config in configs:
             lora_cfg = config.lora_configs.get("attn")
-            # TODO: add lora attn support
-            if lora_cfg is not None:
-                raise NotImplementedError
             if config.num_kv_heads == config.num_heads:
                 # Combined QKV projection
                 self.q_proj.append(
@@ -258,6 +260,28 @@ class Attention(nn.Module):
             self.o_proj.append(
                 nn.Linear(config.num_heads * config.head_dim, config.width, bias=False)
             )
+            self.q_proj_lora.append(
+                LinearLoRA(config.width, self.q_proj[-1].out_features, lora_cfg)
+                if lora_cfg is not None
+                else nn.Identity()
+            )
+            self.k_proj_lora.append(
+                LinearLoRA(config.width, self.k_proj[-1].out_features, lora_cfg)
+                if lora_cfg is not None and self.k_proj[-1] is not None
+                else nn.Identity()
+            )
+            self.v_proj_lora.append(
+                LinearLoRA(config.width, self.v_proj[-1].out_features, lora_cfg)
+                if lora_cfg is not None and self.v_proj[-1] is not None
+                else nn.Identity()
+            )
+            self.o_proj_lora.append(
+                LinearLoRA(
+                    config.num_heads * config.head_dim, config.width, lora_cfg
+                )
+                if lora_cfg is not None
+                else nn.Identity()
+            )
 
         # Initialize weights
         self._init_weights()
@@ -278,6 +302,13 @@ class Attention(nn.Module):
                 self.o_proj[i].weight,
                 std=1.0 / math.sqrt(config.num_heads * config.head_dim),
             )
+
+    @staticmethod
+    def _project(linear: nn.Linear, lora: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        result = linear(x)
+        if isinstance(lora, LinearLoRA):
+            result = result + lora(x)
+        return result
 
     def forward(
         self,
@@ -312,13 +343,19 @@ class Attention(nn.Module):
 
             B, T, _ = x.shape
             if self.k_proj[i] is None:
-                qkv = self.q_proj[i](x)
+                qkv = self._project(self.q_proj[i], self.q_proj_lora[i], x)
                 qkv = qkv.reshape(B, T, 3, self.num_heads, self.head_dim)
                 q, k, v = qkv.unbind(dim=2)
             else:
-                q = self.q_proj[i](x).reshape(B, T, self.num_heads, self.head_dim)
-                k = self.k_proj[i](x).reshape(B, T, self.num_kv_heads, self.head_dim)
-                v = self.v_proj[i](x).reshape(B, T, self.num_kv_heads, self.head_dim)
+                q = self._project(self.q_proj[i], self.q_proj_lora[i], x).reshape(
+                    B, T, self.num_heads, self.head_dim
+                )
+                k = self._project(self.k_proj[i], self.k_proj_lora[i], x).reshape(
+                    B, T, self.num_kv_heads, self.head_dim
+                )
+                v = self._project(self.v_proj[i], self.v_proj_lora[i], x).reshape(
+                    B, T, self.num_kv_heads, self.head_dim
+                )
 
             q_parts.append(q)
             k_parts.append(k)
@@ -386,7 +423,9 @@ class Attention(nn.Module):
             if x is not None:
                 end = start + x.shape[1]
                 expert_out = encoded[:, start:end].reshape(B, x.shape[1], -1)
-                expert_out = self.o_proj[i](expert_out)
+                expert_out = self._project(
+                    self.o_proj[i], self.o_proj_lora[i], expert_out
+                )
                 outputs.append(expert_out)
                 start = end
             else:

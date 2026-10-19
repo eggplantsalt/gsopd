@@ -22,6 +22,7 @@ import re
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .utils import gelu_glu
 
@@ -41,6 +42,26 @@ class LoRAConfig:
         return (
             self.alpha / math.sqrt(self.rank) if self.rslora else self.alpha / self.rank
         )
+
+
+class LinearLoRA(nn.Module):
+    """Low-rank residual for an existing linear projection."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        lora_config: LoRAConfig,
+    ):
+        super().__init__()
+        self.lora_config = lora_config
+        self.lora_a = nn.Parameter(torch.empty(lora_config.rank, in_features))
+        self.lora_b = nn.Parameter(torch.zeros(out_features, lora_config.rank))
+        nn.init.normal_(self.lora_a, std=0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = F.linear(x, self.lora_a.to(x.dtype))
+        return F.linear(hidden, self.lora_b.to(x.dtype)) * self.lora_config.scaling_value
 
 
 class Einsum(nn.Module):

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 from multiprocessing.connection import Client
@@ -10,11 +11,42 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from rlinf.models import get_model
+from rlinf.models.embodiment.openpi.checkpoint import (
+    resolve_full_weights,
+    resolve_model_safetensors,
+)
 from rlinf.envs.sim.libero.utils import get_libero_image, get_libero_wrist_image, quat2axisangle
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft"),
+        help="OpenPI model checkpoint directory or weights file.",
+    )
+    parser.add_argument(
+        "--lora-checkpoint",
+        type=Path,
+        help="Optional standalone Action Expert LoRA adapter paired with --checkpoint.",
+    )
+    parser.add_argument(
+        "--record-physical-state",
+        action="store_true",
+        help="Record read-only MuJoCo object states and post-step contacts in the NPZ trace.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Optional Python/NumPy/PyTorch RNG seed for a reproducible Student rollout.",
+    )
+    parser.add_argument(
+        "--result-out",
+        type=Path,
+        default=Path("/tmp/gs_pi05_safety_l0t0_result.json"),
+        help="JSON path for the final rollout summary.",
+    )
     parser.add_argument(
         "--video-out",
         type=Path,
@@ -1833,21 +1865,62 @@ def get_video_frame(data):
 
 args = parse_args()
 
-ckpt = Path("/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft")
-assert (ckpt / "model.safetensors").is_file(), f"Checkpoint missing: {ckpt}"
+if args.seed is not None:
+    import random
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+ckpt = args.checkpoint.expanduser().resolve()
+ckpt_file = resolve_model_safetensors(ckpt) or resolve_full_weights(ckpt)
+assert ckpt_file is not None, f"Checkpoint missing: {ckpt}"
 
 with initialize_config_dir(config_dir="/workspace/zy_workspace/RLinf/evaluations/libero", version_base=None):
     cfg = compose(config_name="libero_spatial_openpi_pi05_smoke")
 
 cfg.rollout.model.model_path = str(ckpt)
 OmegaConf.update(cfg.rollout.model, "openpi.torch_compile", False, force_add=True)
+if args.lora_checkpoint is not None:
+    if not args.lora_checkpoint.is_file():
+        raise FileNotFoundError(f"LoRA adapter checkpoint missing: {args.lora_checkpoint}")
+    OmegaConf.update(cfg.rollout.model, "is_lora", False, force_add=True)
+    OmegaConf.update(cfg.rollout.model, "lora_rank", 32, force_add=True)
+    OmegaConf.update(
+        cfg.rollout.model,
+        "openpi.action_expert_variant",
+        "gemma_300m_lora",
+        force_add=True,
+    )
+    OmegaConf.update(cfg.rollout.model, "openpi.config_name", "pi05_libero", force_add=True)
+    OmegaConf.update(cfg.rollout.model, "openpi.action_chunk", 10, force_add=True)
+    OmegaConf.update(cfg.rollout.model, "openpi.action_env_dim", 7, force_add=True)
+    OmegaConf.update(cfg.rollout.model, "openpi.model_action_dim", 32, force_add=True)
+norm_stats_path = Path(
+    "/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/physical-intelligence/libero/norm_stats.json"
+)
+OmegaConf.update(
+    cfg.rollout.model,
+    "openpi_data.norm_stats_path",
+    str(norm_stats_path),
+    force_add=True,
+)
 
 print("MODEL PATH:", ckpt, flush=True)
-print("NORM STATS EXISTS:", (ckpt / "norm_stats.json").is_file(), flush=True)
+print("CHECKPOINT FILE:", ckpt_file, flush=True)
+print("NORM STATS:", norm_stats_path, "exists=", norm_stats_path.is_file(), flush=True)
 print("LOADING PI0.5...", flush=True)
 
 model = get_model(cfg.rollout.model)
+adapter_metadata = None
+if args.lora_checkpoint is not None:
+    from research.gs_opd.data.lora_checkpoint import load_lora_adapter
+
+    adapter_metadata = load_lora_adapter(model, args.lora_checkpoint)
 model = model.to("cuda:0").eval()
+if adapter_metadata is not None:
+    print("LORA ADAPTER LOADED:", json.dumps(adapter_metadata, ensure_ascii=False), flush=True)
 print("MODEL LOADED", flush=True)
 
 import time
@@ -1880,7 +1953,12 @@ try:
             "task_id": 0,
             "instruction": data["instruction"],
             "checkpoint_path": str(ckpt),
-            "checkpoint_file": str(ckpt / "model.safetensors"),
+            "checkpoint_file": str(ckpt_file),
+            "lora_checkpoint_path": (
+                str(args.lora_checkpoint) if args.lora_checkpoint is not None else None
+            ),
+            "physical_state_recording": bool(args.record_physical_state),
+            "seed": args.seed,
             "max_steps": args.max_steps,
             "camera_resolution": 256,
             "env_seed": 0,
@@ -2290,6 +2368,9 @@ try:
             payload = {"op": "step", "action": action.tolist()}
             if collection_enabled:
                 payload["include_snapshot_state"] = True
+            if args.record_physical_state:
+                payload["include_snapshot_state"] = True
+                payload["include_contacts"] = True
             conn.send(payload)
             response = conn.recv()
             if collection_enabled and (not isinstance(response, dict) or response.get("error")):
@@ -2598,6 +2679,12 @@ try:
         "done": done,
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "camera_resolution": 256,
+        "checkpoint_path": str(ckpt),
+        "lora_checkpoint_path": (
+            str(args.lora_checkpoint) if args.lora_checkpoint is not None else None
+        ),
+        "physical_state_recording": bool(args.record_physical_state),
+        "seed": args.seed,
     }
     if contact_probe_result is not None:
         if args.contact_safety_probe:
@@ -2618,7 +2705,8 @@ try:
             "failure_reasons": trajectory_validation_report.get("failure_reasons", []),
         }
 
-    with open("/tmp/gs_pi05_safety_l0t0_result.json", "w") as f:
+    args.result_out.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.result_out, "w") as f:
         json.dump(result, f, indent=2)
 
     print("RESULT:", result, flush=True)
