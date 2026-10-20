@@ -104,6 +104,17 @@ def parse_args():
     parser.add_argument("--trajectory-subject-object-id")
     parser.add_argument("--trajectory-validation-out", type=Path)
     parser.add_argument(
+        "--trajectory-candidate-seed",
+        type=int,
+        default=0,
+        help="Seed the uniform choice among physically verified trajectory-bundle candidates.",
+    )
+    parser.add_argument(
+        "--trajectory-validation-stop-after-acceptance",
+        action="store_true",
+        help="Stop this one-shot smoke after Snapshot branch validation and restore.",
+    )
+    parser.add_argument(
         "--mink-osc-left",
         action="store_true",
         help="Plan one current-state left route with Mink and verify native OSC in a Snapshot branch after stable grasp.",
@@ -158,6 +169,10 @@ def parse_args():
             parser.error("--trajectory-validation-out must use the .json extension")
         if args.max_steps == 0:
             parser.error("trajectory physical validation requires --max-steps greater than zero")
+        if args.trajectory_validation_stop_after_acceptance and (
+            args.mink_osc_left or args.direct_bspline_osc_left
+        ):
+            parser.error("--trajectory-validation-stop-after-acceptance applies to bundle acceptance only")
         if mink_osc_enabled:
             if any(
                 value is None
@@ -2027,6 +2042,7 @@ try:
     trajectory_validation_report = None
     trajectory_validation_attempted = False
     trajectory_validation_restore_abort = False
+    trajectory_validation_stop_after_acceptance = False
     direct_execution_stop = False
     trajectory_validation_preflight_failure = None
     if args.trajectory_bundle_physical_validation:
@@ -2101,6 +2117,7 @@ try:
         and collection_preflight_failure is None
         and collection_abort_reason is None
         and not trajectory_validation_restore_abort
+        and not trajectory_validation_stop_after_acceptance
         and not direct_execution_stop
     ):
         if (
@@ -2161,6 +2178,7 @@ try:
                         args.trajectory_validation_out,
                         decision_step=steps,
                         grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                        candidate_selection_seed=args.trajectory_candidate_seed,
                     )
             except Exception as exc:
                 trajectory_validation_report = {
@@ -2247,6 +2265,14 @@ try:
                     "TRAJECTORY VALIDATION STOPPED ROLLOUT BEFORE NEXT STUDENT ACTION:",
                     trajectory_validation_report.get("status"),
                     trajectory_validation_report.get("failure_reasons", []),
+                    flush=True,
+                )
+                break
+            if args.trajectory_validation_stop_after_acceptance:
+                trajectory_validation_stop_after_acceptance = True
+                print(
+                    "TRAJECTORY BUNDLE SMOKE STOPPED AFTER BRANCH VALIDATION AND RESTORE:",
+                    trajectory_validation_report.get("status"),
                     flush=True,
                 )
                 break
@@ -2594,13 +2620,18 @@ try:
                 "direct_B_Spline_OSC_route_failed"
                 if direct_execution_stop
                 else
+                "trajectory_validation_stopped_after_acceptance"
+                if trajectory_validation_stop_after_acceptance
+                else
                 "trajectory_validation_state_integrity_failure"
                 if trajectory_validation_restore_abort
                 else
                 "success" if success else "environment_done" if done else "max_steps"
             ),
             "rollout_stopped_before_next_student_action": (
-                trajectory_validation_restore_abort or direct_execution_stop
+                trajectory_validation_restore_abort
+                or trajectory_validation_stop_after_acceptance
+                or direct_execution_stop
             ),
             "direct_route_student_continuation": {
                 "route_completed": bool(trajectory_validation_report.get("route_completed")),
@@ -2699,6 +2730,7 @@ try:
         "physical_state_recording": bool(args.record_physical_state),
         "substep_contact_recording": bool(args.record_substep_contacts),
         "seed": args.seed,
+        "trajectory_candidate_seed": args.trajectory_candidate_seed,
     }
     if contact_probe_result is not None:
         if args.contact_safety_probe:

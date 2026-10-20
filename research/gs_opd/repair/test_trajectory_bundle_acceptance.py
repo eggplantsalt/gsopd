@@ -44,6 +44,96 @@ class FakeConnection:
         return self.responses.pop(0)
 
 
+class VerifiedCandidateSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _candidate(candidate_id, direction, points):
+        return {
+            "candidate_id": candidate_id,
+            "direction": direction,
+            "path_length_m": 0.4,
+            "executable_safe": True,
+            "physical_safety_verified": True,
+            "physical_tracking_performed": True,
+            "physical_tracking_status": "complete",
+            "main_snapshot_restore_verified": True,
+            "contact_compiler": {"verdict": "safe"},
+            "geometric_candidate": {
+                "goal_world_m": points[-1],
+                "points_world_m": points,
+            },
+        }
+
+    @classmethod
+    def _tracking(cls):
+        return {
+            "status": "complete",
+            "main_state_restored": True,
+            "snapshot_restore_status": "verified",
+            "executable_safe_candidate_ids": ["route-2", "route-1"],
+            "candidates": [
+                cls._candidate(
+                    "route-1", "left", [[0, 0, 0], [0.1, 0.1, 0], [0.2, 0.2, 0]]
+                ),
+                cls._candidate(
+                    "route-2", "right", [[0, 0, 0], [0.1, -0.1, 0], [0.2, -0.2, 0]]
+                ),
+            ],
+        }
+
+    def test_seeded_choice_is_repeatable_and_varies_across_verified_routes(self):
+        tracking = self._tracking()
+        self.assertEqual(
+            acceptance.select_verified_candidate(tracking, 71),
+            acceptance.select_verified_candidate(tracking, 71),
+        )
+        result = acceptance.build_candidate_selection_smoke(tracking, 71)
+        self.assertTrue(result["same_seed_reproducible"])
+        self.assertEqual(result["selection_pool_candidate_ids"], ["route-1", "route-2"])
+        self.assertEqual(len(result["ten_seed_trials"]), 10)
+        self.assertGreaterEqual(result["ten_seed_unique_candidate_count"], 2)
+        self.assertTrue(result["different_verified_route_selected"])
+        self.assertGreater(
+            result["ten_seed_trials"][1]["route_difference_from_first_selection"][
+                "normalized_path_max_separation_m"
+            ],
+            0.1,
+        )
+
+    def test_selection_fails_closed_without_complete_restore_or_safe_compiler(self):
+        tracking = self._tracking()
+        tracking["main_state_restored"] = False
+        self.assertIsNone(acceptance.select_verified_candidate(tracking, 0))
+        tracking = self._tracking()
+        tracking["candidates"][0]["contact_compiler"]["verdict"] = "unknown"
+        selected = acceptance.select_verified_candidate(tracking, 0)
+        self.assertIn(selected["candidate_id"], {"route-2"})
+
+    def test_selection_seed_must_be_integer(self):
+        with self.assertRaisesRegex(ValueError, "seed must be an integer"):
+            acceptance.select_verified_candidate(self._tracking(), True)
+
+    def test_empty_verified_pool_records_all_ten_seeded_rejections(self):
+        result = acceptance.build_candidate_selection_smoke(
+            {
+                "status": "complete",
+                "main_state_restored": True,
+                "snapshot_restore_status": "verified",
+                "executable_safe_candidate_ids": [],
+                "candidates": [],
+            },
+            71,
+        )
+        self.assertIsNone(result["primary_selection"])
+        self.assertIsNone(result["same_seed_reproducible"])
+        self.assertEqual(len(result["ten_seed_trials"]), 10)
+        self.assertEqual(
+            [item["seed"] for item in result["ten_seed_trials"]], list(range(10))
+        )
+        self.assertTrue(
+            all(item["candidate_id"] is None for item in result["ten_seed_trials"])
+        )
+
+
 def _finger_contact(finger_geom, finger_body, object_geom, object_body):
     return {
         "geom1": {"id": finger_geom, "name": f"finger-{finger_geom}"},

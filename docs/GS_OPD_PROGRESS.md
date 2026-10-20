@@ -2373,3 +2373,27 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 路径显示 Student 携碗沿障碍物的 +World-Y 一侧、并低于障碍中心绕行，几何轨迹明显比演示路线紧。最近点出现在第 467 步，碗心 `[-0.14037, 0.19034, 1.02173] m`，障碍中心 `[-0.06113, 0.03591, 1.12236] m`；两者中心距 0.200633 m。使用同一 Geometry Inventory 的碗/障碍保守包围球半径估计，剩余包围球间距约 **0.19 mm**，表示轨迹非常贴近保守包络；它不是实际碰撞证据，完整子步 Compiler 未观察到 forbidden 接触。原始 845 步成功示范的 EEF 路径可完整对比，示范中的真实 carried-sphere 中心轨迹则仅保存了 OSC 搬运的 749 步（55–803），放置和抓取阶段没有逐步物理体位置，图中如实显示该段范围。原先 LoRA Student 评测目录已按 2026-10-20 空间清理记录删除，旧 Student 轨迹无文件可读；图中标为 unavailable，没有拿其他回合代替。
 
 产物和原始证据保存在 `logs/gs_opd/eval/pi05_libero_full_trajectory_lora_constant_lr_attempt3_obstacle_avoidance_l0t0_20261020/`：`evaluation_report.json`、`result.json`、`student_rollout.mp4`、含七维动作/双相机/物理状态/接触事件的 `student_rollout.npz`、`safety_compiler_audit.json`、`preflight_geometry_bindings.json`、`trajectory_route_summary.json`、`eef_bowl_route_comparison.png` 及 Bridge/Student 日志。为这次审计只给 rollout 增加了显式 `--record-substep-contacts` 被动采集选项，并让 `TrajectoryWriter` 保存返回的监测 JSON；不改动作计算、训练、归一化、OSC、模型或安全阈值。本次 Adapter 与原始数据均保留。
+
+## attempt3 step-6000 Checkpoint rollout 请求（2026-10-20）
+
+用户请求用 attempt3 的 6,000-step Checkpoint 再做一个 Student rollout。启动前核对了 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_constant_lr_20261020_attempt3/`：磁盘仅有 `checkpoints/global_step_10000/actor/model_state_dict/full_weights.pt`（6,974,319,650 bytes）和 final `lora_adapter.pt`（27,792,805 bytes）；全 `/workspace` 没有 `global_step_6000` 目录或 step-6000 权重文件。训练 `report.json` 确有 step 6,000 的固定 Observation 拟合评估记录，但它不包含可加载模型权重。因此本次没有启动 Bridge/Student，也没有将 10,000-step 权重冒充成 6,000-step 模型执行 rollout。唯一阻塞点：缺少 step-6000 模型权重；现存 step-6000 固定评估指标不能用于真实闭环 rollout。没有修改模型或执行代码，尚无本次 rollout 日志或轨迹产物。
+
+## attempt3 step-4000 Checkpoint rollout 请求（2026-10-20）
+
+再次按请求核对 `/workspace` 与 attempt3 Checkpoint 目录；没有 `global_step_4000` 目录或 step-4000 权重/Adapter 文件，当前仍只保留 `global_step_10000` 完整权重及 final Adapter。因此没有启动 Bridge/Student，也没有用其他步数权重替代。`report.json` 中存在 step 4,000 固定示范状态评估（抓取 Flow MSE/10×7 MAE `0.002230/0.017806`，OSC 搬运 `0.001452/0.011247`，放置 `0.002274/0.017192`），但这些评估值不能还原模型权重或用于真实闭环 rollout。唯一阻塞仍为缺少对应可加载 Checkpoint；本次无 rollout 结果及产物，也未修改执行或模型代码。
+
+## 同一 Student 抓持状态的随机安全候选 Smoke（2026-10-20）
+
+为候选选择添加最小接口：`trajectory_bundle_acceptance.py` 只从 Snapshot 分支已完整跟踪、物理安全标志通过、Compiler verdict 为 `safe` 且主状态恢复已核验的候选中均匀随机选择；先按候选 ID 排序，选择种子可复现。报告同时记录主 seed 与 0–9 十组选择、候选 ID 和按弧长归一化的路线差异。`pi05_rollout.py` 增加候选种子参数及“完成分支验收后立即停止”的本次 Smoke 选项；默认 Student/Bridge 行为不变。没有改 `trajectory_bundle.py`、OSC、Teacher、Grounding、Near–Far、训练或安全阈值。选择器定向回归 18 项通过，Python 语法和接口检查通过；Ruff 在排除 rollout 原有 import 顺序、延迟 import 和缺版权头规则后通过。
+
+真实回合使用 attempt3 rank-32 Adapter 与原始 Student 基座，在 `obstacle_avoidance` L0T0 初始状态 0 到第 **50** 个 Student 环境动作触发真实稳定双指抓持（4 个有效不同状态样本）。同一完整 Snapshot `snapshot-000001` 下生成 18 条候选，18/18 通过几何筛选；现有每候选 480 步上限保持不变，只有三条各需 422 步的候选进入物理分支。剩余 15 条因需 495/505/583/593/673 步而未进入分支。
+
+| 候选 | 分支结果 | 首个关键拒绝证据 |
+| --- | --- | --- |
+| `trajectory-001` / left | 执行 399/422 步 | 第 398 步 Panda 关节限位和路径跟踪检查未通过；Compiler `unknown`。 |
+| `trajectory-002` / right | 执行 80/422 步 | 第 79 步双指接触缺失、抓持跟踪失败；Compiler `unknown`。 |
+| `trajectory-003` / above | 执行 422/422 步 | 完成路径跟踪，但 Compiler `unknown`，因此不合格。 |
+
+三条候选从同一 Snapshot 执行后主积分状态恢复成功，最大数值误差为 0。`object_1→object_4` 规则检查未发现接触，但真实 Teacher 的另一目标 `object_3` 在现有绑定文件中缺失，Compiler 对其返回 `semantic_disambiguation_result_is_not_an_object`；未伪造绑定，所有 unknown 均继续按 unknown 处理。因此本次实际物理合格池为 **0**，主 seed `20261020` 无候选可选，seed 0–9 均明确记录为空，不能声称真实安全路线多样性或不同 seed 选择成功。纯选择器合成回归在两个合格测试路线中验证了同 seed 复现和不同 seed 可选到不同路线，但不替代真实物理证据。三条已跟踪的几何路线确实不同（归一化路径 RMS 分离约 0.268–0.380 m），但均未通过全套安全验收。分支后未在主环境执行候选路线；Student 在第 50 步后即停止，未测试任务完成。
+
+完整原始日志保存在 `logs/gs_opd/eval/trajectory_bundle_random_candidate_smoke_l0t0_attempt1_20261020/`：`trajectory_validation_report.json`（含三个 Snapshot 分支的全子步接触与 Compiler 证据）、18 路线 `trajectory_validation_report_bundle/trajectory_bundle.json` 和 `.svg`、`student_trigger.mp4`、`result.json`、`bridge.log`。简要摘要另存为同目录 `smoke_summary.md`。没有启动第二个 Episode；代码与文档已在本地提交。普通 Push 因远端 `Permission denied (publickey)` 失败；未强推，也未上传实验产物。

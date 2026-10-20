@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,147 @@ from research.gs_opd.smoke.trajectory_bundle_scene_smoke import (
 )
 
 LIVE_GRASP_REQUIRED_SAMPLES = 3
+RANDOM_SELECTION_SMOKE_SEEDS = tuple(range(10))
+
+
+def select_verified_candidate(tracking: Any, seed: int) -> dict[str, Any] | None:
+    """Choose uniformly from candidates that passed real branch validation."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("candidate selection seed must be an integer")
+    if (
+        not isinstance(tracking, dict)
+        or tracking.get("status") != "complete"
+        or tracking.get("main_state_restored") is not True
+        or tracking.get("snapshot_restore_status") != "verified"
+    ):
+        return None
+    candidate_ids = tracking.get("executable_safe_candidate_ids")
+    records = tracking.get("candidates")
+    if not isinstance(candidate_ids, list) or not isinstance(records, list):
+        return None
+    by_id = {
+        item.get("candidate_id"): item
+        for item in records
+        if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+    }
+    eligible = []
+    for candidate_id in sorted(set(candidate_ids)):
+        item = by_id.get(candidate_id)
+        compiler = item.get("contact_compiler") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("executable_safe") is not True
+            or item.get("physical_safety_verified") is not True
+            or item.get("physical_tracking_performed") is not True
+            or item.get("physical_tracking_status") != "complete"
+            or item.get("main_snapshot_restore_verified") is not True
+            or not isinstance(compiler, dict)
+            or compiler.get("verdict") != "safe"
+        ):
+            continue
+        eligible.append(item)
+    if not eligible:
+        return None
+    selected = random.Random(seed).choice(eligible)
+    candidate = selected.get("geometric_candidate")
+    return {
+        "seed": seed,
+        "candidate_id": selected["candidate_id"],
+        "direction": selected.get("direction"),
+        "path_length_m": selected.get("path_length_m"),
+        "goal_world_m": candidate.get("goal_world_m") if isinstance(candidate, dict) else None,
+        "points_world_m": candidate.get("points_world_m") if isinstance(candidate, dict) else None,
+        "selection_pool_candidate_ids": [item["candidate_id"] for item in eligible],
+        "physical_tracking_status": selected.get("physical_tracking_status"),
+        "contact_compiler_verdict": compiler.get("verdict"),
+        "main_snapshot_restore_verified": selected.get("main_snapshot_restore_verified"),
+    }
+
+
+def _candidate_route_difference(reference: Any, candidate: Any) -> dict[str, float] | None:
+    try:
+        paths = [np.asarray(item, dtype=np.float64) for item in (reference, candidate)]
+        if any(
+            path.ndim != 2 or path.shape[1] != 3 or len(path) < 2 or not np.isfinite(path).all()
+            for path in paths
+        ):
+            return None
+        samples = np.linspace(0.0, 1.0, 101)
+        normalized = []
+        for path in paths:
+            lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
+            distance = np.concatenate(([0.0], np.cumsum(lengths)))
+            if distance[-1] <= 1e-12:
+                return None
+            normalized.append(
+                np.column_stack(
+                    [np.interp(samples * distance[-1], distance, path[:, axis]) for axis in range(3)]
+                )
+            )
+        delta = np.linalg.norm(normalized[0] - normalized[1], axis=1)
+        return {
+            "normalized_path_rms_separation_m": float(np.sqrt(np.mean(delta**2))),
+            "normalized_path_max_separation_m": float(np.max(delta)),
+            "goal_separation_m": float(np.linalg.norm(paths[0][-1] - paths[1][-1])),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def build_candidate_selection_smoke(tracking: Any, primary_seed: int) -> dict[str, Any]:
+    """Record one seeded choice and a reproducible ten-seed selection probe."""
+    selected = select_verified_candidate(tracking, primary_seed)
+    repeat = select_verified_candidate(tracking, primary_seed)
+    same_seed_reproducible = selected == repeat if selected is not None else None
+    trials = [select_verified_candidate(tracking, seed) for seed in RANDOM_SELECTION_SMOKE_SEEDS]
+    valid_trials = [item for item in trials if item is not None]
+    reference = valid_trials[0] if valid_trials else None
+    reference_points = reference.get("points_world_m") if reference is not None else None
+    trial_records = []
+    for item in valid_trials:
+        item["route_difference_from_first_selection"] = (
+            _candidate_route_difference(
+                reference_points, item.get("points_world_m")
+            )
+            if reference is not None
+            else None
+        )
+        item.pop("points_world_m", None)
+        trial_records.append(item)
+    trial_records_by_seed = {item["seed"]: item for item in trial_records}
+    for seed, item in zip(RANDOM_SELECTION_SMOKE_SEEDS, trials):
+        if item is None:
+            trial_records_by_seed[seed] = {
+                "seed": seed,
+                "candidate_id": None,
+                "selection_status": "no_physically_verified_candidate",
+                "route_difference_from_first_selection": None,
+            }
+    if selected is not None:
+        selected.pop("points_world_m", None)
+    ids = [
+        trial_records_by_seed[seed].get("candidate_id")
+        for seed in RANDOM_SELECTION_SMOKE_SEEDS
+    ]
+    return {
+        "policy": "uniform random among physically verified candidates; sorted candidate IDs stabilize the pool order",
+        "primary_seed": primary_seed,
+        "primary_selection": selected,
+        "same_seed_reproducible": same_seed_reproducible,
+        "selection_pool_candidate_ids": (
+            selected["selection_pool_candidate_ids"] if selected is not None else []
+        ),
+        "ten_seed_trials": [
+            trial_records_by_seed[seed] for seed in RANDOM_SELECTION_SMOKE_SEEDS
+        ],
+        "ten_seed_unique_candidate_count": len(
+            {item for item in ids if item is not None}
+        ),
+        "ten_seed_selected_candidate_ids": ids,
+        "different_verified_route_selected": len(set(ids)) > 1,
+        "main_environment_execution": False,
+        "note": "all budget-qualified candidates were physically tracked in isolated OSC Snapshot branches; seed trials test pool selection only",
+    }
 
 
 def must_stop_rollout_after_acceptance(report: Any) -> bool:
@@ -351,6 +493,7 @@ def run_snapshot_trajectory_acceptance(
     *,
     decision_step: int,
     grasp_stability: dict[str, Any],
+    candidate_selection_seed: int = 0,
     tracking_config: TrackingConfig = TrackingConfig(),
 ) -> dict[str, Any]:
     """Generate and track the complete live geometry bundle in isolated branches."""
@@ -530,6 +673,9 @@ def run_snapshot_trajectory_acceptance(
             config=tracking_config,
         )
         report["tracking"] = tracking
+        report["candidate_selection"] = build_candidate_selection_smoke(
+            tracking, candidate_selection_seed
+        )
         report["branch_candidate_count"] = tracking.get("tracked_candidate_count", 0)
         report["candidates"] = tracking.get("candidates", [])
         passed_ids = tracking.get("executable_safe_candidate_ids", [])
