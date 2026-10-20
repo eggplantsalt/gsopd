@@ -2373,3 +2373,27 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 路径显示 Student 携碗沿障碍物的 +World-Y 一侧、并低于障碍中心绕行，几何轨迹明显比演示路线紧。最近点出现在第 467 步，碗心 `[-0.14037, 0.19034, 1.02173] m`，障碍中心 `[-0.06113, 0.03591, 1.12236] m`；两者中心距 0.200633 m。使用同一 Geometry Inventory 的碗/障碍保守包围球半径估计，剩余包围球间距约 **0.19 mm**，表示轨迹非常贴近保守包络；它不是实际碰撞证据，完整子步 Compiler 未观察到 forbidden 接触。原始 845 步成功示范的 EEF 路径可完整对比，示范中的真实 carried-sphere 中心轨迹则仅保存了 OSC 搬运的 749 步（55–803），放置和抓取阶段没有逐步物理体位置，图中如实显示该段范围。原先 LoRA Student 评测目录已按 2026-10-20 空间清理记录删除，旧 Student 轨迹无文件可读；图中标为 unavailable，没有拿其他回合代替。
 
 产物和原始证据保存在 `logs/gs_opd/eval/pi05_libero_full_trajectory_lora_constant_lr_attempt3_obstacle_avoidance_l0t0_20261020/`：`evaluation_report.json`、`result.json`、`student_rollout.mp4`、含七维动作/双相机/物理状态/接触事件的 `student_rollout.npz`、`safety_compiler_audit.json`、`preflight_geometry_bindings.json`、`trajectory_route_summary.json`、`eef_bowl_route_comparison.png` 及 Bridge/Student 日志。为这次审计只给 rollout 增加了显式 `--record-substep-contacts` 被动采集选项，并让 `TrajectoryWriter` 保存返回的监测 JSON；不改动作计算、训练、归一化、OSC、模型或安全阈值。本次 Adapter 与原始数据均保留。
+
+## 恢复到已验证成功的过拟合基线（2026-10-21）
+
+从 Git 提交 `08a019814ed753a4d049f9db78befd8ad303de59` 建立独立恢复分支 `gs-opd-overfit-recovery-08a0198`，工作树位于 `/workspace/zy_workspace/RLinf-gs-opd-overfit-recovery`。分支起点与该提交一致；原 `/workspace/zy_workspace/RLinf` 的 `main` 仍在 `bde3adf36c86ce09f85b09dcc04f83da2324039f`，本次没有改动其工作树。恢复分支只增加下述背景接触分类修复、相应边界测试和本节记录，没有带入后续 Far/Mid/Near、候选验收扩展、关节限位诊断化或其他后续机制。
+
+### 保留并核验 object_3 绑定
+
+原始 `logs/gs_opd` 保持原位置，并通过恢复工作树中的 `logs` 符号链接读取，没有复制、覆盖或清理实验数据。`logs/gs_opd/semantic_bindings_l0t0.json` 继续将 Teacher 的红边盘目标 `object_3` 标为 `resolved`，SAM3 选中 candidate 28，SAM score 为 `0.01043701171875`；SAM3/MuJoCo 几何 IoU 匹配到 `plate_1_main`（body 28）及 `plate_1_g0`（geom 438），IoU 为 `0.9850392264185368`。语义绑定记录与原始 `sam3_mujoco_iou_results.json` 中的 body、geom、IoU 一致。
+
+原始核验材料仍在 `logs/gs_opd/eval/object3_binding_trajectory003_l0t0_20261020/`，包括原始图像、编号候选图、SAM3 全量结果、candidate 28 mask/overlay、IoU 结果和 comparison 图及 `object3_binding_evidence.json`。关键记录 SHA-256：语义绑定 `a90f5119fee6d6d2f26d7420a610979abaa019c5c247d07d8bcc98330e001620`；绑定证据 `1873973d394ab35118a0f4d03c0380807ee6e245bd5bfe8056cc1a15dcdfc408`；SAM3 结果 `a276e973d85d8ff9b40d2b526da10d0bd3f59551ceafc1ed5e017bbc13ea603e`；IoU 结果 `99b17e69929117f5caf708c967fb82c6a1389f9e5a6c4a33955a559017b484dc`。本次没有重跑分割或修改绑定，只核对现存原始记录及其文件摘要。
+
+### 移植背景接触分类修复
+
+参考 `bbe664849d217b8de39bfe98185928b98fb221d2`，仅将已存在的背景接触分类逻辑及其必要边界测试移植到 `research/gs_opd/repair/trajectory_tracking.py` 和 `research/gs_opd/repair/test_trajectory_tracking.py`。只有同时满足以下条件的接触才会归类为 `out_of_scope_background_contact`：属于场景与场景接触、机器人分类和完整几何清单可用、两侧 geom/body 身份均精确匹配且语义无歧义、不是夹爪或被搬运物体，并且该接触已存在于同一候选 Snapshot 起点的接触记录中。原始接触事件和起点证据仍写入分类结果。涉及机器人、夹爪或被搬运物体的接触，以及身份不完整、Snapshot 起点不匹配或无法与 Teacher 规则判定的接触，仍不能借此标记为背景安全。
+
+按明确回归要求运行 `research/gs_opd/repair/test_trajectory_tracking.py`：**36 passed，2 个子测试通过**。`git diff --check` 通过。相对恢复基线的代码差异限于上述两个文件及本进度记录；Safety Bridge、MuJoCo 模型、Teacher、Grounding、Compiler、抓持、碰撞安全约束、Student/LoRA 和训练流程均未修改。没有启动 MuJoCo、训练或历史轨迹复现。
+
+### 保留产物与稳定执行入口
+
+确认原始 Student Checkpoint、845 步成功 Left 示范 `direct_bspline_osc_trajectory.npz`、attempt3 `lora_adapter.pt`、attempt3 `global_step_10000/actor` Checkpoint，以及完整 Episode LeRobot 数据集都仍存在于原路径；所有 `logs/gs_opd` 实验日志及上述 SAM3/IoU 证据也保留。恢复分支通过共享 `logs` 链接访问这些历史产物，没有清理、复制覆盖或改写它们。
+
+已验证成功的完整 Student 抓取 → Left B-Spline/native OSC 搬运 → Student 放置入口仍是 `research/gs_opd/smoke/pi05_rollout.py` 的 `--direct-bspline-osc-left --trajectory-bundle-physical-validation` 路径，并使用 `initial_center_distinction_teacher_raw.txt` 与 `semantic_bindings_l0t0.json`。历史成功运行的完整参数及产物索引保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/launch.json`；该次真实记录为 845 步、奖励 1.0、done=True。其 NPZ、视频和验收报告均保留。本次只确认入口及证据位置，没有再次执行。
+
+恢复分支目前以指定基线提交为 HEAD，含上述最小审查差异的工作树尚未提交；`main` 和原始未提交修改保持原样。等待复核后再继续实验。
