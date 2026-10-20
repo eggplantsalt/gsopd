@@ -760,6 +760,8 @@ def _candidate_contact_classification(
     teacher: dict[str, Any],
     semantic_results: dict[str, Any],
     gripper_inventory: dict[str, Any],
+    geometry_inventory: dict[str, Any],
+    carried_body_id: int,
 ) -> dict[str, Any]:
     monitor = candidate.get("contact_monitoring")
     events = monitor.get("events") if isinstance(monitor, dict) else None
@@ -780,6 +782,97 @@ def _candidate_contact_classification(
         body_id = association.get("body_id") if isinstance(association, dict) else None
         if isinstance(body_id, int) and not isinstance(body_id, bool):
             body_objects.setdefault(body_id, []).append(object_id)
+
+    geometry_by_id: dict[int, list[dict[str, Any]]] = {}
+    inventory_geometries = (
+        geometry_inventory.get("geometries")
+        if isinstance(geometry_inventory, dict)
+        else None
+    )
+    geometry_inventory_complete = (
+        isinstance(geometry_inventory, dict)
+        and geometry_inventory.get("status") == "complete"
+        and geometry_inventory.get("robot_classification_status") == "available"
+        and isinstance(inventory_geometries, list)
+        and geometry_inventory.get("geom_count") == len(inventory_geometries)
+    )
+    if isinstance(inventory_geometries, list):
+        for geometry in inventory_geometries:
+            if not isinstance(geometry, dict):
+                continue
+            geom_id = geometry.get("geom_id")
+            if isinstance(geom_id, int) and not isinstance(geom_id, bool):
+                geometry_by_id.setdefault(geom_id, []).append(geometry)
+
+    def contact_signature(
+        geom_pair: Any, body_pair: Any
+    ) -> tuple[tuple[int, str, int, str], ...] | None:
+        if not geometry_inventory_complete:
+            return None
+        if not isinstance(geom_pair, list) or not isinstance(body_pair, list):
+            return None
+        if len(geom_pair) != 2 or len(body_pair) != 2:
+            return None
+        sides = []
+        for geom, body in zip(geom_pair, body_pair, strict=True):
+            if not isinstance(geom, dict) or not isinstance(body, dict):
+                return None
+            geom_id, geom_name = geom.get("id"), geom.get("name")
+            body_id, body_name = body.get("id"), body.get("name")
+            if (
+                isinstance(geom_id, bool)
+                or not isinstance(geom_id, int)
+                or not isinstance(geom_name, str)
+                or not geom_name
+                or isinstance(body_id, bool)
+                or not isinstance(body_id, int)
+                or not isinstance(body_name, str)
+                or not body_name
+            ):
+                return None
+            inventory_matches = geometry_by_id.get(geom_id, [])
+            if len(inventory_matches) != 1:
+                return None
+            inventory_geometry = inventory_matches[0]
+            if (
+                inventory_geometry.get("geom_name") != geom_name
+                or inventory_geometry.get("body_id") != body_id
+                or inventory_geometry.get("body_name") != body_name
+                or inventory_geometry.get("category") != "scene"
+            ):
+                return None
+            sides.append((geom_id, geom_name, body_id, body_name))
+        return tuple(sorted(sides))
+
+    start_contacts = candidate.get("start_contacts")
+    start_contact_signatures: set[tuple[tuple[int, str, int, str], ...]] = set()
+    start_contact_evidence: dict[
+        tuple[tuple[int, str, int, str], ...], list[dict[str, Any]]
+    ] = {}
+    if (
+        isinstance(start_contacts, dict)
+        and start_contacts.get("status") == "contact"
+        and isinstance(start_contacts.get("contacts"), list)
+    ):
+        for contact in start_contacts["contacts"]:
+            if not isinstance(contact, dict):
+                continue
+            signature = contact_signature(
+                [contact.get("geom1"), contact.get("geom2")],
+                [contact.get("body1"), contact.get("body2")],
+            )
+            if signature is not None and all(
+                side[2] != carried_body_id for side in signature
+            ):
+                start_contact_signatures.add(signature)
+                start_contact_evidence.setdefault(signature, []).append(contact)
+
+    robot_classification_complete = (
+        monitor.get("status") == "complete"
+        and monitor.get("robot_classification_status") == "available"
+        and "robot_classification_error" in monitor
+        and monitor.get("robot_classification_error") is None
+    )
     classified = []
     overall = "pass"
     for event in events:
@@ -790,7 +883,11 @@ def _candidate_contact_classification(
                 raise ValueError
         except (KeyError, TypeError, ValueError):
             classified.append(
-                {"status": "unknown", "reason": "contact_identity_malformed"}
+                {
+                    "status": "unknown",
+                    "reason": "contact_identity_malformed",
+                    "raw_event": event,
+                }
             )
             overall = "unknown"
             continue
@@ -849,6 +946,35 @@ def _candidate_contact_classification(
                 status, reason = "violation", "teacher_forbids_bound_object_contact"
                 category = "teacher_forbidden_contact"
                 overall = "violation"
+            elif not matching:
+                signature = contact_signature(event.get("geom_pair"), event.get("body_pair"))
+                semantic_identity_unambiguous = all(
+                    len(body_objects.get(body_id, [])) <= 1 for body_id in body_ids
+                )
+                # Teacher IR rules are task-scoped; ignore only a verified
+                # non-robot/non-payload scene pair already present at this
+                # candidate's exact Snapshot start.
+                if (
+                    candidate.get("snapshot_start_state_match") is True
+                    and event.get("classification") == "scene_scene"
+                    and event.get("robot_involved") is False
+                    and robot_classification_complete
+                    and all(geom_id not in gripper_ids for geom_id in geom_ids)
+                    and all(body_id != carried_body_id for body_id in body_ids)
+                    and semantic_identity_unambiguous
+                    and signature is not None
+                    and signature in start_contact_signatures
+                ):
+                    status = "out_of_scope_background_contact"
+                    reason = "confirmed_preexisting_scene_contact_outside_robot_and_payload_scope"
+                    category = "out_of_scope_background_contact"
+                else:
+                    status, reason = (
+                        "unknown",
+                        "contact_has_no_unambiguous_teacher_allow_rule",
+                    )
+                    category = "unclassified_or_other_contact"
+                    overall = "unknown"
             else:
                 status, reason = (
                     "unknown",
@@ -856,28 +982,33 @@ def _candidate_contact_classification(
                 )
                 category = "unclassified_or_other_contact"
                 overall = "unknown"
-        classified.append(
-            {
-                "status": status,
-                "category": category,
-                "reason": reason,
-                "geom_pair": event.get("geom_pair"),
-                "body_pair": event.get("body_pair"),
-                "first_control_step": event.get("first_control_step"),
-                "first_physics_substep": event.get("first_physics_substep"),
-                "first_contact_position_world": event.get(
-                    "first_contact_position_world"
-                ),
-                "contact_position_status": event.get("contact_position_status"),
-                "first_contact_normal_geom1_to_geom2_world": event.get(
-                    "first_contact_normal_geom1_to_geom2_world"
-                ),
-                "contact_normal_status": event.get("contact_normal_status"),
-                "max_force_norm": event.get("max_force_norm"),
-                "force_sample_count": event.get("force_sample_count"),
-                "force_unavailable_count": event.get("force_unavailable_count"),
-            }
-        )
+        record = {
+            "status": status,
+            "category": category,
+            "reason": reason,
+            "geom_pair": event.get("geom_pair"),
+            "body_pair": event.get("body_pair"),
+            "first_control_step": event.get("first_control_step"),
+            "first_physics_substep": event.get("first_physics_substep"),
+            "first_contact_position_world": event.get(
+                "first_contact_position_world"
+            ),
+            "contact_position_status": event.get("contact_position_status"),
+            "first_contact_normal_geom1_to_geom2_world": event.get(
+                "first_contact_normal_geom1_to_geom2_world"
+            ),
+            "contact_normal_status": event.get("contact_normal_status"),
+            "max_force_norm": event.get("max_force_norm"),
+            "force_sample_count": event.get("force_sample_count"),
+            "force_unavailable_count": event.get("force_unavailable_count"),
+            "raw_event": event,
+        }
+        if status == "out_of_scope_background_contact":
+            signature = contact_signature(event.get("geom_pair"), event.get("body_pair"))
+            record["preexisting_start_contact_evidence"] = start_contact_evidence.get(
+                signature, []
+            )
+        classified.append(record)
     return {"status": overall, "events": classified}
 
 
@@ -985,6 +1116,7 @@ def _candidate_assessment(
     teacher: dict[str, Any],
     semantic_results: dict[str, Any],
     gripper_inventory: dict[str, Any],
+    geometry_inventory: dict[str, Any],
     carried_object_id: str,
     carried_body_id: int,
     verified_sphere_center_world_m: Any,
@@ -996,7 +1128,12 @@ def _candidate_assessment(
     grasp = candidate.get("grasp_evidence", {})
     task_feasibility = candidate.get("task_feasibility", {})
     classifications = _candidate_contact_classification(
-        candidate, teacher, semantic_results, gripper_inventory
+        candidate,
+        teacher,
+        semantic_results,
+        gripper_inventory,
+        geometry_inventory,
+        carried_body_id,
     )
     errors = []
     if not restored:
@@ -1787,6 +1924,7 @@ def track_trajectory_bundle(
             teacher=teacher,
             semantic_results=semantic_results,
             gripper_inventory=gripper_inventory,
+            geometry_inventory=geometry_inventory,
             carried_object_id=object_id,
             carried_body_id=carried_binding["body_id"],
             verified_sphere_center_world_m=scene["carried"]["center_world_m"],

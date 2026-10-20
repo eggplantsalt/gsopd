@@ -472,6 +472,7 @@ def _bridge_candidate(
             "status": "complete",
             "sampling_point": "immediately_after_each_successful_MjSim.step",
             "robot_classification_status": "available",
+            "robot_classification_error": None,
             "control_steps": control_steps,
             "expected_physics_substeps_total": control_step_count,
             "captured_physics_substeps": control_step_count,
@@ -721,7 +722,20 @@ class TrajectoryTrackingTests(unittest.TestCase):
         )
 
     def test_teacher_forbidden_object_collision_is_rejected(self):
-        result, _ = self._run([_bridge_candidate("candidate-0", collision=True)])
+        candidate = _bridge_candidate("candidate-0", collision=True)
+        event = candidate["contact_monitoring"]["events"][-1]
+        candidate["start_contacts"] = {
+            "status": "contact",
+            "contacts": [
+                {
+                    "geom1": event["geom_pair"][0],
+                    "geom2": event["geom_pair"][1],
+                    "body1": event["body_pair"][0],
+                    "body2": event["body_pair"][1],
+                }
+            ],
+        }
+        result, _ = self._run([candidate])
         self.assertEqual(result["executable_safe_candidate_ids"], [])
         self.assertEqual(
             result["candidates"][0]["contact_compiler"]["verdict"], "violation"
@@ -729,6 +743,10 @@ class TrajectoryTrackingTests(unittest.TestCase):
         classified = result["candidates"][0]["contact_classification"]["events"]
         self.assertIn(
             "teacher_forbidden_contact", {item["category"] for item in classified}
+        )
+        self.assertNotIn(
+            "out_of_scope_background_contact",
+            {item["status"] for item in classified},
         )
 
     def test_teacher_forbidden_gripper_contact_for_any_bound_object_is_compiled(self):
@@ -794,6 +812,259 @@ class TrajectoryTrackingTests(unittest.TestCase):
         self.assertEqual(
             result["candidates"][0]["contact_classification"]["status"], "unknown"
         )
+
+    def test_preexisting_unrelated_scene_contact_is_out_of_scope_with_raw_evidence(self):
+        fixtures = _fixtures(1)
+        geometry_inventory = fixtures[5]
+        geometry_inventory["geom_count"] = 7
+        geometry_inventory["model_body_count"] = 32
+        geometry_inventory["geometries"].extend(
+            [
+                {
+                    "geom_id": 5,
+                    "geom_name": "background_geom_a",
+                    "body_id": 30,
+                    "body_name": "background_body_a",
+                    "category": "scene",
+                },
+                {
+                    "geom_id": 6,
+                    "geom_name": "background_geom_b",
+                    "body_id": 31,
+                    "body_name": "background_body_b",
+                    "category": "scene",
+                },
+            ]
+        )
+        other_event = {
+            "geom_pair": [
+                {"id": 5, "name": "background_geom_a"},
+                {"id": 6, "name": "background_geom_b"},
+            ],
+            "body_pair": [
+                {"id": 30, "name": "background_body_a"},
+                {"id": 31, "name": "background_body_b"},
+            ],
+            "classification": "scene_scene",
+            "robot_involved": False,
+            "first_control_step": 0,
+            "first_physics_substep": 0,
+            "occurrence_count": 5,
+            "contact_point_count": 5,
+            "max_force_norm": 0.25,
+            "force_sample_count": 5,
+            "force_unavailable_count": 0,
+        }
+        candidate = _bridge_candidate("candidate-0")
+        candidate["contact_monitoring"]["events"].append(other_event)
+        candidate["start_contacts"] = {
+            "status": "contact",
+            "contacts": [
+                {
+                    "geom1": other_event["geom_pair"][0],
+                    "geom2": other_event["geom_pair"][1],
+                    "body1": other_event["body_pair"][0],
+                    "body2": other_event["body_pair"][1],
+                }
+            ],
+        }
+        connection = FakeConnection([candidate])
+        result = track_trajectory_bundle(connection, "snapshot-1", *fixtures)
+        self.assertEqual(result["executable_safe_candidate_ids"], ["candidate-0"])
+        classified = result["candidates"][0]["contact_classification"]
+        background = next(
+            item
+            for item in classified["events"]
+            if item.get("category") == "out_of_scope_background_contact"
+        )
+        self.assertEqual(classified["status"], "pass")
+        self.assertEqual(background["status"], "out_of_scope_background_contact")
+        self.assertEqual(background["raw_event"], other_event)
+        self.assertEqual(
+            background["preexisting_start_contact_evidence"][0]["geom1"],
+            other_event["geom_pair"][0],
+        )
+        candidate["snapshot_start_state_match"] = False
+        mismatched_snapshot_result, _ = self._run([candidate])
+        self.assertEqual(
+            mismatched_snapshot_result["candidates"][0]["contact_classification"][
+                "status"
+            ],
+            "unknown",
+        )
+        candidate["snapshot_start_state_match"] = True
+        candidate["contact_monitoring"].pop("robot_classification_error")
+        incomplete_classification_result, _ = self._run([candidate])
+        self.assertEqual(
+            incomplete_classification_result["candidates"][0][
+                "contact_classification"
+            ]["status"],
+            "unknown",
+        )
+
+    def test_preexisting_robot_contact_is_not_out_of_scope(self):
+        fixtures = _fixtures(1)
+        geometry_inventory = fixtures[5]
+        geometry_inventory["geom_count"] = 6
+        geometry_inventory["geometries"].append(
+            {
+                "geom_id": 5,
+                "geom_name": "robot_arm_geom",
+                "body_id": 1,
+                "body_name": "robot_body",
+                "category": "robot",
+            }
+        )
+        robot_event = {
+            "geom_pair": [
+                {"id": 5, "name": "robot_arm_geom"},
+                {"id": 1, "name": "obstacle_geom"},
+            ],
+            "body_pair": [
+                {"id": 1, "name": "robot_body"},
+                {"id": 20, "name": "obstacle_body"},
+            ],
+            "classification": "robot_scene",
+            "robot_involved": True,
+            "first_control_step": 0,
+            "first_physics_substep": 0,
+            "occurrence_count": 1,
+            "contact_point_count": 1,
+            "max_force_norm": 0.1,
+            "force_sample_count": 1,
+            "force_unavailable_count": 0,
+        }
+        candidate = _bridge_candidate("candidate-0")
+        candidate["contact_monitoring"]["events"].append(robot_event)
+        candidate["start_contacts"] = {
+            "status": "contact",
+            "contacts": [
+                {
+                    "geom1": robot_event["geom_pair"][0],
+                    "geom2": robot_event["geom_pair"][1],
+                    "body1": robot_event["body_pair"][0],
+                    "body2": robot_event["body_pair"][1],
+                }
+            ],
+        }
+        result, _ = self._run([candidate])
+        self.assertEqual(result["executable_safe_candidate_ids"], [])
+        classified = result["candidates"][0]["contact_classification"]
+        self.assertEqual(classified["status"], "unknown")
+        robot_record = next(
+            item for item in classified["events"] if item.get("raw_event") == robot_event
+        )
+        self.assertEqual(robot_record["status"], "unknown")
+
+    def test_preexisting_carried_object_contact_is_not_out_of_scope(self):
+        fixtures = _fixtures(1)
+        geometry_inventory = fixtures[5]
+        geometry_inventory["geom_count"] = 6
+        geometry_inventory["geometries"].append(
+            {
+                "geom_id": 5,
+                "geom_name": "background_geom",
+                "body_id": 30,
+                "body_name": "background_body",
+                "category": "scene",
+            }
+        )
+        carried_event = {
+            "geom_pair": [
+                {"id": 0, "name": "carry_geom"},
+                {"id": 5, "name": "background_geom"},
+            ],
+            "body_pair": [
+                {"id": 10, "name": "carry_body"},
+                {"id": 30, "name": "background_body"},
+            ],
+            "classification": "scene_scene",
+            "robot_involved": False,
+            "first_control_step": 0,
+            "first_physics_substep": 0,
+            "occurrence_count": 1,
+            "contact_point_count": 1,
+            "max_force_norm": 0.1,
+            "force_sample_count": 1,
+            "force_unavailable_count": 0,
+        }
+        candidate = _bridge_candidate("candidate-0")
+        candidate["contact_monitoring"]["events"].append(carried_event)
+        candidate["start_contacts"] = {
+            "status": "contact",
+            "contacts": [
+                {
+                    "geom1": carried_event["geom_pair"][0],
+                    "geom2": carried_event["geom_pair"][1],
+                    "body1": carried_event["body_pair"][0],
+                    "body2": carried_event["body_pair"][1],
+                }
+            ],
+        }
+        result, _ = self._run([candidate])
+        self.assertEqual(result["executable_safe_candidate_ids"], [])
+        classified = result["candidates"][0]["contact_classification"]
+        self.assertEqual(classified["status"], "unknown")
+        carried_record = next(
+            item
+            for item in classified["events"]
+            if item.get("raw_event") == carried_event
+        )
+        self.assertEqual(carried_record["status"], "unknown")
+
+    def test_initial_contact_with_unverified_geometry_identity_stays_unknown(self):
+        fixtures = _fixtures(1)
+        geometry_inventory = fixtures[5]
+        geometry_inventory["geom_count"] = 6
+        geometry_inventory["geometries"].append(
+            {
+                "geom_id": 5,
+                "geom_name": "verified_background_geom",
+                "body_id": 30,
+                "body_name": "background_body",
+                "category": "scene",
+            }
+        )
+        event = {
+            "geom_pair": [
+                {"id": 1, "name": "obstacle_geom"},
+                {"id": 5, "name": "unverified_background_geom"},
+            ],
+            "body_pair": [
+                {"id": 20, "name": "obstacle_body"},
+                {"id": 30, "name": "background_body"},
+            ],
+            "classification": "scene_scene",
+            "robot_involved": False,
+            "first_control_step": 0,
+            "first_physics_substep": 0,
+            "occurrence_count": 1,
+            "contact_point_count": 1,
+            "max_force_norm": 0.1,
+            "force_sample_count": 1,
+            "force_unavailable_count": 0,
+        }
+        candidate = _bridge_candidate("candidate-0")
+        candidate["contact_monitoring"]["events"].append(event)
+        candidate["start_contacts"] = {
+            "status": "contact",
+            "contacts": [
+                {
+                    "geom1": event["geom_pair"][0],
+                    "geom2": event["geom_pair"][1],
+                    "body1": event["body_pair"][0],
+                    "body2": event["body_pair"][1],
+                }
+            ],
+        }
+        result, _ = self._run([candidate])
+        self.assertEqual(result["executable_safe_candidate_ids"], [])
+        classified = result["candidates"][0]["contact_classification"]
+        self.assertEqual(classified["status"], "unknown")
+        identity_record = next(
+            item for item in classified["events"] if item.get("raw_event") == event
+        )
+        self.assertEqual(identity_record["status"], "unknown")
 
     def test_lost_grasp_and_tracking_failure_are_rejected(self):
         for candidate in (

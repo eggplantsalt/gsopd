@@ -2044,7 +2044,7 @@ KeyError: 'eef_quaternion_world_wxyz'
 - 使用独立的新 Safety Bridge（日志显示 `SAFETY BRIDGE READY`）与现有 `mink_osc_snapshot_smoke.py` 入口；能力握手通过显式 EEF pose、子步接触监测与完整 Snapshot 恢复检查。一次过早连接在 Bridge 监听就绪前返回 `ConnectionRefusedError`，保存在 `bridge_startup_race.log`；Bridge ready 后原入口重跑成功。输出目录为 `logs/gs_opd/mink_panda_physical_v3/live_left_osc_snapshot_smoke_20261019_attempt4/`，没有覆盖前次报告。
 - Student 实际运行 50 步，在当前抓持状态触发唯一左绕分支。实时抓持通过：闭合比例 1.0，黑碗 `akita_black_bowl_1_main` 左右指都接触，Snapshot 时 7 个匹配接触。新鲜当前状态下 Mink 规划完成 **847 步**，四类轨迹均 **848 点**；与上一次已保存 Snapshot 的 850 步不同，这是本次 Student Snapshot 的实时路径。
 - 原生 `OSC_POSE` 使用显式 Mink FK EEF 参考执行 **108/847 步**。首次拒绝在 0-based 控制索引 107：`gripper_object_relative_rotation_changed_beyond_limit`，抓持相对旋转误差 **0.204605 rad**，超过 0.20 rad 限制。拒绝时左右指仍接触（6 个接触），闭合命令保持 1.0；抓持相对位置误差 0.008205 m。OSC EEF 跟踪误差全段最大 **0.003352 m**，黑碗球心跟踪误差最大 **0.012877 m**；首次拒绝步的 EEF 误差为 0.002956 m，黑碗球心误差为 0.012877 m。接触子步监测完整：108 控制步的 2700/2700 个物理子步均被采样。
-- Contact Compiler 总 verdict 为 **`unknown`**：`object_1` 的 Teacher 明确允许夹爪—目标物接触，结果为 `safe`；`object_3` 因 `semantic_disambiguation_result_is_not_an_object` 返回 `unknown`。接触分类记录 101 个事件，其中 19 个 `allowed`、82 个 `unknown`。分支因此拒绝，不能报告为安全通过。
+- Contact Compiler 总 verdict 为 **`unknown`**：`object_1` 的 Teacher 明确允许夹爪—目标物接触，结果为 `safe`；`object_3` 因 `semantic_disambiguation_result_is_not_an_object` 返回 `unknown`。当前保存的源 JSON 中接触分类为 91 条聚合 Geom 对记录，其中 9 个 `allowed`、82 个 `unknown`；此前进度摘要记载的 101/19 与该源文件不符，现按原始 JSON 更正。分支因此拒绝，不能报告为安全通过。
 - Snapshot 恢复通过：分支前完整状态与 OSC controller context 的比较均匹配，最大数值误差为 0；108 步分支后恢复 `snapshot-000001`，完整状态比较 0 个 mismatch、最大数值误差 0，恢复后的抓持复核也通过（闭合比例 1.0，左右指接触，7 个匹配接触）。这次完成了真实 branch 后恢复验证。
 
 真实产物：
@@ -2397,3 +2397,45 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 三条候选从同一 Snapshot 执行后主积分状态恢复成功，最大数值误差为 0。`object_1→object_4` 规则检查未发现接触，但真实 Teacher 的另一目标 `object_3` 在现有绑定文件中缺失，Compiler 对其返回 `semantic_disambiguation_result_is_not_an_object`；未伪造绑定，所有 unknown 均继续按 unknown 处理。因此本次实际物理合格池为 **0**，主 seed `20261020` 无候选可选，seed 0–9 均明确记录为空，不能声称真实安全路线多样性或不同 seed 选择成功。纯选择器合成回归在两个合格测试路线中验证了同 seed 复现和不同 seed 可选到不同路线，但不替代真实物理证据。三条已跟踪的几何路线确实不同（归一化路径 RMS 分离约 0.268–0.380 m），但均未通过全套安全验收。分支后未在主环境执行候选路线；Student 在第 50 步后即停止，未测试任务完成。
 
 完整原始日志保存在 `logs/gs_opd/eval/trajectory_bundle_random_candidate_smoke_l0t0_attempt1_20261020/`：`trajectory_validation_report.json`（含三个 Snapshot 分支的全子步接触与 Compiler 证据）、18 路线 `trajectory_validation_report_bundle/trajectory_bundle.json` 和 `.svg`、`student_trigger.mp4`、`result.json`、`bridge.log`。简要摘要另存为同目录 `smoke_summary.md`。没有启动第二个 Episode；代码与文档已在本地提交。普通 Push 因远端 `Permission denied (publickey)` 失败；未强推，也未上传实验产物。
+
+
+## 同一 Snapshot 的 Above 候选 `object_3` 语义绑定复核（2026-10-20）
+
+只处理 `trajectory-003` / Above 候选此前因缺少 `object_3` 语义绑定而得到的 Compiler `unknown`。Teacher Safety IR v2 中 `object_3` 是可见的 red-rimmed plate / placement target；`rule_2` 明确允许 gripper 与该盘接触（phase `any`），理由是任务要求将碗放到盘上。未改 Teacher 规则、Compiler 或安全阈值。
+
+复用 SAM3 → VLM Candidate 消歧 → SAM Mask/Geom ID IoU → 活动 Geometry Inventory 校验链路。SAM3 在 L0T0 场景图像生成 36 个候选；Qwen3.8 VLM 依据原始 RGB、候选编号轮廓和 Teacher 视觉事实，将 Candidate 28 判为红色同心盘（原始 VLM 响应保留）。该候选 Mask 与对齐 Geom ID capture 的 IoU 为 `0.9850`，匹配到 body 28 `plate_1_main` / geom 438 `plate_1_g0`。再与上一轮完整 Snapshot 分支保存的活动 Geometry Inventory（520/520 geoms）核对，body、geom 名称、ID 和 scene 分类均一致。分支触发视频第 50 帧也可直接看到抓持触发状态下同一红边盘；该图仅作当前场景外观佐证，Candidate–Geom IoU 使用与其逐像素对齐的既有 Geom capture。此绑定被追加到 `logs/gs_opd/semantic_bindings_l0t0.json`，修改前的两对象映射保存在本次证据目录备份中。
+
+对保存的 `snapshot-000001` 分支接触记录离线重编译，未重新运行 MuJoCo。`trajectory-003` 已真实执行 `422/422` 步，10550/10550 个预期物理子步采集完整；原 Snapshot 恢复已验证，最大状态误差为 0。新 Compiler 对 `object_3` 的 `rule_2` 返回 `safe`，理由是 Teacher 明确允许目标放置接触且子步覆盖完整；`object_1` 的 `rule_1` 也为 `safe`，`object_1→object_4` 禁止接触对未观察到接触。因此本次 Compiler 规则集合 verdict 从 `unknown` 更新为 `safe`。
+
+这不使候选通过整体验收：源报告中的接触分类仍为 `unknown`，有 82 个未匹配到明确 Teacher 许可规则的场景接触事件（样例包括 table 与 cookies/ramekin 的接触记录）；`physical_safety_verified=false`、`executable_safe=false` 及拒绝原因 `contact_event_classification_incomplete_or_unsafe` 保持不变。没有将这些接触改判为 safe，也没有重新执行候选或另外 17 条路线。新绑定证据和重编译结果位于 `logs/gs_opd/eval/object3_binding_trajectory003_l0t0_20261020/`；其中 `object3_binding_evidence.json`、SAM3/VLM/IoU 输出及 `trajectory003_contact_compiler_recompile.json` 保留完整可追溯数据。
+
+
+## `trajectory-003` Above 剩余接触记录离线分类（2026-10-20）
+
+只读取 `trajectory_bundle_random_candidate_smoke_l0t0_attempt1_20261020/trajectory_validation_report.json` 中已保存的原始子步接触监测与分类记录，并对照 `object3_binding_trajectory003_l0t0_20261020/trajectory003_contact_compiler_recompile.json`。没有启动环境或改动 Compiler、分类器、规则及阈值。
+
+82 指 **82 条不同 Geom 对的聚合记录**，不是 82 次碰撞。分支共执行 422 个控制步，10,550/10,550 个物理子步有完整记录；82 条均从控制步 0 出现，原始记录全部 `robot_involved=false`。91 条聚合 Geom 对记录中另有 9 条已按 Teacher 许可识别为夹爪抓持接触。82 条 unknown 的分类理由全部是 `contact_has_no_unambiguous_teacher_allow_rule`，具体 Body 对如下：
+
+| Body 对 | unknown 聚合 Geom 对数 | 原始接触证据与判断 |
+| --- | ---: | --- |
+| `table` (1) – `cookies_1_main` (25) | 1：`table_collision` – `cookies_1_g1` | 全部子步持续出现，法线朝上、最大力范数 0.0236；符合桌面支撑型接触。 |
+| `table` (1) – `glazed_rim_porcelain_ramekin_1_main` (26) | 17：`table_collision` – `ramekin_g2…g18` | 全部子步持续出现，法线朝上、最大力范数 0.00279–0.00292；是多个网格几何记录的支撑接触。 |
+| `table` (1) – `plate_1_main` (28, 当前映射为 Teacher `object_3`) | 9：`table_collision` – `plate_1_g2…g10` | 全部子步持续出现，法线朝上、最大力范数 0.0104–0.0153；符合盘与桌面的支撑接触。Teacher `rule_2` 许可的是夹爪–盘接触，并未显式列出盘–桌面许可。 |
+| `akita_black_bowl_2_main` (24) – `wooden_cabinet_1_base` (30) | 5：`bowl_2_g36…g40` – `cabinet_g9` | 全部子步持续出现，最大力范数 0.00273–0.00350；这是非目标 bowl_2 与柜底的静态场景接触，记录不显示机器人或被搬运碗参与。 |
+| `bottle_of_perfume_1_main` (27) – `white_place_box_1_main` (39) | 50：瓶体 `g{2,4,8,9,13,15,27,29,32,42,43,66,69,75,86,89,90,94,95,109,112,114,116,117,126,138,144,146,151,154,162,165,166,173,181,183,184,188,189,196,199,203,212,213,215,225,233,236,237,238}` – `white_place_box_1_g2` | 全部从步 0 起；49 对在全部 10,550 个子步出现，1 对出现于 9,797 个子步，最大力范数 0.2824。它是持久的无关场景–场景接触；单靠当前记录不能确定是容器接触还是初始几何重叠，故不标 safe。 |
+
+分类判断：前三组是有向上法线和持续接触支持的正常桌面支撑；bowl_2–柜底是稳定的非目标场景接触；瓶体–白盒也是非机器人场景接触，但其物理成因尚不能仅凭接触表定为无害。现有语义映射把 Body 27 对应到 Teacher `object_4`，不过此前视觉 IoU 仅 0.1427，语义置信仍应谨慎。该组虽涉及映射为障碍的瓶体，却是瓶体–白盒，并非 Teacher 明确禁止的被搬运碗 `object_1`–障碍 `object_4` 接触。离线重编译对 `object_1→object_4` 的完整子步检查为未观察到接触；82 条中也没有机器人或 carried bowl 的接触。因此这些记录不是机器人–环境碰撞证据，也不能据此宣称瓶体–白盒接触已获许可。
+
+`_candidate_contact_classification()`（`research/gs_opd/repair/trajectory_tracking.py`）确有“未匹配到唯一显式 allow 就标 unknown”的保守逻辑：夹爪接触按夹爪目标规则判断；非夹爪接触则要求匹配 `object_contact_rules` 的 allow，否则一律 unknown。它把 IR v2 中未声明的静态场景对也当成需要逐对许可，导致正常支撑接触阻断候选。最小语义调整建议是：优先将明确匹配的 forbid 判为 violation；保留明确 allow；未匹配的**非机器人场景–场景**接触可记作 `unregulated_scene_contact` 并保留原始证据，但不单独触发机器人路径安全拒绝。机器人参与、携带物体相关但尚无明确规则、身份绑定不确定的接触仍应是 unknown；不能把它们改成 safe，也不应补造 allow 规则。此次只记录建议，没有实施。
+
+源候选的 `rejection_reasons` 保存了 `contact_compiler_unknown` 和 `contact_event_classification_incomplete_or_unsafe`。前一项已被后续离线重编译解决：`object_1` 的 rule_1、`object_3` 的 rule_2 及禁止接触对检查均为 safe；源候选 JSON 未回写，故列表保留旧项。当前仍独立阻断验收的只有 `contact_event_classification_incomplete_or_unsafe`。轨迹执行 422/422 步、tracking 与子步监测完整、Snapshot 恢复通过、task feasibility 为 pass、无执行或预算失败；`task_success_confirmed=false` 是该局部搬运分支的预期范围，不是另一项失败原因。
+
+## `trajectory-003` Above 背景接触范围收敛与离线重新验收（2026-10-20）
+
+在 `research/gs_opd/repair/trajectory_tracking.py` 中收敛 `_candidate_contact_classification()`：只有当聚合接触对的 Geom/Body ID 与名称同时匹配分支起始 `start_contacts` 和完整活动 Geometry Inventory、两侧 Inventory 类别都为 `scene`、子步监测及机器人分类完整、事件明确为 `scene_scene` 且 `robot_involved=false`、接触不涉及 carried Body/夹爪、Teacher 语义映射无冲突且没有匹配的显式规则时，才标记 `out_of_scope_background_contact`。缺少起始接触证据、身份不匹配或不完整、机器人/载荷接触和 Teacher 规则未知仍保持原严格判定；显式 forbid 优先判为 violation。该类别不阻断汇总 verdict，但会保留完整 `raw_event` 和所有匹配的分支起始原始接触样本 `preexisting_start_contact_evidence`。未修改 Safety Compiler、Teacher 规则或安全阈值。
+
+为无 Snapshot 起始证据、机器人接触、载荷接触、几何身份不匹配和显式 forbid 添加/强化回归覆盖。语法检查通过；`test_trajectory_tracking` 与 `test_trajectory_bundle_acceptance` 合计 **54 项测试通过**。
+
+使用既有 `trajectory-003` Above 分支的 422/422 步原始记录离线重算。最新语义绑定对活动 520/520 Geom Inventory 的 Teacher 规则绑定核验通过；`object_3` 仍绑定到 `plate_1_main` Body 28 / Geom 438。Compiler 对 `object_1` 与 `object_3` 两个 gripper 规则均为 `safe`，完整物体接触检查未发现 `object_1→object_4` 禁止接触。接触分类为 `pass`：82 条有起始 Snapshot 原始证据的背景接触标记为范围外，9 条夹爪–黑碗接触保留 `allowed`；没有 unknown 或 violation。完整逐控制步/子步、抓持、OSC、跟踪、任务段和 Snapshot 恢复检查均通过，`physical_safety_verified=true`、`executable_safe=true`、`rejection_reasons=[]`。局部分支没有测试最终放置，故 `task_success_confirmed=false`；这不代表完整任务成功。
+
+仅将重新计算且全部通过的 `trajectory-003` 放入本次离线验收候选池。复用现有 `select_verified_candidate()`，seed `20261020` 选择了 `trajectory-003`，同 seed 复选一致。该选择只验证候选池接口，没有执行路线或启动 Student/MuJoCo。完整离线分类、两侧原始接触证据、Compiler 结果、全部拒绝原因和选择结果保存于 `logs/gs_opd/eval/object3_binding_trajectory003_l0t0_20261020/trajectory003_offline_reacceptance.json`；此前原始分支报告及轨迹数据未覆盖。
