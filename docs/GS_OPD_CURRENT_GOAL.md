@@ -1,5 +1,13 @@
 # GS-OPD 当前局部目标
 
+## 已完成：Far/Mid/Near Episode 分层调度接入与 Far Pilot（2026-10-20）
+
+- `pi05_rollout.py --stratified-episode-index N` 按 Far/Mid/Near 循环分配 Episode 风险层，复用现有 20/10/5 mm 间距阈值；稳定抓持后使用只读实时 Geom 距离检测首次层命中，再进入原候选验收/执行入口。阈值、轨迹生成、OSC、Teacher、Grounding、Compiler 和训练逻辑未变。
+- index 0 Far Pilot 在真实 L0T0 执行了 1000 个 Student 动作。第 71 个状态采样命中 Far，距离 15.138 mm；18 条候选都未通过几何筛选，Snapshot 恢复后 Student 继续，最终到预算上限仍未成功。原 NPZ、MP4、候选验收 JSON 和纠正过汇总标志的 sidecar 都已保存，详见进度报告。
+- 分层接入测试和相关 Near–Far/轨迹束/单候选选择回归共 44 项通过。`local_exit_region_scale=0.5` 保持不变。
+
+接下来的采集按新 Episode index 1（Mid）、2（Near）分别运行，每次使用新的报告、NPZ、视频和 rollout 结果路径；本次没有启动这两轮。
+
 ## 已完成：恢复 B-Spline 出口基线并诊断 attempt3 Student 接管（2026-10-20）
 
 - `local_exit_region_scale` 的 `BundleConfig` 与 CLI 默认值恢复到已验证的 0.5，相关测试断言同步；`test_trajectory_bundle` 27 项通过。

@@ -108,6 +108,14 @@ class VerifiedCandidateSelectionTests(unittest.TestCase):
         selected = acceptance.select_verified_candidate(tracking, 0)
         self.assertIn(selected["candidate_id"], {"route-2"})
 
+    def test_one_verified_candidate_remains_selectable(self):
+        tracking = self._tracking()
+        tracking["executable_safe_candidate_ids"] = ["route-1"]
+        tracking["candidates"] = tracking["candidates"][:1]
+        selected = acceptance.select_verified_candidate(tracking, 0)
+        self.assertEqual(selected["candidate_id"], "route-1")
+        self.assertEqual(selected["selection_pool_candidate_ids"], ["route-1"])
+
     def test_selection_seed_must_be_integer(self):
         with self.assertRaisesRegex(ValueError, "seed must be an integer"):
             acceptance.select_verified_candidate(self._tracking(), True)

@@ -120,6 +120,14 @@ def parse_args():
         help="Optional subset of the generated bundle to run as physical Snapshot branches.",
     )
     parser.add_argument(
+        "--stratified-episode-index",
+        type=int,
+        help=(
+            "Opt into cross-Episode Far/Mid/Near scheduling. Indices cycle Far, Mid, Near; "
+            "requires verified bundle acceptance and main-environment candidate execution."
+        ),
+    )
+    parser.add_argument(
         "--trajectory-max-branch-steps",
         type=int,
         default=480,
@@ -146,6 +154,8 @@ def parse_args():
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
+    if args.stratified_episode_index is not None and args.stratified_episode_index < 0:
+        parser.error("--stratified-episode-index must be zero or greater")
     if args.record_substep_contacts and not args.record_physical_state:
         parser.error("--record-substep-contacts requires --record-physical-state")
     if args.video_out is not None and args.video_out.suffix != ".mp4":
@@ -177,6 +187,13 @@ def parse_args():
         parser.error("--execute-verified-bundle-candidate-in-main-env requires --trajectory-bundle-physical-validation")
     if bundle_main_execution_enabled and (mink_osc_enabled or direct_osc_enabled):
         parser.error("verified bundle main-environment execution is mutually exclusive with direct-left and Mink modes")
+    if args.stratified_episode_index is not None and not (
+        trajectory_validation_enabled and bundle_main_execution_enabled
+    ):
+        parser.error(
+            "--stratified-episode-index requires --trajectory-bundle-physical-validation "
+            "and --execute-verified-bundle-candidate-in-main-env"
+        )
     if trajectory_validation_enabled:
         if args.teacher_json is None or args.semantic_results_json is None:
             parser.error(
@@ -228,6 +245,13 @@ def parse_args():
             parser.error(f"Semantic results mapping does not exist: {args.semantic_results_json}")
         if args.trajectory_validation_out.exists():
             parser.error(f"Choose a fresh trajectory validation report path: {args.trajectory_validation_out}")
+        if args.stratified_episode_index is not None:
+            for output_path in (args.result_out, args.trace_out, args.video_out):
+                if output_path is not None and output_path.exists():
+                    parser.error(
+                        "stratified collection requires fresh output paths; existing file: "
+                        f"{output_path}"
+                    )
     elif collection_enabled:
         if args.trajectory_validation_out is not None or args.trajectory_subject_object_id is not None:
             parser.error("trajectory validation options require --trajectory-bundle-physical-validation")
@@ -320,6 +344,7 @@ def parse_args():
             True if args.mink_osc_left else None,
             True if args.direct_bspline_osc_left else None,
             True if args.execute_verified_bundle_candidate_in_main_env else None,
+            args.stratified_episode_index,
         )
     ):
         parser.error(
@@ -1915,7 +1940,65 @@ def get_video_frame(data):
     return np.ascontiguousarray(get_libero_image({"agentview_image": frame}))
 
 
+def _observe_episode_risk_layer(connection, context, layer_record, step_index):
+    """Record a read-only live object-to-forbidden-obstacle gap sample."""
+    from research.gs_opd.repair.episode_risk_layer import record_episode_risk_distance
+    from research.gs_opd.repair.near_far import query_geom_gap
+
+    payload = context.get("query_payload") if isinstance(context, dict) else None
+    carried = payload.get("carried_binding") if isinstance(payload, dict) else None
+    obstacles = payload.get("obstacle_bindings") if isinstance(payload, dict) else None
+    subject_ids = carried.get("geom_ids") if isinstance(carried, dict) else None
+    obstacle_ids = sorted({
+        int(geom_id)
+        for binding in (obstacles or [])
+        if isinstance(binding, dict)
+        for geom_id in binding.get("geom_ids", [])
+        if isinstance(geom_id, int) and not isinstance(geom_id, bool)
+    })
+    if (
+        not isinstance(subject_ids, list)
+        or not subject_ids
+        or not obstacle_ids
+        or set(subject_ids) & set(obstacle_ids)
+    ):
+        record_episode_risk_distance(
+            layer_record,
+            step_index=step_index,
+            distance_m=None,
+            distance_available=False,
+            query_status="unavailable",
+            errors=["validated_carried_or_forbidden_obstacle_geom_set_unavailable"],
+        )
+        return None
+    sample = query_geom_gap(
+        connection,
+        subject_geom_ids=subject_ids,
+        obstacle_geom_ids=obstacle_ids,
+        step_index=step_index,
+    )
+    return record_episode_risk_distance(
+        layer_record,
+        step_index=step_index,
+        distance_m=sample.get("minimum_distance_m"),
+        distance_available=sample.get("distance_available") is True,
+        query_status=sample.get("query_status"),
+        minimum_pair=sample.get("minimum_pair"),
+        errors=sample.get("errors"),
+    )
+
+
 args = parse_args()
+
+episode_risk_layer = None
+if args.stratified_episode_index is not None:
+    from research.gs_opd.repair.episode_risk_layer import (
+        new_episode_risk_layer_record,
+    )
+
+    episode_risk_layer = new_episode_risk_layer_record(
+        args.stratified_episode_index
+    )
 
 if args.seed is not None:
     import random
@@ -2017,6 +2100,12 @@ try:
             "env_seed": 0,
             "initial_state_index": 0,
         }
+        if episode_risk_layer is not None:
+            trace_metadata["episode_risk_stratification"] = {
+                key: value
+                for key, value in episode_risk_layer.items()
+                if key not in ("observations", "trigger")
+            }
         if collection_enabled:
             trace_metadata.update({
                 "collection_mode": "continuous_on_policy_safety",
@@ -2103,6 +2192,23 @@ try:
                 data["instruction"],
                 subject_id=args.trajectory_subject_object_id,
             )
+            if episode_risk_layer is not None:
+                query_payload = trajectory_validation_context.get("query_payload", {})
+                carried = query_payload.get("carried_binding", {})
+                obstacles = query_payload.get("obstacle_bindings", [])
+                episode_risk_layer["geometry_binding"] = {
+                    "source": "validated_active_geometry_inventory_and_safety_ir_v2",
+                    "carried_object_id": carried.get("object_id"),
+                    "carried_geom_ids": carried.get("geom_ids"),
+                    "forbidden_obstacles": [
+                        {
+                            "object_id": item.get("object_id"),
+                            "geom_ids": item.get("geom_ids"),
+                        }
+                        for item in obstacles
+                        if isinstance(item, dict)
+                    ],
+                }
             trajectory_validation_context["teacher_json_path"] = str(
                 args.teacher_json.resolve()
             )
@@ -2121,6 +2227,16 @@ try:
                         "initial_grasp_status": initial_grasp_state.get("status"),
                         "initial_grasp_reason": initial_grasp_state.get("reason"),
                         "bridge_connection": "same persistent connection used for Student step and Snapshot branches",
+                        "episode_risk_layer": (
+                            {
+                                "episode_id": episode_risk_layer["episode_id"],
+                                "episode_index": episode_risk_layer["episode_index"],
+                                "selected_layer": episode_risk_layer["selected_layer"],
+                                "trigger_threshold_m": episode_risk_layer["trigger_threshold_m"],
+                            }
+                            if episode_risk_layer is not None
+                            else None
+                        ),
                     },
                     ensure_ascii=False,
                 ),
@@ -2153,14 +2269,38 @@ try:
         and not candidate_main_execution_stop
     ):
         if (
+            episode_risk_layer is not None
+            and episode_risk_layer.get("trigger") is None
+            and trajectory_validation_preflight_failure is None
+            and trajectory_validation_context is not None
+            and trajectory_grasp_monitor is not None
+            and trajectory_grasp_monitor.stable
+        ):
+            _observe_episode_risk_layer(
+                conn, trajectory_validation_context, episode_risk_layer, steps
+            )
+        if (
             args.trajectory_bundle_physical_validation
             and not trajectory_validation_attempted
             and trajectory_validation_preflight_failure is None
             and trajectory_validation_context is not None
             and trajectory_grasp_monitor is not None
             and trajectory_grasp_monitor.stable
+            and (
+                episode_risk_layer is None
+                or episode_risk_layer.get("trigger") is not None
+            )
         ):
             trajectory_validation_attempted = True
+            if episode_risk_layer is not None:
+                episode_risk_layer["workflow_status"] = "physical_candidate_acceptance_started"
+                print(
+                    "STRATIFIED RISK LAYER REACHED:",
+                    json.dumps(episode_risk_layer["trigger"], sort_keys=True),
+                    "EPISODE:",
+                    episode_risk_layer["episode_id"],
+                    flush=True,
+                )
             direct_latest_data = data
             try:
                 if args.mink_osc_left:
@@ -2229,6 +2369,8 @@ try:
                     "main_environment_candidate_execution": False,
                     "training_label_created": False,
                 }
+            if episode_risk_layer is not None:
+                trajectory_validation_report["episode_risk_stratification"] = episode_risk_layer
             print(
                 "TRAJECTORY PHYSICAL ACCEPTANCE:",
                 json.dumps(
@@ -2326,6 +2468,7 @@ try:
                             else []
                         ),
                         "fallback": "resume_Student_from_the_verified_restored_main_state",
+                        "student_continuation": True,
                         "main_environment_osc_steps": 0,
                     }
                     print(
@@ -2539,6 +2682,7 @@ try:
 
         actual_chunk_actions = []
         actual_chunk_post = []
+        stratified_layer_reached_during_chunk = False
         for action_index, action in enumerate(execution_chunk):
             payload = {
                 "op": "step_monitored" if args.record_substep_contacts else "step",
@@ -2587,6 +2731,20 @@ try:
                         "reason": f"{type(exc).__name__}:{exc}",
                     }
                 trajectory_grasp_monitor.update(grasp_state, rollout_step=steps)
+                if (
+                    episode_risk_layer is not None
+                    and episode_risk_layer.get("trigger") is None
+                    and trajectory_grasp_monitor.stable
+                ):
+                    _observe_episode_risk_layer(
+                        conn,
+                        trajectory_validation_context,
+                        episode_risk_layer,
+                        steps,
+                    )
+                    stratified_layer_reached_during_chunk = (
+                        episode_risk_layer.get("trigger") is not None
+                    )
             if trace_writer is not None:
                 try:
                     trace_writer.add_step(
@@ -2626,6 +2784,15 @@ try:
 
             if steps % 20 == 0 or success or done:
                 print(f"STEP={steps} REWARD={data['reward']} DONE={done} SUCCESS={success}", flush=True)
+
+            if stratified_layer_reached_during_chunk and not success and not done:
+                print(
+                    "STRATIFIED RISK LAYER REACHED DURING STUDENT CHUNK; "
+                    "stopping the predicted suffix and opening bundle acceptance at the next decision:",
+                    json.dumps(episode_risk_layer["trigger"], sort_keys=True),
+                    flush=True,
+                )
+                break
 
             if steps >= args.max_steps or done or success:
                 break
@@ -2727,6 +2894,16 @@ try:
             if trajectory_validation_preflight_failure is not None:
                 trajectory_status = "blocked"
                 reasons = [trajectory_validation_preflight_failure]
+            elif episode_risk_layer is not None and episode_risk_layer.get("trigger") is None:
+                if trajectory_grasp_monitor is None or not trajectory_grasp_monitor.stable:
+                    trajectory_status = "stratified_stable_grasp_not_observed"
+                    reasons = ["stable_grasp_precondition_not_reached_for_risk_layer_sampling"]
+                else:
+                    trajectory_status = "stratified_layer_not_reached"
+                    reasons = ["selected_risk_layer_not_observed_after_stable_grasp"]
+            elif episode_risk_layer is not None:
+                trajectory_status = "stratified_layer_reached_episode_ended_before_acceptance"
+                reasons = ["episode_ended_before_bundle_acceptance_started"]
             elif trajectory_grasp_monitor is not None and trajectory_grasp_monitor.stable:
                 trajectory_status = "stable_grasp_found_without_following_decision_state"
                 reasons = ["episode_ended_before_next_student_decision"]
@@ -2750,6 +2927,70 @@ try:
                     else None
                 ),
             }
+        if episode_risk_layer is not None:
+            main_execution = trajectory_validation_report.get("main_environment_execution")
+            candidate_selection = trajectory_validation_report.get("candidate_selection")
+            primary_selection = (
+                candidate_selection.get("primary_selection")
+                if isinstance(candidate_selection, dict)
+                else None
+            )
+            selected_candidate_id = (
+                main_execution.get("selected_candidate_id")
+                if isinstance(main_execution, dict)
+                else primary_selection.get("candidate_id")
+                if isinstance(primary_selection, dict)
+                else None
+            )
+            if trajectory_validation_preflight_failure is not None:
+                episode_risk_layer["workflow_status"] = "trajectory_validation_preflight_failed"
+            elif episode_risk_layer.get("trigger") is None:
+                episode_risk_layer["workflow_status"] = (
+                    "stable_grasp_not_observed"
+                    if trajectory_grasp_monitor is None or not trajectory_grasp_monitor.stable
+                    else "selected_layer_not_reached"
+                )
+            elif not trajectory_validation_attempted:
+                episode_risk_layer["workflow_status"] = "layer_reached_but_episode_ended_before_acceptance"
+            elif isinstance(main_execution, dict) and main_execution.get("status") == "no_qualified_candidate":
+                episode_risk_layer["workflow_status"] = "no_qualified_candidate_student_resumed"
+            elif isinstance(main_execution, dict):
+                episode_risk_layer["workflow_status"] = main_execution.get("status", "main_environment_execution_recorded")
+            elif trajectory_validation_report.get("candidate_outcome") == "all_tracked_candidates_rejected":
+                episode_risk_layer["workflow_status"] = "no_qualified_candidate_student_resumed"
+            elif trajectory_validation_report.get("status") == "blocked":
+                episode_risk_layer["workflow_status"] = "candidate_acceptance_blocked"
+            else:
+                episode_risk_layer["workflow_status"] = "candidate_acceptance_finished_without_main_execution_record"
+            episode_risk_layer["episode_result"] = {
+                "selected_candidate_id": selected_candidate_id,
+                "candidate_pool": (
+                    main_execution.get(
+                        "candidate_pool",
+                        main_execution.get("selection_pool_candidate_ids"),
+                    )
+                    if isinstance(main_execution, dict)
+                    else candidate_selection.get("selection_pool_candidate_ids", [])
+                    if isinstance(candidate_selection, dict)
+                    else []
+                ),
+                "main_environment_osc_actions": (
+                    main_execution.get("main_environment_actions", 0)
+                    if isinstance(main_execution, dict)
+                    else 0
+                ),
+                "student_continued": (
+                    main_execution.get("student_continuation") is True
+                    or main_execution.get("fallback") == "resume_Student_from_the_verified_restored_main_state"
+                    if isinstance(main_execution, dict)
+                    else False
+                ),
+                "candidate_acceptance_status": trajectory_validation_report.get("status"),
+                "task_success": bool(success),
+                "environment_done": bool(done),
+                "executed_environment_actions": int(steps),
+            }
+            trajectory_validation_report["episode_risk_stratification"] = episode_risk_layer
         trajectory_validation_report["episode_rollout"] = {
             "instruction": data.get("instruction"),
             "max_steps": args.max_steps,
@@ -2825,6 +3066,19 @@ try:
                 ),
             },
             "checkpoint_path": str(ckpt),
+            "episode_risk_layer": (
+                {
+                    "episode_id": episode_risk_layer["episode_id"],
+                    "episode_index": episode_risk_layer["episode_index"],
+                    "selected_layer": episode_risk_layer["selected_layer"],
+                    "trigger": episode_risk_layer.get("trigger"),
+                    "workflow_status": episode_risk_layer.get("workflow_status"),
+                    "selected_candidate_id": episode_risk_layer.get("episode_result", {}).get("selected_candidate_id"),
+                    "task_success": success,
+                }
+                if episode_risk_layer is not None
+                else None
+            ),
             "bridge_endpoint": "127.0.0.1:38567",
             "bridge_connection_policy": "the existing pi05_rollout Client connection was used for Student steps, grasp queries, Snapshot, geometry, and branch tracking",
         }
@@ -2832,6 +3086,8 @@ try:
             trajectory_validation_report["grasp_stability"] = (
                 trajectory_grasp_monitor.diagnostics()
             )
+        if trace_writer is not None and episode_risk_layer is not None:
+            trace_writer.metadata["episode_risk_stratification"] = episode_risk_layer
         trajectory_validation_report["physical_safety_claim"] = False
         trajectory_validation_report["training_label_created"] = False
         trajectory_validation_report["main_environment_candidate_execution"] = bool(
@@ -2912,6 +3168,7 @@ try:
         "substep_contact_recording": bool(args.record_substep_contacts),
         "seed": args.seed,
         "trajectory_candidate_seed": args.trajectory_candidate_seed,
+        "episode_risk_stratification": episode_risk_layer,
     }
     if contact_probe_result is not None:
         if args.contact_safety_probe:
