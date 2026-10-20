@@ -2338,3 +2338,24 @@ Epoch 1 的搬运 MSE 下降 `8.21%`、原始 7D full-chunk MAE 下降 `2.51%`�
 第一次启动 attempt1 在 optimizer step 1 因学习率浮点表示 `9.999999747e-5` 被过严的精确比较误判为 LR 变化而停止；实际 LR 为恒定 `1e-4`，Loss `0.012444`、梯度范数 `0.003799`，没有 NaN/Inf。将比较改为容许浮点误差后，以相同配置、相同原始权重和随机种子启动 attempt2。attempt2 在 **18 optimizer steps** 后停止：step 18 Loss 为 **0.444459**，是之前 10 个有限 step Loss 中位数 `0.037221` 的 **11.94 倍**；梯度范数 `0.730469`，实际 LR 全程为 `9.999999747e-5`。所有 18 步记录的 Loss、梯度和 LR 均为有限值，没有 NaN/Inf。保护按“超过前 10 个有限 Loss 的中位数 10 倍”触发；没有降低 LR，也没有继续训练。该停止点早于 step 100，因此无法判断搬运阶段拟合是否改善。
 
 完整 attempt2 逐步记录、训练前分阶段评估、报告和控制台日志保留在 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_constant_lr_20261020_attempt2/`；attempt1 的浮点误判记录保留在同名 `attempt1/`。step 18 的 RLinf 全量权重与重复 DCP 共释放 14,006,829,056 allocated bytes（约 13.05 GiB），仅保留日志与报告；本轮没有可用的最终 Checkpoint 或独立 Adapter。修改范围仅为 `research/gs_opd/data/run_single_episode_sft.py` 的 fresh LoRA 初始化、500 步预算、定点固定评估和停止记录，以及 `examples/sft/config/gs_opd_full_episode_lora_constant_1e4_20261020.yaml`。没有启动 Student、MuJoCo 或评测，没有改数据、模型结构、训练目标或归一化，也没有 Push。
+
+## 完整 845 步轨迹恒定 1e-4 LoRA 过拟合（attempt3，2026-10-20）
+
+按本项目当前默认做法，本次从原始 Student `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 初始化新 rank-32 Action Expert LoRA；未使用已删除的 Adapter。非 LoRA 基座权重完整加载（667 个键），216 个 LoRA 张量、13,860,864 个参数为唯一可训练参数，其余 VLM 和原始权重冻结。AdamW 状态重新初始化；学习率固定为 `1e-4`、零 Warmup、无衰减，实际逐步记录为 float32 `9.999999747e-5`。训练继续使用 RLinf `SFTRunner`、官方 OpenPI SFT DataLoader、原生 Flow Matching Loss、原归一化和 845 帧单 Episode（836 个完整 horizon-10 窗口，三个阶段每个完整 Epoch 各曝光 750 个窗口）。每步保留 Loss、梯度范数、LR、显存与耗时。停止条件已取消有限 Batch Loss 倍数尖峰、固定评估尖峰和按搬运指标停滞的早停，只保留非有限训练指标/梯度、LR 或固定评估停止。
+
+训练完成 **10,000 个 optimizer step**（8 个完整 Epoch 加第 9 个 Epoch 的 1,000 步），总耗时 **5,373.0 秒（约 89.6 分钟）**。10,000 行逐步指标的 Loss、梯度范数与 LR 均有限；最大有限 Batch Loss 为 **0.446732（step 18）**、梯度范数最大 **0.710938**，不再因单 Batch 尖峰中止。首 100 步平均 Loss 为 `0.032218`，末 100 步为 `0.000822`。单卡 RTX 4090 峰值 allocated **14.27 GiB**、reserved **22.22 GiB**；最终参数签名与初始化不同。训练完成原因是配置步数预算，不是数值停止。
+
+固定评估沿用训练前的同一组 **48 个真实 Observation（每阶段 16 个）**、相同 Flow/动作噪声种子 `20261020` 和 3 步动作采样。Flow 项为模型空间 MSE；Action MAE 是官方 `pi05_libero` 输出变换解码后的真实 **10×7** 环境动作。数值如下：
+
+| 阶段 / 指标 | 训练前 | 2,000 步 | 4,000 步 | 6,000 步 | 10,000 步 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 抓取 Flow MSE | 0.026213 | 0.001948 | 0.002230 | 0.001097 | 0.001170 |
+| 抓取 10×7 Action MAE | 0.050710 | 0.020360 | 0.017806 | 0.013744 | 0.014483 |
+| OSC 搬运 Flow MSE | 0.152026 | 0.003590 | 0.001452 | 0.001475 | 0.000982 |
+| OSC 搬运 10×7 Action MAE | 0.183005 | 0.009446 | 0.011247 | 0.007775 | 0.009061 |
+| 放置 Flow MSE | 0.015728 | 0.002877 | 0.002274 | 0.002195 | 0.001972 |
+| 放置 10×7 Action MAE | 0.032736 | 0.018061 | 0.017192 | 0.015308 | 0.014691 |
+
+搬运阶段在最终点相对基线的 Flow MSE 下降 **99.35%**，真实动作 MAE 下降 **95.05%**；4,000 步时动作 MAE 曾短暂回升，6,000 和 10,000 步均回落。三个阶段最终指标都低于训练前。以上确认模型在固定示范状态上的动作拟合改善，不代表新的闭环或安全泛化结果。本次没有启动 Student、MuJoCo 或评测。
+
+RLinf 最终完整 checkpoint 保存在 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_constant_lr_20261020_attempt3/checkpoints/global_step_10000/actor/`；独立 rank-32 Adapter 在同目录的 `lora_adapter.pt`（27,792,805 bytes）。现有导出及组合验证脚本成功重载 Adapter；同一真实示范 Observation step 0、随机种子 `20261019` 下，训练 checkpoint 与“原始 Student + Adapter”推理均为 `[10,7]`，最大及平均绝对动作差均为 **0**。保存了 `report.json`、10,000 行 `step_metrics.jsonl`、定点评估 `fixed_eval_by_step.jsonl`、`loss_curve.png`、`adapter_reload_verification.json`、完整 Runner `console.log` 及 Adapter 导出日志。首次导出验证使用错误的 Hydra 环境配置路径而失败；修正 `EMBODIED_PATH` 后验证通过。由于该次实验完成全部预算且 Adapter 可重载，没有清理本实验权重；未触及旧实验、Student、原始 NPZ 或数据集，也没有 Push。
