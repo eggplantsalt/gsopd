@@ -2,20 +2,33 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
-## Far/Mid/Near 跨 Episode 分层采集接入（2026-10-20）
+## 主线恢复：成功的单场景过拟合基线（2026-10-20）
 
-- 新增 `research/gs_opd/repair/episode_risk_layer.py`，用 Episode 索引按 `Far → Mid → Near` 循环调度；Far 为 `10 mm < gap <= 20 mm`，Mid 为 `5 mm < gap <= 10 mm`，Near 为 `gap <= 5 mm`。分界只复用 `near_far.GAP_THRESHOLDS_M=(5, 10, 20) mm`，未新增或改变风险阈值；采样跳过某一带时不回填已越过的层。
-- `pi05_rollout.py` 新增可选 `--stratified-episode-index N`，仅与已有 `--trajectory-bundle-physical-validation --execute-verified-bundle-candidate-in-main-env` 同用。稳定双指抓持后按每个真实 Student 动作状态通过活动 Safety IR 与 Geometry Inventory 已验证的碗/禁止接触物 Geom 集合调用现有只读 `query_geom_gap()`；达到选定间距带时停止执行预测 Chunk 未发送的后缀，并调用原有 18 候选几何筛选、Snapshot 物理验收、随机选择、恢复主环境执行及 Student 接续流程。测距 unknown 时只记录并继续 Student；Layer 不是安全证明。默认 rollout 路径不变。
-- 保持 `trajectory_bundle.py` 的 `local_exit_region_scale=0.5`、B-Spline/OSC、Teacher/Grounding、Compiler、原物理筛选条件及 480 步单候选预算不变。合格候选只有一条时沿用已有随机选择器；空池时沿用恢复 Snapshot 后 Student 接续。
-- 新增 7 项分层调度测试和 1 项单合格候选选择回归，覆盖循环确定性、阈值复用、三带边界、不可用/非有限距离、跳过带不补触发、首次命中只触发一次，以及单个已验收候选可被选中。Near–Far、轨迹束和 CLI/候选选择回归共 44 项通过；`py_compile`、入口 `--help`、`git diff --check` 通过。单独运行更广的 Snapshot Acceptance 套件时，两项合成用例失败：其 mock bundle 返回空 `candidates`，而断言期望已执行候选跟踪；本次没有改写 Acceptance 逻辑或以单测声称物理通过。
-- 进行了一个真实 Far Pilot，Episode index 0，初始状态 0，原始 Student Checkpoint，最大 1000 步。稳定抓持后首次观测到 Far 带在状态步 71，黑碗 geom 83 到 Teacher `object_4` geom 193 的有符号距离为 **15.138 mm**（对方为 mesh，报告保留近似标志；该数值不是安全证明）。活动几何绑定来自现有 `initial_center_distinction_teacher_raw.txt` 与 `semantic_bindings_l0t0.json`，未伪造语义。
-- 原有几何初筛生成了 18 条候选，0 条通过；18 条均因 `start_sphere_clearance_insufficient:object_4` 及 `sphere_clearance_below_margin:object_4` 被拒绝，未进入候选物理分支，Snapshot 恢复核验通过。合格池为空，因此没有候选 ID、随机选择或主环境 OSC 动作；按原回退继续 Student。最终达到 1000 步上限，`reward=0`、`done=false`、任务失败。NPZ 中保留 1000 个真实 7D Student Action 与双相机 post Observation；阈值触发后 Student 又执行 929 步。未记录子步接触，因而不作“无碰撞”结论。
-- 原始报告、轨迹和视频保存在 `logs/gs_opd/stratified_far_mid_near_20261020_attempt1/episode_000000_far/`。另有 `episode_reconciled_summary.json`：原 `result.json` 把空池 fallback 标成 `student_continued=false`，但验收 JSON 明确为恢复 Snapshot 后恢复 Student，NPZ 也包含完整 1000 步；摘要保留原始文件并据实际记录写明接续。报告/产物：`result.json`、`trajectory_validation.json`、`episode_trace.npz`、`episode.mp4`、`episode_reconciled_summary.json`。
-- 初次 Bridge 用 RLinf `.venv` 启动时，系统加载到的 LIBERO 没注册 `obstacle_avoidance`，在 reset 前退出；改用文档指定的 `LIBERO-Safety/.venv` 后 Bridge 正常启动并完成同一 Pilot。没有训练或 Push。
+- 已从 `pi05_rollout.py` 移除 Far/Mid/Near Episode 调度参数、实时采样轮询、命中后的 Chunk 中断和相关报告元数据；通用验收不再等待 Episode 风险层。Episode-only helper 与测试已删除。Near–Far 的预警、Repair 和只读 Geom 查询模块没有回滚；历史实验目录和日志完整保留。
+- 固定成功参考为两条不同路径：① `live_left_bspline_osc_adaptive_20261019_attempt1` 中 `--direct-bspline-osc-left`：Student 抓取 55 步，直接 B-Spline→原生 OSC 左绕 749 步，Student 接续放置 41 步，共 845 步、reward=1；② attempt3 rank-32 LoRA 纯 Student：711 步成功。当前直接 Left 执行入口与近期“18 候选 Snapshot 验收→随机候选主环境接管”是不同模式，不将后者当成历史成功路径。
+- 用原始 `launch.json` 的配置做了一次隔离输出的直接路径复现。checkpoint、task、Teacher/语义输入、`--max-steps 1600`、`--direct-bspline-osc-left`、20 mm/s 参考速度及 OSC 配置与历史相同，只将所有输出写入新目录 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_restore_20261020_attempt1/`。原始 `launch.json` 没有固定 `--seed`，本次也沿用未设种子的启动方式；复现于抓持后第 50 步进入路线，当前真实起点生成的 Left 轨迹为 843 点 / 1082 步预算（历史第 55 步进入，840 点 / 1079 步预算）。82 个真实 OSC 步后首次失败 `bilateral_grasp_or_gripper_closure_lost`；总计 132 个 Student/OSC 动作，任务失败，没有物理碰撞记录。失败时最大抓持相对旋转误差 0.198865 rad、最终双指抓持状态为 `not_grasped`。其余控制算法未改，也没有再次重试。
+- 回归：轨迹束、OSC Bridge controller、rollout contact probe 共 37 项通过；`pi05_rollout.py` 与轨迹测试 `py_compile` 通过；入口 `--help` 确认保留 `--direct-bspline-osc-left`、不再暴露 `--stratified-episode-index`。本次一回真实复现未能重现历史成功，因此只恢复了入口和触发条件，未宣称执行基线复现成功。
+- 可直接复用的历史命令依据：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/launch.json`。本次复现的 launch、report、result、NPZ 和 MP4 均在上述新目录，旧轨迹、数据集、Checkpoint 与日志未覆盖。
 
-### 后续 Episode 调度
+## 历史实验（已退出主线）：Far/Mid/Near 采样分层与真实三层 Smoke（2026-10-20）
 
-每次运行一个独立 Episode，索引 `0/1/2` 分别为 Far/Mid/Near；后续索引按 3 循环。每次指定新的 `--result-out`、`--trajectory-validation-out`、`--trace-out` 和 `--video-out`，不要复用已有产物路径。Pilot 命令：
+- 当时增加的 Episode-only 采样实现使用 Far `(60,100] mm`、Mid `(30,60] mm`、Near `≤30 mm`；该实现已从活动主流程删除。以下三回合是历史真实数据，日志和验收记录保留；其距离只用于当时的采样调度，不是物理安全结论。
+- 这些采样边界不引用、不更改 Near–Far 预警/Repair 阈值。`near_far.GAP_THRESHOLDS_M` 仍为 `(5,10,20) mm`；物理碰撞、抓持、几何余量、Contact Compiler 及 OSC 验收条件均未改。
+- `pi05_rollout.py --stratified-episode-index N` 复用原有候选生成→几何/物理筛选→随机选择→主环境 OSC 执行→Student 接续流程。候选池为空时记录拒绝原因、Snapshot 恢复结果并继续 Student。为本次保留主环境物理状态/子步接触记录；测试 `test_episode_risk_layer` 和 `test_near_far` 共 11 项通过，涉及文件 `py_compile` 通过。
+
+本次三回合均从相同初始状态使用原始 Student Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，主环境最多 1000 个动作，seed 0；候选随机种子分别为 Episode 索引。触发 Geom 对为黑碗 `geom 83` 与禁触障碍 `object_4 / geom 193`，MuJoCo Mesh 距离标有 approximation。
+
+| Episode 层 | 首次触发步 | 实测 Geom 间隙 | 候选生成 / 通过 | Snapshot 与执行 | 任务结果 | NPZ |
+|---|---:|---:|---:|---|---|---|
+| Far / index 0 | 61 | 93.269 mm | 18 / 0；6 条进入物理分支 | 恢复通过；池空，OSC 0 步，Student 接续至 1000 步 | 失败，reward 0、未 done | `logs/gs_opd/stratified_far_mid_near_20261020_attempt2/episode_000_far/episode_trace.npz` |
+| Mid / index 1 | 65 | 57.122 mm | 18 / 0；均被几何筛查拒绝 | 恢复通过；池空，OSC 0 步，Student 接续 | 成功，第 152 步 reward 1、done | `logs/gs_opd/stratified_far_mid_near_20261020_attempt2/episode_001_mid/episode_trace.npz` |
+| Near / index 2 | 68 | 26.180 mm | 18 / 0；均被几何筛查拒绝 | 恢复通过；池空，OSC 0 步，Student 接续至 1000 步 | 失败，reward 0、未 done | `logs/gs_opd/stratified_far_mid_near_20261020_attempt2/episode_002_near/episode_trace.npz` |
+
+Far 的 6 条真实 Snapshot 分支均未通过完整抓持/关节/跟踪/Compiler/任务分段验收，拒绝原因包含丢失双指抓持、Panda 关节限位及轨迹/接触证据不完整。Mid 与 Near 的 18 条候选均因 `object_4` 的 `start_sphere_clearance_insufficient` 和 `sphere_clearance_below_margin` 未进入物理分支。三层均无选中路线，且未在主环境执行候选 OSC；这是空池回退结果，不代表绕障执行成功。Near 的真实距离、18 条候选拒绝证据与 Snapshot 恢复结果均已保留。
+
+每回合完整目录同时保留 `result.json`、`trajectory_validation.json`、`episode.mp4` 和 `episode_trace.npz`，位于 `logs/gs_opd/stratified_far_mid_near_20261020_attempt2/episode_000_far/`、`episode_001_mid/`、`episode_002_near/`。Far 完整分支报告较大（306 MB），保留了真实物理验收记录。Student 与 Bridge 均已正常退出/关闭，没有训练或 Push。
+
+复现命令的 `--stratified-episode-index` 设为 0、1、2，候选 seed 跟随索引，输出目录需使用新路径：
 
 ```bash
 cd /workspace/zy_workspace/RLinf
@@ -24,24 +37,24 @@ PYTHONPATH=/workspace/zy_workspace/LIBERO-Safety \
   research/gs_opd/smoke/safety_bridge.py
 ```
 
-另一个终端执行 Episode 0；Episode 1、2 将索引分别改为 `1` / `2`、候选随机种子设为对应索引，并将输出目录换成唯一的新值：
-
 ```bash
 cd /workspace/zy_workspace/RLinf
 PYTHONPATH=/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
   /workspace/zy_workspace/RLinf/.venv/bin/python \
   research/gs_opd/smoke/pi05_rollout.py \
-  --seed 0 --max-steps 1000 \
+  --seed 0 --max-steps 1000 --record-physical-state --record-substep-contacts \
   --teacher-json logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt \
   --semantic-results-json logs/gs_opd/semantic_bindings_l0t0.json \
   --trajectory-bundle-physical-validation \
   --execute-verified-bundle-candidate-in-main-env \
   --stratified-episode-index 0 --trajectory-candidate-seed 0 \
-  --trajectory-validation-out logs/gs_opd/stratified_collection/episode_000000_far/trajectory_validation.json \
-  --trace-out logs/gs_opd/stratified_collection/episode_000000_far/episode_trace.npz \
-  --video-out logs/gs_opd/stratified_collection/episode_000000_far/episode.mp4 \
-  --result-out logs/gs_opd/stratified_collection/episode_000000_far/result.json
+  --trajectory-validation-out <fresh-dir>/trajectory_validation.json \
+  --trace-out <fresh-dir>/episode_trace.npz \
+  --video-out <fresh-dir>/episode.mp4 \
+  --result-out <fresh-dir>/result.json
 ```
+
+历史 attempt1 Far Pilot 在当时初版 5/10/20 mm 分层代码下命中 15.138 mm；它是旧采样带下的数据，不能视为本次 100/60/30 mm 区间实验结果。相关产物继续保留在 `stratified_far_mid_near_20261020_attempt1/`。
 
 ## 当前环境与基线
 

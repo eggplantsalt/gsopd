@@ -1,12 +1,13 @@
 # GS-OPD 当前局部目标
 
-## 已完成：Far/Mid/Near Episode 分层调度接入与 Far Pilot（2026-10-20）
+## 当前主线：恢复单场景过拟合成功执行基线（2026-10-20）
 
-- `pi05_rollout.py --stratified-episode-index N` 按 Far/Mid/Near 循环分配 Episode 风险层，复用现有 20/10/5 mm 间距阈值；稳定抓持后使用只读实时 Geom 距离检测首次层命中，再进入原候选验收/执行入口。阈值、轨迹生成、OSC、Teacher、Grounding、Compiler 和训练逻辑未变。
-- index 0 Far Pilot 在真实 L0T0 执行了 1000 个 Student 动作。第 71 个状态采样命中 Far，距离 15.138 mm；18 条候选都未通过几何筛选，Snapshot 恢复后 Student 继续，最终到预算上限仍未成功。原 NPZ、MP4、候选验收 JSON 和纠正过汇总标志的 sidecar 都已保存，详见进度报告。
-- 分层接入测试和相关 Near–Far/轨迹束/单候选选择回归共 44 项通过。`local_exit_region_scale=0.5` 保持不变。
+- Episode 风险层调度及其对 rollout 触发的门控已从 `pi05_rollout.py` 移除；Near–Far 独立研究、旧日志和三层采集产物均保留。稳定抓持后原有 B-Spline/OSC 直接路径和通用 Snapshot 候选验收路径不再受 Episode 采样层影响。
+- 固定成功基线：原成功示范 `55 Student 抓取 + 749 direct B-Spline/OSC Left + 41 Student 放置 = 845 步，reward=1`；attempt3 LoRA 纯 Student 回合 `711 步成功`。直接 Left 与 18 候选 Snapshot/随机接管路径保持明确区分。
+- 已按历史 `launch.json` 用原始 Student 做一次新目录真实复现：第 50 步抓持后启动直接 Left，82 OSC 步后因 `bilateral_grasp_or_gripper_closure_lost` 失败；总 132 步，未碰撞记录、任务未成功。原始 launch 未固定 `--seed`，本次也沿用未设种子；当前第 50 步稳定抓持起点生成 843 个参考点（1082 步预算），历史第 55 步起点为 840 点（1079 步预算），直接路线按实时抓持状态生成。本次不调整算法、不再重试。
+- 37 项相关单元测试、语法检查和 CLI 入口检查通过。复现视频/NPZ/JSON 保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_restore_20261020_attempt1/`；历史成功数据和配置仍在 attempt1 原目录。详见 `docs/GS_OPD_PROGRESS.md`。
 
-接下来的采集按新 Episode index 1（Mid）、2（Near）分别运行，每次使用新的报告、NPZ、视频和 rollout 结果路径；本次没有启动这两轮。
+该次入口恢复与一次复现已完成；下一步可从历史成功 `launch.json` 直接进入 `--direct-bspline-osc-left`，使用新输出目录。此入口保留但当前复现并未成功，不能把历史成功当作当前代码的确定性保证。没有训练、修改模型/数据或 Push。
 
 ## 已完成：恢复 B-Spline 出口基线并诊断 attempt3 Student 接管（2026-10-20）
 
