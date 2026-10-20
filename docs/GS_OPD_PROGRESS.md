@@ -2214,7 +2214,7 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 
 同一组固定 32 个 Episode 窗口（含首尾、索引和顺序写入报告；评估种子 `20261019`）在训练前后使用原生 Flow Matching Loss 评估：归一化模型空间 MSE **0.108403 → 0.000176912**，对应 RMSE **0.329246 → 0.013301**。这是训练轨迹拟合度，不是物理动作单位误差，也不是留出集泛化指标。三个 Epoch 的逐步 Loss 均值分别为 **0.0214884、0.00113900、0.000407166**；每个 optimizer step 的 Loss、梯度范数、学习率和显存记录在 `step_metrics.jsonl`。
 
-实际耗时（worker 计时）**946.8 s**。PyTorch 峰值 allocated 为 **17,483,085,824 bytes（16.28 GiB）**，峰值 reserved 为 **24,123,539,456 bytes（22.46 GiB）**。RLinf 保存独立 Checkpoint：`logs/gs_opd/sft/pi05_libero_lerobot_bspline_osc_v21_overfit_20261019_attempt4/checkpoints/global_step_1110/actor/`。其中 `model_state_dict/full_weights.pt` 为 6,946,527,306 bytes，no-shard FSDP `dcp_checkpoint` 也随 Runner 保存。随后用 RLinf `get_model()` 从该目录实际重新加载了 3,353,433,872 参数 Pi0.5；Action Expert 参数 `llm.layers.0.attn.q_proj.1.weight` 的已训练与重载签名完全一致，差值 **0**。原始初始 Checkpoint 和 LeRobot Episode 未覆盖。
+实际耗时（worker 计时）**946.8 s**。PyTorch 峰值 allocated 为 **17,483,085,824 bytes（16.28 GiB）**，峰值 reserved 为 **24,123,539,456 bytes（22.46 GiB）**。RLinf 当时在 `logs/gs_opd/sft/pi05_libero_lerobot_bspline_osc_v21_overfit_20261019_attempt4/checkpoints/global_step_1110/actor/` 保存独立 Checkpoint，`model_state_dict/full_weights.pt` 为 6,946,527,306 bytes，no-shard FSDP `dcp_checkpoint` 也随 Runner 保存；这些过拟合训练权重已于 2026-10-20 清理。随后实际用 RLinf `get_model()` 重新加载了 3,353,433,872 参数 Pi0.5；Action Expert 参数 `llm.layers.0.attn.q_proj.1.weight` 的已训练与重载签名完全一致，差值 **0**。原始初始 Checkpoint 和 LeRobot Episode 未覆盖。
 
 运行过程中的阻塞和处置均留在对应输出目录：无后缀的首次尝试在 Dataset 子集化后遇到 `DistributedSampler.total_size` 仍为 749，尚未反向传播；`attempt2` 的 batch 4 在注意力 Softmax 处 OOM，尝试额外申请 60 MiB 时 GPU 只剩约 58 MiB；`attempt3` 虽运行 1110 个批次，但余弦计划误设为 555 步，后半程学习率为 0，因此不作为最终结果。随后只同步 sampler 长度、把 batch 降到 2、修正计划长度并增加一致性断言，最终 `attempt4` 完整通过。最终报告和固定评估结果在 `.../attempt4/report.json`，Checkpoint 重载签名在 `.../attempt4/checkpoint_reload.json`，逐步曲线在 `.../attempt4/step_metrics.jsonl`，完整 Runner 日志在 `.../attempt4/run.log`。
 
@@ -2226,7 +2226,7 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 
 实际执行 **240 步、48 个动作块**，耗时 90.26 s，达到 Rollout 步数上限后结束；所有步的奖励均为 0，`done=False`、`success_once=False`，没有提前成功或环境终止。EEF 从 `[-0.2085, 0.0000, 1.1733] m` 移至 `[-0.6905, -0.3176, 0.8187] m`，位移 0.6775 m；实际双指关节位置和每步执行动作均在原始 NPZ 保留。该次评测未完成取放任务。它只覆盖一个初始状态和 240 步；训练 Episode 是抓持后连续 OSC 搬运片段，因此此结果说明当前 Checkpoint 直接从任务初始状态启动时尚未完成任务，不能据此否定其对训练片段的动作拟合，也不能声称完整左绕或闭环成功。此普通 Student rollout 没有运行 Contact Compiler，不能视为碰撞安全证明。
 
-评测产物保存在 `logs/gs_opd/eval/pi05_libero_overfit_attempt4_obstacle_avoidance_l0t0_20261019/`：`student_rollout.mp4`、真实七维动作及双相机 Observation/Next Observation 的 `student_rollout.npz`、原始 `result.json`、指标 `evaluation_metrics.json`、`student.log`、`safety_bridge.log` 和 `launch.json`。轨迹中 `executed_actions` 为 `(240,7)`，决策及下一状态均保存 agentview 与 wrist 的 `256×256×3` 图像。为加载这个 RLinf SFT Checkpoint 并避免覆盖固定 `/tmp` 结果，本次只给 `pi05_rollout.py` 增加了可选 `--checkpoint`、`--result-out` 参数，默认仍指向原路径，未改模型或控制逻辑。Bridge 初次被系统已安装的普通 LIBERO 包遮蔽了 Safety benchmark，修正为使用 `LIBERO-Safety/.venv` 启动后正常运行；该启动错误发生在 Student 评测开始前。
+评测产物当时保存在 `logs/gs_opd/eval/pi05_libero_overfit_attempt4_obstacle_avoidance_l0t0_20261019/`，包含 `student_rollout.mp4`、真实七维动作及双相机 Observation/Next Observation 的 `student_rollout.npz`、原始 `result.json`、指标与日志；该专属评测目录已于 2026-10-20 清理。轨迹中 `executed_actions` 为 `(240,7)`，决策及下一状态均保存 agentview 与 wrist 的 `256×256×3` 图像。为加载这个 RLinf SFT Checkpoint 并避免覆盖固定 `/tmp` 结果，本次只给 `pi05_rollout.py` 增加了可选 `--checkpoint`、`--result-out` 参数，默认仍指向原路径，未改模型或控制逻辑。Bridge 初次被系统已安装的普通 LIBERO 包遮蔽了 Safety benchmark，修正为使用 `LIBERO-Safety/.venv` 启动后正常运行；该启动错误发生在 Student 评测开始前。
 
 本次完成一次真实 MuJoCo Student 评测，没有继续重试或扩展路线；未改训练代码、模型、动作定义、安全阈值或原始数据，也未 Push。
 
@@ -2234,7 +2234,7 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 
 ### 旧权重清理与完整 Episode
 
-- 检查 `logs/gs_opd/sft/pi05_libero_lerobot_bspline_osc_v21_overfit_20261019_attempt*` 后，只删除 attempt3/4 中 8 个确认冗余的 `full_weights.pt` 与 `__0_0.distcp` 文件，释放 64,359,661,684 bytes（59.94 GiB）。attempt3/4 的报告、日志、step metrics、checkpoint 元数据均保留；其他 attempt、初始 Student Checkpoint、原始 NPZ 和原 749 步 LeRobot 数据集没有删除或覆盖。清理清单：`logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/cleanup_manifest.json`。
+- 当时先删除 attempt3/4 中 8 个冗余的 `full_weights.pt` 与 `__0_0.distcp` 文件，释放 64,359,661,684 bytes（59.94 GiB）；报告与日志曾暂时保留。2026-10-20 后续空间清理已移除本节涉及的所有过拟合训练/评测产物，保留的数据和原始 Checkpoint 见文末清理记录。
 - 从原始 `direct_bspline_osc_trajectory.npz` 新建独立 LeRobot v2.1 单 Episode：845 帧、20 Hz、原始 7D Action，阶段为 Student 抓取 55 步（0–54）、B-Spline OSC 搬运 749 步（55–803）、Student 放置 41 步（804–844）。数据集：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/lerobot_full_episode_v21/`。
 - 对 845 步 Observation–Action 做逐步对齐读取验证；horizon 10 产生 836 个无 Padding 窗口。完整索引 0–835 保留，含抓取→搬运窗口起点 46–54 和搬运→放置窗口起点 795–803；每阶段独有窗口数分别为 55/749/32。报告：`.../lerobot_full_episode_v21_conversion_report.json`。
 
@@ -2243,15 +2243,15 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 - 使用 RLinf 官方 OpenPI SFT DataLoader、`SFTRunner` 与 Pi0.5 原生 Flow Matching Loss，初始 Checkpoint 为 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，norm stats 原样读取 `physical-intelligence/libero/norm_stats.json`；没有重算统计或更改 7D 环境动作 / 32D 模型动作定义。
 - Action Expert 使用 `gemma_300m_lora` rank 32。加载器将原始 812 个旧版 OpenPI 键转换为 667 个 RLinf Pi0 非 LoRA 权重键；667/667 全部匹配，缺失和多余均为 0，官方加载器的严格 missing/unexpected 检查通过；抽查 `action_out_proj.weight` 最大值差为 0。216 个 LoRA 张量（13,860,864 个参数）是唯一可训练项，均属于 Action Expert `.1.`；VLM 和所有基础模型权重冻结。
 - 每 Epoch 纳入所有 836 个独有窗口，再均衡到抓取/搬运/放置各 750 次曝光，共 2250 个训练样本与 1125 个 optimizer step。完成单 GPU RTX 4090、no-shard FSDP、batch size 2 的 **3 Epoch / 3375 Step**，耗时 1859.0 s；峰值 allocated 15,322,550,784 bytes（14.27 GiB），峰值 reserved 23,790,092,288 bytes（22.15 GiB）。
-- Epoch 平均训练 Loss 为 **0.052098 / 0.045824 / 0.041013**。对固定的 48 个分阶段窗口做训练前后同条件评估：整体 Flow Matching MSE **0.058804 → 0.041368**；抓取 **0.017022 → 0.012987**（下降 23.7%），搬运 **0.131135 → 0.087699**（下降 33.1%），放置 **0.028254 → 0.023418**（下降 17.1%）。这些是归一化模型空间的 Flow Matching 拟合指标，不是物理动作误差或泛化指标。完整训练参数、曲线和基线见 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/report.json` 与 `step_metrics.jsonl`。
-- Runner 输出完整 Checkpoint 后导出独立 adapter：`logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/lora_adapter.pt`。其 216 个参数名与训练清单一致。对原始轨迹 step 0 的同一 Observation 使用固定 seed 做推理对照：完整训练 Checkpoint 与“初始 Student + 独立 adapter”的 `[10,7]` Action 完全一致，最大绝对差为 0。校验记录：`adapter_composition_verification.json`。训练完整权重、DCP、adapter 均保留。
+- Epoch 平均训练 Loss 为 **0.052098 / 0.045824 / 0.041013**。对固定的 48 个分阶段窗口做训练前后同条件评估：整体 Flow Matching MSE **0.058804 → 0.041368**；抓取 **0.017022 → 0.012987**（下降 23.7%），搬运 **0.131135 → 0.087699**（下降 33.1%），放置 **0.028254 → 0.023418**（下降 17.1%）。这些是归一化模型空间的 Flow Matching 拟合指标，不是物理动作误差或泛化指标。该次 report 与 step metrics 随过拟合实验产物于 2026-10-20 清理；此处保留汇总指标。
+- Runner 输出完整 Checkpoint 后当时导出独立 adapter（路径 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/lora_adapter.pt`）；该权重已于 2026-10-20 清理。其 216 个参数名与训练清单一致。对原始轨迹 step 0 的同一 Observation 使用固定 seed 做推理对照：完整训练 Checkpoint 与“初始 Student + 独立 adapter”的 `[10,7]` Action 完全一致，最大绝对差为 0。校验记录当时位于 `adapter_composition_verification.json`；训练完整权重、DCP、adapter 后于 2026-10-20 清理。
 - 启动期间出现两次未进入反向传播的接口/审计错误，均记在 `run.log`：`is_lora=true` 触发了不兼容双专家 ModuleList 的全模型 PEFT 包装；随后审计把旧 OpenPI 原始键名错当 Pi0 转换后键名。最小处理分别是关闭重复的全模型 PEFT（内部 rank-32 Action Expert LoRA 保留），以及让键名审计复用官方转换映射。最终训练只完整执行一次。
 
 ### 纯 Student 闭环评测
 
 - 加载初始 Student 与独立 LoRA，在 LIBERO-Safety `obstacle_avoidance` L0T0、初始状态 0 执行一次纯 Student rollout。Action Horizon 10、原生 7D 环境动作和原 norm stats 保持不变；设置 1000 步上限，环境在 Student 的 **120 步 / 12 个 Action Chunk** 后返回成功和 `done=True`，因此按真实终止条件停止。实际 reward sum 为 **1.0**，成功标志为真。
 - 原始 MuJoCo 状态轨迹显示目标 `akita_black_bowl_1_main` 从 `[-0.27027,-0.14337,0.92891] m` 移至 `[0.04123,0.21814,0.91234] m`，终点距 plate body 20.3 mm。目标碗与夹爪首次接触为 step 30；step 40–119 共 80 个 post-step 样本同时观察到两个真实 finger geom 与该碗接触。每个真实控制步都保存了 7D Action、双相机 post Observation、物理状态和原始接触枚举；12 个决策点保存了双相机输入和 10×7 预测 Action。此记录是逐控制步末端接触采样，没有使用 Contact Compiler、生成语义绑定或给出安全 verdict。
-- 完整 NPZ 为 `(120,7)` actions、`(120,256,256,3)` 双相机 post images、120 项物理状态与接触记录；MP4 解码验证为 121 帧（含初始帧），分辨率 256×256。产物目录：`logs/gs_opd/eval/pi05_libero_full_trajectory_lora_20261019_attempt1/`，简明结果在 `evaluation_diagnostics.json`。
+- 完整 NPZ 为 `(120,7)` actions、`(120,256,256,3)` 双相机 post images、120 项物理状态与接触记录；MP4 解码验证为 121 帧（含初始帧），分辨率 256×256。该次评测目录（视频、轨迹、日志和结果 JSON）后于 2026-10-20 清理；执行步数、奖励和接触结论保留在本进度记录。
 - 本次真实任务成功仅确认该 checkpoint 在这一固定初始状态完成该任务；不代表多初始状态泛化或安全证明。没有再训练、连续重试、批量采集或 Push。初始 Student Checkpoint、原始成功轨迹及原 749 步数据保持原样；`object_3` 语义绑定没有被伪造或修改。
 
 ## 完整示范轨迹与 LoRA 的离线动作拟合诊断（2026-10-20）
@@ -2278,10 +2278,63 @@ Smoke 报告：`logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptiv
 
 `Pi0.sft_forward()` 的 `use_action_chunk_loss` 默认是 `False`，`SFTRunner` 的 SFT 调用也没有覆盖该参数；`_reduce_sft_loss()` 因而直接对 `[B,10,32]` 全部元素求均值。Loader 中 Padding 目标维度 7–31 均严格为零，仍参加该均值；这次计算中其实际加权损失占比各阶段均低于 1%（LoRA 约 `0.31%–0.98%`），故不能把 Padding 维当作未参与训练。训练与本次闭环推理都使用 Action Horizon 10、Action Chunk 10、原始环境动作 7 维和模型动作 32 维；`pi05_rollout.py` 显式将评测配置的 `openpi.action_chunk` 覆盖为 10。实现位置见 `rlinf/models/embodiment/openpi/pi0.py:754-775,826-838` 和 `rlinf/workers/sft/fsdp_vla_sft_worker.py:86-88`。
 
-轨迹可视化 `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/spatial_paths_comparison.png` 并排显示：完整成功示范与纯 Student 的 EEF 路径；成功示范中 749 步 OSC 搬运段的实际碗心球路径与 Student 评测保存的碗 body 位置路径。示范 EEF 路径 845 点 / 1.449 m，Student EEF 120 点 / 1.047 m；B-Spline 碗心路径 749 点 / 0.748 m，Student 碗路径 120 点 / 0.756 m。Carry 段以外的示范碗位置没有伪造补齐。图中没有障碍物/碰撞判定；原始接触记录也没有重新归类。`object_3` 缺少可靠语义绑定，Compiler unknown 仍是 unknown，因此这些动作拟合指标不能解释成安全性证明。
+离线轨迹图（原保存于 `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/spatial_paths_comparison.png`，已于 2026-10-20 清理）并排显示：完整成功示范与纯 Student 的 EEF 路径；成功示范中 749 步 OSC 搬运段的实际碗心球路径与 Student 评测保存的碗 body 位置路径。示范 EEF 路径 845 点 / 1.449 m，Student EEF 120 点 / 1.047 m；B-Spline 碗心路径 749 点 / 0.748 m，Student 碗路径 120 点 / 0.756 m。Carry 段以外的示范碗位置没有伪造补齐。图中没有障碍物/碰撞判定；原始接触记录也没有重新归类。`object_3` 缺少可靠语义绑定，Compiler unknown 仍是 unknown，因此这些动作拟合指标不能解释成安全性证明。
 
-完整逐阶段数值、通道误差、模型输入维度、固定窗口索引和原始预测数组保存在 `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/offline_action_fit_diagnostic.json` 与 `paired_action_predictions.npz`。此次只新增离线诊断脚本、报告和图，未 Push。
+完整逐阶段数值、通道误差、模型输入维度与固定窗口索引曾保存在报告及预测数组中；这些离线诊断产物于 2026-10-20 清理，汇总结论保留在本节。
 
 ### 暂停指令到达时的评测队列状态
 
-处理“暂停训练和 MuJoCo 评测”的消息时，先前已经运行的 10 回合 Student 评测队列在停止信号生效前完成了剩余回合。保存记录显示 **10/10 成功**（每回合 reward `1.0`、`done=True`），实际步数为 `121, 123, 129, 124, 126, 120, 118, 124, 120, 120`；种子为 `20261020–20261029`，每回合的 MP4、NPZ、JSON 和日志均保留在 `logs/gs_opd/eval/pi05_full_trajectory_lora_obstacle_avoidance_l0t0_10runs_20261020_attempt1/`。随后已停止 Safety Bridge；这组固定状态重复率结果不构成安全证明，也没有在暂停后再次运行 Student 或 MuJoCo。
+处理“暂停训练和 MuJoCo 评测”的消息时，先前已经运行的 10 回合 Student 评测队列在停止信号生效前完成了剩余回合。保存记录显示 **10/10 成功**（每回合 reward `1.0`、`done=True`），实际步数为 `121, 123, 129, 124, 126, 120, 118, 124, 120, 120`；种子为 `20261020–20261029`，每回合的 MP4、NPZ、JSON 和日志曾保存在该评测目录，后于 2026-10-20 清理；10/10 汇总和步数列表保留在本节。随后已停止 Safety Bridge；这组固定状态重复率结果不构成安全证明，也没有在暂停后再次运行 Student 或 MuJoCo。
+
+## 从已训练 Adapter 继续做完整轨迹 LoRA 过拟合（2026-10-20）
+
+从 `pi05_libero_full_trajectory_lora_20261019_attempt1/lora_adapter.pt` 继续训练，未从原始 Student 重置 LoRA。每次初始化时先从原始 Student Checkpoint 严格加载全部 667 个非 LoRA 权重，再校验并加载旧 Adapter 的 216 个 rank-32 Action Expert LoRA 张量（13,860,864 个参数）。VLM 与全部原始权重冻结。数据仍是原始 845 步 LeRobot Episode、836 个完整 horizon-10 窗口；官方 OpenPI SFT DataLoader 每阶段每 Epoch 均衡曝光 750 个窗口，使用 RLinf `SFTRunner` 和原生 Flow Matching Loss。
+
+旧产物没有可恢复的 AdamW 状态，因此这次由旧 Adapter 权重起步，但优化器状态明确为**重新初始化**。新 AdamW 使用 `openpi_cosine` 调度：峰值 LR `1e-5`、10 步 warmup、最低 LR `1e-6`、预算 3375 步；初始 LR 为 `9.09e-7`（非零）。所有固定评估使用相同 48 个 Observation，Flow 随机种子和动作初始噪声种子均为 `20261020`；动作预测用 3 步 Euler 采样，先用原 Checkpoint 输出变换反归一化，再在真实环境 7D Action 空间计算误差。完整 chunk 指 10×7，首动作指标指 chunk 第一个时刻的 7D 动作。
+
+| 固定评估点 | 阶段 | Flow Matching MSE | 10×7 原始 Action MAE | 首动作 7D MAE |
+| --- | --- | ---: | ---: | ---: |
+| Adapter 起点 | 抓取 | 0.022752 | 0.049570 | 0.019442 |
+| Adapter 起点 | OSC 搬运 | 0.099442 | 0.158788 | 0.157280 |
+| Adapter 起点 | 放置 | 0.014252 | 0.035853 | 0.027350 |
+| Epoch 1 / 1125 步 | 抓取 | 0.022223 | 0.049332 | 0.020505 |
+| Epoch 1 / 1125 步 | OSC 搬运 | 0.091281 | 0.154809 | 0.152199 |
+| Epoch 1 / 1125 步 | 放置 | 0.014344 | 0.036527 | 0.028830 |
+| Epoch 2 / 2250 步 | 抓取 | 0.022213 | 0.049239 | 0.020680 |
+| Epoch 2 / 2250 步 | OSC 搬运 | 0.091244 | 0.154662 | 0.152211 |
+| Epoch 2 / 2250 步 | 放置 | 0.014358 | 0.036450 | 0.028871 |
+
+Epoch 1 的搬运 MSE 下降 `8.21%`、原始 7D full-chunk MAE 下降 `2.51%`，故继续训练。Epoch 2 两项分别只改善 `0.041%` 和 `0.096%`，均低于预先设定的 `1%` 停滞门槛；Runner 在 **2250 个 optimizer step / 2 Epoch** 后停止，没有开启第三 Epoch。两个 Epoch 的逐步训练 Loss 均值为 `0.0423235`、`0.0412029`。这表示固定示范状态的搬运拟合继续略有改善后进入平台期；抓取和放置固定误差变化很小，不能据此声称物理成功或泛化改善。
+
+训练 worker 用时 `1264.9 s`；GPU 峰值 allocated `14.27 GiB`、reserved `22.16 GiB`。所有 2250 条逐步 Loss / 学习率 / 梯度记录均为有限值。独立 RLinf Checkpoint 当时保存于 attempt2 的 `global_step_2250/actor/`，`full_weights.pt` 为 6,974,319,650 bytes，DCP 也已写入；独立 Adapter 有 216 张量、13,860,864 参数。Checkpoint 与 Adapter 分别重新加载后，在同一真实示范 Observation 上 10×7 预测最大绝对差为 **0.0**。这些训练权重已于 2026-10-20 清理。原始 Student Checkpoint、初始 Adapter、LeRobot 数据和 norm stats 未覆盖；norm stats SHA-256 仍为 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`。
+
+完整报告、2250 行逐步 Loss、逐 Epoch 固定评估、曲线图、Adapter 重载验证和首次启动失败日志均曾保存在两个 continuation attempt 目录中，已于 2026-10-20 清理；训练结论与指标保留在本节。该训练没有启动 Student、MuJoCo 或评测，也没有 Push。
+
+
+## 过拟合训练与评测产物空间清理（2026-10-20）
+
+按要求清理此前完整轨迹单 Episode 过拟合实验的训练权重、重复 DCP、训练日志/曲线、评测视频/轨迹/JSON 与离线拟合诊断文件。删除的专属目录包括：
+
+- `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/`、`pi05_libero_full_trajectory_lora_continue_20261020_attempt1/`、`pi05_libero_full_trajectory_lora_continue_20261020_attempt2/`。
+- `logs/gs_opd/sft/pi05_libero_lerobot_bspline_osc_v21_overfit_20261019` 及其 `attempt2`、`attempt3`、`attempt4`，以及只用于这些 SFT 实验的 `logs/gs_opd/sft/tensorboard/`。
+- `logs/gs_opd/eval/pi05_libero_full_trajectory_lora_20261019_attempt1/`、`pi05_libero_overfit_attempt4_obstacle_avoidance_l0t0_20261019/`、`pi05_full_trajectory_lora_obstacle_avoidance_l0t0_20261020_attempt1/`。
+- `logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt2/`。
+
+共删除 107 个文件，按实际分配块统计释放 **28,377,280,512 bytes（约 26.43 GiB）**。保留原始 Student Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`、845 步成功示范 `direct_bspline_osc_trajectory.npz`、749 步及完整 Episode LeRobot 数据集、执行代码、其他实验产物和本文件中的训练/评测汇总。早前各节中提到的过拟合产物路径仅作历史记录，实体文件已按本节清理；其他实验目录未动。没有 Push。
+
+
+## 恒定 1e-4 学习率的 845 步轨迹 LoRA 过拟合尝试（2026-10-20）
+
+按用户选择，从保留的原始 Student `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 初始化新的 rank-32 Action Expert LoRA；此前 Adapter 已按空间清理要求删除，本次不是从已训练 Adapter 续训。RLinf 官方 OpenPI DataLoader、`SFTRunner`、原生 Flow Matching Loss、完整 845 帧 Episode、836 个 horizon-10 完整窗口、三阶段每阶段每 Epoch 750 次均衡曝光、冻结范围和原 norm stats 均保持不变。基座的 667 个非 LoRA 权重键完整加载，216 个 Action Expert LoRA 张量（13,860,864 参数）为唯一可训练项；其余 667 个参数张量冻结。原七维环境动作、32 维模型动作及原始归一化均未改。
+
+新配置将 AdamW 优化器重新初始化，LR 固定为 `1e-4`，采用官方 `constant` Scheduler、零 Warmup、500 步预算；记录每步 Loss、梯度范数和实际 LR。训练前及计划中的 100/200/300/500 步评估均使用同一组 48 个固定 Observation、Flow/动作噪声种子 `20261020`、3 步动作采样，并逐阶段统计 Flow Matching MSE 与反归一化后的真实 10×7 动作 MAE。由于训练触发停止保护，最终只完成了 step 0 基线，未到达后续评估点：
+
+| 阶段 | 训练前 Flow Matching MSE | 训练前真实 10×7 Action MAE |
+| --- | ---: | ---: |
+| Student 抓取 | 0.026213 | 0.050710 |
+| B-Spline OSC 搬运 | 0.152026 | 0.183005 |
+| Student 放置 | 0.015728 | 0.032736 |
+
+第一次启动 attempt1 在 optimizer step 1 因学习率浮点表示 `9.999999747e-5` 被过严的精确比较误判为 LR 变化而停止；实际 LR 为恒定 `1e-4`，Loss `0.012444`、梯度范数 `0.003799`，没有 NaN/Inf。将比较改为容许浮点误差后，以相同配置、相同原始权重和随机种子启动 attempt2。attempt2 在 **18 optimizer steps** 后停止：step 18 Loss 为 **0.444459**，是之前 10 个有限 step Loss 中位数 `0.037221` 的 **11.94 倍**；梯度范数 `0.730469`，实际 LR 全程为 `9.999999747e-5`。所有 18 步记录的 Loss、梯度和 LR 均为有限值，没有 NaN/Inf。保护按“超过前 10 个有限 Loss 的中位数 10 倍”触发；没有降低 LR，也没有继续训练。该停止点早于 step 100，因此无法判断搬运阶段拟合是否改善。
+
+完整 attempt2 逐步记录、训练前分阶段评估、报告和控制台日志保留在 `logs/gs_opd/sft/pi05_libero_full_trajectory_lora_constant_lr_20261020_attempt2/`；attempt1 的浮点误判记录保留在同名 `attempt1/`。step 18 的 RLinf 全量权重与重复 DCP 共释放 14,006,829,056 allocated bytes（约 13.05 GiB），仅保留日志与报告；本轮没有可用的最终 Checkpoint 或独立 Adapter。修改范围仅为 `research/gs_opd/data/run_single_episode_sft.py` 的 fresh LoRA 初始化、500 步预算、定点固定评估和停止记录，以及 `examples/sft/config/gs_opd_full_episode_lora_constant_1e4_20261020.yaml`。没有启动 Student、MuJoCo 或评测，没有改数据、模型结构、训练目标或归一化，也没有 Push。

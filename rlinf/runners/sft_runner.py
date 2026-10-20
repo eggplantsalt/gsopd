@@ -106,15 +106,23 @@ class SFTRunner:
                 if save_model:
                     self._save_checkpoint()
 
-                should_stop = False
+                # Optional actor-side early-stop signal for bounded SFT jobs.
+                # It is emitted only by the opt-in GS-OPD continuation worker.
+                should_stop = any(
+                    float(metrics.get("gs_opd_stop_training", 0.0)) > 0.0
+                    for metrics in actor_metrics
+                )
+                if should_stop and not save_model:
+                    self._save_checkpoint()
                 if eval_model:
                     eval_handle: Handle = self.actor.run_eval()
                     eval_metrics = eval_handle.wait()
 
                     if self.early_stop is not None:
-                        should_stop, best_val_acc_improved = self.early_stop.update(
+                        validation_stop, best_val_acc_improved = self.early_stop.update(
                             eval_metrics[0]
                         )
+                        should_stop = should_stop or validation_stop
                         if best_val_acc_improved:
                             self._save_checkpoint(is_best=True)
 

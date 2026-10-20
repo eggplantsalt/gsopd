@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import itertools
 import logging
 import os
@@ -140,6 +141,11 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
         model = get_model(self.cfg.actor.model)
         if model is None:
             return super().model_provider_func()
+        from research.gs_opd.data.lora_checkpoint import load_lora_adapter
+        from openpi.transforms import compose
+        from rlinf.models.embodiment.openpi.transforms.pipeline import (
+            build_openpi_transforms,
+        )
         from safetensors import safe_open
         from rlinf.models.embodiment.openpi.checkpoint import (
             _convert_official_openpi_keys,
@@ -193,6 +199,35 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
                         f"initial_checkpoint_sample_weight_mismatch:{sample_key}:{sample_diff}"
                     )
 
+        adapter_path_value = self.cfg.gs_opd.get("initial_adapter_path", None)
+        if adapter_path_value:
+            adapter_path = Path(adapter_path_value).expanduser().resolve()
+            if not adapter_path.is_file():
+                raise FileNotFoundError(f"initial_lora_adapter_not_found:{adapter_path}")
+            adapter_metadata = load_lora_adapter(model, adapter_path)
+            if int(adapter_metadata.get("rank", -1)) != int(self.cfg.actor.model.lora_rank):
+                raise RuntimeError(
+                    f"initial_adapter_rank_mismatch:{adapter_metadata.get('rank')}"
+                )
+            loaded_adapter_names = set(adapter_metadata.get("tensor_names", []))
+            if loaded_adapter_names != adapter_keys:
+                raise RuntimeError("initial_adapter_does_not_cover_all_action_expert_lora_tensors")
+            self._initial_adapter_load = {
+                "status": "loaded_existing_adapter",
+                "path": str(adapter_path),
+                "sha256": hashlib.sha256(adapter_path.read_bytes()).hexdigest(),
+                "metadata": adapter_metadata,
+                "all_action_expert_lora_tensors_loaded": True,
+            }
+        else:
+            self._initial_adapter_load = {
+                "status": "fresh_lora_initialization",
+                "path": None,
+                "reason": "no prior adapter was available; rank-32 Action Expert LoRA tensors use the model initializer",
+                "rank": int(self.cfg.actor.model.lora_rank),
+                "tensor_count": len(adapter_keys),
+            }
+
         trainable_names = []
         for name, parameter in model.named_parameters():
             parameter.requires_grad_("lora_" in name)
@@ -232,6 +267,14 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
             "sample_weight_max_abs_diff": sample_diff,
             "complete_non_lora_load": True,
         }
+        _, output_transforms = build_openpi_transforms(
+            str(self.cfg.actor.model.model_path),
+            str(self.cfg.actor.model.openpi.config_name),
+            data_kwargs=OmegaConf.to_container(
+                self.cfg.actor.model.openpi_data, resolve=True
+            ),
+        )
+        self._eval_output_transform = compose(output_transforms)
         self._pre_fsdp_trainable_parameters = trainable
         self._pre_fsdp_frozen_tensor_count = frozen_tensors
         return model
@@ -239,9 +282,14 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
     def init_worker(self):
         super().init_worker()
         self._steps_per_epoch = self.get_max_steps_per_epoch()
-        self._expected_total_steps = self._steps_per_epoch * int(
-            self.cfg.runner.max_epochs
-        )
+        step_limits = []
+        max_epochs = int(self.cfg.runner.get("max_epochs", -1))
+        max_steps = int(self.cfg.runner.get("max_steps", -1))
+        if max_epochs > 0:
+            step_limits.append(self._steps_per_epoch * max_epochs)
+        if max_steps >= 0:
+            step_limits.append(max_steps)
+        self._expected_total_steps = min(step_limits) if step_limits else self._steps_per_epoch
         configured_total_steps = int(self.cfg.actor.optim.total_training_steps)
         if configured_total_steps != self._expected_total_steps:
             raise ValueError(
@@ -256,10 +304,42 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
         self._training_started = time.monotonic()
         self._step_metrics_path = self._report_dir / "step_metrics.jsonl"
         self._step_metrics_path.write_text("", encoding="utf-8")
-        self._eval_seed = 20261019
+        self._epoch_eval_metrics_path = self._report_dir / "epoch_eval.jsonl"
+        self._epoch_eval_metrics_path.write_text("", encoding="utf-8")
+        self._flow_eval_seed = int(self.cfg.gs_opd.flow_eval_seed)
+        self._action_eval_seed = int(self.cfg.gs_opd.action_eval_seed)
+        self._action_eval_solver_steps = int(self.cfg.gs_opd.action_eval_solver_steps)
+        self._fixed_eval_steps = [
+            int(step) for step in self.cfg.gs_opd.get("fixed_eval_steps", [])
+        ]
+        if self._fixed_eval_steps != sorted(set(self._fixed_eval_steps)) or any(
+            step <= 0 or step > self._expected_total_steps
+            for step in self._fixed_eval_steps
+        ):
+            raise ValueError(f"invalid_fixed_eval_steps:{self._fixed_eval_steps}")
+        self._fixed_eval_metrics_path = self._report_dir / "fixed_eval_by_step.jsonl"
+        self._fixed_eval_metrics_path.write_text("", encoding="utf-8")
+        self._epoch_evaluations: list[dict[str, Any]] = []
+        self._fixed_eval_by_step: list[dict[str, Any]] = []
+        self._training_loss_history: list[float] = []
+        self._first_failure_reason: str | None = None
+        self._stop_training_requested = False
 
-        baseline = self._evaluate_fixed_flow_loss()
+        baseline = self._evaluate_fixed_fit()
+        if not self._tree_is_finite(baseline):
+            raise RuntimeError("nonfinite_fixed_evaluation_before_training")
+        baseline_record = {"step": 0, "fixed_eval": baseline}
+        self._fixed_eval_by_step.append(baseline_record)
+        with self._fixed_eval_metrics_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(baseline_record, ensure_ascii=False) + "\n")
         initial_parameter = self._trainable_parameter_signature()
+        initial_lr = float(self.optimizer.param_groups[0]["lr"])
+        if not np.isfinite(initial_lr) or initial_lr != float(self.cfg.actor.optim.lr):
+            raise RuntimeError(f"configured_initial_learning_rate_mismatch:{initial_lr}")
+        if str(self.cfg.actor.optim.lr_scheduler) == "constant" and int(
+            self.cfg.actor.optim.get("lr_warmup_steps", -1)
+        ) != 0:
+            raise RuntimeError("constant_learning_rate_requires_zero_warmup")
         report = {
             "dataset_path": str(self.cfg.data.train_data_paths),
             "episode_frames": int(self.cfg.data.expected_frames),
@@ -275,8 +355,28 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
             "total_optimizer_steps": int(self._expected_total_steps),
             "optimizer_schedule_steps": configured_total_steps,
             "fixed_eval_indices_by_phase": self._fixed_eval_phase_indices,
-            "fixed_eval_seed": self._eval_seed,
+            "fixed_eval_steps": [0, *self._fixed_eval_steps],
+            "fixed_eval_seed": self._flow_eval_seed,
+            "fixed_action_eval_seed": self._action_eval_seed,
+            "fixed_action_eval_solver_steps": self._action_eval_solver_steps,
             "base_checkpoint": str(self.cfg.actor.model.model_path),
+            "initial_adapter_load": self._initial_adapter_load,
+            "optimizer_state": {
+                "status": "reinitialized",
+                "reason": "a new AdamW optimizer was created for this run; no optimizer state was loaded",
+                "optimizer": "RLinf SFTRunner configured AdamW",
+                "initial_optimizer_step": 0,
+            },
+            "learning_rate_schedule": {
+                "scheduler": str(self.cfg.actor.optim.lr_scheduler),
+                "peak_lr": float(self.cfg.actor.optim.lr),
+                "minimum_lr": float(self.cfg.actor.optim.min_lr),
+                "warmup_steps": int(self.cfg.actor.optim.lr_warmup_steps),
+                "schedule_steps": configured_total_steps,
+                "initial_lr_after_scheduler_setup": initial_lr,
+                "constant_learning_rate": str(self.cfg.actor.optim.lr_scheduler) == "constant"
+                and int(self.cfg.actor.optim.lr_warmup_steps) == 0,
+            },
             "norm_stats_path": str(self.cfg.actor.model.openpi_data.norm_stats_path),
             "frozen_original_parameter_tensors": int(
                 getattr(self, "_pre_fsdp_frozen_tensor_count", 0)
@@ -288,6 +388,16 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
             "lora_rank": 32,
             "trainable_parameter_signature_before": initial_parameter,
             "fixed_eval_before": baseline,
+            "fixed_eval_by_step": self._fixed_eval_by_step,
+            "fixed_eval_by_epoch": self._epoch_evaluations,
+            "divergence_guard": {
+                "stop_on_nonfinite_loss_gradient_or_learning_rate": True,
+                "stop_on_finite_batch_loss_spike": False,
+            },
+            "early_stop_policy": {
+                "fit_plateau_or_regression_stopping": False,
+                "stop_only_on_nonfinite_training_or_fixed_evaluation_metrics": True,
+            },
             "gpu_name": torch.cuda.get_device_name(torch.cuda.current_device()),
             "gpu_peak_memory_bytes_before_training": int(
                 torch.cuda.max_memory_allocated()
@@ -304,25 +414,76 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
     def run_training(self):
         metrics = super().run_training()
         completed_step = int(self.global_step) + 1
+        scalar_metrics = {}
+        nonfinite_metrics = []
+        for key, value in metrics.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                scalar_metrics[key] = number
+            else:
+                nonfinite_metrics.append(key)
+        current_loss = scalar_metrics.get("loss")
+        failure_reason = None
+        if nonfinite_metrics:
+            failure_reason = "nonfinite_training_metrics:" + ",".join(sorted(nonfinite_metrics))
+        if failure_reason is None and str(self.cfg.actor.optim.lr_scheduler) == "constant":
+            actual_lr = scalar_metrics.get("learning_rate")
+            expected_lr = float(self.cfg.actor.optim.lr)
+            if actual_lr is None or not np.isclose(actual_lr, expected_lr, rtol=1e-6, atol=0.0):
+                failure_reason = f"constant_learning_rate_changed:{actual_lr}"
+        if current_loss is not None and np.isfinite(current_loss):
+            self._training_loss_history.append(current_loss)
+
         step_record = {
             "step": completed_step,
             "epoch": int((completed_step - 1) // self._steps_per_epoch + 1),
-            **{key: float(value) for key, value in metrics.items()},
+            **scalar_metrics,
+            "nonfinite_metrics": nonfinite_metrics,
+            "stop_reason": failure_reason,
             "elapsed_seconds": float(time.monotonic() - self._training_started),
             "gpu_memory_allocated_bytes": int(torch.cuda.memory_allocated()),
             "gpu_memory_reserved_bytes": int(torch.cuda.memory_reserved()),
             "gpu_peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
         }
+        if failure_reason is None and completed_step in self._fixed_eval_steps:
+            fixed_eval = self._evaluate_fixed_fit()
+            if not self._tree_is_finite(fixed_eval):
+                failure_reason = "nonfinite_fixed_evaluation_at_step_" + str(completed_step)
+            eval_record = {
+                "step": completed_step,
+                "fixed_eval": fixed_eval,
+                "elapsed_seconds": float(time.monotonic() - self._training_started),
+            }
+            self._fixed_eval_by_step.append(eval_record)
+            with self._fixed_eval_metrics_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(eval_record, ensure_ascii=False) + "\n")
+
+        if failure_reason is not None:
+            self._first_failure_reason = failure_reason
+            self._stop_training_requested = True
+            step_record["stop_reason"] = failure_reason
+
         with self._step_metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(step_record, ensure_ascii=False) + "\n")
 
-        if completed_step == self._expected_total_steps:
-            final_fit = self._evaluate_fixed_flow_loss()
+        if self._stop_training_requested:
+            metrics["gs_opd_stop_training"] = 1.0
+
+        if completed_step == self._expected_total_steps or self._stop_training_requested:
+            final_fit = self._fixed_eval_by_step[-1]["fixed_eval"]
             final_parameter = self._trainable_parameter_signature()
             final = json.loads((self._report_dir / "report.json").read_text())
             final.update(
                 {
                     "fixed_eval_after": final_fit,
+                    "fixed_eval_by_step": self._fixed_eval_by_step,
+                    "fixed_eval_by_epoch": self._epoch_evaluations,
+                    "stop_reason": self._first_failure_reason
+                    or "configured_optimizer_step_budget_completed",
+                    "completed_optimizer_steps": completed_step,
                     "trainable_parameter_signature_after": final_parameter,
                     "trainable_parameter_changed": (
                         final_parameter["signature"]
@@ -338,7 +499,7 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
                     "checkpoint_path": str(
                         self._report_dir
                         / "checkpoints"
-                        / f"global_step_{self._expected_total_steps}"
+                        / f"global_step_{completed_step}"
                         / "actor"
                     ),
                 }
@@ -346,53 +507,198 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
             self._write_report(final)
         return metrics
 
-    def _evaluate_fixed_flow_loss(self) -> dict[str, Any]:
+    @classmethod
+    def _tree_is_finite(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            return all(cls._tree_is_finite(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return all(cls._tree_is_finite(item) for item in value)
+        if isinstance(value, (int, float, np.number)):
+            return bool(np.isfinite(value))
+        return True
+
+    @staticmethod
+    def _fit_metric_spiked(current: dict[str, Any], previous: dict[str, Any]) -> bool:
+        for phase, metrics in current["by_phase"].items():
+            old = previous["by_phase"][phase]
+            old_values = (
+                float(old["flow_matching_mse"]),
+                float(old["raw_7d_action_error_full_10_step_chunk"]["mae_all_7d"]),
+            )
+            new_values = (
+                float(metrics["flow_matching_mse"]),
+                float(metrics["raw_7d_action_error_full_10_step_chunk"]["mae_all_7d"]),
+            )
+            if any(new > max(1e-8, 10.0 * old) for old, new in zip(old_values, new_values)):
+                return True
+        return False
+
+    def _evaluate_fixed_fit(self) -> dict[str, Any]:
         self.model.eval()
-        torch.manual_seed(self._eval_seed)
-        torch.cuda.manual_seed_all(self._eval_seed)
+        torch.manual_seed(self._flow_eval_seed)
+        torch.cuda.manual_seed_all(self._flow_eval_seed)
         loss_sum = 0.0
         examples = 0
-        phase_loss_sums = {
-            name: {"loss_sum": 0.0, "examples": 0}
-            for name in ("student_grasp", "bspline_osc_carry", "student_place")
-        }
+        phase_losses = {name: [] for name in self._fixed_eval_phase_indices}
+        phase_actions = {name: {"pred": [], "target": []} for name in phase_losses}
+        rng = np.random.default_rng(self._action_eval_seed)
+        fixed_noise = rng.standard_normal((48, 10, 32), dtype=np.float32)
         with torch.no_grad():
             eval_torch_loader = self.eval_data_loader._data_loader.torch_loader
             if len(self._fixed_eval_phase_sequence) != len(eval_torch_loader):
                 raise RuntimeError("fixed_phase_eval_order_does_not_match_loader_length")
+            if len(eval_torch_loader) != 48:
+                raise RuntimeError(
+                    f"fixed_eval_expected_48_samples_got_{len(eval_torch_loader)}"
+                )
+            module = self.model.module
             for eval_index, batch in enumerate(
                 itertools.islice(self.eval_data_loader, len(eval_torch_loader))
             ):
-                with self.amp_context:
-                    output = self.model(forward_type=ForwardType.SFT, data=batch)
+                # Call through the FSDP root for the native loss forward so its
+                # lazy initialization and mixed-precision hooks stay active.
+                output = self.model(forward_type=ForwardType.SFT, data=batch)
                 loss = output["loss"] if isinstance(output, dict) else output
-                batch_size = int(batch[1].shape[0])
+                raw_observation, raw_actions = module._unpack_sft_batch(batch)
+                observation = module._observation_to_device(raw_observation)
+                actions = module._actions_to_device(raw_actions)
+                noise = torch.as_tensor(
+                    fixed_noise[eval_index : eval_index + 1], device=self.device
+                )
+                predicted_model_actions = module.sample_actions(
+                    observation,
+                    num_steps=self._action_eval_solver_steps,
+                    noise=noise,
+                )
+                predicted_raw_actions = self._decode_raw_actions(
+                    predicted_model_actions, observation.state
+                )
+                target_raw_actions = self._decode_raw_actions(actions, observation.state)
+                batch_size = int(actions.shape[0])
                 if batch_size != 1:
                     raise ValueError("phase-specific fixed evaluation requires eval_batch_size=1")
                 phase = self._fixed_eval_phase_sequence[eval_index]
                 step_loss = float(loss.detach().float().item())
                 loss_sum += step_loss * batch_size
                 examples += batch_size
-                phase_loss_sums[phase]["loss_sum"] += step_loss
-                phase_loss_sums[phase]["examples"] += batch_size
+                phase_losses[phase].append(step_loss)
+                predicted_np = predicted_raw_actions.detach().float().cpu().numpy()
+                target_np = target_raw_actions.detach().float().cpu().numpy()
+                if predicted_np.shape != (1, 10, 7) or target_np.shape != (1, 10, 7):
+                    raise RuntimeError(
+                        "raw_action_eval_shape_mismatch:"
+                        f"pred={predicted_np.shape}:target={target_np.shape}"
+                    )
+                phase_actions[phase]["pred"].append(predicted_np[0])
+                phase_actions[phase]["target"].append(target_np[0])
         self.model.train()
+        self.model.module.img.eval()
         if examples == 0:
             raise RuntimeError("fixed evaluation subset is empty")
         mean_loss = loss_sum / examples
+
+        def action_metrics(predictions: list[np.ndarray], targets: list[np.ndarray]):
+            pred = np.asarray(predictions, dtype=np.float64)
+            target = np.asarray(targets, dtype=np.float64)
+            error = pred - target
+            return {
+                "sample_count": int(error.shape[0]),
+                "action_horizon": int(error.shape[1]),
+                "raw_action_dim": int(error.shape[2]),
+                "mae_all_7d": float(np.abs(error).mean()),
+                "rmse_all_7d": float(np.sqrt(np.square(error).mean())),
+                "mae_by_dim": np.abs(error).mean(axis=(0, 1)).tolist(),
+                "rmse_by_dim": np.sqrt(np.square(error).mean(axis=(0, 1))).tolist(),
+            }
+
+        by_phase = {}
+        for name, losses in phase_losses.items():
+            predictions = phase_actions[name]["pred"]
+            targets = phase_actions[name]["target"]
+            by_phase[name] = {
+                "flow_matching_mse": float(np.mean(losses)),
+                "flow_matching_rmse_normalized_model_space": float(
+                    np.sqrt(np.mean(losses))
+                ),
+                "examples": len(losses),
+                "raw_7d_action_error_full_10_step_chunk": action_metrics(
+                    predictions, targets
+                ),
+                "raw_7d_action_error_first_action": action_metrics(
+                    [item[:1] for item in predictions],
+                    [item[:1] for item in targets],
+                ),
+            }
         return {
             "flow_matching_mse": mean_loss,
             "flow_matching_rmse_normalized_model_space": float(np.sqrt(mean_loss)),
             "examples": examples,
-            "by_phase": {
-                name: {
-                    "flow_matching_mse": values["loss_sum"] / values["examples"],
-                    "flow_matching_rmse_normalized_model_space": float(
-                        np.sqrt(values["loss_sum"] / values["examples"])
-                    ),
-                    "examples": int(values["examples"]),
-                }
-                for name, values in phase_loss_sums.items()
-            },
+            "flow_matching_seed": self._flow_eval_seed,
+            "fixed_action_noise_seed": self._action_eval_seed,
+            "action_solver_steps": self._action_eval_solver_steps,
+            "action_error_target": "official OpenPI loader targets decoded by the original pi05_libero output transform to raw environment 7D actions",
+            "by_phase": by_phase,
+        }
+
+    def _decode_raw_actions(
+        self, model_actions: torch.Tensor, state: torch.Tensor
+    ) -> torch.Tensor:
+        from rlinf.models.embodiment.openpi.transforms.apply import (
+            apply_output_transform,
+        )
+
+        decoded = apply_output_transform(
+            self._eval_output_transform,
+            {"actions": model_actions, "state": state},
+            action_chunk=int(self.cfg.actor.model.num_action_chunks),
+        )["actions"]
+        return decoded.to(device=self.device, dtype=torch.float32)
+
+    def _evaluate_carry_progress(
+        self, previous: dict[str, Any], current: dict[str, Any]
+    ) -> dict[str, Any]:
+        phase = "bspline_osc_carry"
+        previous_phase = previous["by_phase"][phase]
+        current_phase = current["by_phase"][phase]
+        previous_mse = float(previous_phase["flow_matching_mse"])
+        current_mse = float(current_phase["flow_matching_mse"])
+        previous_mae = float(
+            previous_phase["raw_7d_action_error_full_10_step_chunk"]["mae_all_7d"]
+        )
+        current_mae = float(
+            current_phase["raw_7d_action_error_full_10_step_chunk"]["mae_all_7d"]
+        )
+        values = (previous_mse, current_mse, previous_mae, current_mae)
+        if not all(np.isfinite(value) for value in values):
+            return {
+                "stop_training": True,
+                "reason": "nonfinite_carry_fit_metric",
+                "relative_flow_mse_reduction": None,
+                "relative_raw_7d_chunk_mae_reduction": None,
+            }
+        mse_reduction = (previous_mse - current_mse) / max(abs(previous_mse), 1e-12)
+        mae_reduction = (previous_mae - current_mae) / max(abs(previous_mae), 1e-12)
+        regression = max(-mse_reduction, -mae_reduction)
+        if regression > self._regression_stop_relative_threshold:
+            stop, reason = True, "carry_fit_metric_regression_exceeded_stop_threshold"
+        elif (
+            mse_reduction < self._plateau_relative_threshold
+            and mae_reduction < self._plateau_relative_threshold
+        ):
+            stop, reason = True, "carry_flow_mse_and_raw_7d_action_error_improvement_stalled"
+        else:
+            stop, reason = False, "carry_fit_still_improving"
+        return {
+            "stop_training": stop,
+            "reason": reason,
+            "previous_flow_matching_mse": previous_mse,
+            "current_flow_matching_mse": current_mse,
+            "relative_flow_mse_reduction": float(mse_reduction),
+            "previous_raw_7d_chunk_mae": previous_mae,
+            "current_raw_7d_chunk_mae": current_mae,
+            "relative_raw_7d_chunk_mae_reduction": float(mae_reduction),
+            "plateau_relative_threshold": self._plateau_relative_threshold,
+            "regression_stop_relative_threshold": self._regression_stop_relative_threshold,
         }
 
     def _trainable_parameter_signature(self) -> dict[str, Any]:
@@ -448,6 +754,13 @@ def main(cfg) -> None:
         epochs: dict[int, list[float]] = {}
         for row in step_rows:
             epochs.setdefault(int(row["epoch"]), []).append(float(row["loss"]))
+        completed_steps = len(step_rows)
+        report["checkpoint_path"] = str(
+            report_dir
+            / "checkpoints"
+            / f"global_step_{completed_steps}"
+            / "actor"
+        )
         report["loss_curve_by_epoch"] = [
             {
                 "epoch": epoch,
@@ -458,10 +771,33 @@ def main(cfg) -> None:
             }
             for epoch, losses in sorted(epochs.items())
         ]
-        report["completed_optimizer_steps"] = len(step_rows)
+        report["completed_optimizer_steps"] = completed_steps
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        figure, loss_axis = plt.subplots(figsize=(12, 5), constrained_layout=True)
+        steps = [int(row["step"]) for row in step_rows]
+        losses = [float(row["loss"]) for row in step_rows]
+        loss_axis.plot(steps, losses, linewidth=0.7, alpha=0.65, label="optimizer-step Flow MSE")
+        loss_axis.set_xlabel("Optimizer step")
+        loss_axis.set_ylabel("Flow Matching loss")
+        loss_axis.grid(True, alpha=0.25)
+        lr_axis = loss_axis.twinx()
+        learning_rates = [float(row["learning_rate"]) for row in step_rows]
+        lr_axis.plot(steps, learning_rates, color="tab:orange", linewidth=1.0, label="learning rate")
+        lr_axis.set_ylabel("Learning rate")
+        for epoch in sorted(epochs):
+            loss_axis.axvline(epoch * int(report["steps_per_epoch"]), color="gray", linestyle="--", linewidth=0.7)
+        handles_a, labels_a = loss_axis.get_legend_handles_labels()
+        handles_b, labels_b = lr_axis.get_legend_handles_labels()
+        loss_axis.legend(handles_a + handles_b, labels_a + labels_b, loc="upper right")
+        figure.savefig(report_dir / "loss_curve.png", dpi=160)
+        plt.close(figure)
 
 
 if __name__ == "__main__":
