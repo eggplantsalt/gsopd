@@ -2594,3 +2594,21 @@ OSC 路线完成后，Student 从最后一帧真实主环境 Observation 接续�
 两条路线均为 `trajectory-001` Left、原生 7D `OSC_POSE`，参考速度 0.020 m/s、控制步长 0.05 s、软推进误差 12 mm、单 Waypoint 追赶上限 32 步、总追赶上限 240 步、局部出口尺度 0.5、绕障间隙 20 mm；OSC 控制器报告与完整控制参数相同。前 82 个球心参考点的失败−成功平均位移是 `[+1.35, +1.72, -11.28]` mm，平均差模长 11.49 mm；扣除首点平移后，两条路线的形状差 RMS 0.99 mm、最大 1.72 mm。参考路线上主要是跟随不同起始球心/场景几何造成的整体下移，并非 B-Spline 形状或 OSC 配置改变。两次计算出的预算 1079/1082 步及路线点数 840/843 随状态生成而异，不是控制器参数差异。
 
 **判断：**现有证据更支持失败来自不同的 Student 交接/抓持起始状态，而非代码或控制配置回归。尤其起始黑碗低约 12 mm、姿态差约 6.46°且 EEF 相对抓持横向偏移；失败又在第 82 步表现为单步抓持滑脱，而非 EEF 跟踪发散。最小建议是下一次复现固定 Student 初始状态/随机种子和抓取前缀，并在启动 OSC 前核对起始关节、EEF、黑碗位姿及双指接触与成功回合一致；暂不改规划或控制逻辑。数据源为两目录各自的 `*_report.json` 与 `direct_bspline_osc_trajectory.npz`。
+
+## 原始 π₀.₅ 多候选 On-Policy 采集试跑（2026-10-20）
+
+以历史 `55 Student + 749 Left 自适应 OSC + 41 Student` 成功回合为参照，使用原始 Student Checkpoint（未加载 LoRA）启动一次 L0T0 初始状态 0 采集。先将 `trajectory_tracking` 分支预算设为允许上限 1200 步，物理验证候选仅选 Left `trajectory-001` 和 Above `trajectory-003`，避免默认 480 步预算截断 Left 路线；`local_exit_region_scale=0.5`、OSC、跟踪及安全阈值不变。Student seed 为 0，候选选择 seed 为 1；分支在第 50 步稳定双指抓持 Snapshot 上运行。
+
+| 项目 | 结果 |
+| --- | --- |
+| B-Spline 候选生成/几何筛选 | 18 条生成；2 条进入本次 Snapshot 物理分支 |
+| 分支验证/恢复 | 完成 2 条；Snapshot 恢复通过；完整物理验收通过 0 条，合格池为空，未选择候选 |
+| 首要分支阻塞 | 两条路线均触发真实 `active_Panda_joint_limit_violated`（轨迹跟踪记录的对应关节限位失败分别出现在控制步 176/180）；未因此放宽关节或其他安全约束 |
+| 主环境 B-Spline/OSC 搬运 | 0 步；未执行未通过分支 |
+| Student 回退任务结果 | 空池后按现有路径继续；原始 Student 在总第 778 步 reward=1、`done=True`。这是 Student-only 成功 Episode，不是新的 B-Spline 安全绕障示范 |
+
+完整 778 步 NPZ 保存 778×7 实际 Student Action、156 帧决策 Observation 和 778 帧 Next Observation（两相机均为 256×256×3），并启用逐步物理状态及接触/子步监测。该回合的动作来源全为 Student；没有 OSC 候选动作，逐步来源映射另存于 `action_source_manifest.json`。MP4、NPZ、完整 Snapshot 分支与接触记录、结果和启动参数分别保存在 `logs/gs_opd/eval/trajectory_bundle_multiroute_onpolicy_l0t0_20261020_attempt1/` 下的 `student_and_candidate.mp4`、`student_onpolicy_trace.npz`、`trajectory_validation_report.json`、`result.json`、`launch.json` 与日志文件中。报告约 142 MB，NPZ 约 168 MB。没有将 Student 成功 reward 解释为整回合 Contact Compiler `safe`：本次候选没有通过完整物理验收，也未产生主环境安全绕障路段。
+
+最小回归最初发现 2 项 Snapshot 接受测试的模拟 Bundle 声明有候选数量但列表为空，当前入口按预期拒绝了这份不一致输入；只补齐测试夹具中的两条候选，没有改生产代码。轨迹生成、验收、跟踪及 Rollout 相关测试最终 **83 项通过、67 个子测试通过**，语法与 CLI 参数核对通过。
+
+**当前阻塞：**已排除默认 480 步上限，但最有希望的历史 Left 路线和一个已通过旧 Above Smoke 的参考候选在当前抓持状态下均未通过 Panda 关节限位检查。当前未获得新的安全 B-Spline→OSC→Student 完整成功示范，本轮不继续调参或重试。下一步需先从现有失败分支的关节限位记录定位发生限位的活动关节和参考姿态；在没有经验证的最小路线/起始状态调整前，不将这些候选加入合格池。

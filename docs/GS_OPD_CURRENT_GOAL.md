@@ -1,13 +1,11 @@
 # GS-OPD 当前局部目标
 
-## 当前主线：恢复单场景过拟合成功执行基线（2026-10-20）
+## 当前主线：多候选 On-Policy 安全轨迹采集试跑（2026-10-20）
 
-- Episode 风险层调度及其对 rollout 触发的门控已从 `pi05_rollout.py` 移除；Near–Far 独立研究、旧日志和三层采集产物均保留。稳定抓持后原有 B-Spline/OSC 直接路径和通用 Snapshot 候选验收路径不再受 Episode 采样层影响。
-- 固定成功基线：原成功示范 `55 Student 抓取 + 749 direct B-Spline/OSC Left + 41 Student 放置 = 845 步，reward=1`；attempt3 LoRA 纯 Student 回合 `711 步成功`。直接 Left 与 18 候选 Snapshot/随机接管路径保持明确区分。
-- 已按历史 `launch.json` 用原始 Student 做一次新目录真实复现：第 50 步抓持后启动直接 Left，82 OSC 步后因 `bilateral_grasp_or_gripper_closure_lost` 失败；总 132 步，未碰撞记录、任务未成功。原始 launch 未固定 `--seed`，本次也沿用未设种子；当前第 50 步稳定抓持起点生成 843 个参考点（1082 步预算），历史第 55 步起点为 840 点（1079 步预算），直接路线按实时抓持状态生成。本次不调整算法、不再重试。
-- 37 项相关单元测试、语法检查和 CLI 入口检查通过。复现视频/NPZ/JSON 保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_restore_20261020_attempt1/`；历史成功数据和配置仍在 attempt1 原目录。详见 `docs/GS_OPD_PROGRESS.md`。
-
-该次入口恢复与一次复现已完成；下一步可从历史成功 `launch.json` 直接进入 `--direct-bspline-osc-left`，使用新输出目录。此入口保留但当前复现并未成功，不能把历史成功当作当前代码的确定性保证。没有训练、修改模型/数据或 Push。
+- 沿用原始 π₀.₅ Student、当前 Safety Bridge 和完整的 `18 候选生成 → Snapshot 物理验收 → 合格池随机选择 → 主环境 OSC 执行 → Student 接续` 入口。历史 845 步 Left 成功回合继续作为直接路线基线；本次没有改 B-Spline、OSC、Teacher、Grounding、Compiler、安全阈值、LoRA 或训练流程。
+- 新 attempt1 在第 50 步稳定双指抓持后几何生成 18 条，只对 Left `trajectory-001` 和 Above `trajectory-003` 做物理分支；预算设 1200，Snapshot 恢复通过，但 0/2 候选完整验收通过，跟踪期间遇到 Panda 关节限位失败。合格池为空，未执行候选路线。
+- 空池后原始 Student 按既有回退继续，并于第 778 步 reward=1、`done=True`。这回合是完整 Student-only 成功，不计为新的 B-Spline/OSC 安全轨迹。NPZ、双相机视频、全步物理与子步接触记录及完整分支报告保存在 `logs/gs_opd/eval/trajectory_bundle_multiroute_onpolicy_l0t0_20261020_attempt1/`。
+- 当前唯一阻塞是候选路线在该稳定抓持起点下触发活动 Panda 关节限位；未降低约束、未重试。需要基于保存的两条分支报告定位限位关节与姿态，确认安全的最小调整后再开展下一条路线。测试夹具最小修正后相关回归为 83 项通过、67 个子测试通过。
 
 ## 已完成：恢复 B-Spline 出口基线并诊断 attempt3 Student 接管（2026-10-20）
 

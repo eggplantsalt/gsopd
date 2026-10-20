@@ -526,9 +526,12 @@ class SnapshotAcceptanceTests(unittest.TestCase):
         }
         bundle = {
             "status": "complete",
-            "candidate_count": 18,
+            "candidate_count": 2,
             "screen_pass_count": 2,
-            "candidates": [],
+            "candidates": [
+                {"candidate_id": "path-1", "direction": "left"},
+                {"candidate_id": "path-2", "direction": "above"},
+            ],
         }
         tracking = tracking_override or {
             "status": "complete",
