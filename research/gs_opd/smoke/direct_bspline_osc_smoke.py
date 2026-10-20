@@ -665,3 +665,422 @@ def run_live_direct_bspline_osc_smoke(
         except Exception:
             pass
         return report, latest_bridge_data
+
+
+def run_live_verified_bundle_candidate_main_execution(
+    connection: Any,
+    context: dict[str, Any],
+    trigger_grasp_state: dict[str, Any],
+    acceptance_report: dict[str, Any],
+    selected: dict[str, Any],
+    selected_tracking_candidate: dict[str, Any],
+    *,
+    decision_step: int,
+    trace_writer: Any,
+    chunk_index: int,
+    initial_bridge_data: dict[str, Any],
+    video_frames: list[Any] | None,
+    video_frame_encoder: Callable[[dict[str, Any]], np.ndarray] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Execute one already-accepted bundle route in the restored main environment."""
+    from research.gs_opd.repair.trajectory_bundle_acceptance import (
+        select_verified_candidate,
+    )
+
+    latest_bridge_data = initial_bridge_data
+    report: dict[str, Any] = {
+        "operation": "execute_selected_physically_verified_bundle_candidate_in_main_environment",
+        "status": "blocked",
+        "execution_environment": "main_MuJoCo_environment_after_verified_Snapshot_restore",
+        "decision_step": int(decision_step),
+        "selected_candidate_id": selected.get("candidate_id"),
+        "selected_direction": selected.get("direction"),
+        "selection_seed": selected.get("seed"),
+        "selection_pool_candidate_ids": selected.get("selection_pool_candidate_ids"),
+        "branch_physical_tracking_status": selected.get("physical_tracking_status"),
+        "branch_contact_compiler_verdict": selected.get("contact_compiler_verdict"),
+        "main_environment_actions": 0,
+        "route_completed": False,
+        "student_continuation": False,
+        "training_label_created": False,
+        "steps": [],
+        "failure_reason": None,
+    }
+    try:
+        tracking = acceptance_report.get("tracking")
+        if (
+            not isinstance(tracking, dict)
+            or tracking.get("status") != "complete"
+            or tracking.get("main_state_restored") is not True
+            or tracking.get("snapshot_restore_status") != "verified"
+            or selected.get("candidate_id")
+            not in tracking.get("executable_safe_candidate_ids", [])
+            or select_verified_candidate(tracking, int(selected.get("seed", -1)))
+            != selected
+        ):
+            raise ValueError("selected_candidate_is_not_from_the_verified_random_pool")
+        candidate_id = selected.get("candidate_id")
+        if selected_tracking_candidate.get("candidate_id") != candidate_id:
+            raise ValueError("selected_candidate_tracking_record_id_mismatch")
+        if (
+            selected_tracking_candidate.get("executable_safe") is not True
+            or selected_tracking_candidate.get("physical_safety_verified") is not True
+            or selected_tracking_candidate.get("main_snapshot_restore_verified") is not True
+            or (selected_tracking_candidate.get("contact_compiler") or {}).get("verdict") != "safe"
+        ):
+            raise ValueError("selected_candidate_no_longer_satisfies_complete_physical_acceptance")
+        references = np.asarray(
+            selected_tracking_candidate.get("reference_path"), dtype=np.float64
+        )
+        if (
+            references.ndim != 2
+            or references.shape[1] != 3
+            or len(references) < 2
+            or not np.isfinite(references).all()
+            or len(references) - 1 != selected_tracking_candidate.get("requested_steps")
+            or selected_tracking_candidate.get("executed_steps")
+            != selected_tracking_candidate.get("requested_steps")
+        ):
+            raise ValueError("accepted_candidate_has_no_complete_finite_branch_reference_path")
+        grasp_evidence = selected_tracking_candidate.get("grasp_evidence")
+        initial_relative_position = np.asarray(
+            grasp_evidence.get("initial_eef_sphere_center_relative_position_body_local_m")
+            if isinstance(grasp_evidence, dict)
+            else None,
+            dtype=np.float64,
+        )
+        initial_relative_quaternion = _unit_quaternion(
+            grasp_evidence.get("initial_eef_body_relative_quaternion_local_wxyz")
+            if isinstance(grasp_evidence, dict)
+            else None,
+            "accepted_branch_initial_EEF_object_relative_quaternion",
+        )
+        if initial_relative_position.shape != (3,) or not np.isfinite(initial_relative_position).all():
+            raise ValueError("accepted_branch_initial_EEF_object_relative_position_is_invalid")
+        branch_steps = selected_tracking_candidate.get("steps")
+        sphere_local = np.asarray(
+            branch_steps[0].get("sphere_center_body_local_offset_m")
+            if isinstance(branch_steps, list) and branch_steps
+            else None,
+            dtype=np.float64,
+        )
+        if sphere_local.shape != (3,) or not np.isfinite(sphere_local).all():
+            raise ValueError("accepted_branch_carried_sphere_body_local_offset_is_missing")
+
+        expected_snapshot = acceptance_report.get("snapshot", {}).get("snapshot_state")
+        if not isinstance(expected_snapshot, dict):
+            raise ValueError("acceptance_report_has_no_restored_Snapshot_state")
+        current_snapshot = _request(connection, {"op": "snapshot"})
+        current_snapshot_state = current_snapshot.get("snapshot_state")
+        expected_integration = np.asarray(
+            expected_snapshot.get("mujoco_integration_state"), dtype=np.float64
+        )
+        current_integration = np.asarray(
+            current_snapshot_state.get("mujoco_integration_state")
+            if isinstance(current_snapshot_state, dict)
+            else None,
+            dtype=np.float64,
+        )
+        snapshot_match = bool(
+            expected_integration.ndim == current_integration.ndim == 1
+            and expected_integration.size > 0
+            and expected_integration.shape == current_integration.shape
+            and np.isfinite(expected_integration).all()
+            and np.isfinite(current_integration).all()
+            and np.array_equal(expected_integration, current_integration)
+        )
+        report["main_environment_start_snapshot_match"] = {
+            "matched": snapshot_match,
+            "integration_state_length": int(current_integration.size),
+            "comparison": "exact restored Snapshot mujoco_integration_state equality",
+        }
+        if not snapshot_match:
+            raise ValueError("main_environment_is_not_at_the_physically_validated_Snapshot")
+
+        query_payload = acceptance_report.get("query_payload")
+        carried = query_payload.get("carried_binding") if isinstance(query_payload, dict) else None
+        if not isinstance(carried, dict):
+            raise ValueError("accepted_carried_object_binding_is_missing")
+        live_grasp = _request(
+            connection,
+            {
+                "op": "grasp_state",
+                "carried_binding": carried,
+                "expected_instruction": context["instruction"],
+            },
+        )
+        if (
+            live_grasp.get("status") != "pass"
+            or live_grasp.get("grasp_confirmed") is not True
+            or live_grasp.get("state_id") != trigger_grasp_state.get("state_id")
+        ):
+            raise ValueError("restored_main_environment_no_longer_has_the_validated_stable_grasp")
+
+        controller = _request(connection, {"op": "repair_context"})
+        controller_fields = _controller_fields(controller)
+        robots = controller.get("robots") or []
+        if (
+            len(robots) != 1
+            or robots[0].get("controller_name") != "OSC_POSE"
+            or robots[0].get("action_dim") != 7
+        ):
+            raise ValueError("active_controller_is_not_native_seven_dimensional_Panda_OSC_POSE")
+        gripper_inventory = _request(connection, {"op": "gripper_geometry_inventory"})
+        if gripper_inventory.get("status") != "complete":
+            raise ValueError("active_Panda_gripper_geometry_inventory_is_incomplete")
+        finger_geom_ids = {
+            int(geometry["geom_id"])
+            for gripper in gripper_inventory.get("grippers", [])
+            for geometry in gripper.get("geometries", [])
+        }
+        carried_body_ids = {int(value) for value in carried.get("body_ids", [])}
+        if not carried_body_ids and isinstance(carried.get("body_id"), int):
+            carried_body_ids = {int(carried["body_id"])}
+        active_inventory = acceptance_report.get("geometry_inventory")
+        inventory_geometries = (
+            active_inventory.get("geometries")
+            if isinstance(active_inventory, dict)
+            and active_inventory.get("status") == "complete"
+            and active_inventory.get("robot_classification_status") == "available"
+            else None
+        )
+        if not isinstance(inventory_geometries, list):
+            raise ValueError("accepted_complete_active_Geometry_Inventory_is_unavailable")
+        carried_geom_ids = {
+            int(geometry["geom_id"])
+            for geometry in inventory_geometries
+            if isinstance(geometry, dict)
+            and geometry.get("body_id") in carried_body_ids
+            and isinstance(geometry.get("geom_id"), int)
+        }
+        if not finger_geom_ids or not carried_geom_ids or not carried_body_ids:
+            raise ValueError("active_finger_or_carried_object_contact_geometries_are_unavailable")
+        config = TrackingConfig()
+        start_eef_pos, start_eef_quat, root_pos, object_quat = _pose(
+            current_snapshot_state, int(carried["body_id"])
+        )
+        current_sphere = root_pos + quaternion_to_matrix(object_quat) @ sphere_local
+        if np.linalg.norm(current_sphere - references[0]) > config.state_tolerance_m:
+            raise ValueError("accepted_reference_start_does_not_match_restored_main_Snapshot")
+        step_limit = config.maximum_sphere_center_tracking_error_m
+        initial_contact_baseline = None
+
+        route_chunk_index = 1_000_000 + int(chunk_index)
+        if trace_writer is not None:
+            trace_writer.metadata["verified_candidate_main_environment_execution"] = {
+                "source": "physically_verified_trajectory_bundle_candidate_native_OSC_POSE",
+                "candidate_id": candidate_id,
+                "direction": selected.get("direction"),
+                "selection_seed": selected.get("seed"),
+                "selection_pool_candidate_ids": selected.get("selection_pool_candidate_ids"),
+                "reference_control_steps": int(len(references) - 1),
+                "reference_speed_m_s": selected_tracking_candidate.get("reference_speed_limit_m_s"),
+                "control_timestep_s": selected_tracking_candidate.get("control_timestep_s"),
+                "branch_contact_compiler_verdict": "safe",
+                "training_label_valid": False,
+            }
+            trace_writer.add_decision(
+                route_chunk_index,
+                decision_step,
+                initial_bridge_data,
+                np.empty((0, 7), dtype=np.float32),
+                safety_record={
+                    "source": "physically_verified_trajectory_bundle_candidate_native_OSC_POSE",
+                    "candidate_id": candidate_id,
+                    "selection_seed": selected.get("seed"),
+                    "training_label_valid": False,
+                    "high_quality_task_demonstration": False,
+                },
+            )
+
+        report.update({
+            "status": "executing",
+            "candidate_reference_steps": int(len(references) - 1),
+            "reference_path_world_m": references.tolist(),
+            "active_controller": controller,
+            "initial_grasp": live_grasp,
+            "limits": {
+                "sphere_center_tracking_error_m": config.maximum_sphere_center_tracking_error_m,
+                "eef_tracking_error_m": config.maximum_eef_tracking_error_m,
+                "grasp_relative_position_error_m": config.maximum_grasp_relative_position_error_m,
+                "grasp_relative_rotation_error_rad": config.maximum_grasp_relative_rotation_error_rad,
+            },
+        })
+        actual_sphere_trace = [current_sphere.tolist()]
+        current_state = current_snapshot_state
+        current_eef_pos, current_eef_quat = start_eef_pos, start_eef_quat
+        for index, target_sphere in enumerate(references[1:]):
+            _eef_pos, _eef_quat, object_root_now, object_quat_now = _pose(
+                current_state, int(carried["body_id"])
+            )
+            object_rotation = quaternion_to_matrix(object_quat_now)
+            target_eef = target_sphere + object_rotation @ initial_relative_position
+            target_eef_quat = quaternion_multiply(
+                object_quat_now, initial_relative_quaternion
+            )
+            action = world_pose_tracking_action(
+                current_eef_pos,
+                current_eef_quat,
+                target_eef,
+                target_eef_quat,
+                controller_fields,
+                gripper_action=1.0,
+            )
+            response = _request(
+                connection,
+                {
+                    "op": "step_monitored",
+                    "action": action.tolist(),
+                    "action_index": index,
+                },
+            )
+            report["main_environment_actions"] += 1
+            latest_bridge_data = response
+            current_state = response.get("snapshot_state")
+            if not isinstance(current_state, dict):
+                raise RuntimeError("main_OSC_transition_did_not_return_live_MuJoCo_state")
+            current_eef_pos, current_eef_quat, root_pos_now, object_quat_now = _pose(
+                current_state, int(carried["body_id"])
+            )
+            actual_sphere = root_pos_now + quaternion_to_matrix(object_quat_now) @ sphere_local
+            actual_sphere_trace.append(actual_sphere.tolist())
+            relative_position_now = quaternion_to_matrix(object_quat_now).T @ (
+                current_eef_pos - actual_sphere
+            )
+            relative_position_error = float(
+                np.linalg.norm(relative_position_now - initial_relative_position)
+            )
+            relative_quaternion_now = quaternion_multiply(
+                quaternion_conjugate(object_quat_now), current_eef_quat
+            )
+            relative_rotation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
+                quaternion_multiply(
+                    relative_quaternion_now,
+                    quaternion_conjugate(initial_relative_quaternion),
+                )
+            )))
+            sphere_error = float(np.linalg.norm(actual_sphere - target_sphere))
+            eef_error = float(np.linalg.norm(current_eef_pos - target_eef))
+            eef_rotation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
+                quaternion_multiply(current_eef_quat, quaternion_conjugate(target_eef_quat))
+            )))
+            grasp_state = _request(
+                connection,
+                {
+                    "op": "grasp_state",
+                    "carried_binding": carried,
+                    "expected_instruction": context["instruction"],
+                },
+            )
+            monitoring = response.get("contact_monitoring", {})
+            if initial_contact_baseline is None:
+                initial_contact_baseline = response.get("start_contacts", {})
+            unexpected_contacts = _unexpected_contact_events(
+                monitoring,
+                initial_contact_baseline,
+                finger_geom_ids,
+                carried_geom_ids,
+                carried_body_ids,
+            )
+            record = {
+                "step_index": decision_step + index,
+                "route_reference_index": index + 1,
+                "osc_action_7d": np.asarray(action, dtype=np.float32).tolist(),
+                "target_sphere_center_world_m": target_sphere.tolist(),
+                "actual_sphere_center_world_m": actual_sphere.tolist(),
+                "target_eef_position_world_m": target_eef.tolist(),
+                "actual_eef_position_world_m": current_eef_pos.tolist(),
+                "actual_eef_quaternion_world_wxyz": current_eef_quat.tolist(),
+                "sphere_center_tracking_error_m": sphere_error,
+                "eef_position_tracking_error_m": eef_error,
+                "eef_orientation_tracking_error_rad": eef_rotation_error,
+                "grasp_relative_position_error_m": relative_position_error,
+                "grasp_relative_rotation_error_rad": relative_rotation_error,
+                "grasp_state": grasp_state,
+                "contact_monitoring_status": monitoring.get("status"),
+                "contact_monitoring_control_step": (monitoring.get("control_steps") or [None])[0],
+                "unexpected_contact_events": unexpected_contacts,
+                "reward": float(response.get("reward", 0.0)),
+                "done": bool(response.get("done", False)),
+            }
+            report["steps"].append(record)
+            if trace_writer is not None:
+                trace_writer.add_step(
+                    step_index=record["step_index"],
+                    chunk_index=route_chunk_index,
+                    action_index=index,
+                    action=action,
+                    bridge_data=response,
+                )
+            if video_frames is not None and video_frame_encoder is not None:
+                video_frames.append(video_frame_encoder(response))
+            if monitoring.get("status") != "complete":
+                report["failure_reason"] = "MuJoCo_substep_contact_monitoring_incomplete"
+            elif unexpected_contacts:
+                report["failure_reason"] = "unexpected_robot_or_carried_object_contact_observed"
+            elif grasp_state.get("status") != "pass" or grasp_state.get("grasp_confirmed") is not True:
+                report["failure_reason"] = "bilateral_grasp_or_gripper_closure_lost"
+            elif sphere_error > step_limit:
+                report["failure_reason"] = "sphere_center_tracking_error_exceeded_existing_limit"
+            elif eef_error > config.maximum_eef_tracking_error_m:
+                report["failure_reason"] = "EEF_tracking_error_exceeded_existing_limit"
+            elif relative_position_error > config.maximum_grasp_relative_position_error_m:
+                report["failure_reason"] = "grasp_relative_position_error_exceeded_existing_limit"
+            elif relative_rotation_error > config.maximum_grasp_relative_rotation_error_rad:
+                report["failure_reason"] = "grasp_relative_rotation_error_exceeded_existing_0.20_rad_limit"
+            elif response.get("done"):
+                report["failure_reason"] = "MuJoCo_environment_terminated_during_selected_route"
+            if report["failure_reason"]:
+                report["status"] = "stopped_on_first_main_environment_safety_or_tracking_failure"
+                break
+            if report["main_environment_actions"] % 50 == 0:
+                print(
+                    "VERIFIED B-SPLINE CANDIDATE MAIN-ENV EXECUTION:",
+                    report["main_environment_actions"], "/", len(references) - 1,
+                    "candidate=", candidate_id,
+                    "sphere_err_m=", round(sphere_error, 4),
+                    "grasp_rot_err_rad=", round(relative_rotation_error, 4),
+                    flush=True,
+                )
+
+        if report["failure_reason"] is None:
+            report["route_completed"] = report["main_environment_actions"] == len(references) - 1
+            report["status"] = "complete" if report["route_completed"] else "incomplete"
+            if not report["route_completed"]:
+                report["failure_reason"] = "main_environment_route_ended_before_all_verified_references"
+            else:
+                report["student_continuation"] = True
+        report["execution_summary"] = {
+            "actual_main_environment_osc_steps": report["main_environment_actions"],
+            "branch_verified_reference_steps": int(len(references) - 1),
+            "first_failure_reason": report["failure_reason"],
+            "maximum_sphere_center_tracking_error_m": max(
+                (item["sphere_center_tracking_error_m"] for item in report["steps"]), default=None
+            ),
+            "maximum_eef_position_tracking_error_m": max(
+                (item["eef_position_tracking_error_m"] for item in report["steps"]), default=None
+            ),
+            "maximum_grasp_relative_position_error_m": max(
+                (item["grasp_relative_position_error_m"] for item in report["steps"]), default=None
+            ),
+            "maximum_grasp_relative_rotation_error_rad": max(
+                (item["grasp_relative_rotation_error_rad"] for item in report["steps"]), default=None
+            ),
+            "final_dual_finger_grasp_status": (
+                report["steps"][-1]["grasp_state"].get("status")
+                if report["steps"] else live_grasp.get("status")
+            ),
+            "final_sphere_center_world_m": actual_sphere_trace[-1],
+            "route_endpoint_tracking_error_m": float(np.linalg.norm(
+                np.asarray(actual_sphere_trace[-1]) - references[-1]
+            )),
+        }
+        return report, latest_bridge_data
+    except Exception as exc:
+        report["status"] = "blocked_before_or_during_main_environment_execution"
+        report["failure_reason"] = f"{type(exc).__name__}:{exc}"
+        report["execution_summary"] = {
+            "actual_main_environment_osc_steps": report["main_environment_actions"],
+            "first_failure_reason": report["failure_reason"],
+        }
+        return report, latest_bridge_data

@@ -2471,3 +2471,27 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 三个分支实际执行 1,446 步；每个已执行区间的接触子步记录均完整，合计 36,150/36,150，缺失/不可用子步为 0。所有分支均使用相同起始状态指纹并各自恢复成功；最终 Snapshot 恢复最大数值误差为 0。上述 82/9/10/1 是聚合接触对事件分类数量，不是碰撞次数。Left/Right 候选未运行；本轮新试的两条 Above 候选都因关节限制提前结束，不能计入安全合格池。
 
 最终真实合格池仍只有 `trajectory-003`。Seed 0 的现有选择器选择 `trajectory-003`，同 seed 重放一致；因没有第二条完整合格路线，按条件未运行 seeds 0–9 多路线选择测试，也没有宣称随机选择到不同物理执行路线。Student 主环境只执行到第 50 步，任何候选都未在主环境执行，任务没有完成。本次报告、轨迹和日志位于 `logs/gs_opd/eval/trajectory_bundle_above_diversity_l0t0_20261020_attempt1/`，包含逐步/子步原始报告、摘要、18 候选 SVG/JSON、Student 视频与 Bridge/Student 日志。
+
+## L0T0 随机安全候选接入主环境 On-Policy Smoke（2026-10-20）
+
+`pi05_rollout.py` 增加显式 `--execute-verified-bundle-candidate-in-main-env` 接续入口：稳定双指抓持后仍复用原有完整 Snapshot 分支验收和 `select_verified_candidate()`；只从 `executable_safe_candidate_ids` 随机选候选。主 Snapshot 恢复不通过时不执行；合格池为空时沿用已有流程，从恢复后的真实状态继续 Student。选中的完整参考轨迹在恢复的主环境用 `world_pose_tracking_action()` 生成七维 OSC_POSE 动作，逐步复用已有双指、球心/EEF/相对抓持误差及子步接触停止检查，并通过 `TrajectoryWriter` 记录真实执行动作、双相机观察和下一状态。路径动作标记为 B-Spline OSC 来源，不伪装成 Student 预测标签。未改候选筛选规则、OSC 控制器、Teacher/Grounding、安全阈值或训练。
+
+一次 attempt3 完整 Smoke 使用原始 π₀.₅ Student 加载现有 10k-step rank-32 Adapter，在 `obstacle_avoidance` L0T0 初始状态 0，第 50 个真实 Student 动作达到稳定抓持。一个同状态 Snapshot 生成 18 条 B-Spline 候选并全部通过几何筛选；本次按既有成功证据只对 `trajectory-003` / Above 做 422 步物理分支验收。分支 `contact_compiler=safe`、`physical_safety_verified=true`、`executable_safe=true`，完整 Snapshot 恢复通过。随机 seed `20261020` 从单候选合格池选择了 `trajectory-003`，之后确实在主环境执行了 **422/422** 步原生 OSC 搬运轨迹。球心/EEF 最大跟踪误差为 **17.49/16.35 mm**，相对抓持位置/旋转最大误差为 **1.81 mm/0.0463 rad**，双指抓持持续通过，未触发主环境首次失败条件。
+
+OSC 路线完成后，Student 从最后一帧真实主环境 Observation 接续执行 **528 步**；总主环境动作达到 1000 步上限，reward 始终未成功、环境未 done。因此验证了候选从分支验收进入主环境真实执行、轨迹写入和 Student 接续，但本回合没有完成最终放置/任务成功。
+
+完整 attempt3 数据保存在 `logs/gs_opd/eval/trajectory_bundle_onpolicy_collection_l0t0_20261020_attempt3/`：`trajectory_validation_report.json`（分支验收、随机选择、422 步主环境轨迹及逐步接触/跟踪指标）、`student_onpolicy_trace.npz`（1000 个实际七维动作、1000 帧双相机 Next Observation，Student 与 OSC 路段来源元数据）、`student_and_candidate.mp4`、`result.json` 和 Bridge/Student 日志。NPZ 中 Student 决策 Observation 为 59 帧/相机，所有图像为 `256×256×3`。attempt1 最初通过 RLinf `.venv` 启动 Bridge 时加载到普通 LIBERO、因缺少 `obstacle_avoidance` benchmark 启动失败；切换至 LIBERO-Safety venv 后继续。attempt1 首轮主环境执行在动作前暴露绑定缺少 `body_ids` 的接口适配问题；attempt2 在第 186 步把指垫–碗的正常抓持 Geom 对误认为新碰撞，已用活动 Geometry Inventory 中携带 Body 的完整 41 个 Geom ID 修正身份覆盖后重跑。attempt1/2 原始结果与日志均保留在各自目录。语法和 CLI 接口检查通过；未 Push。
+
+## B-Spline 局部出口收束及 `trajectory-003` 物理 Smoke（2026-10-20）
+
+先在项目 `.venv` 中运行修改前的 `test_trajectory_bundle`：27 项通过。默认系统 Python 未安装 pytest/NumPy，因此没有用它运行该套测试。基线 `local_exit_region` 以障碍几何计算的 `reference_inflated_radius_m=0.230447 m` 为尺度，旧比例 0.5 产生 `half_extent=0.115223 m`；`_candidate_exit_goal()` 按 Left/Right/Above 三族和六个幅度在区域内采样，令 18 个终点的 XYZ 包围跨度达到 `0.1495 × 0.1754 × 0.0943 m`。出口中心是障碍物另一侧由现有局部绕行几何构造的中心，并非最终盘目标。
+
+只把 `BundleConfig.local_exit_region_scale` 与 CLI 默认值从 0.5 收到 0.2。出口半范围仍按同一局部障碍几何自适应，变为 `0.046089 m`；中心、出口安全距离、候选中段 entry/peak/exit 控制点、三族路线、筛选和控制接口均未改。对同一保存场景重生成 18 条后，全部 18 条仍通过原几何筛选，终点 XYZ 包围跨度降至 `0.0598 × 0.0701 × 0.0377 m`，距终点均值的最大半径由 0.1163 m 降至 0.0465 m。以 `trajectory-003` / Above 为例，终点局部上向偏移从 19.20 mm 收至 7.68 mm；已有末段控制点从 `exit_point` 向新终点过渡，因此参考线在越障后继续下降并收束。单测改动只断言默认区域比例为 0.2。
+
+修改前后的 18 路线 SVG、JSON 与逐候选终点比较保存在 `logs/gs_opd/eval/local_exit_convergence_l0t0_20261020_attempt1/`：[`trajectory_bundle_before.svg`](../logs/gs_opd/eval/local_exit_convergence_l0t0_20261020_attempt1/trajectory_bundle_before.svg)、[`trajectory_bundle_after.svg`](../logs/gs_opd/eval/local_exit_convergence_l0t0_20261020_attempt1/trajectory_bundle_after.svg)、`endpoint_comparison.json`。修改后的 `test_trajectory_bundle` 再次 27 项全部通过。
+
+随后启动一次原始 Student 真实运行至第 50 步稳定双指抓持，并仅在 Snapshot 分支执行新生成的 `trajectory-003` Above。分支预算请求 427 步，执行到第 72 步时首次超过原抓持旋转限制：相对旋转误差达到 `0.21546 rad`（上限 0.20 rad），故立即拒绝并停止；该时刻双指仍有接触。最大相对位置误差 7.42 mm、EEF 跟踪误差 7.25 mm、黑碗球心跟踪误差 14.92 mm。该路线在触发停止时仍距出口约 0.512 m，未到达末段，因此**收束目前只由同场景的 18 路线几何对比验证，尚无完整终点的物理验证**。
+
+已观测的 1,800/1,800 物理子步接触监测完整，Contact Compiler 对该部分记录为 `safe`，接触分类 `pass`（82 条有初始状态证据的范围外背景接触、15 条 Teacher 允许的夹爪接触）。但整条候选 `physical_safety_verified=false`、`executable_safe=false`，原因是路径未完成且抓持旋转越限，不能将部分 Compiler verdict 当作完整安全通过。分支及主环境 Snapshot 恢复均成功，主环境没有执行候选路线；Student 主环境共 50 步后即停止，没有运行完整 Episode。
+
+真实报告及当前场景生成的 SVG/JSON 保存在同一目录，其中 `trajectory_validation_report.json`、`trajectory_validation_report_bundle/trajectory_bundle.svg` 和 `result.json` 保留实际数据。代码修改为 `trajectory_bundle.py` 两行默认值和 `test_trajectory_bundle.py` 一条断言，即 3 行新增、2 行删除；另更新本进度记录。未修改 Teacher、Grounding、OSC、Safety Compiler、跟踪与验收规则，未 Push。

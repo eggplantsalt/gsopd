@@ -191,6 +191,7 @@ class TrajectoryBundleTests(unittest.TestCase):
         result = planner.generate_trajectory_bundle(input_scene)
         region = result["local_exit_region"]
         self.assertEqual(region["region_type"], "bounded_plane_behind_obstacle")
+        self.assertEqual(region["region_scale"], 0.2)
         self.assertAlmostEqual(
             region["half_extent_m"],
             region["reference_inflated_radius_m"] * region["region_scale"],

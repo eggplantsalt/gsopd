@@ -88,6 +88,11 @@ def parse_args():
         action="store_true",
         help="Run one Snapshot-only trajectory tracking acceptance after a live stable grasp is observed.",
     )
+    parser.add_argument(
+        "--execute-verified-bundle-candidate-in-main-env",
+        action="store_true",
+        help="After Snapshot acceptance and restore, randomly select a verified B-Spline candidate and execute it in the main environment before Student continuation.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -157,6 +162,7 @@ def parse_args():
     probe_enabled = args.contact_safety_probe or args.verifier_guided_repair
     collection_enabled = args.on_policy_safety_collection
     trajectory_validation_enabled = args.trajectory_bundle_physical_validation
+    bundle_main_execution_enabled = args.execute_verified_bundle_candidate_in_main_env
     mink_osc_enabled = args.mink_osc_left
     direct_osc_enabled = args.direct_bspline_osc_left
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
@@ -167,6 +173,10 @@ def parse_args():
         parser.error("--mink-osc-left requires --trajectory-bundle-physical-validation")
     if direct_osc_enabled and not trajectory_validation_enabled:
         parser.error("--direct-bspline-osc-left requires --trajectory-bundle-physical-validation")
+    if bundle_main_execution_enabled and not trajectory_validation_enabled:
+        parser.error("--execute-verified-bundle-candidate-in-main-env requires --trajectory-bundle-physical-validation")
+    if bundle_main_execution_enabled and (mink_osc_enabled or direct_osc_enabled):
+        parser.error("verified bundle main-environment execution is mutually exclusive with direct-left and Mink modes")
     if trajectory_validation_enabled:
         if args.teacher_json is None or args.semantic_results_json is None:
             parser.error(
@@ -187,7 +197,9 @@ def parse_args():
         ) != len(args.trajectory_candidate_ids):
             parser.error("--trajectory-candidate-ids must be unique")
         if args.trajectory_validation_stop_after_acceptance and (
-            args.mink_osc_left or args.direct_bspline_osc_left
+            args.mink_osc_left
+            or args.direct_bspline_osc_left
+            or bundle_main_execution_enabled
         ):
             parser.error("--trajectory-validation-stop-after-acceptance applies to bundle acceptance only")
         if mink_osc_enabled:
@@ -202,10 +214,10 @@ def parse_args():
                 parser.error("--mink-osc-left requires --mink-python, --mink-model-binary, and --mink-model-metadata")
             if not args.mink_python.is_file() or not args.mink_model_binary.is_file() or not args.mink_model_metadata.is_file():
                 parser.error("Mink Python and current-model export files must exist")
-        if (args.trace_out is not None and not direct_osc_enabled) or args.on_policy_safety_out is not None:
-            parser.error("trajectory physical validation does not write rollout trace/training data unless direct OSC execution is enabled")
-        if direct_osc_enabled and (args.trace_out is None or args.video_out is None):
-            parser.error("--direct-bspline-osc-left requires --trace-out and --video-out for real action/observation recording")
+        if (args.trace_out is not None and not (direct_osc_enabled or bundle_main_execution_enabled)) or args.on_policy_safety_out is not None:
+            parser.error("trajectory physical validation writes rollout trace data only when real main-environment OSC execution is enabled")
+        if (direct_osc_enabled or bundle_main_execution_enabled) and (args.trace_out is None or args.video_out is None):
+            parser.error("real main-environment OSC execution requires --trace-out and --video-out")
         if args.probe_out_dir is not None or args.repair_out_dir is not None:
             parser.error("probe and repair output directories cannot be used for trajectory validation")
         if args.task_object_id is not None or args.task_object_semantic_result is not None:
@@ -307,6 +319,7 @@ def parse_args():
             args.mink_model_metadata,
             True if args.mink_osc_left else None,
             True if args.direct_bspline_osc_left else None,
+            True if args.execute_verified_bundle_candidate_in_main_env else None,
         )
     ):
         parser.error(
@@ -2061,6 +2074,7 @@ try:
     trajectory_validation_restore_abort = False
     trajectory_validation_stop_after_acceptance = False
     direct_execution_stop = False
+    candidate_main_execution_stop = False
     trajectory_validation_preflight_failure = None
     if args.trajectory_bundle_physical_validation:
         try:
@@ -2136,6 +2150,7 @@ try:
         and not trajectory_validation_restore_abort
         and not trajectory_validation_stop_after_acceptance
         and not direct_execution_stop
+        and not candidate_main_execution_stop
     ):
         if (
             args.trajectory_bundle_physical_validation
@@ -2283,6 +2298,108 @@ try:
                 if not route_completed or done or success:
                     break
                 continue
+            if args.execute_verified_bundle_candidate_in_main_env:
+                if must_stop_rollout_after_acceptance(trajectory_validation_report):
+                    trajectory_validation_restore_abort = True
+                    print(
+                        "TRAJECTORY CANDIDATE EXECUTION BLOCKED BY UNVERIFIED SNAPSHOT RESTORE:",
+                        trajectory_validation_report.get("status"),
+                        trajectory_validation_report.get("failure_reasons", []),
+                        flush=True,
+                    )
+                    break
+                from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                    select_verified_candidate,
+                )
+
+                tracking = trajectory_validation_report.get("tracking")
+                selected_candidate = select_verified_candidate(
+                    tracking, args.trajectory_candidate_seed
+                )
+                if selected_candidate is None:
+                    trajectory_validation_report["main_environment_candidate_execution"] = False
+                    trajectory_validation_report["main_environment_execution"] = {
+                        "status": "no_qualified_candidate",
+                        "candidate_pool": (
+                            tracking.get("executable_safe_candidate_ids", [])
+                            if isinstance(tracking, dict)
+                            else []
+                        ),
+                        "fallback": "resume_Student_from_the_verified_restored_main_state",
+                        "main_environment_osc_steps": 0,
+                    }
+                    print(
+                        "VERIFIED CANDIDATE POOL EMPTY; RESUMING STUDENT AFTER SNAPSHOT RESTORE",
+                        flush=True,
+                    )
+                else:
+                    selected_record = next(
+                        (
+                            item
+                            for item in tracking.get("candidates", [])
+                            if isinstance(item, dict)
+                            and item.get("candidate_id") == selected_candidate["candidate_id"]
+                        ),
+                        None,
+                    )
+                    try:
+                        from research.gs_opd.smoke.direct_bspline_osc_smoke import (
+                            run_live_verified_bundle_candidate_main_execution,
+                        )
+
+                        main_execution, direct_latest_data = run_live_verified_bundle_candidate_main_execution(
+                            conn,
+                            trajectory_validation_context,
+                            trajectory_grasp_monitor.samples[-1],
+                            trajectory_validation_report,
+                            selected_candidate,
+                            selected_record,
+                            decision_step=steps,
+                            trace_writer=trace_writer,
+                            chunk_index=chunks,
+                            initial_bridge_data=data,
+                            video_frames=video_frames,
+                            video_frame_encoder=get_video_frame,
+                        )
+                    except Exception as exc:
+                        main_execution = {
+                            "status": "blocked",
+                            "selected_candidate_id": selected_candidate.get("candidate_id"),
+                            "main_environment_actions": 0,
+                            "route_completed": False,
+                            "student_continuation": False,
+                            "failure_reason": f"{type(exc).__name__}:{exc}",
+                        }
+                        direct_latest_data = data
+                    trajectory_validation_report["main_environment_execution"] = main_execution
+                    main_count = int(main_execution.get("main_environment_actions", 0))
+                    steps += main_count
+                    route_completed = main_execution.get("route_completed") is True
+                    if route_completed:
+                        data = direct_latest_data
+                    if main_execution.get("steps"):
+                        last_transition = main_execution["steps"][-1]
+                        success = success or bool(last_transition.get("reward", 0.0) > 0)
+                        done = bool(last_transition.get("done", False))
+                    trajectory_validation_report["main_environment_candidate_execution"] = main_count > 0
+                    trajectory_validation_report["main_environment_actions_by_acceptance"] = main_count
+                    candidate_main_execution_stop = not route_completed
+                    print(
+                        "VERIFIED B-SPLINE CANDIDATE MAIN-ENV ROUTE:",
+                        main_execution.get("status"),
+                        "CANDIDATE:",
+                        selected_candidate.get("candidate_id"),
+                        "REAL OSC STEPS:",
+                        main_count,
+                        "STUDENT_CONTINUATION:",
+                        bool(route_completed and not done and not success),
+                        "FIRST_FAILURE:",
+                        main_execution.get("failure_reason"),
+                        flush=True,
+                    )
+                    if not route_completed or done or success:
+                        break
+                    continue
             if args.mink_osc_left or must_stop_rollout_after_acceptance(trajectory_validation_report):
                 trajectory_validation_restore_abort = True
                 print(
@@ -2643,6 +2760,8 @@ try:
             "episode_end_reason": (
                 "direct_B_Spline_OSC_route_failed"
                 if direct_execution_stop
+                else "verified_B_Spline_candidate_main_execution_failed"
+                if candidate_main_execution_stop
                 else
                 "trajectory_validation_stopped_after_acceptance"
                 if trajectory_validation_stop_after_acceptance
@@ -2656,6 +2775,7 @@ try:
                 trajectory_validation_restore_abort
                 or trajectory_validation_stop_after_acceptance
                 or direct_execution_stop
+                or candidate_main_execution_stop
             ),
             "direct_route_student_continuation": {
                 "route_completed": bool(trajectory_validation_report.get("route_completed")),
@@ -2673,6 +2793,37 @@ try:
                     + int(trajectory_validation_report.get("real_execution_steps", 0))
                 ),
             },
+            "verified_candidate_student_continuation": {
+                "candidate_selected": bool(
+                    trajectory_validation_report.get("main_environment_execution", {}).get(
+                        "selected_candidate_id"
+                    )
+                ),
+                "route_completed": bool(
+                    trajectory_validation_report.get("main_environment_execution", {}).get(
+                        "route_completed"
+                    )
+                ),
+                "student_steps_after_route": max(
+                    0,
+                    steps
+                    - int(trajectory_validation_report.get("decision_step", 0))
+                    - int(trajectory_validation_report.get("main_environment_execution", {}).get(
+                        "main_environment_actions", 0
+                    )),
+                ),
+                "student_continued_from_latest_live_observation": bool(
+                    trajectory_validation_report.get("main_environment_execution", {}).get(
+                        "route_completed"
+                    )
+                    and not candidate_main_execution_stop
+                    and steps
+                    > int(trajectory_validation_report.get("decision_step", 0))
+                    + int(trajectory_validation_report.get("main_environment_execution", {}).get(
+                        "main_environment_actions", 0
+                    ))
+                ),
+            },
             "checkpoint_path": str(ckpt),
             "bridge_endpoint": "127.0.0.1:38567",
             "bridge_connection_policy": "the existing pi05_rollout Client connection was used for Student steps, grasp queries, Snapshot, geometry, and branch tracking",
@@ -2686,10 +2837,16 @@ try:
         trajectory_validation_report["main_environment_candidate_execution"] = bool(
             args.direct_bspline_osc_left
             and trajectory_validation_report.get("real_execution_steps", 0) > 0
+        ) or bool(
+            args.execute_verified_bundle_candidate_in_main_env
+            and trajectory_validation_report.get("main_environment_execution", {}).get(
+                "main_environment_actions", 0
+            ) > 0
         )
-        trajectory_validation_report["main_environment_actions_by_acceptance"] = int(
-            trajectory_validation_report.get("real_execution_steps", 0)
-        )
+        if not args.execute_verified_bundle_candidate_in_main_env:
+            trajectory_validation_report["main_environment_actions_by_acceptance"] = int(
+                trajectory_validation_report.get("real_execution_steps", 0)
+            )
         trajectory_validation_summary_path = args.trajectory_validation_out
         trajectory_validation_summary_path.parent.mkdir(parents=True, exist_ok=True)
         trajectory_validation_summary_path.write_text(
