@@ -37,6 +37,11 @@ def parse_args():
         help="Record read-only MuJoCo object states and post-step contacts in the NPZ trace.",
     )
     parser.add_argument(
+        "--record-substep-contacts",
+        action="store_true",
+        help="Passively capture every native MuJoCo physics-substep contact for Safety Compiler auditing.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         help="Optional Python/NumPy/PyTorch RNG seed for a reproducible Student rollout.",
@@ -114,6 +119,8 @@ def parse_args():
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
+    if args.record_substep_contacts and not args.record_physical_state:
+        parser.error("--record-substep-contacts requires --record-physical-state")
     if args.video_out is not None and args.video_out.suffix != ".mp4":
         parser.error("--video-out must use the .mp4 extension")
     if args.trace_out is not None and args.trace_out.suffix != ".npz":
@@ -1958,6 +1965,7 @@ try:
                 str(args.lora_checkpoint) if args.lora_checkpoint is not None else None
             ),
             "physical_state_recording": bool(args.record_physical_state),
+            "substep_contact_recording": bool(args.record_substep_contacts),
             "seed": args.seed,
             "max_steps": args.max_steps,
             "camera_resolution": 256,
@@ -2365,7 +2373,12 @@ try:
         actual_chunk_actions = []
         actual_chunk_post = []
         for action_index, action in enumerate(execution_chunk):
-            payload = {"op": "step", "action": action.tolist()}
+            payload = {
+                "op": "step_monitored" if args.record_substep_contacts else "step",
+                "action": action.tolist(),
+            }
+            if args.record_substep_contacts:
+                payload["action_index"] = steps
             if collection_enabled:
                 payload["include_snapshot_state"] = True
             if args.record_physical_state:
@@ -2684,6 +2697,7 @@ try:
             str(args.lora_checkpoint) if args.lora_checkpoint is not None else None
         ),
         "physical_state_recording": bool(args.record_physical_state),
+        "substep_contact_recording": bool(args.record_substep_contacts),
         "seed": args.seed,
     }
     if contact_probe_result is not None:

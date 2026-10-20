@@ -123,6 +123,13 @@ class TrajectoryWriter:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+        if "contact_monitoring" in bridge_data:
+            step["contact_monitoring_json"] = json.dumps(
+                bridge_data["contact_monitoring"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         for key in _CAMERA_KEYS:
             step[key] = _decode_image(bridge_data, key)
         for key in _STATE_KEYS:
@@ -256,6 +263,11 @@ class TrajectoryWriter:
         if any("contacts_json" in item for item in self.steps):
             arrays["post_contacts_json"] = np.asarray(
                 [item.get("contacts_json", "{}") for item in self.steps],
+                dtype=np.str_,
+            )
+        if any("contact_monitoring_json" in item for item in self.steps):
+            arrays["post_contact_monitoring_json"] = np.asarray(
+                [item.get("contact_monitoring_json", "{}") for item in self.steps],
                 dtype=np.str_,
             )
         if any("safety_record" in item for item in self.decisions):
