@@ -2495,3 +2495,30 @@ OSC 路线完成后，Student 从最后一帧真实主环境 Observation 接续�
 已观测的 1,800/1,800 物理子步接触监测完整，Contact Compiler 对该部分记录为 `safe`，接触分类 `pass`（82 条有初始状态证据的范围外背景接触、15 条 Teacher 允许的夹爪接触）。但整条候选 `physical_safety_verified=false`、`executable_safe=false`，原因是路径未完成且抓持旋转越限，不能将部分 Compiler verdict 当作完整安全通过。分支及主环境 Snapshot 恢复均成功，主环境没有执行候选路线；Student 主环境共 50 步后即停止，没有运行完整 Episode。
 
 真实报告及当前场景生成的 SVG/JSON 保存在同一目录，其中 `trajectory_validation_report.json`、`trajectory_validation_report_bundle/trajectory_bundle.svg` 和 `result.json` 保留实际数据。代码修改为 `trajectory_bundle.py` 两行默认值和 `test_trajectory_bundle.py` 一条断言，即 3 行新增、2 行删除；另更新本进度记录。未修改 Teacher、Grounding、OSC、Safety Compiler、跟踪与验收规则，未 Push。
+
+## 恢复 `local_exit_region_scale=0.5` 与 attempt3 接管段离线诊断（2026-10-20）
+
+将 `BundleConfig.local_exit_region_scale` 和 `trajectory_bundle.py` 离线 CLI 默认值恢复为已验证基线 `0.5`，将回归断言同步为 0.5。未改候选构造、OSC、安全规则或数据采集。项目 `.venv` 中 `research.gs_opd.repair.test_trajectory_bundle` **27 项全部通过**。
+
+离线读取 `trajectory_bundle_onpolicy_collection_l0t0_20261020_attempt3/` 的完整报告、1000 步 NPZ 和视频。数据段边界由报告与 Trace 元数据共同确认：Student 先执行 50 步至稳定抓持，随后主环境原生 OSC 执行 `trajectory-003` Above **422 步**，Student 从该真实状态接续 **528 步**；总计 1000 步，任务无成功 reward、未 done。下表中的障碍位置是已绑定的 `bottle_of_perfume_1_main` 参考球心，目标盘位置是 `plate_1_main` Body 原点。
+
+| 阶段/位置 | 黑碗中心或 EEF 位置（m） | 到障碍距离 | 到盘子 Body 原点距离 |
+| --- | --- | ---: | ---: |
+| OSC 起点，路线第 1 步，黑碗 | `[-0.264, -0.136, 0.952]` | 0.316 m | 0.483 m |
+| OSC 越障高点，路线第 311 步，黑碗 | `[-0.058, 0.043, 1.400]` | 0.278 m | 0.541 m |
+| OSC 出口终点，路线第 422 步，黑碗 | `[0.067, 0.142, 1.265]` | 0.219 m | 0.370 m |
+| Student 交接后的第 1 步，EEF | `[0.096, 0.184, 1.271]` | 0.262 m | 0.371 m |
+| Student 第 528 步，EEF | `[0.040, 0.479, 1.472]` | 0.573 m | 0.628 m |
+
+静态目标/障碍参考位置分别为盘子 `[0.064, 0.215, 0.902]`、障碍 `[−0.061, 0.036, 1.122]`；局部出口中心为 `[0.086, 0.161, 1.248]`，离盘子 Body 原点 0.350 m。OSC 终点相对其参考出口偏差 17.25 mm；最大黑碗球心/EEF 位置误差为 17.25/16.02 mm，末端姿态跟踪误差 0.0443 rad，相对抓持旋转误差 0.0463 rad，双指持续接触，Compiler `safe`，路线完整。其最小黑碗—障碍球心距离 0.219 m，大于搬运球与障碍球半径之和 0.200 m；该终点是明确的局部绕障出口而非最终放置姿态。位置和姿态日志没有显示 OSC 把物体送错出口或跟踪失败。
+
+向远处的运动发生在 **Student 接管后的 528 步**：EEF 从 `[0.096, 0.184, 1.271]` 移至 `[0.040, 0.479, 1.472]`，净位移约 0.361 m（世界 +Y 约 0.296 m、+Z 约 0.200 m）。接管后 EEF 到盘子 Body 原点的最小距离仍是 0.371 m（接管第 2 步），之后增至 0.628 m；接管期间夹爪关节位置仍保持闭合附近，视频第 600 帧可见碗离开机械臂附近/画面边缘，至第 800、1000 帧盘子仍未放入黑碗。因本回合 `physical_state_recording=false`，NPZ 的逐步黑碗世界位姿仅覆盖 OSC 的 422 步；Student 段没有逐步黑碗位姿，`post_contacts_json` 也为空对象。末段碗是持续夹持移出画面还是中途脱落，现有坐标记录无法区分。综合现有证据，旧任务失败更符合 **Student 接管后没有朝盘子下降/靠近**，而不是出口中心或 OSC 末端姿态错误；这属于最可能归因，不是对接管后黑碗轨迹的完整测量结论。
+
+物理安全的较早检查点存在：OSC 路线第 **386** 步（全局动作约 436），黑碗沿障碍前进轴的投影首次持续超过“搬运半径 + 障碍半径 + 10 mm 几何间隙”0.2104 m；当步实际中心到障碍 0.2334 m、到盘子原点 0.432 m，双指抓持通过、相对旋转误差 0.0440 rad、接触监测完整且无 unexpected contact。它是可供进一步评估的清障检查点，但没有做过在该点 Snapshot 停止/恢复或控制权交接验证；且它比完整 OSC 终点离盘子远约 62 mm，现有证据不支持将它作为更优的 Student 交接点。
+
+最多两个待确认的改进方向：
+
+1. 保持已通过的 OSC Above 出口与末端姿态，让后续接管显式进入朝盘子下降/放置阶段；先核对 Student 在真实交接 Observation 上的首个 Action Chunk 是否朝目标盘推进，再决定是否需要改变接管策略。
+2. 若要缩短 OSC 路段，可把路线第 386 步作为候选清障检查点做独立 Snapshot 交接验证；当前只确认该时刻的接触/抓持证据，不应直接当作已验证的安全交接。
+
+分析数据源：`logs/gs_opd/eval/trajectory_bundle_onpolicy_collection_l0t0_20261020_attempt3/trajectory_validation_report.json`、`student_onpolicy_trace.npz`、`student_and_candidate.mp4` 与 `result.json`。没有启动 MuJoCo、训练或新增验收逻辑。

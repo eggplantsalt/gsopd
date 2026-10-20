@@ -1,5 +1,12 @@
 # GS-OPD 当前局部目标
 
+## 已完成：恢复 B-Spline 出口基线并诊断 attempt3 Student 接管（2026-10-20）
+
+- `local_exit_region_scale` 的 `BundleConfig` 与 CLI 默认值恢复到已验证的 0.5，相关测试断言同步；`test_trajectory_bundle` 27 项通过。
+- 只离线分析已有 attempt3 主环境轨迹：422 步 OSC 安全完成到 Above 局部出口，随后 Student 528 步使 EEF 朝远离盘子的方向升高并偏移；任务失败更符合 Student 接管后的行为。后续 Student 段缺少逐步黑碗物理坐标，因此不把 EEF 路径冒充为黑碗路径。
+- `trajectory-003` 路线第 386 步存在通过几何间隙和当步抓持/接触检查的较早候选检查点，但该位置未测试控制权交接且比 OSC 终点更远离盘子，暂不作为新的默认方案。
+- 本次没有运行 MuJoCo、训练或改动规划/安全逻辑。改进方向仅记在进度报告中，待明确批准后再实施。
+
 ## 已完成：attempt3 LoRA 训练与纯 Student 闭环评测（2026-10-20）
 
 - 从原始 Student 初始化 rank-32 Action Expert LoRA，完成 10,000 optimizer steps。冻结范围、完整 845 帧 Episode、三阶段均衡采样、官方 OpenPI DataLoader、RLinf `SFTRunner`、原生 Flow Matching Loss 和归一化保持不变；搬运阶段固定示范 Observation 的 Flow MSE 从 0.152026 降至 0.000982，10×7 Action MAE 从 0.183005 降至 0.009061。

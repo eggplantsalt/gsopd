@@ -42,7 +42,7 @@ class BundleConfig:
     minimum_curve_samples: int = 65
     maximum_curve_samples: int = 4097
     clearance_error_m: float = 0.001
-    local_exit_region_scale: float = 0.2
+    local_exit_region_scale: float = 0.5
 
 
 def _vector(value: Any, field: str) -> np.ndarray:
@@ -1002,7 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--candidate-count", type=int, default=18)
     parser.add_argument("--clearance-m", type=float, default=0.01)
-    parser.add_argument("--local-exit-region-scale", type=float, default=0.2)
+    parser.add_argument("--local-exit-region-scale", type=float, default=0.5)
     args = parser.parse_args(argv)
     try:
 
