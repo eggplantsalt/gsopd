@@ -2455,3 +2455,19 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 为限制这次物理分支数量，`pi05_rollout.py` 现可指定候选 ID 子集与单候选步数预算；预算 CLI 默认保持 480。本次未改 OSC、几何间隙、抓持条件、Teacher、安全阈值或 Safety Compiler。Smoke 原始逐控制步/子步报告、Compact 摘要、18 路线 SVG/JSON、Student 视频、结果及日志保存在 `logs/gs_opd/eval/trajectory_bundle_same_snapshot_extended_budget_l0t0_20261020/`。原始完整 JSON 为约 348 MB，保持未压缩且不纳入代码提交。
 
 运行报告里的 `same_seed_reproducible=false` 是单候选摘要比较时先从第一次选择结果移除了路径数组、却未从第二次结果移除造成的派生字段错误；原始物理候选池不受影响。已修正后续运行的比较顺序，并对本次已验收候选池离线重放：seed 0 两次实际返回的候选 ID 相同。完整选择器 seeds 0–9 按上述单候选条件未运行。
+
+## 同状态 Above 路线扩展 Smoke：003 对照 015/018（2026-10-20）
+
+从上一轮完整 18 条候选几何中筛选 Above 候选。`trajectory-006/009` 相对 `trajectory-003` 的规划路径 RMS 分离分别仅 58.8/81.7 mm；`trajectory-012` 为 137.0 mm、预计 583 步；因此选择分离度更大且几何安全间隙更宽的 `trajectory-015`（预计 593 步，连续间隙下界 48.6 mm）和 `trajectory-018`（预计 673 步，56.8 mm）。二者相对 003 的规划路线 RMS 分离为 159.9 mm、214.6 mm。单候选步数上限设 700，总预算及几何、OSC、关节限位、双指抓持、禁止接触和 Compiler 判定保持不变。未执行此前已失败的 Left 004 或 Right 008。
+
+重新运行 attempt3 Student，同 seed 在第 50 步稳定抓持时生成 Snapshot，并与前一轮稳定抓持状态指纹完全相同。全部 18/18 候选通过几何筛选；只从同一个 Snapshot 执行 `trajectory-003`、`trajectory-015`、`trajectory-018`。结果如下：
+
+| 候选 | 实际控制步 | 结果 |
+| --- | ---: | --- |
+| `trajectory-003` Above | 422/422 | 对照路线完整通过：最大球心/EEF 跟踪误差 17.49/16.35 mm；双指抓持通过；Compiler 对 `object_1`、`object_3` 均为 safe；接触分类 pass（82 条起始背景聚合记录、9 条 allowed）。`physical_safety_verified=true`、`executable_safe=true`。 |
+| `trajectory-015` Above | 489/593 | 第 488 步触发真实 Panda 关节限位后停止。首次失败时双指接触仍通过，球心/EEF 最大误差 15.28/13.56 mm；接触分类 pass、Compiler 对两目标 safe，但路径未完成，候选拒绝。 |
+| `trajectory-018` Above | 535/673 | 第 534 步触发真实 Panda 关节限位后停止。首次失败时双指接触仍通过，球心/EEF 最大误差 17.53/15.63 mm；接触分类包含 1 条 unknown，Compiler 两目标 safe，但路径未完成且分类不完整，候选拒绝。 |
+
+三个分支实际执行 1,446 步；每个已执行区间的接触子步记录均完整，合计 36,150/36,150，缺失/不可用子步为 0。所有分支均使用相同起始状态指纹并各自恢复成功；最终 Snapshot 恢复最大数值误差为 0。上述 82/9/10/1 是聚合接触对事件分类数量，不是碰撞次数。Left/Right 候选未运行；本轮新试的两条 Above 候选都因关节限制提前结束，不能计入安全合格池。
+
+最终真实合格池仍只有 `trajectory-003`。Seed 0 的现有选择器选择 `trajectory-003`，同 seed 重放一致；因没有第二条完整合格路线，按条件未运行 seeds 0–9 多路线选择测试，也没有宣称随机选择到不同物理执行路线。Student 主环境只执行到第 50 步，任何候选都未在主环境执行，任务没有完成。本次报告、轨迹和日志位于 `logs/gs_opd/eval/trajectory_bundle_above_diversity_l0t0_20261020_attempt1/`，包含逐步/子步原始报告、摘要、18 候选 SVG/JSON、Student 视频与 Bridge/Student 日志。
