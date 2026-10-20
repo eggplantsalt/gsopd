@@ -2439,3 +2439,19 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 使用既有 `trajectory-003` Above 分支的 422/422 步原始记录离线重算。最新语义绑定对活动 520/520 Geom Inventory 的 Teacher 规则绑定核验通过；`object_3` 仍绑定到 `plate_1_main` Body 28 / Geom 438。Compiler 对 `object_1` 与 `object_3` 两个 gripper 规则均为 `safe`，完整物体接触检查未发现 `object_1→object_4` 禁止接触。接触分类为 `pass`：82 条有起始 Snapshot 原始证据的背景接触标记为范围外，9 条夹爪–黑碗接触保留 `allowed`；没有 unknown 或 violation。完整逐控制步/子步、抓持、OSC、跟踪、任务段和 Snapshot 恢复检查均通过，`physical_safety_verified=true`、`executable_safe=true`、`rejection_reasons=[]`。局部分支没有测试最终放置，故 `task_success_confirmed=false`；这不代表完整任务成功。
 
 仅将重新计算且全部通过的 `trajectory-003` 放入本次离线验收候选池。复用现有 `select_verified_candidate()`，seed `20261020` 选择了 `trajectory-003`，同 seed 复选一致。该选择只验证候选池接口，没有执行路线或启动 Student/MuJoCo。完整离线分类、两侧原始接触证据、Compiler 结果、全部拒绝原因和选择结果保存于 `logs/gs_opd/eval/object3_binding_trajectory003_l0t0_20261020/trajectory003_offline_reacceptance.json`；此前原始分支报告及轨迹数据未覆盖。
+
+## 同一 L0T0 抓持 Snapshot 的 Above/Left/Right 物理候选 Smoke（2026-10-20）
+
+基于当前 `object_3` 绑定（SAM3/IoU 绑定到 `plate_1_main` Body 28 / Geom 438，IoU 0.985）启动一次 Student；原始 Student 与既有 attempt3 rank-32 Adapter 组合加载成功。Student 在第 50 个真实环境动作步达到 3 个连续且指纹不同的稳定双指抓持状态后触发 Snapshot `snapshot-000001`。同一 Snapshot 下生成并保存全部 18 条 B-Spline 候选，18/18 通过原有几何筛选；本次分支预算显式设为 510 步（每候选默认仍为 480 步，总预算和其余跟踪、安全、OSC 参数未变），只对 `trajectory-003` Above/422 步、`trajectory-004` Left/495 步、`trajectory-008` Right/505 步做真实 MuJoCo 闭环分支。三条起始状态指纹完全相同。Student 主环境停在第 50 步，候选未提交到主环境，未验证整项任务成功。
+
+| 候选 | 实际执行 | 跟踪、抓持与 Compiler | 物理验收 |
+| --- | ---: | --- | --- |
+| `trajectory-003` Above | 422/422 步 | 最大黑碗球心误差 17.49 mm、EEF 误差 16.35 mm；相对抓持位置/旋转最大误差 1.81 mm / 0.0463 rad；双指持续，接触分类 `pass`。Compiler 对 `object_1`、`object_3` 均为 `safe`，禁止的 `object_1→object_4` 未观察到接触。 | `physical_safety_verified=true`、`executable_safe=true`、无拒绝原因；唯一合格候选。 |
+| `trajectory-004` Left | 378/495 步 | 第 377 步触发 `active_Panda_joint_limit_violated`，立即停止。停止前跟踪误差未超过原阈值，双指保持；接触分类 `pass`，Compiler 两目标为 `safe`。 | 路径不完整，物理验收拒绝；关节限制不能由 Compiler 的接触安全 verdict 覆盖。 |
+| `trajectory-008` Right | 75/505 步 | 第 74 步失去 opposing-finger 接触，立即停止。此前黑碗球心/EEF 最大跟踪误差 7.70/6.61 mm；接触分类 `unknown`（93 条聚合接触对记录中 82 条为起始背景、8 条 allow、3 条 unknown）。Compiler 两目标为 `safe`，但不改变失持和分类拒绝。 | 路径不完整，`physical_safety_verified=false`、`executable_safe=false`。 |
+
+三个分支实际执行 **875** 个控制步。各分支在已执行控制步上的子步接触采样完整，分别为 10,550/10,550、9,450/9,450、1,875/1,875；未观测/不可用子步均为 0。上表“聚合接触对记录”是不同接触对的聚合记录数，不是碰撞次数。Snapshot 最终恢复成功，完整积分状态最大误差为 0；三个候选的分支恢复均通过。Left 与 Right 的生成参考路线分别与 Above 有明显空间差异（归一化路径 RMS 分离 0.306 m / 0.330 m），但只有 Above 通过完整物理验收，因此真实合格池仍只有一个候选。Seed 0 选择器从该池只能选 `trajectory-003`；因不足两个合格候选，不运行 seeds 0–9 多路线 Smoke，也不声称路线随机多样性。离线重放 seed 0 两次均选到 `trajectory-003`。
+
+为限制这次物理分支数量，`pi05_rollout.py` 现可指定候选 ID 子集与单候选步数预算；预算 CLI 默认保持 480。本次未改 OSC、几何间隙、抓持条件、Teacher、安全阈值或 Safety Compiler。Smoke 原始逐控制步/子步报告、Compact 摘要、18 路线 SVG/JSON、Student 视频、结果及日志保存在 `logs/gs_opd/eval/trajectory_bundle_same_snapshot_extended_budget_l0t0_20261020/`。原始完整 JSON 为约 348 MB，保持未压缩且不纳入代码提交。
+
+运行报告里的 `same_seed_reproducible=false` 是单候选摘要比较时先从第一次选择结果移除了路径数组、却未从第二次结果移除造成的派生字段错误；原始物理候选池不受影响。已修正后续运行的比较顺序，并对本次已验收候选池离线重放：seed 0 两次实际返回的候选 ID 相同。完整选择器 seeds 0–9 按上述单候选条件未运行。

@@ -110,6 +110,17 @@ def parse_args():
         help="Seed the uniform choice among physically verified trajectory-bundle candidates.",
     )
     parser.add_argument(
+        "--trajectory-candidate-ids",
+        nargs="+",
+        help="Optional subset of the generated bundle to run as physical Snapshot branches.",
+    )
+    parser.add_argument(
+        "--trajectory-max-branch-steps",
+        type=int,
+        default=480,
+        help="Per-candidate Snapshot branch budget (the default remains 480 control steps).",
+    )
+    parser.add_argument(
         "--trajectory-validation-stop-after-acceptance",
         action="store_true",
         help="Stop this one-shot smoke after Snapshot branch validation and restore.",
@@ -169,6 +180,12 @@ def parse_args():
             parser.error("--trajectory-validation-out must use the .json extension")
         if args.max_steps == 0:
             parser.error("trajectory physical validation requires --max-steps greater than zero")
+        if not 1 <= args.trajectory_max_branch_steps <= 1200:
+            parser.error("--trajectory-max-branch-steps must be in 1..1200")
+        if args.trajectory_candidate_ids is not None and len(
+            set(args.trajectory_candidate_ids)
+        ) != len(args.trajectory_candidate_ids):
+            parser.error("--trajectory-candidate-ids must be unique")
         if args.trajectory_validation_stop_after_acceptance and (
             args.mink_osc_left or args.direct_bspline_osc_left
         ):
@@ -2170,6 +2187,9 @@ try:
                     from research.gs_opd.repair.trajectory_bundle_acceptance import (
                         run_snapshot_trajectory_acceptance,
                     )
+                    from research.gs_opd.repair.trajectory_tracking import (
+                        TrackingConfig,
+                    )
 
                     trajectory_validation_report = run_snapshot_trajectory_acceptance(
                         conn,
@@ -2179,6 +2199,10 @@ try:
                         decision_step=steps,
                         grasp_stability=trajectory_grasp_monitor.diagnostics(),
                         candidate_selection_seed=args.trajectory_candidate_seed,
+                        candidate_ids_to_track=args.trajectory_candidate_ids,
+                        tracking_config=TrackingConfig(
+                            max_control_steps_per_candidate=args.trajectory_max_branch_steps
+                        ),
                     )
             except Exception as exc:
                 trajectory_validation_report = {

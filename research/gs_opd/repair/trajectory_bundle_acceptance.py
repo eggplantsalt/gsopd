@@ -494,9 +494,10 @@ def run_snapshot_trajectory_acceptance(
     decision_step: int,
     grasp_stability: dict[str, Any],
     candidate_selection_seed: int = 0,
+    candidate_ids_to_track: list[str] | None = None,
     tracking_config: TrackingConfig = TrackingConfig(),
 ) -> dict[str, Any]:
-    """Generate and track the complete live geometry bundle in isolated branches."""
+    """Generate the full live bundle and track the requested subset in branches."""
     output_path = Path(output_json)
     if output_path.exists():
         raise FileExistsError(
@@ -519,6 +520,8 @@ def run_snapshot_trajectory_acceptance(
         "candidate_count": 0,
         "geometric_screen_pass_count": None,
         "branch_candidate_count": 0,
+        "candidate_ids_selected_for_physical_branches": None,
+        "candidate_ids_not_selected_for_physical_branches": [],
         "candidates": [],
         "snapshot": None,
         "restore": {"attempted": False, "verified": False},
@@ -656,6 +659,42 @@ def run_snapshot_trajectory_acceptance(
         report["geometric_screen_pass_count"] = bundle.get("screen_pass_count")
         bundle_outputs = save_trajectory_bundle(bundle, bundle_dir)
         report["bundle_outputs"] = bundle_outputs
+        all_candidates = bundle.get("candidates", [])
+        if candidate_ids_to_track is None:
+            selected_candidate_ids = [
+                item.get("candidate_id")
+                for item in all_candidates
+                if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+            ]
+        else:
+            selected_candidate_ids = list(candidate_ids_to_track)
+        candidates_by_id = {
+            item.get("candidate_id"): item
+            for item in all_candidates
+            if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+        }
+        unknown_candidate_ids = sorted(set(selected_candidate_ids) - set(candidates_by_id))
+        if unknown_candidate_ids:
+            raise ValueError(
+                "requested_physical_branch_candidate_ids_not_in_generated_bundle:"
+                + ",".join(unknown_candidate_ids)
+            )
+        if not selected_candidate_ids:
+            raise ValueError("no_candidate_ids_selected_for_physical_branches")
+        selected_set = set(selected_candidate_ids)
+        selected_candidates = [
+            item
+            for item in all_candidates
+            if item.get("candidate_id") in selected_set
+        ]
+        report["candidate_ids_selected_for_physical_branches"] = [
+            item["candidate_id"] for item in selected_candidates
+        ]
+        report["candidate_ids_not_selected_for_physical_branches"] = [
+            item.get("candidate_id")
+            for item in all_candidates
+            if isinstance(item, dict) and item.get("candidate_id") not in selected_set
+        ]
         carried_binding = geometry_before.get("objects", {}).get(context["subject_id"])
         if not isinstance(carried_binding, dict):
             raise ValueError("same_state_carried_object_geometry_missing")
@@ -663,7 +702,7 @@ def run_snapshot_trajectory_acceptance(
         tracking = track_trajectory_bundle(
             connection=connection,
             snapshot_id=snapshot_id,
-            bundle=bundle,
+            bundle={**bundle, "candidates": selected_candidates},
             carried_binding=carried_binding,
             repair_context=repair_context,
             teacher=context["teacher"],
@@ -673,12 +712,32 @@ def run_snapshot_trajectory_acceptance(
             config=tracking_config,
         )
         report["tracking"] = tracking
-        report["candidate_selection"] = build_candidate_selection_smoke(
-            tracking, candidate_selection_seed
-        )
+        passed_ids = tracking.get("executable_safe_candidate_ids", [])
+        if len(passed_ids) >= 2:
+            report["candidate_selection"] = build_candidate_selection_smoke(
+                tracking, candidate_selection_seed
+            )
+        else:
+            selected = select_verified_candidate(tracking, candidate_selection_seed)
+            repeated = select_verified_candidate(tracking, candidate_selection_seed)
+            same_seed_reproducible = selected == repeated
+            if isinstance(selected, dict):
+                selected.pop("points_world_m", None)
+            report["candidate_selection"] = {
+                "policy": "uniform random among physically verified candidates",
+                "primary_seed": candidate_selection_seed,
+                "primary_selection": selected,
+                "same_seed_reproducible": same_seed_reproducible,
+                "selection_pool_candidate_ids": list(passed_ids),
+                "ten_seed_trials": [],
+                "ten_seed_trials_performed": False,
+                "reason": (
+                    "fewer_than_two_candidates_passed_full_physical_acceptance"
+                ),
+                "main_environment_execution": False,
+            }
         report["branch_candidate_count"] = tracking.get("tracked_candidate_count", 0)
         report["candidates"] = tracking.get("candidates", [])
-        passed_ids = tracking.get("executable_safe_candidate_ids", [])
         if tracking.get("status") == "complete":
             if passed_ids:
                 report["status"] = "complete_with_verified_tracking_candidate"
