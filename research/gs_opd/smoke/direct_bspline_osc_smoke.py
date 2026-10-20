@@ -348,7 +348,13 @@ def run_live_direct_bspline_osc_smoke(
         if not finger_geom_ids or not carried_geom_ids:
             raise ValueError("finger_or_carried_object_contact_geometries_are_unavailable")
 
-        config = TrackingConfig()
+        config = TrackingConfig(
+            reference_speed_m_s=REFERENCE_SPEED_M_S,
+            adaptive_reference_progression=True,
+            reference_progression_soft_error_m=SOFT_SPHERE_CENTER_ERROR_M,
+            max_catchup_steps_per_waypoint=MAX_CATCHUP_STEPS_PER_WAYPOINT,
+            max_catchup_steps_total=MAX_CATCHUP_STEPS_TOTAL,
+        )
         report.update({
             "selected_route": {
                 "candidate_id": selected["candidate_id"],
@@ -686,6 +692,13 @@ def run_live_verified_bundle_candidate_main_execution(
     from research.gs_opd.repair.trajectory_bundle_acceptance import (
         select_verified_candidate,
     )
+    from research.gs_opd.repair.trajectory_tracking import (
+        ADAPTIVE_REFERENCE_SOFT_ERROR_M,
+        MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+        MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
+        MAX_CONTROL_STEPS_PER_CANDIDATE,
+        update_adaptive_reference_progression,
+    )
 
     latest_bridge_data = initial_bridge_data
     report: dict[str, Any] = {
@@ -739,9 +752,37 @@ def run_live_verified_bundle_candidate_main_execution(
             or not np.isfinite(references).all()
             or len(references) - 1 != selected_tracking_candidate.get("requested_steps")
             or selected_tracking_candidate.get("executed_steps")
-            != selected_tracking_candidate.get("requested_steps")
+            != len(selected_tracking_candidate.get("steps", []))
         ):
             raise ValueError("accepted_candidate_has_no_complete_finite_branch_reference_path")
+        progression_config = selected_tracking_candidate.get("reference_progression")
+        adaptive_progression = (
+            isinstance(progression_config, dict)
+            and progression_config.get("type") == "adaptive_actual_sphere_center_error"
+        )
+        maximum_catchup_per_waypoint = int(
+            (progression_config or {}).get(
+                "max_catchup_steps_per_waypoint",
+                MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+            )
+        )
+        maximum_catchup_total = int(
+            (progression_config or {}).get(
+                "max_catchup_steps_total", MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL
+            )
+        )
+        soft_progression_error = float(
+            (progression_config or {}).get(
+                "soft_error_threshold_m", ADAPTIVE_REFERENCE_SOFT_ERROR_M
+            )
+        )
+        nominal_reference_steps = len(references) - 1
+        if adaptive_progression and (
+            selected_tracking_candidate.get("executed_steps") < nominal_reference_steps
+            or selected_tracking_candidate.get("executed_steps")
+            > nominal_reference_steps + maximum_catchup_total
+        ):
+            raise ValueError("accepted_adaptive_branch_step_count_is_outside_its_budget")
         grasp_evidence = selected_tracking_candidate.get("grasp_evidence")
         initial_relative_position = np.asarray(
             grasp_evidence.get("initial_eef_sphere_center_relative_position_body_local_m")
@@ -855,7 +896,15 @@ def run_live_verified_bundle_candidate_main_execution(
         }
         if not finger_geom_ids or not carried_geom_ids or not carried_body_ids:
             raise ValueError("active_finger_or_carried_object_contact_geometries_are_unavailable")
-        config = TrackingConfig()
+        config = TrackingConfig(
+            reference_speed_m_s=float(
+                selected_tracking_candidate.get("reference_speed_limit_m_s", 0.04)
+            ),
+            adaptive_reference_progression=adaptive_progression,
+            reference_progression_soft_error_m=soft_progression_error,
+            max_catchup_steps_per_waypoint=maximum_catchup_per_waypoint,
+            max_catchup_steps_total=maximum_catchup_total,
+        )
         start_eef_pos, start_eef_quat, root_pos, object_quat = _pose(
             current_snapshot_state, int(carried["body_id"])
         )
@@ -876,6 +925,7 @@ def run_live_verified_bundle_candidate_main_execution(
                 "reference_control_steps": int(len(references) - 1),
                 "reference_speed_m_s": selected_tracking_candidate.get("reference_speed_limit_m_s"),
                 "control_timestep_s": selected_tracking_candidate.get("control_timestep_s"),
+                "reference_progression": progression_config,
                 "branch_contact_compiler_verdict": "safe",
                 "training_label_valid": False,
             }
@@ -897,6 +947,10 @@ def run_live_verified_bundle_candidate_main_execution(
             "status": "executing",
             "candidate_reference_steps": int(len(references) - 1),
             "reference_path_world_m": references.tolist(),
+            "reference_progression": progression_config,
+            "reference_speed_m_s": selected_tracking_candidate.get(
+                "reference_speed_limit_m_s"
+            ),
             "active_controller": controller,
             "initial_grasp": live_grasp,
             "limits": {
@@ -909,7 +963,21 @@ def run_live_verified_bundle_candidate_main_execution(
         actual_sphere_trace = [current_sphere.tolist()]
         current_state = current_snapshot_state
         current_eef_pos, current_eef_quat = start_eef_pos, start_eef_quat
-        for index, target_sphere in enumerate(references[1:]):
+        reference_index = 1
+        catchup_steps_at_waypoint = 0
+        total_catchup_steps = 0
+        route_completed = False
+        execution_budget = nominal_reference_steps
+        if adaptive_progression:
+            execution_budget = min(
+                MAX_CONTROL_STEPS_PER_CANDIDATE,
+                nominal_reference_steps + maximum_catchup_total,
+            )
+        report["execution_budget_steps"] = execution_budget
+        for index in range(execution_budget):
+            if reference_index >= len(references):
+                break
+            target_sphere = references[reference_index]
             _eef_pos, _eef_quat, object_root_now, object_quat_now = _pose(
                 current_state, int(carried["body_id"])
             )
@@ -932,6 +1000,7 @@ def run_live_verified_bundle_candidate_main_execution(
                     "op": "step_monitored",
                     "action": action.tolist(),
                     "action_index": index,
+                    "include_joint_limits": True,
                 },
             )
             report["main_environment_actions"] += 1
@@ -984,7 +1053,10 @@ def run_live_verified_bundle_candidate_main_execution(
             )
             record = {
                 "step_index": decision_step + index,
-                "route_reference_index": index + 1,
+                "route_reference_index": reference_index,
+                "waypoint_advanced": False,
+                "catchup_steps_at_waypoint": catchup_steps_at_waypoint,
+                "total_catchup_steps": total_catchup_steps,
                 "osc_action_7d": np.asarray(action, dtype=np.float32).tolist(),
                 "target_sphere_center_world_m": target_sphere.tolist(),
                 "actual_sphere_center_world_m": actual_sphere.tolist(),
@@ -999,6 +1071,7 @@ def run_live_verified_bundle_candidate_main_execution(
                 "grasp_state": grasp_state,
                 "contact_monitoring_status": monitoring.get("status"),
                 "contact_monitoring_control_step": (monitoring.get("control_steps") or [None])[0],
+                "joint_limits": response.get("joint_limits"),
                 "unexpected_contact_events": unexpected_contacts,
                 "reward": float(response.get("reward", 0.0)),
                 "done": bool(response.get("done", False)),
@@ -1028,11 +1101,45 @@ def run_live_verified_bundle_candidate_main_execution(
                 report["failure_reason"] = "grasp_relative_position_error_exceeded_existing_limit"
             elif relative_rotation_error > config.maximum_grasp_relative_rotation_error_rad:
                 report["failure_reason"] = "grasp_relative_rotation_error_exceeded_existing_0.20_rad_limit"
+            elif not isinstance(response.get("joint_limits"), dict) or response["joint_limits"].get("status") != "pass":
+                report["failure_reason"] = "active_Panda_joint_limit_violated_or_unavailable"
             elif response.get("done"):
                 report["failure_reason"] = "MuJoCo_environment_terminated_during_selected_route"
             if report["failure_reason"]:
                 report["status"] = "stopped_on_first_main_environment_safety_or_tracking_failure"
                 break
+            if adaptive_progression:
+                progression = update_adaptive_reference_progression(
+                    reference_index,
+                    len(references),
+                    actual_sphere,
+                    target_sphere,
+                    catchup_steps_at_waypoint,
+                    total_catchup_steps,
+                    soft_error_threshold_m=soft_progression_error,
+                    max_catchup_steps_per_waypoint=maximum_catchup_per_waypoint,
+                    max_catchup_steps_total=maximum_catchup_total,
+                )
+                record["waypoint_advanced"] = progression["waypoint_advanced"]
+                record["catchup_steps_at_waypoint"] = progression[
+                    "catchup_steps_at_waypoint"
+                ]
+                record["total_catchup_steps"] = progression["total_catchup_steps"]
+                reference_index = progression["reference_index"]
+                catchup_steps_at_waypoint = progression[
+                    "catchup_steps_at_waypoint"
+                ]
+                total_catchup_steps = progression["total_catchup_steps"]
+                report["total_catchup_steps"] = total_catchup_steps
+                if progression["failure_reason"] is not None:
+                    report["failure_reason"] = progression["failure_reason"]
+                    report["status"] = "stopped_on_first_main_environment_safety_or_tracking_failure"
+                    break
+                if progression["route_completed"]:
+                    route_completed = True
+                    break
+            else:
+                reference_index += 1
             if report["main_environment_actions"] % 50 == 0:
                 print(
                     "VERIFIED B-SPLINE CANDIDATE MAIN-ENV EXECUTION:",
@@ -1044,15 +1151,44 @@ def run_live_verified_bundle_candidate_main_execution(
                 )
 
         if report["failure_reason"] is None:
-            report["route_completed"] = report["main_environment_actions"] == len(references) - 1
+            report["route_completed"] = (
+                route_completed
+                if adaptive_progression
+                else report["main_environment_actions"] == nominal_reference_steps
+            )
             report["status"] = "complete" if report["route_completed"] else "incomplete"
             if not report["route_completed"]:
                 report["failure_reason"] = "main_environment_route_ended_before_all_verified_references"
             else:
                 report["student_continuation"] = True
+        joint_margins = []
+        for route_step in report["steps"]:
+            limits = route_step.get("joint_limits")
+            if not isinstance(limits, dict) or limits.get("status") != "pass":
+                continue
+            qpos = np.asarray(limits.get("qpos"), dtype=np.float64)
+            ranges = np.asarray(limits.get("ranges"), dtype=np.float64)
+            if qpos.ndim == 1 and ranges.shape == (qpos.size, 2) and np.isfinite(qpos).all() and np.isfinite(ranges).all():
+                joint_margins.extend(
+                    np.minimum(qpos - ranges[:, 0], ranges[:, 1] - qpos).tolist()
+                )
         report["execution_summary"] = {
             "actual_main_environment_osc_steps": report["main_environment_actions"],
             "branch_verified_reference_steps": int(len(references) - 1),
+            "adaptive_catchup_steps": total_catchup_steps,
+            "joint_limit_checked_steps": sum(
+                isinstance(item.get("joint_limits"), dict)
+                and item["joint_limits"].get("status") == "pass"
+                for item in report["steps"]
+            ),
+            "minimum_joint_limit_margin_rad": min(joint_margins)
+            if joint_margins
+            else None,
+            "final_joint_limits": (
+                report["steps"][-1].get("joint_limits")
+                if report["steps"]
+                else None
+            ),
             "first_failure_reason": report["failure_reason"],
             "maximum_sphere_center_tracking_error_m": max(
                 (item["sphere_center_tracking_error_m"] for item in report["steps"]), default=None

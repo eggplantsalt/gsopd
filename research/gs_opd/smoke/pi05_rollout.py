@@ -93,6 +93,11 @@ def parse_args():
         action="store_true",
         help="After Snapshot acceptance and restore, randomly select a verified B-Spline candidate and execute it in the main environment before Student continuation.",
     )
+    parser.add_argument(
+        "--stop-if-no-verified-bundle-candidate",
+        action="store_true",
+        help="Stop after Snapshot restore without Student continuation when no candidate passes acceptance.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -175,6 +180,8 @@ def parse_args():
         parser.error("--direct-bspline-osc-left requires --trajectory-bundle-physical-validation")
     if bundle_main_execution_enabled and not trajectory_validation_enabled:
         parser.error("--execute-verified-bundle-candidate-in-main-env requires --trajectory-bundle-physical-validation")
+    if args.stop_if_no_verified_bundle_candidate and not bundle_main_execution_enabled:
+        parser.error("--stop-if-no-verified-bundle-candidate requires --execute-verified-bundle-candidate-in-main-env")
     if bundle_main_execution_enabled and (mink_osc_enabled or direct_osc_enabled):
         parser.error("verified bundle main-environment execution is mutually exclusive with direct-left and Mink modes")
     if trajectory_validation_enabled:
@@ -2216,7 +2223,9 @@ try:
                         candidate_selection_seed=args.trajectory_candidate_seed,
                         candidate_ids_to_track=args.trajectory_candidate_ids,
                         tracking_config=TrackingConfig(
-                            max_control_steps_per_candidate=args.trajectory_max_branch_steps
+                            max_control_steps_per_candidate=args.trajectory_max_branch_steps,
+                            reference_speed_m_s=0.020,
+                            adaptive_reference_progression=True,
                         ),
                     )
             except Exception as exc:
@@ -2317,6 +2326,7 @@ try:
                     tracking, args.trajectory_candidate_seed
                 )
                 if selected_candidate is None:
+                    stop_before_student = args.stop_if_no_verified_bundle_candidate
                     trajectory_validation_report["main_environment_candidate_execution"] = False
                     trajectory_validation_report["main_environment_execution"] = {
                         "status": "no_qualified_candidate",
@@ -2325,10 +2335,21 @@ try:
                             if isinstance(tracking, dict)
                             else []
                         ),
-                        "fallback": "resume_Student_from_the_verified_restored_main_state",
-                        "student_continuation": True,
+                        "fallback": (
+                            "stop_without_main_environment_or_Student_actions"
+                            if stop_before_student
+                            else "resume_Student_from_the_verified_restored_main_state"
+                        ),
+                        "student_continuation": not stop_before_student,
                         "main_environment_osc_steps": 0,
                     }
+                    if stop_before_student:
+                        candidate_main_execution_stop = True
+                        print(
+                            "VERIFIED CANDIDATE POOL EMPTY; STOPPING BEFORE MAIN-ENV OR STUDENT ACTIONS",
+                            flush=True,
+                        )
+                        break
                     print(
                         "VERIFIED CANDIDATE POOL EMPTY; RESUMING STUDENT AFTER SNAPSHOT RESTORE",
                         flush=True,

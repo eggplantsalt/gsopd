@@ -2,6 +2,18 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## 多候选 Snapshot 分支复用历史 Left 自适应 OSC：单候选真实验证（2026-10-20）
+
+为让候选验收和验收通过后的主环境执行使用相同控制节奏，Snapshot 分支与主环境路线都配置为沿用历史成功 Left 的 `0.020 m/s` 球心参考点采样，并只在真实球心误差达到 12 mm 软门槛后推进；单 waypoint 与总追赶上限分别为 32、240 步。历史直接 Left 路径继续使用自己的同一组常量，没有接入候选记录。OSC_POSE、B-Spline 候选生成、Teacher/Grounding、Contact Compiler、Panda 关节和双指抓持检查及接触安全阈值保持原有约束。验收通过后的主环境函数也配置了相同推进并逐步核对活动 Panda 关节限位；本次候选失败，故该函数没有被真实触发。新增 `--stop-if-no-verified-bundle-candidate` 门控：本轮候选不通过时，不进入主环境 OSC 或 Student 接续。
+
+最小回归：`test_trajectory_tracking.py` **39 项通过、2 个子测试通过**；轨迹束与 Snapshot 验收 **46 项通过、65 个子测试通过**；OSC Snapshot 与 rollout contact probe **6 项通过**；涉及 Python 文件 `py_compile` 通过，CLI `--help` 确认单候选筛选和失败停止入口可用。真实验证只运行一个原始 Student Episode（seed 0），在第 50 个 Student 动作形成稳定双指抓持后，对 18 条几何候选中的 Left `trajectory-001` 做 **一次** Snapshot 分支；Student 使用原 checkpoint、未加载 LoRA。该 Left 路线以 `0.020 m/s` 预采样为 846 个参考步，本次物理分支执行 198 个控制步、4950/4950 个子步接触样本完整，累计追赶步数为 0。
+
+候选**未完整通过**。首个物理阻塞为 0-based 分支控制索引 197（第 198 个动作）真实 Panda `robot0_joint7` 超过上限：`2.9031289221 rad`，上限 `2.8973 rad`，超出 `0.0058289221 rad`；上一动作的 joint7 为 `2.8768686896 rad`，尚余 `0.0204313104 rad`。其他关节未越限。首个限位时双指仍接触碗（左/右均 pass、9 个匹配接触），夹爪动作 `[-1.0, 1.0]`；最大抓持相对位置误差 `0.009744 m`（限值 `0.012 m`）、旋转误差 `0.183919 rad`（限值 `0.20 rad`），没有在该步丢失抓持。该不完整片段的 Contact Compiler verdict 为 `safe`、接触分类通过，不能替代完整轨迹验收。Snapshot 最终恢复通过，积分状态最大误差为 0。验收池为空，主环境 OSC **0 步**，验证后的 Student 接续 **0 步**，没有完成局部路线或获得完整成功安全轨迹。
+
+原始验收报告还包含 `reported_waypoint_advance_differs_from_live_error` 次级记录：该动作虽在 12 mm 误差门槛内，但当步关节限位失败，所以 Tracker 按安全失败路径在参考点推进前停止；原验收器把未推进标记误报为跟踪不一致。真实报告保留原样未回写。随后仅修正离线验收逻辑：跟踪失败的控制步不要求参考点推进，并新增定向回归；没有再次运行 MuJoCo 或尝试其他候选。最后静态核对发现候选配置曾落入历史直接 Left 函数，已恢复该路径对 `REFERENCE_SPEED_M_S` 与自适应常量的引用，并将候选配置放回验收通过后的主环境函数；跟踪回归和涉及文件语法检查再次通过。第一且实际的物理阻塞仍是 Panda joint7 限位。
+
+证据位于 `logs/gs_opd/eval/trajectory_bundle_adaptive_left_l0t0_20261020_attempt1/`：`launch.json`、`trajectory_validation_report.json`（80,217,797 bytes，含逐步状态、限位与子步接触）、`student_onpolicy_trace.npz`（10,403,172 bytes）、`student_and_candidate.mp4`、`result.json` 和 `student.log`。NPZ/视频记录 Student 抓持前缀；Snapshot 候选的完整物理验收证据保存在 JSON 中。本轮没有改历史成功示范、LoRA、数据集或训练流程，也没有批量试错。
+
 ## 主线恢复：成功的单场景过拟合基线（2026-10-20）
 
 - 已从 `pi05_rollout.py` 移除 Far/Mid/Near Episode 调度参数、实时采样轮询、命中后的 Chunk 中断和相关报告元数据；通用验收不再等待 Episode 风险层。Episode-only helper 与测试已删除。Near–Far 的预警、Repair 和只读 Geom 查询模块没有回滚；历史实验目录和日志完整保留。
@@ -2612,3 +2624,15 @@ OSC 路线完成后，Student 从最后一帧真实主环境 Observation 接续�
 最小回归最初发现 2 项 Snapshot 接受测试的模拟 Bundle 声明有候选数量但列表为空，当前入口按预期拒绝了这份不一致输入；只补齐测试夹具中的两条候选，没有改生产代码。轨迹生成、验收、跟踪及 Rollout 相关测试最终 **83 项通过、67 个子测试通过**，语法与 CLI 参数核对通过。
 
 **当前阻塞：**已排除默认 480 步上限，但最有希望的历史 Left 路线和一个已通过旧 Above Smoke 的参考候选在当前抓持状态下均未通过 Panda 关节限位检查。当前未获得新的安全 B-Spline→OSC→Student 完整成功示范，本轮不继续调参或重试。下一步需先从现有失败分支的关节限位记录定位发生限位的活动关节和参考姿态；在没有经验证的最小路线/起始状态调整前，不将这些候选加入合格池。
+
+## 历史成功 Left 与 Snapshot 分支关节限位离线核对（2026-10-20）
+
+只读取 `live_left_bspline_osc_adaptive_20261019_attempt1` 的 NPZ/JSON 及 `trajectory_bundle_multiroute_onpolicy_l0t0_20261020_attempt1` 的完整分支报告，未启动 MuJoCo、训练或修改代码。两份报告保存的活动 Panda 关节范围一致；`robot0_joint7` 范围为 `[-2.8973, 2.8973] rad`。
+
+历史 NPZ 有 845 个实际 7D 动作，其中报告中的 OSC 段为 749 步（全局步 55–803），也保存 EEF、黑碗球心、跟踪、抓持和接触数据；但 NPZ 没有逐步 Panda qpos 字段，749 条 JSON OSC step 也没有关节位置。历史报告只保存了关节限位范围，没有每步实测关节状态。因此无法逐步判断历史 Left 是否越限，也无法计算其最大/最小限位余量；`route_completed=true`、任务成功或 EEF 轨迹不能替代 qpos 证据，不能据此宣称限位通过。
+
+Snapshot 报告则记录了每个控制步的真实 qpos：Left `trajectory-001` 在第 175 步 `joint7=2.87327349 rad`，距上限尚余 `0.02402651 rad`；第 176 步为 `2.90441084 rad`，超上限 `0.00711084 rad`，故检查失败。Above `trajectory-003` 第 179 步 `joint7=2.85596095 rad`，距上限 `0.04133905 rad`；第 180 步为 `2.90000521 rad`，超上限 `0.00270521 rad`，故检查失败。两分支的实测记录证明当前分支越限；因历史 Left 没有相同 qpos 记录，无法判定越限是否由抓持起点、生成的参考路径或执行/监测流程差异导致。
+
+历史成功路线使用专门的 `direct_b_spline_closed_loop_native_osc_pose` Left 执行入口，参考速度 `0.020 m/s`，按球心真实跟踪误差自适应推进，完整执行 749 个 OSC 步骤后由 Student 接续成功。近期 Snapshot 流程从另一个稳定抓持状态生成候选，再逐步执行轨迹跟踪并在每步检查活动 Panda 限位；Left/Above 分别在不同候选的第 176/180 步被关节检查拒绝。两者起始 Snapshot 与参考路线并非同一状态/轨迹，现有日志不足以把差异单独归因于控制器配置，也不能用历史成功证明旧路线未越限。
+
+后续最小复用方式：把历史 `0.020 m/s` 自适应 OSC Left 作为路线和执行流程基线，在稳定抓持的 Snapshot 分支中复用该推进方式验证少量不同的磁感线候选；从下一次开始逐控制步保存七个 Panda qpos 和同一组范围，分支触及限位即按现行规则拒绝。只有逐步 qpos 与其余物理验收都完整的路线才计入安全采集池。数据源为上述 attempt1 的 `direct_bspline_osc_trajectory.npz`、`live_left_bspline_osc_report.json` 和 multiroute attempt1 的 `trajectory_validation_report.json`。

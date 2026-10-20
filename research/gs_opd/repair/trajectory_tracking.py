@@ -41,6 +41,9 @@ from research.gs_opd.teacher.schema_v2 import validate_teacher_output_v2
 MAX_CONTROL_STEPS_PER_CANDIDATE = 1200
 MAX_TOTAL_CONTROL_STEPS = 12_000
 MAX_REFERENCE_SPEED_M_S = 0.04
+ADAPTIVE_REFERENCE_SOFT_ERROR_M = 0.012
+MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT = 32
+MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL = 240
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,10 @@ class TrackingConfig:
     max_control_steps_per_candidate: int = 480
     max_total_control_steps: int = 7_200
     reference_speed_m_s: float = 0.04
+    adaptive_reference_progression: bool = False
+    reference_progression_soft_error_m: float = ADAPTIVE_REFERENCE_SOFT_ERROR_M
+    max_catchup_steps_per_waypoint: int = MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT
+    max_catchup_steps_total: int = MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL
     maximum_sphere_center_tracking_error_m: float = 0.025
     maximum_eef_tracking_error_m: float = 0.025
     maximum_grasp_relative_position_error_m: float = 0.012
@@ -79,6 +86,7 @@ class TrackingConfig:
             )
         for name in (
             "reference_speed_m_s",
+            "reference_progression_soft_error_m",
             "maximum_sphere_center_tracking_error_m",
             "maximum_eef_tracking_error_m",
             "maximum_grasp_relative_position_error_m",
@@ -98,6 +106,86 @@ class TrackingConfig:
             raise ValueError(
                 f"reference_speed_m_s cannot exceed {MAX_REFERENCE_SPEED_M_S} m/s"
             )
+        if not isinstance(self.adaptive_reference_progression, bool):
+            raise ValueError("adaptive_reference_progression must be a bool")
+        for name, maximum in (
+            ("max_catchup_steps_per_waypoint", MAX_CONTROL_STEPS_PER_CANDIDATE),
+            ("max_catchup_steps_total", MAX_CONTROL_STEPS_PER_CANDIDATE),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"{name} must be in 1..{maximum}")
+
+
+def update_adaptive_reference_progression(
+    reference_index: int,
+    reference_count: int,
+    actual_sphere_center_world_m: Any,
+    target_sphere_center_world_m: Any,
+    catchup_steps_at_waypoint: int,
+    total_catchup_steps: int,
+    *,
+    soft_error_threshold_m: float = ADAPTIVE_REFERENCE_SOFT_ERROR_M,
+    max_catchup_steps_per_waypoint: int = MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+    max_catchup_steps_total: int = MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
+) -> dict[str, Any]:
+    """Advance a sphere-center reference only after live tracking catches up."""
+    if (
+        isinstance(reference_index, bool)
+        or not isinstance(reference_index, int)
+        or isinstance(reference_count, bool)
+        or not isinstance(reference_count, int)
+        or reference_count < 2
+        or not 1 <= reference_index < reference_count
+    ):
+        raise ValueError("adaptive reference index must identify a non-start waypoint")
+    for name, value in (
+        ("catchup_steps_at_waypoint", catchup_steps_at_waypoint),
+        ("total_catchup_steps", total_catchup_steps),
+        ("max_catchup_steps_per_waypoint", max_catchup_steps_per_waypoint),
+        ("max_catchup_steps_total", max_catchup_steps_total),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if max_catchup_steps_per_waypoint < 1 or max_catchup_steps_total < 1:
+        raise ValueError("adaptive catchup limits must be positive")
+    if (
+        isinstance(soft_error_threshold_m, bool)
+        or not isinstance(soft_error_threshold_m, (int, float))
+        or not math.isfinite(float(soft_error_threshold_m))
+        or soft_error_threshold_m <= 0
+    ):
+        raise ValueError("soft_error_threshold_m must be finite and positive")
+    actual = _finite_vector(
+        actual_sphere_center_world_m, 3, "actual sphere center"
+    )
+    target = _finite_vector(
+        target_sphere_center_world_m, 3, "target sphere center"
+    )
+    tracking_error = float(np.linalg.norm(actual - target))
+    result = {
+        "reference_index": reference_index,
+        "tracking_error_m": tracking_error,
+        "waypoint_advanced": False,
+        "catchup_steps_at_waypoint": catchup_steps_at_waypoint,
+        "total_catchup_steps": total_catchup_steps,
+        "route_completed": False,
+        "failure_reason": None,
+    }
+    if tracking_error <= float(soft_error_threshold_m):
+        result["route_completed"] = reference_index == reference_count - 1
+        if not result["route_completed"]:
+            result["reference_index"] = reference_index + 1
+            result["waypoint_advanced"] = True
+            result["catchup_steps_at_waypoint"] = 0
+        return result
+    result["catchup_steps_at_waypoint"] = catchup_steps_at_waypoint + 1
+    result["total_catchup_steps"] = total_catchup_steps + 1
+    if result["catchup_steps_at_waypoint"] >= max_catchup_steps_per_waypoint:
+        result["failure_reason"] = "waypoint_catchup_budget_exhausted"
+    elif result["total_catchup_steps"] >= max_catchup_steps_total:
+        result["failure_reason"] = "total_catchup_budget_exhausted"
+    return result
 
 
 def _finite_vector(value: Any, size: int, name: str) -> np.ndarray:
@@ -1220,6 +1308,26 @@ def _candidate_assessment(
     steps = candidate.get("steps")
     requested_steps = candidate.get("requested_steps")
     executed_steps = candidate.get("executed_steps")
+    progression = candidate.get("reference_progression")
+    adaptive_progression = (
+        isinstance(progression, dict)
+        and progression.get("type") == "adaptive_actual_sphere_center_error"
+    )
+    requested_steps_valid = (
+        not isinstance(requested_steps, bool)
+        and isinstance(requested_steps, int)
+        and requested_steps > 0
+    )
+    expected_executed_max = requested_steps if requested_steps_valid else 0
+    if (
+        adaptive_progression
+        and requested_steps_valid
+    ):
+        expected_executed_max = requested_steps + int(
+            progression.get(
+                "max_catchup_steps_total", MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL
+            )
+        )
     if (
         not isinstance(steps, list)
         or isinstance(requested_steps, bool)
@@ -1227,15 +1335,21 @@ def _candidate_assessment(
         or requested_steps <= 0
         or isinstance(executed_steps, bool)
         or not isinstance(executed_steps, int)
-        or executed_steps != requested_steps
-        or len(steps) != requested_steps
+        or executed_steps != len(steps)
+        or (
+            executed_steps < requested_steps
+            if adaptive_progression
+            else executed_steps != requested_steps
+        )
+        or executed_steps > expected_executed_max
     ):
         errors.append("complete_closed_loop_control_step_trace_missing")
     reference_path = np.asarray(candidate.get("reference_path"), dtype=np.float64)
     goal = np.asarray(candidate.get("goal_sphere_center_world_m"), dtype=np.float64)
+    expected_reference_count = requested_steps + 1 if requested_steps_valid else -1
     if (
         not isinstance(steps, list)
-        or reference_path.shape != (len(steps) + 1, 3)
+        or reference_path.shape != (expected_reference_count, 3)
         or goal.shape != (3,)
         or not np.isfinite(reference_path).all()
         or not np.isfinite(goal).all()
@@ -1375,6 +1489,12 @@ def _candidate_assessment(
                 f"step_{index}_gripper_not_confirmed_closed:"
                 f"{step_closure_reason or step_closure.get('reason') or 'unknown'}"
             )
+    expected_reference_index = 1
+    soft_progression_error = (
+        float(progression.get("soft_error_threshold_m", ADAPTIVE_REFERENCE_SOFT_ERROR_M))
+        if adaptive_progression
+        else None
+    )
     if isinstance(steps, list):
         for index, step in enumerate(steps):
             if not isinstance(step, dict):
@@ -1484,6 +1604,21 @@ def _candidate_assessment(
                     3,
                     "sphere-center reference",
                 )
+                reference_index = (
+                    step.get("route_reference_index")
+                    if adaptive_progression
+                    else index + 1
+                )
+                if (
+                    isinstance(reference_index, bool)
+                    or not isinstance(reference_index, int)
+                    or not 1 <= reference_index < len(reference_path)
+                    or (
+                        adaptive_progression
+                        and reference_index != expected_reference_index
+                    )
+                ):
+                    raise ValueError("reported_reference_progression_is_not_sequential")
                 reconstructed_sphere = body_local_point_to_world(
                     state_pose["object_root_position"],
                     state_pose["object_quaternion"],
@@ -1506,7 +1641,7 @@ def _candidate_assessment(
                         actual_object_quaternion - state_pose["object_quaternion"]
                     )
                     > config.rotation_tolerance_rad
-                    or np.linalg.norm(reference - reference_path[index + 1])
+                    or np.linalg.norm(reference - reference_path[reference_index])
                     > config.state_tolerance_m
                 ):
                     raise ValueError("reported_pose_differs_from_canonical_state")
@@ -1515,6 +1650,18 @@ def _candidate_assessment(
                     > config.maximum_sphere_center_tracking_error_m
                 ):
                     raise ValueError("sphere_center_path_tracking_error_exceeded")
+                if adaptive_progression:
+                    sphere_error = float(step["sphere_center_tracking_error_m"])
+                    should_advance = (
+                        step.get("tracking_status") == "pass"
+                        and sphere_error <= soft_progression_error
+                        and reference_index < len(reference_path) - 1
+                    )
+                    if step.get("waypoint_advanced") is not should_advance:
+                        raise ValueError("reported_waypoint_advance_differs_from_live_error")
+                    expected_reference_index = (
+                        reference_index + 1 if should_advance else reference_index
+                    )
             except Exception as exc:
                 errors.append(f"step_{index}_state_pose_consistency_failed:{exc}")
             if not isinstance(step.get("contacts"), dict):
@@ -1527,6 +1674,17 @@ def _candidate_assessment(
             workspace = step.get("workspace")
             if not isinstance(workspace, dict) or workspace.get("status") != "pass":
                 errors.append(f"step_{index}_workspace_check_not_passed")
+        if (
+            adaptive_progression
+            and candidate.get("execution_complete") is True
+            and (
+                not steps
+                or expected_reference_index != len(reference_path) - 1
+                or float(steps[-1].get("sphere_center_tracking_error_m", float("inf")))
+                > soft_progression_error
+            )
+        ):
+            errors.append("adaptive_reference_route_did_not_finish_at_verified_endpoint")
     if compiler_result.get("verdict") != "safe":
         errors.append(f"contact_compiler_{compiler_result.get('verdict', 'unknown')}")
     if classifications.get("status") != "pass":

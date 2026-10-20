@@ -22,6 +22,7 @@ import numpy as np
 from research.gs_opd.repair.panda_gripper_state import parse_panda_gripper_closure
 from research.gs_opd.repair.trajectory_tracking import (
     TrackingConfig,
+    update_adaptive_reference_progression,
     _parse_eef_reference_poses,
     _validate_carried_binding,
     body_local_offset_from_world_point,
@@ -298,6 +299,7 @@ def _bridge_candidate(
     sphere_offset=(0.0, 0.0, 0.0),
     object_quaternion=(1.0, 0.0, 0.0, 0.0),
     step_quaternions=None,
+    adaptive=False,
 ):
     sphere_offset = np.asarray(sphere_offset, dtype=np.float64)
     object_quaternion = np.asarray(object_quaternion, dtype=np.float64)
@@ -397,7 +399,7 @@ def _bridge_candidate(
                 },
             }
         )
-    return {
+    candidate = {
         "candidate_id": candidate_id,
         "status": "ok",
         "snapshot_start_state_match": True,
@@ -485,6 +487,17 @@ def _bridge_candidate(
             "events": events,
         },
     }
+    if adaptive:
+        candidate["reference_progression"] = {
+            "type": "adaptive_actual_sphere_center_error",
+            "soft_error_threshold_m": 0.012,
+            "max_catchup_steps_per_waypoint": 32,
+            "max_catchup_steps_total": 240,
+        }
+        for index, step in enumerate(steps):
+            step["route_reference_index"] = index + 1
+            step["waypoint_advanced"] = index < control_step_count - 1
+    return candidate
 
 
 class FakeConnection:
@@ -566,6 +579,42 @@ class TrajectoryTrackingTests(unittest.TestCase):
             connection.request["options"]["max_control_steps_per_candidate"], 480
         )
         self.assertEqual(connection.request["options"]["max_total_control_steps"], 7200)
+
+    def test_failed_adaptive_tracking_step_does_not_expect_a_waypoint_advance(self):
+        candidate = _bridge_candidate("adaptive-left", adaptive=True)
+        candidate["execution_complete"] = False
+        candidate["executed_steps"] = 3
+        candidate["steps"] = candidate["steps"][:3]
+        candidate["steps"][2]["tracking_status"] = "fail"
+        candidate["steps"][2]["tracking_failure_reason"] = (
+            "active_Panda_joint_limit_violated"
+        )
+        candidate["steps"][2]["joint_limits"] = {
+            "status": "fail",
+            "violating_joint_names": ["robot0_joint7"],
+        }
+        candidate["steps"][2]["waypoint_advanced"] = False
+        candidate["grasp_evidence"]["per_step"] = candidate["grasp_evidence"][
+            "per_step"
+        ][:3]
+        candidate["contact_monitoring"]["control_steps"] = candidate[
+            "contact_monitoring"
+        ]["control_steps"][:3]
+        candidate["contact_monitoring"]["expected_physics_substeps_total"] = 3
+        candidate["contact_monitoring"]["captured_physics_substeps"] = 3
+        candidate["contact_monitoring"]["no_contact_substeps"] = 2
+        candidate["task_feasibility"].update(
+            {"status": "fail", "complete_path_executed": False}
+        )
+        candidate["closed_loop_tracking"].update({"status": "fail"})
+
+        result, _ = self._run([candidate])
+        reasons = result["candidates"][0]["rejection_reasons"]
+        self.assertIn("step_2_tracking_status_not_pass", reasons)
+        self.assertIn("step_2_joint_limit_check_not_passed", reasons)
+        self.assertFalse(
+            any("waypoint_advance_differs_from_live_error" in item for item in reasons)
+        )
 
     def test_ungrasped_start_is_rejected(self):
         result, _ = self._run([_bridge_candidate("candidate-0", grasp=False)])
@@ -1184,6 +1233,52 @@ class TrajectoryTrackingTests(unittest.TestCase):
         )
         self.assertEqual(result["requested_steps"], 10)
         self.assertLessEqual(result["maximum_reference_displacement_m"], 0.002 + 1e-12)
+
+        adaptive_result = resample_polyline_by_distance(
+            [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0]],
+            speed_m_s=0.020,
+            control_timestep_s=0.05,
+            maximum_steps=20,
+        )
+        self.assertEqual(adaptive_result["requested_steps"], 20)
+        self.assertLessEqual(
+            adaptive_result["maximum_reference_displacement_m"], 0.001 + 1e-12
+        )
+
+    def test_adaptive_reference_waits_for_sphere_center_and_finishes_at_endpoint(self):
+        lagging = update_adaptive_reference_progression(
+            1, 3, [0.0, 0.0, 0.0], [0.02, 0.0, 0.0], 0, 0
+        )
+        self.assertEqual(lagging["reference_index"], 1)
+        self.assertFalse(lagging["waypoint_advanced"])
+        self.assertEqual(lagging["catchup_steps_at_waypoint"], 1)
+
+        caught_up = update_adaptive_reference_progression(
+            1, 3, [0.009, 0.0, 0.0], [0.02, 0.0, 0.0], 1, 1
+        )
+        self.assertEqual(caught_up["reference_index"], 2)
+        self.assertTrue(caught_up["waypoint_advanced"])
+        self.assertEqual(caught_up["catchup_steps_at_waypoint"], 0)
+        self.assertEqual(caught_up["total_catchup_steps"], 1)
+
+        endpoint = update_adaptive_reference_progression(
+            2, 3, [0.011, 0.0, 0.0], [0.02, 0.0, 0.0], 0, 1
+        )
+        self.assertTrue(endpoint["route_completed"])
+        self.assertFalse(endpoint["waypoint_advanced"])
+        self.assertIsNone(endpoint["failure_reason"])
+
+    def test_adaptive_reference_reports_existing_per_waypoint_catchup_limit(self):
+        result = update_adaptive_reference_progression(
+            1,
+            2,
+            [0.0, 0.0, 0.0],
+            [0.02, 0.0, 0.0],
+            31,
+            31,
+        )
+        self.assertEqual(result["catchup_steps_at_waypoint"], 32)
+        self.assertEqual(result["failure_reason"], "waypoint_catchup_budget_exhausted")
 
     def test_realistic_long_path_exceeds_old_240_step_cap_within_new_budget(self):
         config = TrackingConfig()

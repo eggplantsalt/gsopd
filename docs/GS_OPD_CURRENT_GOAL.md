@@ -1,11 +1,12 @@
 # GS-OPD 当前局部目标
 
-## 当前主线：多候选 On-Policy 安全轨迹采集试跑（2026-10-20）
+## 当前主线：单条 Left 自适应 OSC Snapshot 复验已完成（2026-10-20）
 
-- 沿用原始 π₀.₅ Student、当前 Safety Bridge 和完整的 `18 候选生成 → Snapshot 物理验收 → 合格池随机选择 → 主环境 OSC 执行 → Student 接续` 入口。历史 845 步 Left 成功回合继续作为直接路线基线；本次没有改 B-Spline、OSC、Teacher、Grounding、Compiler、安全阈值、LoRA 或训练流程。
-- 新 attempt1 在第 50 步稳定双指抓持后几何生成 18 条，只对 Left `trajectory-001` 和 Above `trajectory-003` 做物理分支；预算设 1200，Snapshot 恢复通过，但 0/2 候选完整验收通过，跟踪期间遇到 Panda 关节限位失败。合格池为空，未执行候选路线。
-- 空池后原始 Student 按既有回退继续，并于第 778 步 reward=1、`done=True`。这回合是完整 Student-only 成功，不计为新的 B-Spline/OSC 安全轨迹。NPZ、双相机视频、全步物理与子步接触记录及完整分支报告保存在 `logs/gs_opd/eval/trajectory_bundle_multiroute_onpolicy_l0t0_20261020_attempt1/`。
-- 当前唯一阻塞是候选路线在该稳定抓持起点下触发活动 Panda 关节限位；未降低约束、未重试。需要基于保存的两条分支报告定位限位关节与姿态，确认安全的最小调整后再开展下一条路线。测试夹具最小修正后相关回归为 83 项通过、67 个子测试通过。
+- 在多候选 On-Policy 路径中复用历史 Left 的 `0.020 m/s` 球心参考点采样与 12 mm 自适应推进；Snapshot 分支和验收通过后的主环境函数配置了相同推进规则。单 waypoint/总追赶上限为 32/240 步，Safety Compiler、关节限位、双指抓持、接触安全阈值和路线生成保持原样。主环境函数增加逐步关节限位核对，但本次候选未通过，因此该执行函数未实际运行。历史直接 Left 函数保留其专用速度/追赶常量。
+- 使用原始 Student、seed 0，仅对 Left `trajectory-001` 做一次真实 Snapshot 验证。第 50 步稳定双指抓持后生成 18 条几何候选，单 Left 分支的 846 个参考步预算中真实执行 198 步；0-based 控制索引 197 首次触发 `robot0_joint7=2.9031289221 rad`，超过 `2.8973 rad` 上限 `0.0058289221 rad`。故候选不完整、不进入合格池。
+- 越限时左右指都仍接触黑碗（9 个匹配接触），闭合命令 `[-1.0,1.0]`；抓持相对位置/旋转误差最大分别为 `0.009744 m` / `0.183919 rad`，在原门槛内。分支接触采样完整、Compiler 对这段不完整轨迹返回 `safe`、Snapshot 恢复最大误差 0；这些不构成完整安全路线验收。
+- 因候选失败，主环境 OSC 为 0 步、Student 接续为 0 步。没有获得完整成功安全轨迹，不继续试其他候选。逐步 NPZ、视频、完整验收 JSON、启动参数、结果和 Student 日志保存在 `logs/gs_opd/eval/trajectory_bundle_adaptive_left_l0t0_20261020_attempt1/`。
+- 回归：轨迹跟踪 **39 项 + 2 子测试**、轨迹束与 Snapshot 验收 **46 项 + 65 子测试**、OSC Snapshot/rollout contact probe **6 项**均通过，涉及 Python 文件 `py_compile` 通过。真实报告保留 Tracker 在关节限位失败当步的一个次级 waypoint 标记误报；之后已修正验收器并加回归，没有重新运行物理环境。
 
 ## 已完成：恢复 B-Spline 出口基线并诊断 attempt3 Student 接管（2026-10-20）
 

@@ -1164,12 +1164,16 @@ def _track_trajectory_candidate(
     candidate, snapshot, binding, options, candidate_index, reference_plan
 ):
     from research.gs_opd.repair.trajectory_tracking import (
+        ADAPTIVE_REFERENCE_SOFT_ERROR_M,
+        MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+        MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
         body_local_offset_from_world_point,
         body_local_point_to_world,
         quaternion_conjugate,
         quaternion_multiply,
         quaternion_to_matrix,
         quaternion_to_rotation_vector,
+        update_adaptive_reference_progression,
         world_pose_tracking_action,
     )
 
@@ -1243,6 +1247,9 @@ def _track_trajectory_candidate(
         if not math.isclose(control_timestep, 0.05, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("active environment is not configured for 20 Hz OSC control")
         sampled = reference_plan
+        adaptive_progression = options.get("adaptive_reference_progression", False)
+        if not isinstance(adaptive_progression, bool):
+            raise ValueError("adaptive_reference_progression must be a bool")
         result["eef_reference_pose_source"] = (
             "explicit_Mink_FK_world_pose_trajectory"
             if sampled.get("eef_reference_poses_world") is not None
@@ -1262,6 +1269,35 @@ def _track_trajectory_candidate(
             "path_length_m": sampled["path_length_m"],
             "reference_speed_limit_m_s": options["reference_speed_m_s"],
             "control_timestep_s": control_timestep,
+            "reference_progression": {
+                "type": "adaptive_actual_sphere_center_error"
+                if adaptive_progression
+                else "fixed_reference_per_control_step",
+                "soft_error_threshold_m": (
+                    options.get(
+                        "reference_progression_soft_error_m",
+                        ADAPTIVE_REFERENCE_SOFT_ERROR_M,
+                    )
+                    if adaptive_progression
+                    else None
+                ),
+                "max_catchup_steps_per_waypoint": (
+                    options.get(
+                        "max_catchup_steps_per_waypoint",
+                        MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+                    )
+                    if adaptive_progression
+                    else None
+                ),
+                "max_catchup_steps_total": (
+                    options.get(
+                        "max_catchup_steps_total",
+                        MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
+                    )
+                    if adaptive_progression
+                    else None
+                ),
+            },
         })
         result["start_contacts"] = _collect_contacts()
         gripper_groups, initial_gripper_closure = _tracking_gripper_sides(robot)
@@ -1378,7 +1414,26 @@ def _track_trajectory_candidate(
                 raise ValueError("active OSC orientation clipping cannot be proven inactive")
         tracking_status = "pass"
         tracking_reason = None
-        for step_index in range(sampled["requested_steps"]):
+        route_completed = False
+        reference_index = 1
+        catchup_steps_at_waypoint = 0
+        total_catchup_steps = 0
+        execution_budget = sampled["requested_steps"]
+        if adaptive_progression:
+            execution_budget = min(
+                int(options["max_control_steps_per_candidate"]),
+                sampled["requested_steps"]
+                + int(
+                    options.get(
+                        "max_catchup_steps_total",
+                        MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
+                    )
+                ),
+            )
+        result["execution_budget_steps"] = execution_budget
+        for step_index in range(execution_budget):
+            if reference_index >= len(references):
+                break
             live_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
             object_root_position, object_quaternion = _tracking_state_object(
                 live_diagnostic, binding["body_id"]
@@ -1389,11 +1444,11 @@ def _track_trajectory_candidate(
             robot_state = live_diagnostic["robot_states"][0]
             actual_eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
             actual_eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
-            reference_position = np.asarray(references[step_index + 1], dtype=np.float64)
+            reference_position = np.asarray(references[reference_index], dtype=np.float64)
             object_rotation = quaternion_to_matrix(object_quaternion)
             if explicit_eef_poses is not None:
-                target_eef_position = explicit_eef_poses[step_index + 1, :3]
-                target_eef_quaternion = explicit_eef_poses[step_index + 1, 3:]
+                target_eef_position = explicit_eef_poses[reference_index, :3]
+                target_eef_quaternion = explicit_eef_poses[reference_index, 3:]
             else:
                 target_eef_position = reference_position + object_rotation @ relative_position_local
                 target_eef_quaternion = quaternion_multiply(object_quaternion, relative_quaternion_local)
@@ -1519,6 +1574,10 @@ def _track_trajectory_candidate(
                     grasp["reason"] = reason
                 step = {
                     "step_index": step_index,
+                    "route_reference_index": reference_index,
+                    "waypoint_advanced": False,
+                    "catchup_steps_at_waypoint": catchup_steps_at_waypoint,
+                    "total_catchup_steps": total_catchup_steps,
                     "reference_sphere_center_world_m": reference_position.tolist(),
                     "actual_object_root_pos_world_m": object_root_position.tolist(),
                     "actual_object_sphere_center_world_m": sphere_center.tolist(),
@@ -1560,10 +1619,63 @@ def _track_trajectory_candidate(
                     break
                 if reason is not None:
                     break
+                if adaptive_progression:
+                    progression = update_adaptive_reference_progression(
+                        reference_index,
+                        len(references),
+                        sphere_center,
+                        reference_position,
+                        catchup_steps_at_waypoint,
+                        total_catchup_steps,
+                        soft_error_threshold_m=float(
+                            options.get(
+                                "reference_progression_soft_error_m",
+                                ADAPTIVE_REFERENCE_SOFT_ERROR_M,
+                            )
+                        ),
+                        max_catchup_steps_per_waypoint=int(
+                            options.get(
+                                "max_catchup_steps_per_waypoint",
+                                MAX_ADAPTIVE_CATCHUP_STEPS_PER_WAYPOINT,
+                            )
+                        ),
+                        max_catchup_steps_total=int(
+                            options.get(
+                                "max_catchup_steps_total",
+                                MAX_ADAPTIVE_CATCHUP_STEPS_TOTAL,
+                            )
+                        ),
+                    )
+                    step["waypoint_advanced"] = progression["waypoint_advanced"]
+                    step["catchup_steps_at_waypoint"] = progression[
+                        "catchup_steps_at_waypoint"
+                    ]
+                    step["total_catchup_steps"] = progression["total_catchup_steps"]
+                    reference_index = progression["reference_index"]
+                    catchup_steps_at_waypoint = progression[
+                        "catchup_steps_at_waypoint"
+                    ]
+                    total_catchup_steps = progression["total_catchup_steps"]
+                    result["total_catchup_steps"] = total_catchup_steps
+                    if progression["failure_reason"] is not None:
+                        tracking_status = "fail"
+                        tracking_reason = progression["failure_reason"]
+                        grasp["status"] = "fail"
+                        grasp["reason"] = tracking_reason
+                        break
+                    if progression["route_completed"]:
+                        route_completed = True
+                        break
+                else:
+                    reference_index += 1
             except Exception:
                 raise
         result["execution_complete"] = (
-            result["executed_steps"] == result["requested_steps"]
+            (
+                route_completed
+                if adaptive_progression
+                else result["executed_steps"] == result["requested_steps"]
+            )
             and tracking_status == "pass"
             and all(not step["done"] for step in result["steps"])
         )
@@ -3681,6 +3793,10 @@ try:
                     result["contact_monitoring"] = _contact_monitor_result(monitor)
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
+                    if request.get("include_joint_limits", False):
+                        result["joint_limits"] = _tracking_joint_limit_check(
+                            env.robots[0]
+                        )
                 elif request["op"] == "snapshot":
                     try:
                         snapshot_id = f"snapshot-{next_snapshot_id:06d}"
