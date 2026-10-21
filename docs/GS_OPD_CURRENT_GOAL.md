@@ -1,5 +1,12 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：object_3 bottle 候选验证已完成，保持 unresolved，等待复核（2026-10-22）
+
+- 使用同状态归档 RGB、`green bottle`/0.5 SAM3 全部候选和原始 L0T1 指令，对 object_3 仅调用冻结 Qwen3.8 一次；目标描述为中性 `bottle`。RGB/Mask/Geom ID 的 512×512 坐标与采集状态核验通过。
+- VLM 返回 unresolved，未选择唯一候选，理由是指令需要书而候选看起来是瓶子。回答保存后，归档 Candidate 0 Mask 与 Body 25 `bottle_of_beer__7_1_main` / Geom 133 的 IoU 为 0.98497358。保留为几何对应诊断，不创建语义绑定或修改 Safety IR。
+- 审计限制：调用前的宽泛预检打印了包含 SAM 分数和 Body IoU 的归档摘要；这些数据没有进入提示或候选筛选，但操作者当时已看到摘要。Smoke 在 raw/selection 落盘后才读取详细 IoU 文件；遵守一次推理限制，不重跑，结果按非盲单次选择复核。
+- 完整请求、原始输出、裁剪、输入和状态哈希、post-hoc 对照在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object3_task_conditioned_candidate_verification_20261022_attempt1/`。Qwen 服务已关闭；本轮不继续下游执行，等待人工复核。
+
 ## 当前状态：Task-Conditioned Candidate Verification 通用化与离线回归已完成，等待复核（2026-10-22）
 
 - Smoke 现在按输入 RGB 尺寸、SAM 实际候选列表和任意候选索引工作；移除了固定 1024、固定五候选/索引 0–4、默认 L0T1 指令及 Body 23 专项代码。任务指令改为必填。

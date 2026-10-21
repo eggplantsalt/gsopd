@@ -2,6 +2,14 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1 object_3 bottle Task-Conditioned Candidate Verification（2026-10-22）
+
+- 使用归档 `green bottle`/0.5 SAM3 结果对 `object_3` 做一次真实验证。预检确认 RGB、Candidate 0 Mask 和配对 Geom ID 来自同一份 L0T1/state0 归档；SAM RGB 与几何分割配对 RGB 均为 512×512 且 RGB 逐像素一致，Geom ID 为 512×512 `int32`，二者使用共同的 180° forward 坐标方向。采集期间未 reset/step，前后仿真状态一致。
+- 冻结本地 `Qwen3.8-27B-FP8`（原 SFT Teacher Checkpoint，non-thinking、temperature 0、4096 tokens）仅调用一次，HTTP 200、耗时 2.632 秒。输入为原任务指令 `pick up the book and place it in the back compartment of the caddy`、中性 `bottle` 描述、原始 RGB 与全部 1 个自动生成候选裁剪；提示中没有 Teacher 颜色描述、Body/Geom ID、IoU 或候选分数。
+- 顺序审计限制：推理前一次宽泛预检输出了归档 `run_summary.json`，其中含 SAM 分数和预计算 Body IoU；这些信息没有进入 VLM 请求或用于候选筛选，但操作者在请求前已看到摘要中的几何关联。Smoke 实际读取详细 IoU 文件仍发生在 raw/selection 写盘之后。因本轮限制一次推理，没有重跑；复核时应把结果视为非盲单次选择。
+- VLM 返回 `unresolved`、未选择 Candidate 0，理由是任务要求拿书而候选看起来是瓶子。保存原始回答后才读取归档几何结果：Candidate 0 Mask 对 Body 25 `bottle_of_beer__7_1_main` / Geom 133 的 IoU 为 **0.98497358**。这只证明候选 Mask 与该几何实例高度重叠；VLM 未选择候选，因此不建立 `object_3`→Body 25 语义绑定，Safety IR 未修改。
+- 请求、自动裁剪、原始输出、候选决定、同状态/像素对齐预检、post-hoc 几何诊断及 26 项 SHA-256 证据保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object3_task_conditioned_candidate_verification_20261022_attempt1/`。主报告为该目录 `experiment_report.md`；推理服务已关闭。本轮未重跑 SAM3、MuJoCo、Teacher，未运行 Student、规划或训练；等待复核。
+
 ## Task-Conditioned Candidate Verification Smoke 通用化与离线回归（2026-10-22）
 
 - 最小通用化 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`：移除了 1024 分辨率、5 个候选、连续索引 0–4、默认 L0T1 指令及 Body 23 专项检查。现在读取实际 RGB shape 和 SAM 候选列表，接受稀疏任意候选索引，`--instruction` 必填。
