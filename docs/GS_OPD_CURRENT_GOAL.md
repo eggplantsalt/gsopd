@@ -1,13 +1,14 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：π₂ 累计数据已准备，等待复核（2026-10-21）
+## 当前状态：π₂ 累计经验训练完成，等待复核（2026-10-21）
 
-- 累计 LeRobot v2.1 数据集包含 Round 0 原始 Student 845 步成功 Left，以及 Round 1 attempt3 LoRA Student 的 859/875 步 10%/20% 插值成功 Left；共 3 个独立 Episode、2,579 帧。
-- 全帧相机、状态、动作和任务文本与三份源 NPZ 精确对齐。保存阶段均衡索引、每 Episode 来源/策略/路线/真实动作来源和 Loader 验收报告。
-- `SingleEpisodeSftWorker` 已增加可选 `data.phase_manifest_path` 多 Episode 均衡入口；未设置时旧单 Episode 路径保持原样。训练模式均衡清单生成 6,897 个窗口索引，实际官方 OpenPI Loader 训练 Batch 与 48 个分阶段评估 Batch 均通过。
-- 数据集：`logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/`。本轮没有训练或 Rollout；等待复核后再从 π₁ 继续训练 π₂。
+- 使用累计 LeRobot v2.1 三 Episode 数据集和已验证的三阶段均衡采样，完成 **10,000 optimizer steps**。训练始终从原始 SFT Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 加载冻结基座，并新建 rank-32 Action Expert LoRA；`initial_adapter_path: null`、`resume_dir: null`，没有加载或合并 attempt3 π₁ Adapter。
+- 基座非 LoRA 权重 667/667 键完整覆盖，抽样权重最大差为 0；667 个基座参数张量冻结，13,860,864 个 LoRA 参数独立训练。AdamW 与学习率调度器从头初始化，固定 LR `1e-4`，未改变 OpenPI Flow Matching、归一化或模型结构。
+- 训练 loss 首 100 步均值 `0.025686`、末 100 步均值 `0.001209`。三阶段固定评估覆盖 step 0、2,000、4,000、6,000、10,000；π₂ Adapter 与完整训练权重在相同 Observation 上推理差为 0。
+- 完整训练报告、逐步 Loss、配置、预检、step 0 与阶段评估、5,000/10,000 步 Checkpoint、独立 π₂ Adapter 及导出验证均保存在 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`。
+- 本轮没有 MuJoCo Rollout、物理安全判定或新任务成功结论；等待复核训练与评估结果后再决定下一步。
 
-当前累计数据准备已完成，详见 `docs/GS_OPD_PROGRESS.md`。总体路线见 `docs/GS_OPD_ROADMAP.md`。
+累计数据来源与训练评估详见 `docs/GS_OPD_PROGRESS.md`。总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
 ## 已完成：attempt3 LoRA 训练与纯 Student 闭环评测（2026-10-20）
 

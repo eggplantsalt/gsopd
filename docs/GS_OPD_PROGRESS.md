@@ -2474,4 +2474,31 @@ Student 抓持 **50 步**；原 `0.020 m/s` 自适应 OSC 到达路线安全出�
 
 原训练 Worker 所用的官方 OpenPI `pi05_libero` DataLoader 与上述多 Episode 均衡分支完成无训练 Smoke：训练模式 1 个 Batch 为 `(Observation, actions)`，batch size 2、动作张量 `[2,10,32]` 且为有限值；Worker 生成的 **6,897** 窗口索引与已保存均衡清单完全一致，三阶段曝光均为 2,299。固定评估模式实际读取 **48 个 Batch**，每阶段 16 个，并覆盖三个 Episode 各 16 个；动作形状均为 `[1,10,32]`，相机变换后各视图为 `[1,3,224,224]`、状态为 `[1,32]`。沿用 Checkpoint 自带的原 norm stats，没有重算或改写。
 
-累计数据集与证据位于 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/`：LeRobot `data/`、`images/`、`meta/`，来源 `pi2_cumulative_dataset_manifest.json`，均衡索引 `pi2_stage_balanced_sampling.json`，逐帧与 DataLoader 验收 `pi2_cumulative_dataset_validation.json`。数据目录约 **670 MB**。本轮仅准备数据并验证加载；等待复核后再从 π₁ 继续训练 π₂。
+累计数据集与证据位于 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/`：LeRobot `data/`、`images/`、`meta/`，来源 `pi2_cumulative_dataset_manifest.json`，均衡索引 `pi2_stage_balanced_sampling.json`，逐帧与 DataLoader 验收 `pi2_cumulative_dataset_validation.json`。数据目录约 **670 MB**。在这一步只准备数据并验证加载；后续 π₂ 训练执行结果见下节。
+
+## π₂ 累计经验新初始化 LoRA 训练（2026-10-21）
+
+在此前三 Episode 累计数据与官方 OpenPI Loader 检查通过后，执行唯一一次 π₂ 训练。启动前确认没有既有 π₂ 连续训练进程或同名输出目录；配置解析与静态预检通过，数据验证报告为 `passed`，2,579/2,579 帧完整读取，训练 DataLoader smoke 通过。配置和预检哈希、SFT 基座哈希及数据清单哈希均记录在独立实验目录。
+
+训练初始化严格来自原始已 SFT Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`（`model.safetensors` SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`），norm stats SHA-256 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`。`gs_opd.initial_adapter_path: null`、`runner.resume_dir: null`；attempt3 π₁ Adapter 没有被加载或合并。运行时 Worker 在 step 0 评估与首次优化更新前确认：基座非 LoRA 权重键完整覆盖 **667/667**、抽样基座权重最大绝对差 **0**、**667 个**原始参数张量冻结、rank-32 Action Expert LoRA 的 **216 张量 / 13,860,864 参数**是唯一可训练项。LoRA 权重由模型初始化器新建，训练参数签名在完成时已改变。
+
+累计数据路径为 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/`，共有 **3 Episode / 2,579 帧**，所有 2,552 个 horizon-10 唯一窗口均保留；抓取、OSC 搬运、Student 放置每阶段每 Epoch 均衡曝光 **2,299 次**，共 6,897 个窗口样本。固定评估每阶段使用 16 个窗口，三阶段评估共 48 个样本。原始 OpenPI Flow Matching、pi05_libero 动作变换和 norm stats、模型结构、七维环境动作与 32 维模型动作保持不变。
+
+训练超参数沿用成功 attempt3：RLinf `SFTRunner` 与官方 OpenPI SFT DataLoader、AdamW 新优化器、`lr=1e-4` 常数调度、零 warmup、原 beta/epsilon/weight decay/梯度裁剪、batch size 2、固定评估种子 `20261020` 与 3 步动作采样。执行满 **10,000 optimizer steps**，用时 **5,631.4 s（约 93.9 分钟）**；单张 RTX 4090 峰值 allocated **14.27 GiB**、reserved **22.23 GiB**。逐步训练 Loss、梯度、LR 均有限，参数签名发生变化，结束原因为 `configured_optimizer_step_budget_completed`。首 100 步平均 Flow Loss **0.025686**，末 100 步平均 **0.001209**，全程平均 **0.001968**。
+
+相同固定 Observation、Flow/action 噪声种子和输出变换下，各阶段 Flow Matching MSE 与反归一化真实 10×7 Action MAE 如下：
+
+| 阶段 / 指标 | Step 0 | Step 2,000 | Step 4,000 | Step 6,000 | Step 10,000 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Student 抓取 Flow MSE | 0.053287 | 0.002109 | 0.001725 | 0.001251 | 0.002317 |
+| Student 抓取 10×7 Action MAE | 0.073858 | 0.026210 | 0.020109 | 0.020344 | 0.015393 |
+| B-Spline OSC 搬运 Flow MSE | 0.173468 | 0.001516 | 0.001599 | 0.001296 | 0.001101 |
+| B-Spline OSC 搬运 10×7 Action MAE | 0.186539 | 0.010121 | 0.010454 | 0.008595 | 0.008939 |
+| Student 放置 Flow MSE | 0.013831 | 0.002665 | 0.003390 | 0.002414 | 0.005490 |
+| Student 放置 10×7 Action MAE | 0.035040 | 0.015614 | 0.014682 | 0.018743 | 0.022695 |
+
+指标表示累计训练样本上固定 Observation 的拟合；尤其放置阶段最终指标较 step 6,000 回升。本次没有据此自动调参、提前停止或启动 Rollout，不将固定集拟合等同于闭环能力、安全性或任务成功。
+
+中间完整 Checkpoint 保存在 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/checkpoints/global_step_5000/actor/`，最终完整 Checkpoint 在 `.../checkpoints/global_step_10000/actor/`；各自包含约 6.97 GB `full_weights.pt` 和约 7.03 GB DCP shard。独立 π₂ rank-32 Adapter：`logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/lora_adapter.pt`，27,792,805 bytes，216 张量、13,860,864 参数，SHA-256 `bf6f046a2eebc25540c11fca82608ed48dbfeeeb2b9db2d51f4794aebd1be72a`。`export_and_verify_lora.py` 重载验证通过；原始 SFT 基座 + Adapter 对比最终完整权重，在 Round 0 成功轨迹 step 0 observation 上均输出 `[10,7]`，最大与平均绝对动作差均为 **0**。
+
+配置 `examples/sft/config/gs_opd_pi2_cumulative_fresh_lora_20261021.yaml` 和完整训练证据（`training_config.yaml`、`resolved_training_config.yaml`、`preflight.json`、`run_manifest.json`、`report.json`、10,000 行 `step_metrics.jsonl`、`fixed_eval_by_step.jsonl`、`loss_curve.png`、两个完整 Checkpoint、独立 Adapter、`adapter_reload_verification.json`、控制台和导出日志）保存在该独立 `pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/` 目录。原始 SFT Checkpoint、π₁ attempt3 Adapter、三份成功 NPZ、累计数据集、Teacher/Grounding 和安全监测材料未覆盖或改写；本轮没有 MuJoCo Rollout。

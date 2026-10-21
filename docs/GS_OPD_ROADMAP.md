@@ -18,8 +18,10 @@
 - 当前局部目标：`docs/GS_OPD_CURRENT_GOAL.md`
 - 原始 Student Checkpoint、成功示范和 LeRobot 数据集仍保留。attempt3 训练日志、报告、Adapter 和 RLinf checkpoint，以及本次 Student rollout 视频、NPZ、Compiler 审计和轨迹图，均保留于各自独立目录。详细记录见 `docs/GS_OPD_PROGRESS.md`。
 
-## π₂ 累计数据状态（2026-10-21）
+## π₂ 累计训练状态（2026-10-21）
 
-π₂ 的 Round 0/1 累计 LeRobot v2.1 数据已经就绪：原始 Student 845 步 Left，加上 attempt3 LoRA Student 的 859/875 步 10%/20% 插值 Left；合计 3 Episode、2,579 帧。逐帧转换完整性和现有 `SingleEpisodeSftWorker` 的可选多 Episode 阶段均衡读取已验证，训练数据索引为每阶段 2,299 次曝光。源 NPZ、Adapter、Checkpoint 与安全报告没有改写，当前没有开始 π₂ 训练或新增 Rollout。
+Round 0/1 累计 LeRobot v2.1 数据集包含原始 Student 845 步 Left，以及 attempt3 LoRA Student 起始状态上的 859/875 步 10%/20% 插值 Left；共 3 Episode、2,579 帧。已完成从原始 SFT Checkpoint 新初始化 rank-32 Action Expert LoRA 的 **10,000 optimizer steps** 训练；没有将 attempt3 π₁ Adapter 用作 π₂ 初始化。基座非 LoRA 权重 667/667 键完整覆盖且冻结，阶段均衡采样为每个阶段每 Epoch 2,299 次曝光。
 
-下一步：复核 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/` 的 Episode 来源、阶段均衡清单及 Loader 报告；复核通过后，才从 π₁ Adapter 继续启动 π₂ 训练。详细步骤和验收数值见 `docs/GS_OPD_PROGRESS.md`。
+π₂ 的 step 0、2,000、4,000、6,000、10,000 固定评估、5,000/10,000 步完整 Checkpoint 和独立 Adapter 已保留于 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`。Adapter 导出后重载验证通过，与最终完整权重在同一 Observation 的动作最大差为 0。该训练确认固定数据上的拟合变化；没有进行 MuJoCo Rollout，不构成物理安全或任务成功结论。
+
+下一步：复核 `docs/GS_OPD_PROGRESS.md` 中的训练配置来源、阶段固定评估和 Adapter 验证；复核前不启动 Rollout 或下一轮训练。
