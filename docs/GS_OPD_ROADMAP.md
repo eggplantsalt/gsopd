@@ -12,6 +12,10 @@
 4. **单轨迹学习链路**：2026-10-20 从原始 Student 初始化新的 rank-32 Action Expert LoRA，使用恒定 `1e-4` LR、AdamW 重新初始化、官方 OpenPI DataLoader、`SFTRunner`、原生 Flow Matching Loss 和三阶段均衡采样，完成 10,000 optimizer steps。固定示范状态上的 OSC 搬运 Flow MSE 从 0.152026 降至 0.000982，真实 10×7 Action MAE 从 0.183005 降至 0.009061；独立 Adapter 已成功重载并与训练 checkpoint 推理一致。该结果确认完整轨迹监督拟合，不代表新闭环成功、安全泛化或真实执行能力。
 5. **训练后 Student 评测与后续验证**：attempt3 新 Adapter 已与原始 Student 组合，在 LIBERO-Safety `obstacle_avoidance` L0T0 初始状态 0 完成一次纯 Student MuJoCo 回合：711 步、reward 1.0、`done=True`。完整 MP4、七维动作、双相机 Observation、EEF/黑碗物理状态和 17,775 个子步接触监测均已保存。针对现有 Safety IR 的 object_1/object_4 禁止接触规则，活动 Geometry Inventory 绑定通过核验，Compiler 在全子步记录上判为 `safe`；碗与该障碍的最近保守包围球间距约 0.19 mm，须保留这一很小余量以及 object_4 原语义匹配 IoU 0.1427 的置信限制。路径对比显示 Student 以更紧的 +World-Y 路径绕过障碍。此前 LoRA Student 物理路径文件已被空间清理，本次没有替代或重建该历史曲线。`object_3` 绑定继续保持 unknown，不从 reward 推导安全结论。
 
+## 参数化任务语义采集进度（2026-10-21）
+
+Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨率，默认 L0T0 初始化保持原样。已选择不同 BDDL 的 obstacle_avoidance L0T1“pick up the book and place it in the back compartment of the caddy”，state 0；完成 512×512 双相机观察并用本地冻结 Qwen3.8 Teacher 生成通过 Safety IR v2 Schema 的物体与接触语义。Teacher 的 book→green bottle 搬运物体禁止接触规则及三项位置不确定性单独保留，尚未产生任何几何绑定或物理安全结论。学生 Rollout、规划、动作修复和训练均未执行；当前等待图像与 Teacher 输出复核。完整证据路径和任务 BDDL 对照见 `docs/GS_OPD_PROGRESS.md`。
+
 ## 主要记录
 
 - 实验与历史阻塞：`docs/GS_OPD_PROGRESS.md`

@@ -2,9 +2,20 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## 参数化 Safety Bridge 与新任务 Teacher 观察（2026-10-21）
+
+- `research/gs_opd/smoke/safety_bridge.py` 支持 `--benchmark`、`--level`、`--task-id`（兼容别名 `--task`）、`--init-state`、`--seed` 和 `--camera-resolution`。Bridge 启动和 `reset` 都按同一 benchmark/level/task/init-state 取任务、BDDL 和初始化状态；默认仍为 `obstacle_avoidance / L0 / T0 / state 0 / seed 0 / 256×256`，没有改 OSC 配置或动作接口。Teacher Smoke 的图像元信息额外保存 Bridge 场景元数据，Safety IR v2 Prompt 未改。
+- 本地枚举 `obstacle_avoidance` 后选用 L0T1：指令为 “pick up the book and place it in the back compartment of the caddy”，state 0（该 task 有 50 个 init states）。BDDL 为 `pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl`，SHA-256 `b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844`；与 L0T0 碗任务的 BDDL 路径及 SHA-256（`b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12`）不同。任务、指令、路径、hash、state index、seed 和相机配置均写入 `scene_selection.json` / capture metadata。
+- 只初始化和采集观察：`agentview_image`、`robot0_eye_in_hand_image` 均为 512×512 RGB uint8；保存 PNG、原始 RGB NPZ、重复 reset 图像、元数据和 SHA-256 清单。全程 `step` 动作为 0；未运行 Student、训练、规划、Repair 或绑定生成。
+- 同一 task/init-state 配置下的两次 reset 输出没有逐像素一致（两相机最大像素差分别为 161/156）；具体渲染或随机化来源未证实。Teacher 实际输入图像位于 `teacher_input_attempt3/`，与初始采集分别保留，场景元数据一致。
+- 使用本地冻结 `/workspace/zy_workspace/checkpoints/gs_opd/Qwen3.8-27B-FP8`（vLLM 0.31.0，TP=2）和原 Safety IR v2 Prompt 生成新场景 Teacher 输出。前两次响应分别因空 `message.content`、1800-token 截断未通过；独立保留其状态/原始截断响应。第三次保持 Prompt、temperature=0、关闭 thinking 并将输出上限设为 4096 tokens 后通过 `parse_teacher_output_v2`。原始响应、校验后 JSON、模型/Prompt/Schema 哈希和真实 Teacher 输入图像均保留；未加载任何 L0T0 Teacher JSON 或语义绑定。
+- Teacher 识别 6 个物体：`object_1` white book（target_object）、`object_2` brown caddy（placement_target）、`object_3` green bottle（obstacle）、`object_4` yellow mug、`object_5` black knife、`object_6` green plant（后三者为 avoid_object）。6 条 robot-contact 规则包括 book 抓取 allow、caddy 接触 unknown、green bottle/mug/knife/plant 接触 forbid；另有 1 条 `object_1 → object_3` 搬运物体接触 forbid。Schema 记录的不确定性为：caddy 后侧隔间不可完全确认，以及 bottle 与后侧隔间的相对位置/碰撞风险不明确。上述均是语义观察，不是物理绑定或安全证明。
+- 独立证据目录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_scene_observation_20261021/`。回归检查为 Safety 环境 `py_compile`、CLI `--help` 默认参数核对、真实 task/BDDL/init-state 枚举及新场景 Teacher Schema 校验；没有启动动作回合。
+- 新场景 Bridge 启动参数为 `--benchmark obstacle_avoidance --level 0 --task-id 1 --init-state 0 --seed 0 --camera-resolution 512`；之后使用 `research.gs_opd.teacher.smoke --teacher-version v2` 对 Bridge reset 返回的同场景观察运行 Teacher。原始输出、通过校验的 JSON、审查摘要和 Teacher 配置在上述证据目录中；总 SHA-256 清单为 `evidence_checksums.sha256`。
+
 ## 当前环境与基线
 
-- 仓库：`/workspace/zy_workspace/RLinf`；本次修改时 HEAD 为 `61e2401f50eac200b18da2bbcd15b88813f0ac85`。
+- 当前工作树：`/workspace/zy_workspace/RLinf-gs-opd-overfit-recovery`；本次记录时 HEAD 为 `17da1b97c6c03af55e19824e79a755fb56fbe515`。原始 SFT Checkpoint 路径仍指向 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`。
 - Python：仓库 `.venv/bin/python` 为 Python 3.11.14。
 - Checkpoint：`/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`。此前评测日志记录从该目录加载 `model.safetensors`，并从 checkpoint 中加载 OpenPI LIBERO norm stats。
 - 已完成的普通 LIBERO-Spatial task 0 闭环基线：240 步、1 条 trajectory，`success_once=1.0`、`success_at_end=1.0`、`return=1.0`。当时记录的 Git HEAD 为 `fccbb19c`；日志目录为 `logs/20261014-19:19:37-libero_spatial_openpi_pi05_smoke`，指标在 `metrics.log`，完整运行记录在 `eval_embodiment.log`。该结果是普通 LIBERO-Spatial 基线，不是 LIBERO-Safety 结果。
