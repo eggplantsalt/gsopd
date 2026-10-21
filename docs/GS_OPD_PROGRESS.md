@@ -2,6 +2,25 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 全部 SAM3 候选 Task-Conditioned Verification Smoke（2026-10-22）
+
+- 新增最小 Smoke：`research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`。使用同状态原生 1024×1024 forward RGB 和 `book`/0.1 的全部 5 个 SAM3 Candidate Mask/Box；检查原图与 SAM3 输入逐像素一致。
+- 程序按每个候选 Mask/Box 并集自动裁剪原图，四周增加 `max(24 px, ceil(20% × 较长边))` 背景并裁到图像边界。5 张原生 RGB 局部图均未缩放或叠加标注，索引 0–4 保持；候选未按 SAM 分数、Body、Geom 或 IoU 预筛。
+- 冻结 Qwen3.8-27B-FP8 一次收到原图、全部 5 个自动裁剪图和原始任务指令；提示未包含 Teacher 颜色描述、物理名称、候选分数或 IoU。请求 HTTP 200、耗时 3.336 秒，prompt/completion 共 1734/41 tokens；没有重试或第二次推理。
+- VLM 选择 Candidate 1，原始视觉理由为“完整物体（黑色书/活页夹，带纸页）显示在 Candidate 1”。保存回答后才离线读取原 Body-level IoU：Candidate 1 与 Body 23 `black_book_1_main` / Geom 91 的 IoU 为 **0.916855**，是最佳 Body 匹配；与 Body 27 的 IoU 为 0。该单次模型选择与几何重合只作为实验对照，未改 Safety IR、未创建正式语义绑定，Teacher `object_1` 的语义身份继续等待复核。
+- 顺序限制如实记录：新 Smoke 运行时在保存 VLM 原始回答后才读取候选 IoU；但在初始代码准备阶段，我曾解析原 IoU JSON 确认结构，终端仅展示其开头的通用物理对象记录，没有查看候选 IoU/Body 23/27 匹配，也未将其中任何内容用于裁剪或 VLM 请求。因此本次实验不满足“整个操作流程在推理前完全不读取该文件”的最严格顺序要求；未重复推理，以遵守只调用一次的限制。
+- 所有自动裁剪图、review-only 总览、输入清单和 SHA、含实际图像 data URL 的完整请求 JSON、VLM 原始输出与完整 API 响应、候选选择、post-hoc IoU 对照、模型启动命令与服务日志保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_candidate_verification_1024_20261022_attempt1/`。完整报告：该目录 `experiment_report.md`。推理服务已关闭。
+- 本轮未运行 Teacher、SAM3、MuJoCo、Student、规划或训练；候选选择 Smoke 已完成，等待复核。
+
+## L0T1/state0 `object_1` 原生 512/1024 SAM3 配对实验（2026-10-22）
+
+- 输入只取同一物理状态采集目录 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_native_512_1024_resolution_comparison_20261022_attempt1/`。使用其 512 与 1024 的原生 RGB/Geom ID 同步 180° forward 数据；归档 SHA-256 manifest、对齐/状态报告和 Geometry Inventory 均已核验并保留副本，没有使用此前其他 reset 的 512 图。
+- 对已通过 Schema 的 Safety IR v2 只读取 `object_1`（原始 Teacher 名称 `white book`），两次仅把 SAM3 检索词覆写为 `book`，阈值均为 0.1。同一 Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt`，SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`；两次均在 RTX 4090 上完成。
+- 512×512 返回 4 个候选，分数依次为 `0.124023, 0.212891, 0.232422, 0.238281`；1024×1024 返回 5 个候选，分数依次为 `0.196289, 0.390625, 0.318359, 0.233398, 0.236328`。两组均没有候选达到默认 0.5 阈值。
+- 沿用现有 `sam3_mujoco_iou_smoke.py`，对 18 个可见 Body 组执行 `min_iou=0.1` 的原始像素 IoU 匹配。512 下 Candidate 0→Body 23 `black_book_1_main` IoU `0.920192`；其余候选对 Body 23/27 均为 0。1024 下 Candidate 0→Body 23 IoU `0.327668`、Candidate 1→Body 23 IoU `0.916855`；Candidate 2–4 对 Body 23 为 0。Body 27 `white_place_box_1_main` 在两分辨率、所有候选上的 IoU 均为 0。最优几何匹配不是语义绑定：Teacher `white book` 与 Body 23/27 的身份仍 unresolved，没有写入或更改绑定。
+- 现有 SAM3 和 IoU 脚本均原生支持图像维度；输入方向/shape 检查在 512 与 1024 均通过。因此没有修改模型、后处理、阈值或匹配代码。完整 Candidate Mask/overlay、每分辨率全 18-Body IoU 矩阵、逐候选 Body 23/27 CSV、同方向双分辨率总览、Teacher 副本、源输入、运行代码快照、Console log 与 54 项 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_sam3_native_512_1024_20261022_attempt1/`；主报告为 `experiment_report.md`。
+- 本轮未运行 Teacher/VLM、Bridge、Student、环境动作、规划或训练，也未重新采图。配对 SAM3/IoU 完成，等待复核。
+
 ## L0T1/state0 原生 512/1024 分辨率 RGB 与 Geom ID 对照（2026-10-22）
 
 - Safety Bridge 的只读 `render_highres` 与 `geom_segmentation` 接口现在接受可选正整数 `resolution`；省略参数仍为 512。尺寸直接传给 `env.sim.render(width=N, height=N)`，响应标记 `native_resolution=true`、`interpolation_used=false`；其余环境初始化和控制接口未改。

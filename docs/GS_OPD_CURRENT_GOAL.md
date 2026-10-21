@@ -1,6 +1,19 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 原生 512/1024 RGB+Geom ID 对照已完成，等待复核（2026-10-22）
+## 当前状态：L0T1/state0 全候选 Task-Conditioned Smoke 已完成，等待复核（2026-10-22）
+
+- 新增并运行 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`：从原生 1024 RGB 与全部 `book`/0.1 SAM3 Mask/Box 自动生成 Candidate 0–4 裁剪，将原图、五张裁剪和原任务指令一次性输入冻结 Qwen3.8。无 Body/Geom/IoU 预筛、无 Teacher 颜色描述或 SAM 分数输入。
+- 唯一一次 VLM 请求 HTTP 200，选择 Candidate 1。Raw 输出已保存后才读取 Body IoU：Candidate 1→Body 23 IoU 0.916855，为最佳 Body 匹配；Body 27 IoU 0。没有改 Safety IR 或写入语义绑定，`object_1` 语义身份仍等待复核。
+- 顺序限制：Smoke 运行时在保存原始回答后才解析候选 IoU，但前置准备曾解析 IoU JSON 确认结构（终端只展示开头的通用物理对象记录，未展示或使用候选/Body 23/27 IoU）。因此严格的“任何操作都在 VLM 后才读取 IoU 文件”顺序没有完全满足；未重复调用 VLM。
+- 请求原文及图像 data URL、全部裁剪图、裁剪元数据、模型服务日志、原始回答、IoU 对照和 SHA 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_candidate_verification_1024_20261022_attempt1/`；完整结果见其 `experiment_report.md`。Qwen 服务已关闭，本轮不启动 Student/规划/训练。
+
+## 前置状态：L0T1/state0 原生分辨率 SAM3 对照已完成（2026-10-22）
+
+- 同一物理状态的 512×512/1024×1024 RGB 与 Geom ID 均以 180° forward 方向配对；同一 SAM3 checkpoint、`book` 检索词、阈值 0.1。512 返回 4 个候选，1024 返回 5 个；两组最高分分别为 0.238281 与 0.390625，均未达到 0.5。
+- 原有 Body-level IoU 脚本无需修改，按 `min_iou=0.1` 运行通过。Body 23 IoU：512 Candidate 0 为 0.920192；1024 Candidate 0/1 分别为 0.327668/0.916855。Body 27 在两种分辨率全部候选上 IoU 均为 0。此几何结果不建立 `white book` 语义绑定，身份保持 unresolved。
+- 完整结果、逐候选表、全部 Mask、Body 23/27 IoU 可视化和哈希清单：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_sam3_native_512_1024_20261022_attempt1/experiment_report.md`。没有重新采图、调用 Teacher/VLM、启动 Bridge 或执行动作；当前等待复核。
+
+## 前序采集：L0T1/state0 原生 512/1024 RGB+Geom ID 对照（2026-10-22）
 
 - 同一次 obstacle_avoidance/L0T1/state0、seed 0 Bridge 初始化中，完成 512×512 和 1024×1024 `agentview` MuJoCo 原生 RGB 与 Geom ID 采集；1024 使用 MuJoCo 渲染器直接输出，没有插值或放大。
 - 两个分辨率各自的 RGB/Geom ID 像素坐标及方向检查通过。渲染前后完整 integration state、机器人/物体诊断和缓存 agentview 图像哈希完全相同；期间没有 reset 或 step。无参数 `render_highres` 仍返回默认 512×512，并与 512 segmentation RGB 逐像素一致。
