@@ -111,7 +111,21 @@ def parse_args():
     parser.add_argument(
         "--direct-bspline-osc-left",
         action="store_true",
-        help="Execute one current-state left B-Spline sphere-center route directly with closed-loop native OSC_POSE after stable grasp.",
+        help="After stable grasp, execute the default left B-Spline route, or the route selected by --bspline-candidate-id, with native OSC_POSE.",
+    )
+    parser.add_argument(
+        "--bspline-candidate-id",
+        help="Optional candidate_id from the current geometrically screened B-Spline bundle (requires --direct-bspline-osc-left).",
+    )
+    parser.add_argument(
+        "--bspline-left-001-toward-004-interp-10pct",
+        action="store_true",
+        help="Compatibility alias for --bspline-left-001-toward-004-fraction 0.10.",
+    )
+    parser.add_argument(
+        "--bspline-left-001-toward-004-fraction",
+        type=float,
+        help="Interpolate this fraction of the current-state trajectory-001 Left control points toward trajectory-004, then rerun the existing geometric screen (0 < fraction <= 1).",
     )
     parser.add_argument("--mink-python", type=Path)
     parser.add_argument("--mink-model-binary", type=Path)
@@ -137,6 +151,32 @@ def parse_args():
     trajectory_validation_enabled = args.trajectory_bundle_physical_validation
     mink_osc_enabled = args.mink_osc_left
     direct_osc_enabled = args.direct_bspline_osc_left
+    interpolation_fraction = args.bspline_left_001_toward_004_fraction
+    if args.bspline_left_001_toward_004_interp_10pct:
+        if interpolation_fraction is not None:
+            parser.error(
+                "use either --bspline-left-001-toward-004-interp-10pct or "
+                "--bspline-left-001-toward-004-fraction, not both"
+            )
+        interpolation_fraction = 0.10
+    if interpolation_fraction is not None and (
+        not np.isfinite(interpolation_fraction)
+        or not 0.0 < interpolation_fraction <= 1.0
+    ):
+        parser.error("--bspline-left-001-toward-004-fraction must be finite and in (0, 1]")
+    args.bspline_left_001_toward_004_fraction = interpolation_fraction
+    if interpolation_fraction is not None and not direct_osc_enabled:
+        parser.error(
+            "B-Spline control-point interpolation requires --direct-bspline-osc-left"
+        )
+    if interpolation_fraction is not None and args.bspline_candidate_id is not None:
+        parser.error(
+            "B-Spline control-point interpolation cannot be combined with --bspline-candidate-id"
+        )
+    if args.bspline_candidate_id is not None and not direct_osc_enabled:
+        parser.error("--bspline-candidate-id requires --direct-bspline-osc-left")
+    if args.bspline_candidate_id is not None and not args.bspline_candidate_id.strip():
+        parser.error("--bspline-candidate-id must not be empty")
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
         parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
     if mink_osc_enabled and direct_osc_enabled:
@@ -1936,6 +1976,7 @@ import json
 conn = Client(("127.0.0.1", 38567), authkey=b"gs-opd-local")
 steps = 0
 chunks = 0
+episode_reward_sum = 0.0
 success = False
 done = False
 start = time.monotonic()
@@ -2148,6 +2189,10 @@ try:
                         initial_bridge_data=data,
                         video_frames=video_frames,
                         video_frame_encoder=get_video_frame,
+                        candidate_id=args.bspline_candidate_id,
+                        interpolate_left_001_to_004_fraction=(
+                            args.bspline_left_001_toward_004_fraction
+                        ),
                     )
                 else:
                     from research.gs_opd.repair.trajectory_bundle_acceptance import (
@@ -2216,6 +2261,10 @@ try:
             )
             if args.direct_bspline_osc_left:
                 direct_count = int((trajectory_validation_report or {}).get("real_execution_steps", 0))
+                episode_reward_sum += sum(
+                    float(item.get("reward", 0.0))
+                    for item in (trajectory_validation_report or {}).get("steps", [])
+                )
                 steps += direct_count
                 route_completed = bool(
                     trajectory_validation_report
@@ -2438,6 +2487,7 @@ try:
             if video_frames is not None:
                 video_frames.append(get_video_frame(data))
             success = success or data["reward"] > 0
+            episode_reward_sum += float(data.get("reward", 0.0))
             done = bool(data["done"])
 
             if collection_enabled and "recovery_execution" in safety_decision:
@@ -2588,6 +2638,7 @@ try:
             "max_steps": args.max_steps,
             "executed_steps": steps,
             "decision_chunks": chunks,
+            "reward_sum": float(episode_reward_sum),
             "success": bool(success),
             "done": bool(done),
             "episode_end_reason": (
@@ -2688,6 +2739,7 @@ try:
         "task_id": 0,
         "steps": steps,
         "chunks": chunks,
+        "reward_sum": float(episode_reward_sum),
         "success_once": success,
         "done": done,
         "elapsed_seconds": round(time.monotonic() - start, 2),
@@ -2711,6 +2763,24 @@ try:
         result["trajectory_bundle_physical_validation"] = {
             "status": trajectory_validation_report.get("status"),
             "report_path": str(trajectory_validation_summary_path),
+            "requested_candidate_id": trajectory_validation_report.get(
+                "requested_candidate_id"
+            ),
+            "selected_candidate_id": trajectory_validation_report.get(
+                "selected_candidate_id"
+            ),
+            "selected_route_direction": trajectory_validation_report.get(
+                "selected_route_direction"
+            ),
+            "route_interpolation": trajectory_validation_report.get(
+                "route_interpolation"
+            ),
+            "actual_action_source": trajectory_validation_report.get(
+                "actual_action_source"
+            ),
+            "reference_speed_m_s": trajectory_validation_report.get(
+                "reference_speed_m_s"
+            ),
             "branch_candidate_count": trajectory_validation_report.get("branch_candidate_count", 0),
             "restore_verified": trajectory_validation_report.get("main_state_restored"),
             "real_execution_steps": trajectory_validation_report.get("real_execution_steps", 0),

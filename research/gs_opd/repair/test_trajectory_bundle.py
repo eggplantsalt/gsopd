@@ -186,6 +186,54 @@ class TrajectoryBundleTests(unittest.TestCase):
         self.assertEqual(result["candidate_count"], 18)
         self.assertIsNotNone(result["local_exit_region"])
 
+    def test_ten_percent_left_interpolation_reuses_screen_and_preserves_sources(self):
+        bundle = planner.generate_trajectory_bundle(local_bypass_scene())
+        base = next(item for item in bundle["candidates"] if item["candidate_id"] == "trajectory-001")
+        toward = next(item for item in bundle["candidates"] if item["candidate_id"] == "trajectory-004")
+        original_bundle = copy.deepcopy(bundle)
+
+        candidate = planner.interpolate_screened_left_candidate(
+            bundle,
+            base_candidate_id="trajectory-001",
+            toward_candidate_id="trajectory-004",
+            fraction=0.10,
+        )
+
+        expected = np.asarray(base["control_points_world_m"]) + 0.10 * (
+            np.asarray(toward["control_points_world_m"])
+            - np.asarray(base["control_points_world_m"])
+        )
+        np.testing.assert_allclose(candidate["control_points_world_m"], expected, atol=1e-12, rtol=0)
+        self.assertEqual(candidate["candidate_id"], "trajectory-001-interp-10pct-toward-trajectory-004")
+        self.assertEqual(candidate["direction"], "left")
+        self.assertTrue(candidate["passes_geometric_screen"], candidate["rejection_reasons"])
+        self.assertFalse(candidate["physical_safety_verified"])
+        self.assertFalse(candidate["executable"])
+        self.assertEqual(candidate["derived_from"]["fraction"], 0.10)
+        self.assertGreater(candidate["derived_from"]["max_control_point_displacement_from_base_m"], 0)
+        self.assertEqual(bundle, original_bundle)
+
+    def test_configurable_twenty_percent_left_interpolation_uses_exact_fraction(self):
+        bundle = planner.generate_trajectory_bundle(local_bypass_scene())
+        base = next(item for item in bundle["candidates"] if item["candidate_id"] == "trajectory-001")
+        toward = next(item for item in bundle["candidates"] if item["candidate_id"] == "trajectory-004")
+
+        candidate = planner.interpolate_screened_left_candidate(
+            bundle,
+            base_candidate_id="trajectory-001",
+            toward_candidate_id="trajectory-004",
+            fraction=0.20,
+        )
+
+        expected = np.asarray(base["control_points_world_m"]) + 0.20 * (
+            np.asarray(toward["control_points_world_m"])
+            - np.asarray(base["control_points_world_m"])
+        )
+        np.testing.assert_allclose(candidate["control_points_world_m"], expected, atol=1e-12, rtol=0)
+        self.assertEqual(candidate["candidate_id"], "trajectory-001-interp-20pct-toward-trajectory-004")
+        self.assertEqual(candidate["derived_from"]["fraction"], 0.20)
+        self.assertTrue(candidate["passes_geometric_screen"], candidate["rejection_reasons"])
+
     def test_local_exit_region_samples_three_orthogonal_families_and_exact_endpoints(self):
         input_scene = local_bypass_scene()
         result = planner.generate_trajectory_bundle(input_scene)

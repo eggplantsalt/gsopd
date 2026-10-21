@@ -41,6 +41,19 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
         while hasattr(raw, "_dataset"):
             raw = raw._dataset
 
+        phase_manifest_path = OmegaConf.select(
+            self.cfg, "data.phase_manifest_path", default=None
+        )
+        if phase_manifest_path:
+            return self._build_manifest_phase_dataloader(
+                loader,
+                data_config,
+                transformed,
+                raw,
+                Path(phase_manifest_path),
+                eval_dataset,
+            )
+
         frame_count = len(raw)
         expected_frames = int(self.cfg.data.expected_frames)
         horizon = int(self.cfg.data.action_horizon)
@@ -135,6 +148,149 @@ class SingleEpisodeSftWorker(FSDPVlaSftWorker):
             sampler.num_samples = len(selected)
             sampler.total_size = len(selected)
 
+        return loader, data_config
+
+    def _build_manifest_phase_dataloader(
+        self,
+        loader: Any,
+        data_config: Any,
+        transformed: Any,
+        raw: Any,
+        manifest_path: Path,
+        eval_dataset: bool,
+    ):
+        """Balance horizon windows across multiple full episodes from a sidecar."""
+        from rlinf.data.storage.lerobot.compat import episode_boundaries
+
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"episode_phase_manifest_not_found:{manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_episodes = manifest.get("episode_sources", [])
+        starts, ends = episode_boundaries(raw)
+        if len(starts) != len(manifest_episodes) or len(raw.meta.episodes) != len(
+            manifest_episodes
+        ):
+            raise ValueError(
+                "phase_manifest_episode_count_mismatch:"
+                f"dataset={len(starts)} manifest={len(manifest_episodes)}"
+            )
+
+        horizon = int(self.cfg.data.action_horizon)
+        phase_names = ("student_grasp", "bspline_osc_carry", "student_place")
+        phase_indices: dict[str, list[int]] = {name: [] for name in phase_names}
+        all_unique_indices: list[int] = []
+        phase_segments: dict[str, list[list[int]]] = {name: [] for name in phase_names}
+        for episode_index, (episode, start, end) in enumerate(
+            zip(manifest_episodes, starts, ends)
+        ):
+            frame_count = end - start
+            if int(episode.get("episode_index", -1)) != episode_index or int(
+                episode.get("frame_count", -1)
+            ) != frame_count:
+                raise ValueError(
+                    f"phase_manifest_boundary_mismatch_episode_{episode_index}:"
+                    f"dataset={frame_count} manifest={episode.get('frame_count')}"
+                )
+            valid_count = frame_count - horizon + 1
+            boundaries = [
+                0,
+                *[int(value) for value in episode["phase_boundaries_local_step"]],
+                valid_count,
+            ]
+            if len(boundaries) != 4 or not (
+                0 < boundaries[1] < boundaries[2] < boundaries[3]
+            ):
+                raise ValueError(
+                    f"invalid_phase_manifest_boundaries_episode_{episode_index}:{boundaries}"
+                )
+            all_unique_indices.extend(range(start, start + valid_count))
+            for phase, local_start, local_end in zip(
+                phase_names, boundaries[:-1], boundaries[1:]
+            ):
+                if local_end <= local_start:
+                    raise ValueError(
+                        f"empty_{phase}_window_range_episode_{episode_index}"
+                    )
+                global_start = start + local_start
+                global_end = start + local_end
+                phase_indices[phase].extend(range(global_start, global_end))
+                phase_segments[phase].append([global_start, global_end - 1])
+
+        if any(not values for values in phase_indices.values()):
+            raise ValueError("every cumulative episode phase must have valid windows")
+        if eval_dataset:
+            per_phase = int(self.cfg.data.eval_windows_per_phase)
+            selected: list[int] = []
+            phase_sequence: list[str] = []
+            phase_eval_indices: dict[str, list[int]] = {}
+            for name in phase_names:
+                candidates = np.asarray(phase_indices[name], dtype=np.int64)
+                if candidates.size < per_phase:
+                    raise ValueError(f"not_enough_{name}_windows_for_fixed_eval")
+                positions = np.linspace(
+                    0, candidates.size - 1, per_phase, dtype=np.int64
+                )
+                indices = candidates[positions]
+                if len(np.unique(indices)) != per_phase:
+                    raise ValueError(f"fixed_{name}_evaluation_indices_are_not_unique")
+                selected.extend(indices.tolist())
+                phase_sequence.extend([name] * per_phase)
+                phase_eval_indices[name] = indices.tolist()
+            self._fixed_eval_phase_sequence = phase_sequence
+            self._fixed_eval_phase_indices = phase_eval_indices
+        else:
+            configured_target = int(
+                OmegaConf.select(
+                    self.cfg, "data.balanced_windows_per_phase", default=0
+                )
+            )
+            target_per_phase = max(
+                configured_target, max(len(values) for values in phase_indices.values())
+            )
+            selected = list(all_unique_indices)
+            for name in phase_names:
+                candidates = np.asarray(phase_indices[name], dtype=np.int64)
+                repeats = target_per_phase - int(candidates.size)
+                if repeats:
+                    selected.extend(np.resize(candidates, repeats).tolist())
+            self._phase_ranges = phase_segments
+            self._unique_phase_window_counts = {
+                name: len(values) for name, values in phase_indices.items()
+            }
+            self._balanced_phase_window_exposure = {
+                name: target_per_phase for name in phase_names
+            }
+            self._unique_training_window_count = len(all_unique_indices)
+            self._training_schedule_window_count = len(selected)
+
+        parent = transformed
+        while hasattr(parent, "_dataset") and parent._dataset is not raw:
+            parent = parent._dataset
+        if not hasattr(parent, "_dataset") or parent._dataset is not raw:
+            raise RuntimeError("could_not_locate_raw_LeRobot_dataset_leaf")
+        parent._dataset = Subset(raw, selected)
+        sampler = loader._data_loader.torch_loader.sampler
+        if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+            if sampler.num_replicas != 1:
+                raise ValueError(
+                    "cumulative GS-OPD SFT is configured for one GPU, but "
+                    f"the official loader initialized {sampler.num_replicas} sampler replicas"
+                )
+            sampler.num_samples = len(selected)
+            sampler.total_size = len(selected)
+        if eval_dataset:
+            self._unique_training_window_count = len(all_unique_indices)
+            self._training_schedule_window_count = len(selected)
+            self._unique_phase_window_counts = {
+                name: len(values) for name, values in phase_indices.items()
+            }
+            self._balanced_phase_window_exposure = {
+                name: int(self.cfg.data.eval_windows_per_phase)
+                for name in phase_names
+            }
+            self._phase_ranges = phase_segments
+        self._episode_phase_manifest_path = str(manifest_path)
+        self._selected_phase_window_indices = [int(index) for index in selected]
         return loader, data_config
 
     def model_provider_func(self):

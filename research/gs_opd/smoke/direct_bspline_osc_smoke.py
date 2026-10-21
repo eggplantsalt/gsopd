@@ -32,6 +32,7 @@ from research.gs_opd.repair.trajectory_tracking import (
     resample_polyline_by_distance,
     world_pose_tracking_action,
 )
+from research.gs_opd.repair.trajectory_bundle import interpolate_screened_left_candidate
 from research.gs_opd.smoke.trajectory_bundle_scene_smoke import run_scene_smoke
 
 
@@ -193,6 +194,41 @@ def _sphere_center_in_exit_region(
     return inside, coordinates
 
 
+def _select_route_candidate(
+    bundle: dict[str, Any], candidate_id: str | None = None
+) -> dict[str, Any]:
+    candidates = bundle.get("candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("current_B_Spline_bundle_has_no_candidate_list")
+    if candidate_id is None:
+        left_candidates = [
+            item
+            for item in candidates
+            if isinstance(item, dict)
+            and item.get("direction") == "left"
+            and item.get("passes_geometric_screen") is True
+        ]
+        if not left_candidates:
+            raise ValueError(
+                "current_grasp_state_has_no_geometrically_screened_left_B_Spline_route"
+            )
+        return sorted(left_candidates, key=lambda item: item["candidate_id"])[0]
+
+    matches = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and item.get("candidate_id") == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"requested_B_Spline_candidate_id_missing_or_duplicated:{candidate_id}")
+    selected = matches[0]
+    if selected.get("passes_geometric_screen") is not True:
+        raise ValueError(f"requested_B_Spline_candidate_failed_geometric_screen:{candidate_id}")
+    if selected.get("direction") not in {"left", "right", "above"}:
+        raise ValueError(f"requested_B_Spline_candidate_has_invalid_direction:{candidate_id}")
+    return selected
+
+
 def run_live_direct_bspline_osc_smoke(
     connection: Any,
     context: dict[str, Any],
@@ -207,8 +243,11 @@ def run_live_direct_bspline_osc_smoke(
     initial_bridge_data: dict[str, Any],
     video_frames: list[Any] | None,
     video_frame_encoder: Callable[[dict[str, Any]], np.ndarray] | None,
+    candidate_id: str | None = None,
+    interpolate_left_001_to_004_fraction: float | None = None,
+    interpolate_left_001_to_004_10pct: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Move the actual grasped object along the current left route on the main env."""
+    """Move the actual grasped object along one screened route on the main env."""
     output_path = Path(output_json)
     out_dir = output_path.parent
     report: dict[str, Any] = {
@@ -239,6 +278,8 @@ def run_live_direct_bspline_osc_smoke(
         "steps": [],
         "artifacts": {},
     }
+    if candidate_id is not None:
+        report["requested_candidate_id"] = candidate_id
     latest_bridge_data = initial_bridge_data
     try:
         if (
@@ -272,13 +313,45 @@ def run_live_direct_bspline_osc_smoke(
         carried = payload["carried_binding"]
         bundle_path = scene_dir / "trajectory_bundle.json"
         bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-        candidates = [
-            item for item in bundle.get("candidates", [])
-            if item.get("direction") == "left" and item.get("passes_geometric_screen") is True
-        ]
-        if not candidates:
-            raise ValueError("current_grasp_state_has_no_geometrically_screened_left_B_Spline_route")
-        selected = sorted(candidates, key=lambda item: item["candidate_id"])[0]
+        interpolation_fraction = interpolate_left_001_to_004_fraction
+        if interpolate_left_001_to_004_10pct:
+            if interpolation_fraction is not None:
+                raise ValueError(
+                    "legacy_10pct_interpolation_flag_cannot_be_combined_with_fraction"
+                )
+            interpolation_fraction = 0.10
+        if interpolation_fraction is not None:
+            if candidate_id is not None:
+                raise ValueError(
+                    "left_001_to_004_interpolation_cannot_be_combined_with_candidate_id"
+                )
+            selected = interpolate_screened_left_candidate(
+                bundle,
+                base_candidate_id="trajectory-001",
+                toward_candidate_id="trajectory-004",
+                fraction=interpolation_fraction,
+            )
+            if selected.get("passes_geometric_screen") is not True:
+                raise ValueError(
+                    "interpolated_Left_B_Spline_failed_existing_geometric_screen:"
+                    + ",".join(selected.get("rejection_reasons", []))
+                )
+            report["route_interpolation"] = {
+                **selected["derived_from"],
+                "screening_method": "existing_current_state_B_Spline_geometry_screen",
+                "passes_geometric_screen": True,
+                "physical_safety_verified_before_execution": False,
+            }
+        else:
+            selected = _select_route_candidate(bundle, candidate_id)
+        selected_direction = selected["direction"]
+        report["selected_candidate_id"] = selected["candidate_id"]
+        report["selected_route_direction"] = selected_direction
+        report["actual_action_source"] = "direct_b_spline_closed_loop_native_osc_pose"
+        report["operation"] = f"live_direct_bspline_{selected_direction}_native_osc_execution"
+        report["reference_source"] = (
+            f"current-state geometrically screened {selected_direction} B-Spline carried sphere-center route"
+        )
         path_points = np.asarray(selected["points_world_m"], dtype=np.float64)
         path_plan = resample_polyline_by_distance(
             path_points,
@@ -288,7 +361,46 @@ def run_live_direct_bspline_osc_smoke(
         )
         reference = path_plan["reference_points_world_m"]
         if not np.isfinite(reference).all() or reference.ndim != 2 or reference.shape[1] != 3:
-            raise ValueError("left_B_Spline_reference_is_not_a_finite_world_xyz_path")
+            raise ValueError(
+                f"{selected_direction}_B_Spline_reference_is_not_a_finite_world_xyz_path"
+            )
+        interpolated_route_path = None
+        if interpolation_fraction is not None:
+            base_route = next(
+                item
+                for item in bundle["candidates"]
+                if item.get("candidate_id") == "trajectory-001"
+            )
+            report["route_interpolation"].update({
+                "derived_candidate_id": selected["candidate_id"],
+                "base_path_length_m": float(base_route["length_m"]),
+                "toward_path_length_m": float(
+                    next(
+                        item["length_m"]
+                        for item in bundle["candidates"]
+                        if item.get("candidate_id") == "trajectory-004"
+                    )
+                ),
+                "interpolated_path_length_m": float(selected["length_m"]),
+                "path_length_delta_from_base_m": float(
+                    selected["length_m"] - base_route["length_m"]
+                ),
+                "osc_reference_path_length_m": float(path_plan["path_length_m"]),
+                "osc_reference_steps_requested": int(path_plan["requested_steps"]),
+            })
+            interpolated_route_path = out_dir / "interpolated_left_route.json"
+            _json_write(interpolated_route_path, {
+                "schema_version": "gs_opd.interpolated_left_route.v1",
+                "route_interpolation": report["route_interpolation"],
+                "selected_candidate": selected,
+                "base_candidate": base_route,
+                "toward_candidate": next(
+                    item
+                    for item in bundle["candidates"]
+                    if item.get("candidate_id") == "trajectory-004"
+                ),
+                "geometric_physical_safety_claim": False,
+            })
 
         snapshot = _request(connection, {"op": "snapshot"})
         snapshot_id = snapshot.get("snapshot_id")
@@ -352,13 +464,14 @@ def run_live_direct_bspline_osc_smoke(
         report.update({
             "selected_route": {
                 "candidate_id": selected["candidate_id"],
-                "direction": "left",
+                "direction": selected_direction,
                 "path_length_m": path_plan["path_length_m"],
                 "control_steps_requested": path_plan["requested_steps"],
                 "reference_points": int(len(reference)),
                 "maximum_reference_displacement_m": path_plan["maximum_reference_displacement_m"],
                 "passes_geometric_screen": True,
                 "physical_safety_verified_before_execution": False,
+                "route_interpolation": report.get("route_interpolation"),
             },
             "active_controller": controller,
             "gripper_geometry_inventory": gripper_inventory,
@@ -399,9 +512,10 @@ def run_live_direct_bspline_osc_smoke(
             direct_trace_chunk_index = 1_000_000 + chunk_index
             trace_writer.metadata["direct_bspline_osc_execution"] = report["training_data_metadata"] | {
                 "route_candidate_id": selected["candidate_id"],
-                "route_direction": "left",
+                "route_direction": selected_direction,
                 "reference_speed_m_s": REFERENCE_SPEED_M_S,
                 "control_timestep_s": CONTROL_TIMESTEP_S,
+                "route_interpolation": report.get("route_interpolation"),
             }
             trace_writer.add_decision(
                 direct_trace_chunk_index,
@@ -413,6 +527,8 @@ def run_live_direct_bspline_osc_smoke(
                     "training_label_valid": False,
                     "high_quality_task_demonstration": False,
                     "selected_route_candidate_id": selected["candidate_id"],
+                    "selected_route_direction": selected_direction,
+                    "route_interpolation": report.get("route_interpolation"),
                 },
             )
 
@@ -426,7 +542,9 @@ def run_live_direct_bspline_osc_smoke(
         actual_sphere_trace: list[list[float]] = [current_sphere.tolist()]
         exit_region = bundle.get("local_exit_region")
         if bundle.get("goal_type") != "local_bypass_goal" or not isinstance(exit_region, dict):
-            raise ValueError("left_route_has_no_geometry_defined_local_safe_exit_region")
+            raise ValueError(
+                f"{selected_direction}_route_has_no_geometry_defined_local_safe_exit_region"
+            )
         execution_step_budget = min(
             MAX_TOTAL_EXECUTION_STEPS,
             int(path_plan["requested_steps"]) + MAX_CATCHUP_STEPS_TOTAL,
@@ -575,12 +693,14 @@ def run_live_direct_bspline_osc_smoke(
             elif grasp_relative_rotation_error > config.maximum_grasp_relative_rotation_error_rad:
                 report["failure_reason"] = "grasp_relative_rotation_error_exceeded_existing_0.20_rad_limit"
             elif response.get("done"):
-                report["failure_reason"] = "MuJoCo_environment_terminated_before_left_route_completion"
+                report["failure_reason"] = (
+                    f"MuJoCo_environment_terminated_before_{selected_direction}_route_completion"
+                )
             if report["failure_reason"]:
                 break
             if inside_exit_region and grasp_state.get("status") == "pass" and not unexpected_contacts:
                 report["route_completed"] = True
-                report["status"] = "left_bypass_route_physically_completed"
+                report["status"] = f"{selected_direction}_bypass_route_physically_completed"
                 report["safe_exit_region_reached"] = True
                 report["safe_exit_region_actual_sphere_center_world_m"] = actual_sphere.tolist()
                 break
@@ -621,9 +741,13 @@ def run_live_direct_bspline_osc_smoke(
             if report["real_execution_steps"] >= execution_step_budget:
                 report["failure_reason"] = "total_execution_budget_exhausted_before_safe_exit_region"
             elif reference_index >= len(reference):
-                report["failure_reason"] = "left_route_reference_ended_outside_safe_exit_region"
+                report["failure_reason"] = (
+                    f"{selected_direction}_route_reference_ended_outside_safe_exit_region"
+                )
             else:
-                report["failure_reason"] = "left_route_stopped_before_safe_exit_region"
+                report["failure_reason"] = (
+                    f"{selected_direction}_route_stopped_before_safe_exit_region"
+                )
             report["status"] = "incomplete"
         elif report["failure_reason"] is not None:
             report["status"] = "stopped_on_first_physical_or_tracking_failure"
@@ -650,6 +774,9 @@ def run_live_direct_bspline_osc_smoke(
             "planned_route_svg": str(scene_dir / "trajectory_bundle.svg"),
             "executed_route_svg": str(execution_svg),
             "trajectory_npz": str(trace_writer.output_path) if trace_writer is not None else None,
+            "interpolated_route_json": (
+                str(interpolated_route_path) if interpolated_route_path is not None else None
+            ),
         })
         _json_write(output_path, report)
         return report, latest_bridge_data

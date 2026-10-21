@@ -17,3 +17,9 @@
 - 实验与历史阻塞：`docs/GS_OPD_PROGRESS.md`
 - 当前局部目标：`docs/GS_OPD_CURRENT_GOAL.md`
 - 原始 Student Checkpoint、成功示范和 LeRobot 数据集仍保留。attempt3 训练日志、报告、Adapter 和 RLinf checkpoint，以及本次 Student rollout 视频、NPZ、Compiler 审计和轨迹图，均保留于各自独立目录。详细记录见 `docs/GS_OPD_PROGRESS.md`。
+
+## π₂ 累计数据状态（2026-10-21）
+
+π₂ 的 Round 0/1 累计 LeRobot v2.1 数据已经就绪：原始 Student 845 步 Left，加上 attempt3 LoRA Student 的 859/875 步 10%/20% 插值 Left；合计 3 Episode、2,579 帧。逐帧转换完整性和现有 `SingleEpisodeSftWorker` 的可选多 Episode 阶段均衡读取已验证，训练数据索引为每阶段 2,299 次曝光。源 NPZ、Adapter、Checkpoint 与安全报告没有改写，当前没有开始 π₂ 训练或新增 Rollout。
+
+下一步：复核 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/` 的 Episode 来源、阶段均衡清单及 Loader 报告；复核通过后，才从 π₁ Adapter 继续启动 π₂ 训练。详细步骤和验收数值见 `docs/GS_OPD_PROGRESS.md`。

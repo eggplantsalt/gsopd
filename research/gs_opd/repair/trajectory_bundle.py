@@ -772,6 +772,170 @@ def generate_trajectory_bundle(
     }
 
 
+def interpolate_screened_left_candidate(
+    bundle: dict[str, Any],
+    *,
+    base_candidate_id: str,
+    toward_candidate_id: str,
+    fraction: float,
+) -> dict[str, Any]:
+    """Interpolate two screened Left control polygons and rerun the same screen."""
+    if not isinstance(bundle, dict) or bundle.get("status") != "complete":
+        raise ValueError("control_point_interpolation_requires_a_complete_current_bundle")
+    if isinstance(fraction, (bool, np.bool_)) or not isinstance(
+        fraction, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError("control_point_interpolation_fraction_must_be_numeric")
+    fraction = float(fraction)
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("control_point_interpolation_fraction_must_be_in_(0,1]")
+
+    candidates = bundle.get("candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("current_bundle_candidate_list_is_unavailable")
+
+    def find_source(candidate_id: str) -> dict[str, Any]:
+        matches = [
+            item
+            for item in candidates
+            if isinstance(item, dict) and item.get("candidate_id") == candidate_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"interpolation_source_candidate_missing_or_duplicated:{candidate_id}")
+        candidate = matches[0]
+        if candidate.get("direction") != "left":
+            raise ValueError(f"interpolation_source_candidate_is_not_left:{candidate_id}")
+        if candidate.get("passes_geometric_screen") is not True:
+            raise ValueError(f"interpolation_source_candidate_failed_geometric_screen:{candidate_id}")
+        return candidate
+
+    base = find_source(base_candidate_id)
+    toward = find_source(toward_candidate_id)
+    base_controls = np.asarray(base.get("control_points_world_m"), dtype=np.float64)
+    toward_controls = np.asarray(toward.get("control_points_world_m"), dtype=np.float64)
+    if (
+        base_controls.ndim != 2
+        or base_controls.shape[1:] != (3,)
+        or base_controls.shape != toward_controls.shape
+        or not np.isfinite(base_controls).all()
+        or not np.isfinite(toward_controls).all()
+    ):
+        raise ValueError("interpolation_source_control_points_are_invalid_or_incompatible")
+    controls = base_controls + fraction * (toward_controls - base_controls)
+
+    scene = bundle.get("scene")
+    if not isinstance(scene, dict) or not isinstance(scene.get("obstacles"), list):
+        raise ValueError("current_bundle_screening_scene_is_unavailable")
+    carried = scene.get("carried")
+    config_value = bundle.get("config")
+    if not isinstance(carried, dict) or not isinstance(config_value, dict):
+        raise ValueError("current_bundle_carried_geometry_or_config_is_unavailable")
+    config = BundleConfig(**config_value)
+    _configuration(config)
+    curve, screening, rejection_reasons = _screen_curve(
+        controls,
+        float(carried["radius_m"]),
+        scene["obstacles"],
+        config,
+    )
+
+    goal = (1.0 - fraction) * np.asarray(base["goal_world_m"], dtype=np.float64) + fraction * np.asarray(
+        toward["goal_world_m"], dtype=np.float64
+    )
+    endpoint_error = float(np.linalg.norm(curve[-1] - goal))
+    primary_id = bundle.get("primary_obstacle_id")
+    primary_matches = [
+        item for item in scene["obstacles"]
+        if isinstance(item, dict) and item.get("object_id") == primary_id
+    ]
+    if len(primary_matches) != 1:
+        raise ValueError("current_bundle_primary_obstacle_is_missing_or_duplicated")
+    obstacle_center = np.asarray(primary_matches[0]["center_world_m"], dtype=np.float64)
+    local_exit_region = bundle.get("local_exit_region")
+    if isinstance(local_exit_region, dict):
+        forward = np.asarray(local_exit_region["normal_world"], dtype=np.float64)
+        target_side = float(np.dot(goal - obstacle_center, forward))
+        if target_side < float(local_exit_region["reference_inflated_radius_m"]):
+            rejection_reasons.append(
+                f"goal_behind_obstacle_clearance_insufficient:{primary_id}"
+            )
+    else:
+        goal_axis = goal - obstacle_center
+        goal_axis_norm = float(np.linalg.norm(goal_axis))
+        target_side = (
+            float(np.dot(curve[-1] - obstacle_center, goal_axis / goal_axis_norm))
+            if goal_axis_norm > 1e-12
+            else 0.0
+        )
+    if endpoint_error > 1e-10 or target_side <= 0:
+        rejection_reasons.append("goal_side_region_not_reached")
+
+    def interpolate_optional_array(field: str):
+        base_value, toward_value = base.get(field), toward.get(field)
+        if base_value is None and toward_value is None:
+            return None
+        left = np.asarray(base_value, dtype=np.float64)
+        right = np.asarray(toward_value, dtype=np.float64)
+        if left.shape != right.shape or not np.isfinite(left).all() or not np.isfinite(right).all():
+            raise ValueError(f"interpolation_source_{field}_values_are_incompatible")
+        return ((1.0 - fraction) * left + fraction * right).tolist()
+
+    base_direction = np.asarray(base.get("direction_world"), dtype=np.float64)
+    toward_direction = np.asarray(toward.get("direction_world"), dtype=np.float64)
+    if (
+        base_direction.shape != (3,)
+        or toward_direction.shape != (3,)
+        or not np.isfinite(base_direction).all()
+        or not np.isfinite(toward_direction).all()
+        or not np.allclose(base_direction, toward_direction, atol=1e-12, rtol=0.0)
+    ):
+        raise ValueError("left_interpolation_sources_do_not_share_the_same_direction_axis")
+
+    path_length = float(np.linalg.norm(np.diff(curve, axis=0), axis=1).sum())
+    fraction_label = format(fraction * 100.0, "g").replace(".", "p")
+    derived_id = f"{base_candidate_id}-interp-{fraction_label}pct-toward-{toward_candidate_id}"
+    return {
+        "candidate_id": derived_id,
+        "direction": "left",
+        "direction_world": base_direction.tolist(),
+        "goal_world_m": goal.tolist(),
+        "goal_local_coordinates_m": interpolate_optional_array(
+            "goal_local_coordinates_m"
+        ),
+        "offset_scale": float(
+            (1.0 - fraction) * float(base["offset_scale"])
+            + fraction * float(toward["offset_scale"])
+        ),
+        "lateral_or_above_offset_m": float(
+            (1.0 - fraction) * float(base["lateral_or_above_offset_m"])
+            + fraction * float(toward["lateral_or_above_offset_m"])
+        ),
+        "waypoints_world_m": interpolate_optional_array("waypoints_world_m"),
+        "control_points_world_m": controls.tolist(),
+        "points_world_m": curve.tolist(),
+        "length_m": path_length,
+        "length_method": "discretized_B_spline_chord_sum_not_timing",
+        "goal_endpoint_error_m": endpoint_error,
+        "goal_side_projection_m": target_side,
+        "screening": screening,
+        "passes_geometric_screen": not rejection_reasons,
+        "rejection_reasons": rejection_reasons,
+        "physical_safety_verified": False,
+        "executable": False,
+        "derived_from": {
+            "method": "linear_control_point_interpolation",
+            "base_candidate_id": base_candidate_id,
+            "toward_candidate_id": toward_candidate_id,
+            "fraction": fraction,
+            "base_path_length_m": float(base["length_m"]),
+            "toward_path_length_m": float(toward["length_m"]),
+            "max_control_point_displacement_from_base_m": float(
+                np.linalg.norm(controls - base_controls, axis=1).max()
+            ),
+        },
+    }
+
+
 def _bundle_svg(bundle):
     root = ET.Element(
         "svg",

@@ -2397,3 +2397,81 @@ Student 在 **711 个真实环境动作步 / 72 个模型动作块**后首次得
 已验证成功的完整 Student 抓取 → Left B-Spline/native OSC 搬运 → Student 放置入口仍是 `research/gs_opd/smoke/pi05_rollout.py` 的 `--direct-bspline-osc-left --trajectory-bundle-physical-validation` 路径，并使用 `initial_center_distinction_teacher_raw.txt` 与 `semantic_bindings_l0t0.json`。历史成功运行的完整参数及产物索引保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/launch.json`；该次真实记录为 845 步、奖励 1.0、done=True。其 NPZ、视频和验收报告均保留。本次只确认入口及证据位置，没有再次执行。
 
 恢复分支目前以指定基线提交为 HEAD，含上述最小审查差异的工作树尚未提交；`main` 和原始未提交修改保持原样。等待复核后再继续实验。
+
+## 直接 OSC 的可选 B-Spline candidate_id 与一次真实执行（2026-10-21）
+
+在恢复分支的 `--direct-bspline-osc-left` 路径增加可选 `--bspline-candidate-id <id>`。省略时仍只从当前束中筛选 `direction=left` 且 `passes_geometric_screen=true` 的候选，并按 ID 排序选择首条，保持旧默认 `trajectory-001` 的选择与执行方式。提供 ID 时，只接受本次生成束中唯一存在且通过几何筛选的 Left/Right/Above 候选；不存在、重复或几何筛选失败均在 OSC 执行前拒绝。Student 抓持触发、原有 `0.020 m/s` 自适应 OSC 推进、双指抓持与接触监测、Student 接续、完整轨迹/视频记录和任务成功判定均复用原路径；没有加入 Snapshot 多候选物理验收或新的运动/安全机制。
+
+验收 JSON、Rollout `result.json` 摘要和 NPZ metadata 记录请求/选择的 candidate ID、候选方向及实际动作来源 `direct_b_spline_closed_loop_native_osc_pose`；动作仍标记为非 Student 预测、非训练标签。新增选择器回归覆盖：无 ID 时保留首个 Left、显式选择非默认 Left、可按 ID 选择其他通过筛选的方向，以及拒绝不存在/未通过筛选的 ID。
+
+针对性回归运行 `research/gs_opd/smoke/test_direct_bspline_osc_smoke.py` 与既有 `research/gs_opd/repair/test_trajectory_bundle.py`：**31 passed，65 个子测试通过**；rollout、执行器和测试文件 `py_compile` 通过，`git diff --check` 通过。
+
+### 一次非默认 Left 完整采集尝试
+
+以 2026-10-19 成功 Left 的 Student、Teacher、语义绑定和 rollout 配置为基础，指定 `trajectory-004` 执行一次真实回合；输出写入新的独立目录 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_candidate_trajectory004_20261021_attempt1/`，未覆盖历史成功记录。运行时生成 18 条候选，`trajectory-004` 为 Left 且通过几何筛选；报告记录路径长 `0.994620 m`、请求 995 个参考控制步，参考速度 `0.020 m/s`。
+
+Student 在 50 步后达到稳定双指抓持并开始原生 OSC。主环境实际执行 119 个 OSC 步，随后在整体 step 168（本回合第 169 个动作）首次因双指抓持检查失败停止：夹爪闭合命令仍为闭合，但当步两指对碗的接触数为 0，抓持状态原因是 `opposing_left_and_right_finger_contacts_not_both_present`。最终 sphere-center 跟踪误差 `0.00584 m`；失败原因是抓持丢失，而非跟踪误差或环境 `done`。按照单次尝试要求，未重试、未调参，且因 Left 路线未完成而没有 Student 接续。
+
+OSC 段 **119/119** 控制步的子步 Contact Monitoring 均为 `complete`，未发现非预期接触（事件数 0，`physical_collision_observed=false`）。这表示已执行区间未记录非预期碰撞；路线未完成且抓持失败，不能记为完整安全任务成功。全回合 reward sum 为 `0.0`、`done=false`、`success_once=false`；共 169 个实际动作步，耗时 102.0 s。
+
+已保留 `direct_bspline_osc_trajectory.npz`（`executed_actions` 为 `(169,7)`）、`student_and_direct_osc.mp4`（256×256，170/170 帧解码通过）、`trajectory_validation.json`、`result.json`、`direct_bspline_osc_execution.svg` 及 `current_state_scene/` 下的当次几何候选和验收材料。报告与 NPZ 均记录所选 `trajectory-004`、方向 `left`、OSC 实际动作来源及首次失败原因。本次真实尝试以抓持丢失为首个具体阻塞；等待复核，不继续试错。
+
+## trajectory-004 改用 attempt3 LoRA Student 的一次真实采集（2026-10-21）
+
+先核对前次 `trajectory-004` 运行的 `result.json` 与 NPZ metadata：基座是原始 Student `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，`lora_checkpoint_path=null`，确认没有加载 attempt3 Adapter。attempt3 Adapter 文件仍在原路径，SHA-256 为 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`。
+
+据此仅为 Student 抓取和路线完成后的接续加载该 Adapter；B-Spline 生成/筛选、`trajectory-004` 选择、`0.020 m/s` 自适应 OSC、原有双指抓持和接触检查、失败即停止与成功判定保持不变。基座 Checkpoint 为原始 `pi05_rlinf_libero_sft/model.safetensors`；实际加载的 Adapter rank 32、216 个张量、13,860,864 个参数。运行日志确认 Adapter 已加载，NPZ 与 Rollout 结果均保存了基座和 Adapter 路径。
+
+本次实时生成 18 条候选，其中 18 条通过几何筛选；选中 `trajectory-004`（Left），路径长 `0.986070 m`、请求 987 个参考控制步。阶段执行量：LoRA Student 抓取 **50 步**（episode 索引 0–49）；直接 native OSC **308 步**（索引 50–357）；Student 接续 **0 步**，因为 OSC 路线未完成。首个具体阻塞发生于整体第 358 个动作，即 OSC 第 308 步：夹爪闭合命令仍为闭合，但左右手指对碗的接触数均为 0，grasp 检查报告 `opposing_left_and_right_finger_contacts_not_both_present`。跟踪器据此在该步停止，没有重试或调参。
+
+OSC 已执行区间 **308/308** 步 Contact Monitoring 均完整，非预期接触事件数为 0，`physical_collision_observed=false`；这不抵消抓持失败，也不能算完整路线安全成功。全回合 **358 步**、reward sum `0.0`、`done=false`、`success_once=false`，耗时 `208.63 s`。
+
+输出保存在 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_candidate_trajectory004_attempt3_lora_20261021_attempt1/`。完整 NPZ 的 `executed_actions` 为 `(358,7)`；步索引 0–49 来自 LoRA Student，50–357 为记录为 `direct_b_spline_closed_loop_native_osc_pose` 的真实 OSC 动作（NPZ chunk ID `1000005`）。MP4 为 256×256、359/359 帧解码通过。目录同时保存 `trajectory_validation.json`、`result.json`、`direct_bspline_osc_execution.svg` 与 `run_manifest.json`；运行清单记录确切命令、候选筛选结果、模型/Adapter 摘要及 NPZ/视频/报告摘要。此次仅运行一个完整采集回合，等待复核后再决定后续。
+
+## Left trajectory-001 朝 trajectory-004 插值 10% 的一次真实采集（2026-10-21）
+
+为避免继续单独尝试失败的 `trajectory-004`，在一次真实抓持后的同一当前几何束中，取通过原几何筛选的 Left `trajectory-001` 与 Left `trajectory-004` 控制点，按 `P_new = P_001 + 0.10 × (P_004 − P_001)` 线性插值，并调用同一 B-Spline 离散化、保守球 clearance、终点和安全出口区域检查。新候选 ID 为 `trajectory-001-interp-10pct-toward-trajectory-004`；当前束原有 18/18 条通过几何筛选。成功默认入口没有变化：未启用插值参数时仍走原候选选择器，默认选 `trajectory-001`。本次未引入 Snapshot 多候选物理验收、控制器或新的安全机制。
+
+### 针对性回归
+
+新增的插值单测逐点验证控制点等于两条 Left 源路线按 10% 公式所得，确认派生曲线复用现有几何筛选并保持 `physical_safety_verified=false`、`executable=false`；现有默认选择器回归仍确认未指定候选时选择 `trajectory-001`。运行 `research/gs_opd/repair/test_trajectory_bundle.py` 和 `research/gs_opd/smoke/test_direct_bspline_osc_smoke.py`：**32 passed，65 个子测试通过**。相关 Python 文件 `py_compile` 与 `git diff --check` 通过。
+
+### 一次完整真实采集
+
+执行入口增加显式参数 `--bspline-left-001-toward-004-interp-10pct`；省略时的默认 Left 选择和执行逻辑不变。Student 从起始状态即使用原始 Pi0.5 基座与 attempt3 LoRA Adapter（运行日志记录 `LORA ADAPTER LOADED`，NPZ metadata 记录同一模型路径；rank 32、216 张量、13,860,864 参数，Adapter SHA-256 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`）。Student 抓持、原生 `OSC_POSE`、B-Spline 自适应 `0.020 m/s` 推进及路线后的 Student 接续均沿用现有链路。
+
+同一状态束中的 `trajectory-001` 离散长度为 **0.839512 m**，`trajectory-004` 为 **0.983224 m**；插值新路线为 **0.852494 m**，比成功基线长 **0.012983 m**（约 1.55%），每个控制点相对基线的最大位移为 **0.011841 m**。已有连续曲线球 clearance 检查的最小下界为 **0.029989 m**，高于原 0.01 m 阈值。该几何结果只表示路线通过已有静态筛选；物理安全仍由原执行时的 Contact Monitor 和任务结果判断。
+
+Student 抓持 **50 步**后进入路线执行；插值路线请求 853 个参考点间隔，OSC 到达安全出口区域后以 **767 个实际控制步**完成绕障路线（episode 索引 50–816）。执行中双指抓持 767/767 步均通过，未失持；Contact Monitor 767/767 步完整，非预期接触事件 0。之后 LoRA Student 从最新实时 observation 接续 **42 步**（索引 817–858），共计 **859 步**、10 个决策块。任务最终 reward sum **1.0**、`done=True`、`success_once=True`；报告状态为 `left_bypass_route_physically_completed`。本次达到任务成功且 OSC 区间接触监测无非预期接触；几何筛选、接触结果和任务成功分别记录，没有将任一项替代另一项。
+
+一次采集的独立目录为 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_candidate001_interp10_toward004_attempt3_lora_20261021_attempt1/`。保留完整 NPZ `direct_bspline_osc_trajectory.npz`（`executed_actions` `(859,7)`、完整 episode observations/物理状态/接触记录，SHA-256 `e02741237fecad34e57b4e30ae8cac9d37e01a660e598d6589b85bbb83e23e42`）、MP4 `student_and_direct_osc.mp4`（256×256，860/860 帧解码通过，SHA-256 `d6d43684d32567499810c294e05864c991908c2eb0899733cbeb708abee6c8cf`）、`trajectory_validation.json`、`result.json`、`interpolated_left_route.json`（源候选、派生控制点、离散曲线及原筛选证据）、执行路线 SVG、当前状态候选束、完整 `run.log` 与 `run_manifest.json`。这次只执行一个真实采集回合，没有重试或调整参数。
+
+## Left 控制点插值比例参数化及 20% 一次真实采集（2026-10-21）
+
+将 `--bspline-left-001-toward-004-fraction <value>` 接入现有直接 B-Spline→OSC 入口，要求 `0 < value <= 1`。原 `--bspline-left-001-toward-004-interp-10pct` 保留为兼容别名，继续表示 0.10；两个插值参数均省略时仍不插值，默认成功 Left 路线选择与执行逻辑不变。插值仍只在线性组合本次当前状态束中通过筛选的 `trajectory-001`/`trajectory-004` 控制点后，复用同一离散化、几何 clearance、终点和出口检查；OSC、抓持、安全监测、Student、模型及数据记录均未修改。
+
+针对性回归运行 `research/gs_opd/repair/test_trajectory_bundle.py` 和 `research/gs_opd/smoke/test_direct_bspline_osc_smoke.py`：**33 passed，65 个子测试通过**。新增 20% 单测核验实际控制点公式与 `20pct` 候选 ID；既有 10% 单测仍验证原 ID/0.10 结果，默认候选选择测试仍选择 `trajectory-001`。`pi05_rollout.py --help` 显示新参数与旧兼容别名，相关 Python 文件 `py_compile` 及 `git diff --check` 通过。
+
+使用与成功 10% 采集相同的基座 Pi0.5、attempt3 LoRA Adapter（SHA-256 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`）、Teacher、语义绑定及 rollout 参数，仅将插值比例设为 **0.20**。运行日志确认 Adapter 实际加载；没有读取、复制或重放历史动作，每次 reset/grasp 后均在实时当前状态重新生成 18 条候选，18 条均通过原几何筛选。
+
+本次同状态 Left `trajectory-001` 离散长度 **0.845705 m**，`trajectory-004` **0.992834 m**，新 `trajectory-001-interp-20pct-toward-trajectory-004` 长 **0.872271 m**；相对当前状态的成功基线长度增加 **0.026566 m**，最大控制点位移 **0.025615 m**。现有几何筛选记录的最小连续球间距下界 **0.030177 m**，高于原 `0.01 m` 阈值，路线通过筛选。这里只将几何结论作为筛选结果，实际执行安全仍单独依据 Contact Monitor 和任务记录。
+
+Student 抓持 **50 步**；原 `0.020 m/s` 自适应 OSC 到达路线安全出口并完成 **783 步**（episode 索引 50–832；请求 873 个参考步，达到既有出口完成条件后停止）；OSC 抓持检查 **783/783 通过且未失持**，Contact Monitor **783/783 完整**，非预期接触事件 **0**。LoRA Student 随后从实时 observation 接续 **42 步**（索引 833–874）。全 episode 共 **875 步**，reward sum **1.0**、`done=True`、`success_once=True`，路线状态 `left_bypass_route_physically_completed`；首个失败原因为空，没有触发失败条件。
+
+本次唯一真实采集产物位于 `logs/gs_opd/mink_panda_physical_v3/live_left_bspline_candidate001_interp20_toward004_attempt3_lora_20261021_attempt1/`。完整 NPZ `direct_bspline_osc_trajectory.npz` 的 `executed_actions` 为 `(875,7)`，且保存相机、物理状态与接触记录；MP4 `student_and_direct_osc.mp4` 为 256×256、**876/876 帧解码通过**。目录另含 `trajectory_validation.json`、`result.json`、派生曲线和两条源候选的 `interpolated_left_route.json`、当前状态 `trajectory_bundle.json`、执行 SVG、完整 `run.log` 和包含命令、模型与产物 SHA-256 的 `run_manifest.json`。本轮只运行一次，没有自动重试、参数调整或额外机制。
+
+## π₂ 累计 Episode 数据集准备与读取验证（2026-10-21）
+
+仅从三个已完成的成功 NPZ 构建累计数据集：Round 0 为原始 π₀.₅ Student 的 Left `trajectory-001`（845 步）；Round 1 为 attempt3 LoRA Student 起始状态上的 Left `trajectory-001` 分别向 `trajectory-004` 插值 10% 与 20% 的示范（859、875 步）。三份源 NPZ、成功路线报告、Adapter、基础 Checkpoint、Teacher、Grounding 和安全监测文件均只读；没有启动训练或 Rollout。
+
+新增可复现离线入口 `research/gs_opd/data/prepare_pi2_cumulative_dataset.py`。它复用 `npz_to_lerobot.py` 的 observation 对齐、图像旋转、状态转换及 `LeRobotDatasetWriter` 字段，生成 LeRobot v2.1、20 Hz、3 个独立 Episode、总计 **2,579 帧**的数据集。七维执行动作保持原样；样本包括 256×256 双相机图像、8 维 EEF/夹爪状态、7 维动作和原任务文本。Episode 边界为 `[0,845)`、`[845,1704)`、`[1704,2579)`。逐帧 Reader 回读核验全部通过：**2,579/2,579** 帧的相机图像、状态、动作和任务文本均与相应源 NPZ 精确对齐。
+
+每个 Episode 的清单保留源 NPZ/报告 SHA-256、Episode 来源与 Round、策略版本、基础 Checkpoint、Adapter 路径与哈希、Left B-Spline 候选 ID/插值定义、阶段范围、真实 Student/原生 OSC 动作来源、成功 reward/done，以及原始安全报告引用和抓持/碰撞字段。Round 1 两条示范均记录 attempt3 Adapter SHA-256 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`。安全报告只是保留源执行证据，本次转换没有生成新的 Safety Compiler 判定，也没有把普通行为克隆动作重标为安全修正。
+
+**实际动作步数**按 Student 抓持 / B-Spline OSC 搬运 / Student 接续分布为：845 步示范 `55 / 749 / 41`，10% 示范 `50 / 767 / 42`，20% 示范 `50 / 783 / 42`。对 action horizon 10 采用原训练的完整窗口边界规则，每阶段窗口按起点标注，因此可训练唯一窗口为：抓持 **155**、OSC 搬运 **2,299**、放置/接续 **98**，共 **2,552**。边界附近的窗口仍按起始阶段归类，窗口不会跨 Episode。
+
+将 attempt3 的三阶段均衡规则应用于累计样本：保留全部 2,552 个唯一窗口，再将短阶段按原 `np.resize` 方式补齐到当前最大阶段数 **2,299**，得到每阶段每 Epoch **2,299** 次曝光、合计 **6,897** 个窗口；固定评估清单为每阶段 16 个窗口（48 个）。完整全局起始帧索引和评估索引写入 `pi2_stage_balanced_sampling.json`。为让原训练 Worker 可按这份清单读取多 Episode，`SingleEpisodeSftWorker` 新增仅在配置 `data.phase_manifest_path` 时启用的累计数据分支；未设置该字段时原有单 Episode 行为保持不变。
+
+原训练 Worker 所用的官方 OpenPI `pi05_libero` DataLoader 与上述多 Episode 均衡分支完成无训练 Smoke：训练模式 1 个 Batch 为 `(Observation, actions)`，batch size 2、动作张量 `[2,10,32]` 且为有限值；Worker 生成的 **6,897** 窗口索引与已保存均衡清单完全一致，三阶段曝光均为 2,299。固定评估模式实际读取 **48 个 Batch**，每阶段 16 个，并覆盖三个 Episode 各 16 个；动作形状均为 `[1,10,32]`，相机变换后各视图为 `[1,3,224,224]`、状态为 `[1,32]`。沿用 Checkpoint 自带的原 norm stats，没有重算或改写。
+
+累计数据集与证据位于 `logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021/`：LeRobot `data/`、`images/`、`meta/`，来源 `pi2_cumulative_dataset_manifest.json`，均衡索引 `pi2_stage_balanced_sampling.json`，逐帧与 DataLoader 验收 `pi2_cumulative_dataset_validation.json`。数据目录约 **670 MB**。本轮仅准备数据并验证加载；等待复核后再从 π₁ 继续训练 π₂。
