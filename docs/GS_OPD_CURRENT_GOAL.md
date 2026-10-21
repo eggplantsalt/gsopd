@@ -1,5 +1,11 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：object_2 caddy SAM3/Body IoU 低阈值诊断完成，等待复核（2026-10-22）
+
+- 使用 Teacher 同状态的归档 512×512 RGB、Geom ID 和完整 Inventory；SAM 检索词 `brown caddy`、置信阈值 0.05，原有 Body-level IoU 阈值 0.1。没有 Body 预筛。
+- SAM3 返回 1 个低分候选（0.098633），与 Body 26 `desk_caddy_1_main` / Geom 265 的 IoU 为 0.958812；对最高非目标 Body 27 的 IoU 仅 0.00008255。候选 Mask/BBox、全部 Body IoU 和可视化已归档。保留低 SAM 分数 caveat，不创建语义绑定。
+- 结果在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object2_brown_caddy_sam3_conf005_iou010_20261022_attempt1/`。本轮未调用 VLM/Teacher、未运行环境动作或训练，等待复核。
+
 ## 当前状态：修正 target-description 优先级并完成一次 bottle 验证，等待复核（2026-10-22）
 
 - Smoke Prompt 现规定：有 `--target-description` 时识别该类别，原任务指令只作上下文；无该参数时仍找任务操作目标。支持容器、障碍物等非操作目标，并保留 unresolved 和单候选不强选。

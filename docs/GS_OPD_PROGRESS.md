@@ -2,6 +2,13 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1 object_2 brown caddy SAM3 低阈值候选与 Body IoU 诊断（2026-10-22）
+
+- 复用与 Teacher IR 同一采集状态的 512×512 L0T1/state0 图像。Teacher 的原始 agentview RGB 与几何归档 raw RGB SHA-256 一致；SAM 输入与配对 Geom ID 使用已核验的 180° forward 坐标。采集记录确认 capture 客户端未 reset/step、前后仿真状态一致。
+- 用现有 SAM3 checkpoint、检索词 `brown caddy`，仅将 confidence threshold 设为 0.05；IoU threshold 保持 0.1。SAM3 返回 1 个候选：score `0.098633`，BBox `[211.251, 171.050, 473.396, 301.822]`，Mask 面积 25,734 px。该低分候选在原有全 Body IoU 计算中与 Body 26 `desk_caddy_1_main` / Geom 265 的 IoU 为 **0.958812**。
+- 未按 Body 26 预筛，IoU 一次比较了全部 18 个可见 Body 组。最高非目标重叠为 Body 27、IoU `0.00008255`；没有其他显著误检候选。SAM 分数仍低，需保留置信度限制；几何重叠不建立 Teacher–Body 语义绑定。
+- 全部 SAM Mask、BBox、分数、运行诊断、逐 Body IoU CSV、叠加图、candidate/Geom 对照图和 21 项 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object2_brown_caddy_sam3_conf005_iou010_20261022_attempt1/`，报告为该目录 `experiment_report.md`。没有调用 VLM、重跑 Teacher、启动 Bridge/MuJoCo、运行 Student、规划或训练；等待复核。
+
 ## 修复 Task-Conditioned Verification 的目标描述优先级并真实验证 bottle（2026-10-22）
 
 - 修改 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py` 的系统 Prompt：提供 `--target-description` 时，优先从全部候选中识别该类别，允许它是操作目标、容器、障碍物或其他场景物体；任务指令仅作上下文，不能据此拒绝非操作目标类别。未提供描述时仍按任务指令寻找操作目标。始终允许 unresolved，单候选不构成强制选择理由。
