@@ -6,7 +6,7 @@
 
 ## 阶段与当前状态
 
-1. **安全输入与物体语义**：L0T1/state0 的 512×512 双相机 RGB、Geom segmentation 和完整 Body/Geom Inventory 已从同一次 Bridge 初始化采集并确认像素/状态对齐；book/caddy/bottle 的候选 BDDL 实体各自在独立可见 Body。基于这组 RGB 的一次新 Teacher v2 输出已通过 Schema；与前次输出相比，后 3 个物体命名和 robot-contact 规则数量有差异。两次图像来自不同 capture/reset，差异原因未判定。Teacher `white book` 与 BDDL `black_book_1` / `white_place_box_1` 的颜色和身份关系仍待复核，尚未做 SAM3/VLM 语义绑定；`object_3` 在获得真实语义绑定前继续保持 `unknown`，不补造映射。
+1. **安全输入与物体语义**：L0T1/state0 的 512×512 双相机 RGB、Geom segmentation 和完整 Body/Geom Inventory 已从同一次 Bridge 初始化采集并确认像素/状态对齐；book/caddy/bottle 的候选 BDDL 实体各自在独立可见 Body。基于这组 RGB 的一次新 Teacher v2 输出已通过 Schema；与前次输出相比，后 3 个物体命名和 robot-contact 规则数量有差异。两次图像来自不同 capture/reset，差异原因未判定。对 `object_1` 的 SAM3 单对象提示 `white book` 在默认阈值 0.5 下返回零候选；因此尚无候选可与 Body 23 `black_book_1_main` 或 Body 27 `white_place_box_1_main` 做 IoU 比较，Teacher→Body 绑定仍 unresolved。VLM 语义消歧待复核后决定；`object_3` 在获得真实语义绑定前继续保持 `unknown`，不补造映射。
 2. **真实成功执行**：已有一次真实 Student→B-Spline→原生 OSC 左绕成功回合：749 步 B-Spline 左绕后由 π₀.₅ 接续 41 步，取得真实任务奖励 1.0；完整轨迹和视频保存在 `live_left_bspline_osc_adaptive_20261019_attempt1`。
 3. **数据格式与读取**：已有 749 步 OSC 专用 LeRobot 数据集；现已另从原始成功 NPZ 生成完整 845 步单 Episode（55 抓取 / 749 搬运 / 41 放置），逐步验证 Observation–Action 对齐，保留 836 个 horizon-10 无 Padding 窗口及跨阶段窗口，继续使用初始 Student 对应 norm stats。
 4. **单轨迹学习链路**：2026-10-20 从原始 Student 初始化新的 rank-32 Action Expert LoRA，使用恒定 `1e-4` LR、AdamW 重新初始化、官方 OpenPI DataLoader、`SFTRunner`、原生 Flow Matching Loss 和三阶段均衡采样，完成 10,000 optimizer steps。固定示范状态上的 OSC 搬运 Flow MSE 从 0.152026 降至 0.000982，真实 10×7 Action MAE 从 0.183005 降至 0.009061；独立 Adapter 已成功重载并与训练 checkpoint 推理一致。该结果确认完整轨迹监督拟合，不代表新闭环成功、安全泛化或真实执行能力。
@@ -14,7 +14,7 @@
 
 ## 参数化任务语义采集进度（2026-10-21）
 
-Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨率，默认 L0T0 初始化保持原样。已选择不同 BDDL 的 obstacle_avoidance L0T1“pick up the book and place it in the back compartment of the caddy”，state 0；冻结 Qwen3.8 Teacher 已先后对两次独立 capture 生成 Safety IR v2。最近一次使用 Geom 对齐的同状态 RGB 离线调用一次，不连接 Bridge；输出通过 Schema，保留了输入哈希、原始 JSON 和与旧输出的对比。新旧响应对 book/caddy/bottle 语义保持一致，但对 cup/utensil/plant 的命名和 robot-contact 规则覆盖有差异；旧图与本次 RGB 来自不同 reset，不能把此差异归因于同状态重推理。Teacher `white book` 与 BDDL `black_book_1` 及 `white_place_box_1` 的关系仍未确认。当前没有 SAM3/VLM 语义绑定或物理安全判定；等待复核输入、规则差异与名称歧义后再继续。
+Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨率，默认 L0T0 初始化保持原样。已选择不同 BDDL 的 obstacle_avoidance L0T1“pick up the book and place it in the back compartment of the caddy”，state 0；冻结 Qwen3.8 Teacher 已先后对两次独立 capture 生成 Safety IR v2。最近一次使用 Geom 对齐的同状态 RGB 离线调用一次，不连接 Bridge；输出通过 Schema，保留了输入哈希、原始 JSON 和与旧输出的对比。新旧响应对 book/caddy/bottle 语义保持一致，但对 cup/utensil/plant 的命名和 robot-contact 规则覆盖有差异；旧图与本次 RGB 来自不同 reset，不能把此差异归因于同状态重推理。Teacher `white book` 与 BDDL `black_book_1` 及 `white_place_box_1` 的关系仍未确认。本轮已用已归档 180° 对齐 RGB/Geom 对 `object_1` 运行现有 SAM3 和 Body IoU 脚本；默认 0.5 阈值返回 0 候选，故无候选 IoU，绑定继续 unresolved。VLM 语义消歧与物理安全判定未执行；等待复核零候选和名称歧义后再继续。
 
 ## 主要记录
 

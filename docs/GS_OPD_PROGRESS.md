@@ -2,6 +2,14 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1 object_1 “white book” SAM3 与 Body IoU 检查（2026-10-21）
+
+- 从已归档的 `obstacle_avoidance_L0T1_init0_geom_grounding_20261021/` 读取 512×512 `agentview_512_rgb_rotated_180.png`、逐像素对齐的 `geom_ids_rotated_180.npy`、完整 Geometry Inventory 和 alignment report；复用最新通过 Safety IR v2 Schema 的 `object_1`，没有重置 Bridge 或重新采图。运行前将原始证据复制到独立输出目录并核对哈希。RGB/Geom ID 方向均由元数据标记为同向 180° forward；归档报告确认本次 segmentation 状态未变化。
+- 调用现有 `sam3_smoke.py`，Teacher 名称原样作为单对象 prompt `white book`，不附加视觉事实；本地 SAM3 权重 `/workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt`（SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`），RTX 4090 CUDA 推理，现有默认置信度阈值 0.5。`parse_teacher_output_v2` 校验输入通过；SAM3 返回 `no_candidates`、候选数 0，因此本次没有候选 Mask 或 SAM score，也没有候选可编号。对应的原图说明 overlay、空候选结果及完整运行清单已保存。
+- 现有 `sam3_mujoco_iou_smoke.py` 校验 SAM 输入 RGB 与归档 180° RGB 尺寸相同且逐像素一致，并对 18 个可见 Body 组生成完整匹配输出；由于候选数为 0，IoU 矩阵没有候选行，不能将缺失值当成 IoU=0。重点实体在该帧可见像素为：`black_book_1_main` Body 23 / Geom 91 / 3,090 px；`white_place_box_1_main` Body 27 / Geom 283 / 10,611 px。这些是 Geom 可见面积，不是 SAM overlap。
+- 结果无法判定 Teacher “white book” 更接近 Body 23 还是 Body 27，也不能判断是否存在误匹配或多个候选；`object_1`→Body/Geom 绑定继续为 **unresolved**，没有选择最高 IoU 或按名称建立绑定。Inventory 另有 world Body 0 下名为 `black_book_1` 的静态 Geom；它与 Body 23 的 `black_book_1_main` 分开记录，不作为语义证据。
+- SAM3 结果/候选 Mask 目录、完整 18-Body IoU 矩阵、无候选说明 overlay、Body 23/27 聚焦摘要、原始 RGB/Geom/Inventory/IR 副本、源哈希和产物 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_sam3_geom_iou_20261021_attempt1/`。本轮没有运行 VLM 语义消歧、Student、环境动作、规划或训练；等待复核 SAM3 零候选及白书身份歧义后再决定是否进入语义消歧。
+
 ## L0T1/state0 Geom 对齐 RGB 的 Teacher 再标注（2026-10-21）
 
 - 沿用已归档的 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_geom_grounding_20261021/` 双相机 RGB 和 L0T1 指令，直接调用冻结本地 Qwen3.8 Teacher 一次。没有连接或 reset Safety Bridge，也没有重新采集图像。输入 agentview 与归档 segmentation RGB 在原始方向逐像素相同；两张输入均 512×512 RGB。输入图像 PNG SHA-256：agentview `3b3b1def68143b48132fb7bc92fdd04ea1fb2989807f575309b85bb11592aec7`，eye-in-hand `a6eb1a5afcda3fbc90b87ee6ba6059aaf09cabc0374598848c456c89d8a99bb7`；输出清单另记录解码像素缓冲区和实际 backend PNG data URL 哈希。
