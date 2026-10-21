@@ -2,6 +2,13 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## 修复 Task-Conditioned Verification 的目标描述优先级并真实验证 bottle（2026-10-22）
+
+- 修改 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py` 的系统 Prompt：提供 `--target-description` 时，优先从全部候选中识别该类别，允许它是操作目标、容器、障碍物或其他场景物体；任务指令仅作上下文，不能据此拒绝非操作目标类别。未提供描述时仍按任务指令寻找操作目标。始终允许 unresolved，单候选不构成强制选择理由。
+- 离线构造真实请求并检查两种分支：无目标描述的原始 book 指令仍定位操作目标；加 `bottle` 后明确要求识别瓶子、将 book 指令降为上下文。也核实了 unresolved 保留、单候选不强选，VLM 可见文本不含 Teacher 颜色描述、Body/Geom/IoU、SAM 分数或预期候选。无离线 VLM 请求。
+- 使用同状态 512×512 RGB、`green bottle`/0.5 SAM3 全部 1 个候选和原任务指令，对冻结 `Qwen3.8-27B-FP8` 仅推理一次（non-thinking、temperature 0、4096 tokens；HTTP 200）。模型选择 Candidate 0，理由是候选图中的瓶子符合目标描述。原始回答落盘后才进行几何比较，Candidate 0 对 Body 25 `bottle_of_beer__7_1_main` / Geom 133 的 IoU 为 **0.98497358**。
+- 几何重叠仅是 post-hoc 对照，没有修改 Safety IR 或写入正式语义绑定。此前 `target-description=bottle` 因指令要求 book 而返回 unresolved；本次 Prompt 修复消除了该目标冲突。完整离线检查、输入 payload、原始回答、关联和 29 项 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object3_task_conditioned_candidate_verification_promptfix_20261022_attempt1/`。推理服务已关闭；未重跑 SAM3、Teacher、MuJoCo，也未运行 Student、规划或训练；等待复核。
+
 ## L0T1 object_3 bottle Task-Conditioned Candidate Verification（2026-10-22）
 
 - 使用归档 `green bottle`/0.5 SAM3 结果对 `object_3` 做一次真实验证。预检确认 RGB、Candidate 0 Mask 和配对 Geom ID 来自同一份 L0T1/state0 归档；SAM RGB 与几何分割配对 RGB 均为 512×512 且 RGB 逐像素一致，Geom ID 为 512×512 `int32`，二者使用共同的 180° forward 坐标方向。采集期间未 reset/step，前后仿真状态一致。

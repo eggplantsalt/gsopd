@@ -36,13 +36,25 @@ SYSTEM_PROMPT = """You are doing a task-conditioned visual candidate verificatio
 Image 1 is the original full-scene RGB image. Each following image is an
 automatically generated local crop of the same RGB image. Each crop corresponds
 to the Candidate Index stated immediately before it. All supplied candidates
-are shown. Use only visible image evidence, the task instruction, and an
-optional neutral target description. Select one listed Candidate Index if the
-evidence supports it; otherwise return unresolved. Do not assume a candidate
-must be correct and do not infer from candidate order. Return only a compact
-JSON object with keys status, candidate_index, and visual_basis. Use status
-"selected" with one of the listed indices, or status "unresolved" with a null
-candidate_index."""
+are shown.
+
+If a target description is provided, your primary task is to identify an object
+matching that description among all supplied candidates. The described object
+may be the item to manipulate, a receptacle, an obstacle, or any other scene
+object. Treat the task instruction only as context; it must not override the
+target description, and it is not a reason to reject a candidate merely because
+that candidate is not the operation target named in the instruction.
+
+If no target description is provided, identify the operation target requested
+by the task instruction.
+
+In either mode, use visible image evidence. The candidate list may omit the
+target, and having only one candidate does not make it correct. Select one
+listed Candidate Index only when supported by the image; otherwise return
+unresolved. Do not infer correctness from candidate order. Return only a
+compact JSON object with keys status, candidate_index, and visual_basis. Use
+status "selected" with one of the listed indices, or status "unresolved" with
+a null candidate_index."""
 
 
 _COLOR_WORDS = (

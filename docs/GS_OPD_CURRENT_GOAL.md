@@ -1,5 +1,11 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：修正 target-description 优先级并完成一次 bottle 验证，等待复核（2026-10-22）
+
+- Smoke Prompt 现规定：有 `--target-description` 时识别该类别，原任务指令只作上下文；无该参数时仍找任务操作目标。支持容器、障碍物等非操作目标，并保留 unresolved 和单候选不强选。
+- 离线输入检查通过：book 指令无目标描述时仍按操作目标处理；`bottle` 描述时明确识别瓶子，不因指令提 book 而拒绝。实际请求未包含 Teacher 颜色描述、Body/Geom/IoU、SAM 分数或预期候选。
+- 冻结 Qwen3.8 一次选择 Candidate 0；其归档 Mask 后验匹配 Body 25 / Geom 133，IoU 0.98497358。该值只作几何对照，无 Safety IR 修改或正式语义绑定。完整证据在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object3_task_conditioned_candidate_verification_promptfix_20261022_attempt1/`；服务已关闭，等待复核。
+
 ## 当前状态：object_3 bottle 候选验证已完成，保持 unresolved，等待复核（2026-10-22）
 
 - 使用同状态归档 RGB、`green bottle`/0.5 SAM3 全部候选和原始 L0T1 指令，对 object_3 仅调用冻结 Qwen3.8 一次；目标描述为中性 `bottle`。RGB/Mask/Geom ID 的 512×512 坐标与采集状态核验通过。
