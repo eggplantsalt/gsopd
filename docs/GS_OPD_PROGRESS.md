@@ -2585,3 +2585,33 @@ Round 0 与 Round 1 纯 Student 区域 41 个共同窗口的标签差较大：10
 ### 诊断结论与限制
 
 当前证据不支持数据帧错位、LeRobot Reader 构建错误或三条近似 Round 1 轨迹间存在广泛 d6 监督冲突；确认存在 27 个抓取起点归类、但 chunk 后半已经执行 OSC 的边界窗口，以及 Round 0 与 Round 1 的有限策略/动作差异。π₂ 在离线训练示范状态上的总体拟合较好，伴有一个 10% Episode 的 d6 单步提前误差。闭环证据显示接近/抓取阶段 EEF 和平移动作分岔，π₂ 虽出现双指接触却没有抬起碗。**为什么这一路线偏离并导致无法抬升，原因未证实**；源示范自身没有物理指尖接触/物体抬升记录，单次闭环对照也不能区分策略泛化、输入状态漂移、接触几何或其他机制。结论只为离线诊断，不代表安全判定或新的成功证据，等待复核。
+
+## π₂ 累计经验 Batch Size 3 独立训练（2026-10-21）
+
+在已有 π₂ 三 Episode 累计数据集上重新从原始 SFT Base 初始化新 rank-32 Action Expert LoRA，完成一次 10,000 optimizer steps 训练。独立配置为 `examples/sft/config/gs_opd_pi2_cumulative_fresh_rank32_lora_bs3_20261021.yaml`，训练产物根目录为 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/`。相较 π₂ 原始训练配置，仅将 `actor.micro_batch_size`、`actor.global_batch_size` 从 2 调为 3，并使用独立 experiment name；数据集、阶段均衡采样、模型、原生 OpenPI Flow Matching、动作归一化、恒定 `1e-4` 学习率、rank、优化器及 10,000 步预算均保持不变。用户配置 SHA-256 为 `b915705da3b16c60730e5492cbe1341c1ac5efd553344fba9a5c1f865361bd33`，Resolved 配置 SHA-256 为 `8ca6d24eea584caba4ce160b89e29d44234e940ead3cac2b4a94406deb5b1dc4`。
+
+### 启动前门槛
+
+使用的原有数据集为 `/workspace/zy_workspace/RLinf/logs/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021`，manifest SHA-256 `1c262e7c49177321386fad53281762009dada82d51439f943c2e97ffbaa6979f`。训练 DataLoader 预检确认三个 Episode 均进入官方训练窗口：Round 0 原始 Student Left 845 帧、Round 1 attempt3 LoRA 10% 插值 859 帧、Round 1 attempt3 LoRA 20% 插值 875 帧，共 2,579 帧。原阶段均衡采样序列完全匹配保存的 sampler；每 Epoch 6,897 个窗口、2,299 个 batch，每阶段曝光 2,299 次。各 Episode 的窗口曝光数分别为 2,342、2,289、2,266。
+
+单 Batch 显存门槛使用实际 Batch Size 3 完成一次模型前向与反向，Action Tensor 形状 `[3,10,32]`，没有执行 optimizer step；216 个 LoRA 梯度张量均为有限值，模型参数在门槛测试前后未改变。RTX 4090 峰值 allocated 为 18,944,792,576 bytes（约 17.64 GiB），reserved 为 23,995,613,184 bytes（约 22.35 GiB），未 OOM。预检细节保存在 `single_batch_memory_preflight.json` 和 `training_dataloader_preflight.json`。
+
+### 初始化与训练结果
+
+运行审计确认基座为 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，模型文件 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`。`initial_adapter_path=null`、`resume_dir=null`；无 π₁/π₂ 旧 Adapter 加载。667/667 个非 LoRA 模型权重键严格载入且冻结，rank-32 新 LoRA 包含 216 个张量、13,860,864 个可训练参数；AdamW 状态从头初始化，恒定学习率 `1e-4`。
+
+唯一正式训练进程以 exit code 0 完成 10,000/10,000 optimizer steps，耗时 8,667 秒，停止原因为达到配置步数。首 100 步 Loss 均值为 `0.025686`，末 100 步均值为 `0.001209`，最终记录 Loss 为 `0.00054869`；逐步数据与曲线位于 `step_metrics.jsonl`、`loss_curve.png`。step 0/2,000/4,000/6,000/10,000 的整体固定 Flow Matching MSE 分别为 `0.080195`、`0.001950`、`0.001796`、`0.001067`、`0.001188`。分阶段固定评估 MSE 为：
+
+| 阶段 | step 0 | step 2k | step 4k | step 6k | step 10k |
+|---|---:|---:|---:|---:|---:|
+| Student 抓取 | 0.053287 | 0.002088 | 0.001963 | 0.000594 | 0.000582 |
+| B-Spline/OSC 搬运 | 0.173468 | 0.001350 | 0.001350 | 0.001105 | 0.001051 |
+| Student 放置 | 0.013831 | 0.002412 | 0.002074 | 0.001502 | 0.001931 |
+
+step 10k 的完整 10×7 环境动作块 MAE / 第七维夹爪 MAE / 首动作 7D MAE，按抓取、搬运、放置顺序分别为 `0.013488 / 0.005927 / 0.015191`、`0.007834 / 0.002727 / 0.016045`、`0.012366 / 0.004216 / 0.014196`。其余各检查点固定评估及逐维统计保存在 `fixed_eval_by_step.jsonl` 与 `report.json`。
+
+### Checkpoint、Adapter 与范围
+
+5,000 步 Checkpoint 位于 `checkpoints/global_step_5000/actor/`，其中 `full_weights.pt` SHA-256 为 `6ab8af553e27169d45da6356f20e9ecbb00f5aaa778e417ec26a8bfaff192604`；10,000 步 Checkpoint 位于 `checkpoints/global_step_10000/actor/`，`full_weights.pt` SHA-256 为 `32716283c10de6b06aed7865a11b8ce6819515c368dc749dd88df2b79363eb93`。独立 Adapter 为 `lora_adapter.pt`，rank 32、216 张量、13,860,864 参数，SHA-256 `84adc2edb43639dda5c6c93bf37248286219114f1d6e11d99e276c548152bac5`。导出后重载验证通过，在相同 Observation 上输出 `[10,7]`，相对最终完整训练权重的最大和平均动作差均为 0；验证记录为 `adapter_reload_verification.json`。
+
+原 Runner 汇总计数在创建固定评估 DataLoader 后被覆盖，`report_runner_raw.json` 保留了未改写的原始报告；最终 `report.json` 中的训练窗口数与阶段曝光信息已依据独立复建并核对的官方 train DataLoader 证据校正为 6,897 窗口、每阶段 2,299 次曝光。训练过程使用的仍是原始正确训练 loader 与已保存的 π₂ sampler 序列，未因报告元数据校正重跑训练。所有新增产物均在本节所列独立数据盘目录；本轮只训练和执行模型导出检查，没有运行 MuJoCo Rollout，也没有产生新的闭环任务或物理安全结论。等待复核。

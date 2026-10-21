@@ -1,6 +1,12 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：π₂ 累计经验训练与存储整理完成，等待复核（2026-10-21）
+## 当前状态：π₂ 累计经验 Batch Size 3 独立训练完成，等待复核（2026-10-21）
+
+- 在原三 Episode π₂ 累计数据集上，从原始 SFT Base 新建 rank-32 LoRA，完成一次 10,000 步训练。相较既有 π₂ 配置只把 `actor.micro_batch_size` 和 `actor.global_batch_size` 从 2 改为 3，并使用独立实验标识；学习率、数据采样、模型与 Flow Matching 设置保持一致。
+- 训练前确认官方训练 DataLoader 的 6,897 个窗口覆盖三个 Episode，batch size 为 3，三个阶段各曝光 2,299 次；实际 Batch 3 前向/反向通过，峰值 allocated/reserved 显存约 17.64/22.35 GiB。正式训练完成 10,000/10,000 步，保存 5k/10k Checkpoint、阶段固定评估和可独立重载的 Adapter。
+- 新实验及所有新增产物位于 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/`，无 MuJoCo Rollout。训练细节与预检证据见 `docs/GS_OPD_PROGRESS.md`；等待复核后再决定是否评测。
+
+## π₂ 原始累计经验训练与存储整理基线（2026-10-21）
 
 - 使用累计 LeRobot v2.1 三 Episode 数据集和已验证的三阶段均衡采样，完成 **10,000 optimizer steps**。训练始终从原始 SFT Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 加载冻结基座，并新建 rank-32 Action Expert LoRA；`initial_adapter_path: null`、`resume_dir: null`，没有加载或合并 attempt3 π₁ Adapter。
 - 基座非 LoRA 权重 667/667 键完整覆盖，抽样权重最大差为 0；667 个基座参数张量冻结，13,860,864 个 LoRA 参数独立训练。AdamW 与学习率调度器从头初始化，固定 LR `1e-4`，未改变 OpenPI Flow Matching、归一化或模型结构。
