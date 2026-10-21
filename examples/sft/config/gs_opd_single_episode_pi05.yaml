@@ -19,7 +19,7 @@ cluster:
 runner:
   task_type: sft
   logger:
-    log_path: "/workspace/zy_workspace/RLinf/logs/gs_opd/sft"
+    log_path: "/opt/data/private/gs_opd/sft"
     project_name: rlinf
     experiment_name: "pi05_libero_lerobot_bspline_osc_v21_overfit_20261019_attempt4"
     logger_backends: ["tensorboard"]

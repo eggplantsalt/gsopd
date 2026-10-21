@@ -91,11 +91,15 @@ def _predict(model_path: Path, observation: dict, adapter_path: Path | None, see
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=Path, required=True, help="Final RLinf full_weights.pt")
-    parser.add_argument("--output", type=Path, required=True, help="Standalone adapter output")
+    parser.add_argument("--output", type=Path, help="Standalone adapter output")
     parser.add_argument("--report", type=Path, required=True, help="Training report.json")
     parser.add_argument("--npz", type=Path, default=DEFAULT_NPZ)
-    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--result", type=Path)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = args.report.parent / "lora_adapter.pt"
+    if args.result is None:
+        args.result = args.output.with_name("adapter_reload_verification.json")
 
     raw = torch.load(args.weights, map_location="cpu", weights_only=False)
     full_state = _normalize_state_dict(as_state_dict(raw))

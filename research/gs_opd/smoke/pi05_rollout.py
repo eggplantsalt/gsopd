@@ -49,7 +49,9 @@ def parse_args():
     parser.add_argument(
         "--result-out",
         type=Path,
-        default=Path("/tmp/gs_pi05_safety_l0t0_result.json"),
+        default=Path(
+            "/opt/data/private/gs_opd/rollouts/pi05_safety_l0t0_result.json"
+        ),
         help="JSON path for the final rollout summary.",
     )
     parser.add_argument(

@@ -19,7 +19,7 @@ cluster:
 runner:
   task_type: sft
   logger:
-    log_path: "/workspace/zy_workspace/RLinf/logs/gs_opd/sft"
+    log_path: "/opt/data/private/gs_opd/sft"
     project_name: rlinf
     experiment_name: "pi05_libero_full_trajectory_lora_continue_20261020_attempt2"
     logger_backends: ["tensorboard"]

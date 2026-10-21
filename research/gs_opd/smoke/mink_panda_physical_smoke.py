@@ -1154,7 +1154,9 @@ def main():
     p.add_argument("--model-binary", type=Path)
     p.add_argument("--model-metadata", type=Path)
     p.add_argument("--archive", default=str(DEFAULT_ARCHIVE))
-    p.add_argument("--out-dir", default="logs/gs_opd/mink_panda_physical_v1")
+    p.add_argument(
+        "--out-dir", default="/opt/data/private/gs_opd/rollouts/mink_panda_physical_v1"
+    )
     p.add_argument("--speed", type=float, default=0.02)
     p.add_argument("--max-steps", type=int, default=1200)
     p.add_argument("--guide-tolerance", type=float, default=0.025)

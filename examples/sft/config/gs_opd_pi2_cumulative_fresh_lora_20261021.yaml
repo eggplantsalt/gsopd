@@ -19,7 +19,7 @@ cluster:
 runner:
   task_type: sft
   logger:
-    log_path: "/workspace/zy_workspace/RLinf/logs/gs_opd/sft"
+    log_path: "/opt/data/private/gs_opd/sft"
     project_name: rlinf
     experiment_name: "pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1"
     logger_backends: ["tensorboard"]

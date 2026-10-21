@@ -2502,3 +2502,86 @@ Student 抓持 **50 步**；原 `0.020 m/s` 自适应 OSC 到达路线安全出�
 中间完整 Checkpoint 保存在 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/checkpoints/global_step_5000/actor/`，最终完整 Checkpoint 在 `.../checkpoints/global_step_10000/actor/`；各自包含约 6.97 GB `full_weights.pt` 和约 7.03 GB DCP shard。独立 π₂ rank-32 Adapter：`logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/lora_adapter.pt`，27,792,805 bytes，216 张量、13,860,864 参数，SHA-256 `bf6f046a2eebc25540c11fca82608ed48dbfeeeb2b9db2d51f4794aebd1be72a`。`export_and_verify_lora.py` 重载验证通过；原始 SFT 基座 + Adapter 对比最终完整权重，在 Round 0 成功轨迹 step 0 observation 上均输出 `[10,7]`，最大与平均绝对动作差均为 **0**。
 
 配置 `examples/sft/config/gs_opd_pi2_cumulative_fresh_lora_20261021.yaml` 和完整训练证据（`training_config.yaml`、`resolved_training_config.yaml`、`preflight.json`、`run_manifest.json`、`report.json`、10,000 行 `step_metrics.jsonl`、`fixed_eval_by_step.jsonl`、`loss_curve.png`、两个完整 Checkpoint、独立 Adapter、`adapter_reload_verification.json`、控制台和导出日志）保存在该独立 `pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/` 目录。原始 SFT Checkpoint、π₁ attempt3 Adapter、三份成功 NPZ、累计数据集、Teacher/Grounding 和安全监测材料未覆盖或改写；本轮没有 MuJoCo Rollout。
+
+## GS-OPD 实验存储迁移与默认输出路径（2026-10-21）
+
+### 磁盘盘点与 π₂ 训练目录迁移
+
+迁移前 `df -hT` 显示 `/workspace` 在 `overlay` 文件系统（879G 总量、583G 已用、252G 可用、70%），`/opt/data/private` 在独立 NFS 文件系统（722T 总量、578T 已用、145T 可用、80%）；挂载设备不同，且 inode 余量充足。迁移前 `du -x`：`/workspace` 约 136G；`/opt/data/private` 约 212G，其中 `harness-autobio` 62G、`FastWAM` 57G、`zy_workspace` 55G、`models` 36G、`checkpoints` 3.2G、`yx_data` 4K。数据盘容量满足迁移条件。
+
+已创建 `/opt/data/private/gs_opd/{sft,eval,rollouts,datasets}`。将 `pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1` 的 19 个文件复制到 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`；源和目标的普通文件总字节数均为 **28,059,524,297**。随后以 `rsync -aHnc --numeric-ids --itemize-changes` 对全目录执行内容校验，命令成功且没有任何差异输出。关键哈希如下：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `lora_adapter.pt` | `bf6f046a2eebc25540c11fca82608ed48dbfeeeb2b9db2d51f4794aebd1be72a` |
+| `checkpoints/global_step_10000/actor/model_state_dict/full_weights.pt` | `1aabc0d5e9aedab94599e8ee7d9308b84eee2b57d69627fcaa1717f5e3a3e7d6` |
+| `checkpoints/global_step_10000/actor/dcp_checkpoint/__0_0.distcp` | `e34b9b49843fde75a7347e0ed4316c64313624d5d7addfa687f9de46ae71bf61` |
+| `report.json` | `51c61c6a6bf8ee21847777eddb411ab39079834cae6154df51bded877bf8835f` |
+| `run_manifest.json` | `d751d6d5f5d6bebda4c6f932687fc2876bcfe665606b9e54fc232bd291d0373b` |
+| `training_config.yaml` | `0097732394bc91705d37643f3d38865d5afbea58531b8318b06de4dea9e4f63b` |
+
+复制与哈希核验完成后，原 workspace 目录名改为指向数据盘目录的软链接：`/workspace/zy_workspace/RLinf/logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1` → `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1`。仓库相对路径 `logs/gs_opd/sft/...` 和 RLinf 原日志路径均已验证可读；报告、运行清单、Adapter、5,000/10,000 步完整 Checkpoint 均存在且可按旧路径访问。确认软链接可读后才删除经过验证的 workspace 备份，没有清理其他实验成果。
+
+旧成果仍可访问：原始 SFT `model.safetensors`（SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`）、π₁ attempt3 Adapter（SHA-256 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`）、845 步成功 Left NPZ、完整 Episode LeRobot 数据与 π₂ 三 Episode 累计数据集都保留在原位置；读取验证通过。π₂ Adapter 和 Checkpoint 现位于数据盘，仍通过原路径访问。
+
+迁移后 `df -hT`：`/workspace` 为 879G 总量、557G 已用、278G 可用、67%；`/opt/data/private` 显示 722T 总量、578T 已用、145T 可用、80%（NFS `df` 按 T 显示，舍入后未变化）。`du -x` 的 `/workspace` 从约 136G 降至约 110G，释放约 26G；数据盘新建 GS-OPD 树约 27G，当前主要占用为 `sft` 27G，其余三个目录为空。
+
+### 后续默认输出位置
+
+- **训练日志与完整 Checkpoint**：五个 GS-OPD SFT YAML 的 `runner.logger.log_path` 统一设为 `/opt/data/private/gs_opd/sft`；Runner 按 `<log_path>/<experiment_name>/checkpoints/global_step_*` 保存完整 Checkpoint。因此新实验产物在 `/opt/data/private/gs_opd/sft/<experiment_name>/`。已归档 π₂ 目录中的 `training_config.yaml` 和 resolved 配置保留训练当时的原始配置证据。
+- **独立 Adapter**：`export_and_verify_lora.py` 的 `--output` 默认写在 `--report` 所在训练目录，文件名为 `lora_adapter.pt`；`--result` 默认写到同目录 `adapter_reload_verification.json`。未来训练报告在 `/opt/data/private/gs_opd/sft/<experiment_name>/`，因此 Adapter 与重载验证结果也默认保存在该 SFT 目录；两者仍可用现有参数覆盖。
+- **评测**：`offline_action_fit_diagnostic.py` 默认输出到 `/opt/data/private/gs_opd/eval/offline_action_fit_20261020_attempt1`。需要保留评测视频时，通过现有 `--video-out` 指向 `/opt/data/private/gs_opd/eval/<run_name>/`。
+- **Rollout**：`mink_panda_physical_smoke.py` 与 `mink_osc_snapshot_smoke.py` 的默认 `--out-dir` 指向 `/opt/data/private/gs_opd/rollouts/`；前者默认目录为 `mink_panda_physical_v1`，后者为 `live_left_osc_smoke`。后者把每次运行的 `result.json`、报告、视频与 NPZ 都放在所选运行目录，避免跨运行共用结果文件。`pi05_rollout.py --result-out` 默认也在 `rollouts`；独立使用现有 `--trace-out` 时指定 `/opt/data/private/gs_opd/rollouts/<run_name>/`。
+- **新数据集**：`npz_to_lerobot.py --output-root` 默认 `/opt/data/private/gs_opd/datasets/lerobot_full_episode_v21`；累计数据生成脚本默认 `/opt/data/private/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021`。现存训练数据作为输入继续使用原路径，没有移动或重建。
+
+### 最小路径验证与范围
+
+读取解析了五份 GS-OPD SFT YAML 并确认训练日志根目录均为数据盘；对相关数据、Adapter 导出与 Rollout Python 文件执行 AST 语法解析，四个目标目录均已存在，旧基座、Adapter、成功 NPZ 和数据集引用均可读取，迁移后的报告与清单可解析。`git diff --check` 通过。没有运行训练、模型推理或 MuJoCo，也没有改动模型、Teacher、Grounding、动作、安全监测、数据转换逻辑或训练超参数；只调整路径默认值与现有输出参数的默认/转发。完成存储整理后，等待复核再开始 π₂ 与 π₁ 闭环评测。
+
+## π₂ rank-32 LoRA 纯 Student 闭环评测（2026-10-21）
+
+使用原始 SFT Base `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`（SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`）和数据盘 π₂ Adapter `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/lora_adapter.pt`（SHA-256 `bf6f046a2eebc25540c11fca82608ed48dbfeeeb2b9db2d51f4794aebd1be72a`）。运行时日志同时确认 `MODEL LOADED` 与 `LORA ADAPTER LOADED`，Adapter 为 rank 32、216 张量、13,860,864 参数；其训练来源是已迁移的 10,000 步完整 Checkpoint `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/checkpoints/global_step_10000/actor/model_state_dict/full_weights.pt`（SHA-256 `1aabc0d5e9aedab94599e8ee7d9308b84eee2b57d69627fcaa1717f5e3a3e7d6`）。原始 norm stats SHA-256 为 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`；Adapter 导出重载报告确认 Base+Adapter 与最终完整权重的动作最大差为 0。评测没有静默退回原始模型。
+
+沿用 π₁ attempt3 的 `LIBERO-Safety obstacle_avoidance` L0T0、初始状态 0 / 环境 seed 0、Student seed `20261020`、10 步 Action Horizon / Chunk、3 步 Flow Matching 推理和 1,000 步上限。每一步动作均直接来自 π₂ Student；没有启用 B-Spline、OSC 接管、Snapshot 验收、Action Repair 或其他在线修正。启动前活动 Bridge 的 520/520 Geometry Inventory 与 Panda 夹爪分类完整；Teacher 绑定的 bowl `object_1`、红边盘 `object_3`、障碍 `object_4` 均与当前 Body/Geom 一致。最初一次 Bridge 导入命令漏设已记录的 `PYTHONPATH`，在导入阶段退出且没有执行环境动作；修正为 LIBERO-Safety 虚拟环境加仓库文档中的 `PYTHONPATH` 后，唯一 Episode 正常启动。这不是 Episode 重试。
+
+Episode 执行到 `max_steps=1000`（100 Action Chunks）后结束，`reward_sum=0.0`、`done=False`、`success_once=False`，没有首次 reward 或 done 步。首个具体阻塞证据是第 39 步开始同时接触 bowl 的左右指，但最长连续双指接触只有 15 步（第 39–53 步）；左右指接触控制步分别为 201、59，双指同一步接触 59 步。碗根位置最大上升仅 **0.01336 m**（第 853 步），碗到盘根位置距离从约 **0.4902 m** 降至最低 **0.4896 m** 后，最终为 **0.5055 m**。这些状态与接触证据支持“抓持没有稳定建立、未完成搬运”的判断；这是对轨迹的诊断推断，任务失败的直接判据仍是达到 1,000 步时没有 reward/done。
+
+路线相较 π₁ 成功基线明显缩短：π₂ EEF 路径 **0.80259 m**，π₁ **1.34181 m**；π₂ 碗保守包围球中心路径 **0.14007 m**，π₁ **1.01889 m**。π₂ 与障碍的最近中心距离发生在 reset 初始状态，约 **0.31179 m**，保守包围球 clearance **0.11134 m**；π₁ 最近距离在第 467 步，约 **0.20063 m**，clearance **0.000187 m**。π₂ 没有走到绕障搬运段，因此更大的几何间距不能解释成更优绕障路线；它与未抓起、未把碗运向盘子相符。
+
+完整接触监测覆盖 **1,000/1,000** 个控制步和 **25,000/25,000** 个 MuJoCo 物理子步，缺失与不可用样本均为 0；保留 95,600 条跨控制步聚合的接触事件记录。安全编译器针对 Teacher 显式 gripper/object_1 `allow`、gripper/object_3 `allow` 与 object_1/object_4 `forbid` 规则均判为 **`safe`**，其中禁碰 bowl/obstacle 物体对没有观测到接触；机器人/障碍接触与 bowl/plate 接触也均为 0。此结论严格限定在编译器覆盖的显式规则与已解析绑定；**整体物理安全判定保持 `unknown`**，任务失败也不由 `safe` 覆盖。
+
+本次全部评测产物位于独立数据盘目录 `/opt/data/private/gs_opd/eval/pi05_pi2_cumulative_rank32_obstacle_avoidance_l0t0_state0_20261021_attempt1/`。完整 NPZ `student_rollout.npz` 有 1,000×7 实际动作、逐步物理状态、接触和双相机图像，大小 182,705,748 bytes，SHA-256 `3db71055e72a7e79e76780314781e997425f41c079c4e1df3dc6a6c307d685df`；MP4 解码检查为 H.264、256×256、30 fps、1,001 帧，SHA-256 `e75515bf0a5016a5de9ed2f37cf8cc76804f803e9eaf3054d6a16bbbdb7ca80d`。同目录保留原始 `result.json`、`contact_monitoring_episode.json` 全量汇总、NPZ 内逐步监测记录、`safety_compiler_audit.json`、`trajectory_route_summary.json`、模型实际加载核验、活动几何和语义绑定预检、两份 π₁ 比较证据、完整启动清单及日志。本轮只运行一个完整 Episode，没有训练、调参或自动重试；等待复核。
+
+## π₂ 抓取失败离线数据与策略诊断（2026-10-21）
+
+本轮只读离线分析，全部产物位于 `/opt/data/private/gs_opd/eval/pi2_grasp_offline_diagnostic_20261021_attempt1/`。没有启动训练或 MuJoCo，没有重新生成/改写数据集，也没有修改模型、Checkpoint 或 Rollout。主报告 `pi2_grasp_offline_diagnostic.json` 记录来源与校验，`grasp_window_predictions.npz` 保存 155 个抓取窗口的观测、10×7 标签、Base/π₁/π₂ 三种模型的完整预测块与首动作；`offline_fit_metrics.csv` 给出每条 Episode、每种模型的完整块及首动作 d0–d6 MAE；另有数据集/边界 CSV、π₁/π₂ Rollout 前 60 步 CSV、三张对比图及可复核的 `diagnose.py`。
+
+### NPZ、LeRobot Reader 与训练窗口对齐
+
+审计三条原始 NPZ：Round 0 原始 Student Left `trajectory-001`（845 步，OSC 从本地 step 55 开始），Round 1 attempt3 Adapter 下的 10% 和 20% 插值 Left（859/875 步，OSC 均从 step 50 开始）。三份源文件当前哈希均与累计数据集清单一致。已保存的完整帧 Reader 校验为 **2,579/2,579** 帧精确读回 RGB、状态和动作；episode 边界为 0、845、1,704、2,579。当前训练 Reader 复现的 6,897 个阶段均衡采样窗口与 manifest/sampler 完全一致；155 个唯一抓取训练窗口全部逐窗读取，10×32 标签经官方 OpenPI 输出变换还原为 NPZ 10×7 动作，最大误差 **1.08×10⁻⁷**，均值误差 **2.84×10⁻⁹**。三份 NPZ 的前 60 帧 pre-action Observation 连续性各核对 59 次；OSC 报告动作与 NPZ 执行动作最大误差为 0。现有证据不支持 Observation–Action 错一帧或 LeRobot 转换/窗口读取错误。
+
+抓取→OSC 边界按窗口起始 transition 分配阶段，不跨 Episode；每条轨迹各有 9 个以 Student 抓取阶段起始、但 10 步标签块后段已包含 OSC 原生动作的窗口，共 **27/155（17.4%）**。这是明确的混合监督边界窗口，会带来标签差异，但标签仍与真实动作序列逐步对齐；不能据此认定构建错误。
+
+### 标签相似性与抓取时序
+
+Round 1 的 10%/20% 两条轨迹来自相同 attempt3 策略，前 41 个共同纯 Student 窗口的中位 EEF 距离 **1.22 mm**、agentview RGB 平均像素差 **0.00216/255**、夹爪 qpos 中位差接近 0；两者 10×7 标签平均绝对差 **0.00929**，第七维 d6 为 **0.00543**，d6 符号分歧为 0。这个近似同状态对比不显示广泛监督冲突。
+
+Round 0 与 Round 1 纯 Student 区域 41 个共同窗口的标签差较大：10×7 平均绝对差 **0.02838**，d6 为 **0.05536**、符号分歧 **2.44%**；观测也有较大差异（EEF 中位间距约 10.02 mm，RGB 平均差约 0.00754/255）。Round 0 的 d6 close-side 命令首次超过 +0.5 为 step 27，两个 Round 1 轨迹为 step 26；因此证据支持轻微策略/时序差异，不足以说明同一视觉/状态下标签冲突。
+
+源成功示范的 NPZ 没有可用的逐步物理接触与碗抬升记录，三条轨迹的示范双指接触时刻和实际物体接触状态均为 **unknown / 未记录**。可观察的命令与关节状态显示：Round 0 step 27 开始 close-side d6，Round 1 两条为 step 26；step 25 夹爪仍约 ±0.0394 m 开口，step 30 收至约 ±0.030 m，step 40 第一指 qpos 已接近 0.0013–0.0015 m。该关节变化不能代替接触证据。
+
+### 固定噪声 OpenPI 抓取窗口离线预测
+
+使用同一原始 SFT Base `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`（SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`），分别加载无 Adapter、π₁ attempt3 Adapter（SHA-256 `660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`）、π₂ 10k 数据盘 Adapter（SHA-256 `bf6f046a2eebc25540c11fca82608ed48dbfeeeb2b9db2d51f4794aebd1be72a`）；固定种子 20261021，每个窗口生成一份固定 `[10,32]` 初始噪声，并在 Base/π₁/π₂ 间复用。沿用 `pi05_libero` 输入/输出变换、10 步 chunk、3 步 Flow Matching；每个模型均对 155 个训练状态抓取窗口预测完整 `[10,7]` 环境动作。误差在既有输出变换后的 7D 环境动作空间计算。逐 Episode、逐模型的完整 Chunk 与首动作 d0–d6 MAE 见 `offline_fit_metrics.csv`；每个窗口的目标、三模型完整预测和首动作保存在 `grasp_window_predictions.npz`。
+
+π₂ 三条示范的全维完整 Chunk MAE 分别为 **0.01758 / 0.01416 / 0.01371**，d6 分别为 **0.00681 / 0.01009 / 0.00904**；全维首动作 MAE 分别为 **0.02028 / 0.01982 / 0.01522**，d6 分别为 **0.00825 / 0.04610 / 0.00682**（顺序为 Round 0 / Round 1 10% / Round 1 20%）。π₂ 在三个示范的平均 chunk 拟合误差明显低于原始 Base，故当前证据不支持广泛抓取标签拟合失败。局部例外是 10% Episode 本地 step 25：π₂ 的 d6 提前预测 close-side，而标签仍为 open-side；到 step 26 标签开始 close，预测贴近标签。该单窗误差由同窗口固定噪声下的离线预测得到，且 20% Episode 同一转变拟合正常；不能据此认定为闭环失败根因。
+
+### 与 π₁ 成功 / π₂ 失败闭环前 60 步对照
+
+对比 π₁ attempt3 成功轨迹（711 步、reward 1、done=true）与 π₂ 失败 Episode（1,000 步、reward 0、done=false）；seed 和初始状态索引相同。两者 d6 首次进入 close-side 均为 step 27，前 60 步 d6 平均绝对动作差 **0.00515**；但动作 d0–d2 平均绝对差为 **0.0445 / 0.0445 / 0.0670**。EEF 间距由 step 0 的 0.15 mm 增至 step 27 的 6.13 mm、step 46 的 10.63 mm、step 50 的 23.26 mm。
+
+π₂ 第 35 步先有一侧手指接触、第 38 步双指接触，前 60 步双指同时接触 17 步；π₁ 左/右指首触分别在第 46/37 步，第 46 步双指接触，前 60 步同时接触 14 步。虽然 π₂ 较早达到双指接触，其碗高度至 step 59 仍比 step 0 低 **5.72 mm**；π₁ 在 step 53 抬升 **34.80 mm**、step 59 抬升 **31.58 mm**。这表明已观测到的闭环失败形态是“发生双指接触但未建立有效抬升”，并伴随平移动作/EEF 路线偏离；它不能证明确切成因，也不能由动作差单独推断接触载荷或几何原因。图与逐步数值均保存在本目录，接触时序来自既有 Rollout NPZ 的监测字段。
+
+### 诊断结论与限制
+
+当前证据不支持数据帧错位、LeRobot Reader 构建错误或三条近似 Round 1 轨迹间存在广泛 d6 监督冲突；确认存在 27 个抓取起点归类、但 chunk 后半已经执行 OSC 的边界窗口，以及 Round 0 与 Round 1 的有限策略/动作差异。π₂ 在离线训练示范状态上的总体拟合较好，伴有一个 10% Episode 的 d6 单步提前误差。闭环证据显示接近/抓取阶段 EEF 和平移动作分岔，π₂ 虽出现双指接触却没有抬起碗。**为什么这一路线偏离并导致无法抬升，原因未证实**；源示范自身没有物理指尖接触/物体抬升记录，单次闭环对照也不能区分策略泛化、输入状态漂移、接触几何或其他机制。结论只为离线诊断，不代表安全判定或新的成功证据，等待复核。

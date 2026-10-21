@@ -768,7 +768,7 @@ def main() -> int:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=REPO_ROOT / "logs/gs_opd/mink_panda_physical_v3/live_left_osc_smoke",
+        default=Path("/opt/data/private/gs_opd/rollouts/live_left_osc_smoke"),
     )
     parser.add_argument("--mink-python", type=Path, default=DEFAULT_MINK_PYTHON)
     parser.add_argument("--libero-python", type=Path, default=DEFAULT_LIBERO_PYTHON)
@@ -857,6 +857,8 @@ def main() -> int:
         str(args.semantic_results_json.resolve()),
         "--trajectory-validation-out",
         str(report_path.resolve()),
+        "--result-out",
+        str((args.out_dir / "result.json").resolve()),
         "--video-out",
         str(video_path.resolve()),
     ]

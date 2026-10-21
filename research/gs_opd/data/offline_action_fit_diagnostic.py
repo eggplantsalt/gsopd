@@ -33,7 +33,9 @@ STUDENT_NPZ = ROOT / "logs/gs_opd/eval/pi05_libero_full_trajectory_lora_20261019
 TRAIN_REPORT = ROOT / "logs/gs_opd/sft/pi05_libero_full_trajectory_lora_20261019_attempt1/report.json"
 ROUTE_REPORT = ROOT / "logs/gs_opd/live_left_bspline_osc_adaptive_20261019_attempt1/live_left_bspline_osc_report.json"
 DATASET = ROOT / "logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/lerobot_full_episode_v21"
-DEFAULT_OUT = ROOT / "logs/gs_opd/diagnostics/offline_action_fit_20261020_attempt1"
+DEFAULT_OUT = Path(
+    "/opt/data/private/gs_opd/eval/offline_action_fit_20261020_attempt1"
+)
 PHASES = ("student_grasp", "bspline_osc_carry", "student_place")
 PHASE_BOUNDS = ((0, 55), (55, 804), (804, 836))
 

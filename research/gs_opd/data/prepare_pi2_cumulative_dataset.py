@@ -37,8 +37,9 @@ from research.gs_opd.data.npz_to_lerobot import (  # noqa: E402
 PHASES = ("student_grasp", "bspline_osc_carry", "student_place")
 ACTION_HORIZON = 10
 BASE = ROOT / "logs/gs_opd/mink_panda_physical_v3"
-DEFAULT_OUTPUT = ROOT / "logs/gs_opd/datasets/"
-DEFAULT_OUTPUT /= "pi2_cumulative_lerobot_v21_round0_1_20261021"
+DEFAULT_OUTPUT = Path(
+    "/opt/data/private/gs_opd/datasets/pi2_cumulative_lerobot_v21_round0_1_20261021"
+)
 
 SOURCES = (
     {

@@ -36,7 +36,7 @@ RUN_DIR = Path(
 )
 SOURCE_NPZ = RUN_DIR / "direct_bspline_osc_trajectory.npz"
 SOURCE_REPORT = RUN_DIR / "live_left_bspline_osc_report.json"
-OUTPUT_ROOT = RUN_DIR / "lerobot_full_episode_v21"
+OUTPUT_ROOT = Path("/opt/data/private/gs_opd/datasets/lerobot_full_episode_v21")
 STEP_COUNT = 845
 ACTION_HORIZON = 10
 PHASE_RANGES = {

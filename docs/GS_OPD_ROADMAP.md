@@ -24,4 +24,6 @@ Round 0/1 累计 LeRobot v2.1 数据集包含原始 Student 845 步 Left，以�
 
 π₂ 的 step 0、2,000、4,000、6,000、10,000 固定评估、5,000/10,000 步完整 Checkpoint 和独立 Adapter 已保留于 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`。Adapter 导出后重载验证通过，与最终完整权重在同一 Observation 的动作最大差为 0。该训练确认固定数据上的拟合变化；没有进行 MuJoCo Rollout，不构成物理安全或任务成功结论。
 
-下一步：复核 `docs/GS_OPD_PROGRESS.md` 中的训练配置来源、阶段固定评估和 Adapter 验证；复核前不启动 Rollout 或下一轮训练。
+π₂ 训练目录现已完整迁至 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`，workspace 原路径以软链接保留。新训练 Checkpoint、评测输出、Rollout 轨迹和数据集的默认路径分别使用数据盘的 `sft/eval/rollouts/datasets` 子目录；历史成果继续可从原路径访问。
+
+下一步：复核 `docs/GS_OPD_PROGRESS.md` 中的训练配置来源、阶段固定评估、Adapter 验证和存储迁移哈希；复核前不启动 π₂ 或 π₁ 闭环 Rollout，也不开始下一轮训练。
