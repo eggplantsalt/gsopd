@@ -1,6 +1,14 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 全候选 Task-Conditioned Smoke 已完成，等待复核（2026-10-22）
+## 当前状态：Task-Conditioned Candidate Verification 通用化与离线回归已完成，等待复核（2026-10-22）
+
+- Smoke 现在按输入 RGB 尺寸、SAM 实际候选列表和任意候选索引工作；移除了固定 1024、固定五候选/索引 0–4、默认 L0T1 指令及 Body 23 专项代码。任务指令改为必填。
+- 可选 `--target-description` 接受中性对象类别（例如 `book`、`bottle`、`caddy`）；拒绝常见颜色描述和仿真身份元数据。提示仅发送指令、可选目标描述、原图、全部自动裁剪图与候选索引。
+- IoU 只在响应落盘后读取；输出通用的最佳 Body/Geom overlap，并只在 IoU 接受状态下填 `verified_body_geom_match`。不写 Safety IR 或语义绑定，unresolved 状态保留。
+- 用已归档 book 数据与既有 VLM 回答进行离线回归：Candidate 1、Body 23 / Geom 91、IoU 0.916855；新推理请求数为 0。另完成 13×17 RGB、稀疏索引 `[2,9]`、中性 `bottle` 描述和颜色拒绝的无网络检查。结果在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_candidate_verification_offline_regression_20261022_attempt1/`。
+- `py_compile`、离线回归和 `git diff --check` 通过。没有运行 VLM、SAM3、MuJoCo、Student、规划或训练；当前等待复核。
+
+## 前次真实执行：L0T1/state0 全候选 Task-Conditioned Smoke（2026-10-22）
 
 - 新增并运行 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`：从原生 1024 RGB 与全部 `book`/0.1 SAM3 Mask/Box 自动生成 Candidate 0–4 裁剪，将原图、五张裁剪和原任务指令一次性输入冻结 Qwen3.8。无 Body/Geom/IoU 预筛、无 Teacher 颜色描述或 SAM 分数输入。
 - 唯一一次 VLM 请求 HTTP 200，选择 Candidate 1。Raw 输出已保存后才读取 Body IoU：Candidate 1→Body 23 IoU 0.916855，为最佳 Body 匹配；Body 27 IoU 0。没有改 Safety IR 或写入语义绑定，`object_1` 语义身份仍等待复核。

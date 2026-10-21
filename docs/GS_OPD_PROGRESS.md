@@ -2,6 +2,14 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## Task-Conditioned Candidate Verification Smoke 通用化与离线回归（2026-10-22）
+
+- 最小通用化 `research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`：移除了 1024 分辨率、5 个候选、连续索引 0–4、默认 L0T1 指令及 Body 23 专项检查。现在读取实际 RGB shape 和 SAM 候选列表，接受稀疏任意候选索引，`--instruction` 必填。
+- 新增可选 `--target-description`，可传中性类别描述如 `book`、`bottle`、`caddy`；不读取 Teacher IR，并拒绝目标描述中的常见颜色属性和 Body/Geom/IoU 元数据。VLM 只接收任务指令、（若提供）中性目标描述、原图、全部自动裁剪图及候选索引。
+- 保留原来的单次 VLM 请求路径与“保存 raw response/decision 后再读 IoU”顺序。所选候选的 IoU 输出现为通用最佳 Body/Geom overlap；仅当归档 IoU 状态通过阈值时填充 `verified_body_geom_match`，未匹配时保持 unresolved，不创建正式语义绑定。
+- 使用已归档 L0T1 `book` RGB、5 个候选及既有 VLM raw response 做离线回归：0 次新请求，仍解析为 Candidate 1；后验几何结果为 Body 23 / Geom 91，IoU `0.916855`，只作为几何匹配。另以无网络内存输入检查 13×17 RGB、稀疏 ID `[2, 9]`、中性 `bottle` 描述与颜色描述拒绝逻辑。
+- 离线回归报告、结果、自动裁剪图和 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_candidate_verification_offline_regression_20261022_attempt1/`。`py_compile` 与 `git diff --check` 通过；没有运行 VLM、SAM3、MuJoCo、Student、规划或训练。本项已完成，等待复核。
+
 ## L0T1/state0 全部 SAM3 候选 Task-Conditioned Verification Smoke（2026-10-22）
 
 - 新增最小 Smoke：`research/gs_opd/grounding/task_conditioned_candidate_verification_smoke.py`。使用同状态原生 1024×1024 forward RGB 和 `book`/0.1 的全部 5 个 SAM3 Candidate Mask/Box；检查原图与 SAM3 输入逐像素一致。

@@ -1,8 +1,9 @@
 """One-shot task-conditioned selection among all SAM candidate crops.
 
 This Smoke deliberately builds its VLM request from only the source RGB,
-candidate indices, candidate Masks and candidate Boxes. Body/Geom/IoU data and
-Teacher JSON are not read until after the single VLM request has completed.
+candidate indices, candidate Masks and candidate Boxes, plus caller-provided
+task text. Teacher JSON is never read. Body/Geom/IoU data are opened only after
+the single VLM response has been persisted.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 import time
 import urllib.error
@@ -34,16 +36,37 @@ SYSTEM_PROMPT = """You are doing a task-conditioned visual candidate verificatio
 Image 1 is the original full-scene RGB image. Each following image is an
 automatically generated local crop of the same RGB image. Each crop corresponds
 to the Candidate Index stated immediately before it. All supplied candidates
-are shown. Use only visible image evidence and the task instruction. Select one
-Candidate Index if the evidence supports it; otherwise return unresolved. Do
-not assume a candidate must be correct and do not infer from candidate order.
-Return only a compact JSON object. For a selection use
-{"status":"selected","candidate_index":0,"visual_basis":"short reason"}
-with an integer index from 0 through 4. If uncertain use
-{"status":"unresolved","candidate_index":null,"visual_basis":"short reason"}."""
+are shown. Use only visible image evidence, the task instruction, and an
+optional neutral target description. Select one listed Candidate Index if the
+evidence supports it; otherwise return unresolved. Do not assume a candidate
+must be correct and do not infer from candidate order. Return only a compact
+JSON object with keys status, candidate_index, and visual_basis. Use status
+"selected" with one of the listed indices, or status "unresolved" with a null
+candidate_index."""
 
 
-DEFAULT_INSTRUCTION = "pick up the book and place it in the back compartment of the caddy"
+_COLOR_WORDS = (
+    "white", "black", "green", "brown", "red", "blue", "yellow", "orange",
+    "purple", "pink", "gray", "grey", "silver", "gold", "beige", "tan",
+    "ivory", "cream", "dark", "light", "clear", "transparent",
+)
+_COLOR_WORDS_ZH = ("白色", "黑色", "绿色", "棕色", "褐色", "红色", "蓝色", "黄色", "橙色", "紫色", "粉色", "灰色", "银色", "金色")
+
+
+def _validate_target_description(value: str | None) -> str | None:
+    if value is None:
+        return None
+    description = value.strip()
+    if not description:
+        raise ValueError("Target description cannot be empty when supplied")
+    color_pattern = r"\b(?:" + "|".join(re.escape(word) for word in _COLOR_WORDS) + r")\b"
+    if re.search(color_pattern, description, flags=re.IGNORECASE) or any(
+        word in description for word in _COLOR_WORDS_ZH
+    ):
+        raise ValueError("Target description must omit color/appearance attributes")
+    if re.search(r"\b(?:body|geom|iou)\b|black_book|white_place_box", description, flags=re.IGNORECASE):
+        raise ValueError("Target description must not contain simulator identity or IoU metadata")
+    return description
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
@@ -81,8 +104,10 @@ def _candidate_inputs(sam3_results_path: Path, rgb: np.ndarray) -> list[dict[str
     # confidence scores in the same JSON are intentionally ignored.
     sam = _read_json(sam3_results_path, "SAM candidate")
     raw_candidates = sam.get("candidates")
-    if not isinstance(raw_candidates, list) or not raw_candidates:
-        raise RuntimeError("SAM results must contain at least one candidate")
+    if not isinstance(raw_candidates, list):
+        raise RuntimeError("SAM results must contain a candidate list")
+    if sam.get("candidate_count") is not None and sam.get("candidate_count") != len(raw_candidates):
+        raise RuntimeError("SAM candidate_count does not match the candidate list")
     height, width = rgb.shape[:2]
     if sam.get("image_width") != width or sam.get("image_height") != height:
         raise RuntimeError("SAM image dimensions do not match the source RGB")
@@ -143,8 +168,6 @@ def _candidate_inputs(sam3_results_path: Path, rgb: np.ndarray) -> list[dict[str
             }
         )
     candidates.sort(key=lambda item: item["candidate_index"])
-    if indices != set(range(len(candidates))):
-        raise RuntimeError(f"Candidate indices must be contiguous from 0: {sorted(indices)}")
     return candidates
 
 
@@ -187,7 +210,7 @@ def _save_crops_and_montage(
         crops.append((candidate["candidate_index"], thumb))
     max_h = max([full_thumb.height, *(image.height for _, image in crops)])
     cols = 3
-    rows = 2
+    rows = math.ceil((len(crops) + 1) / cols)
     sheet = Image.new("RGB", (cols * tile_w, rows * (max_h + label_h)), (245, 245, 245))
     draw = ImageDraw.Draw(sheet)
     tiles = [("Original full scene (review overview only)", full_thumb)] + [
@@ -202,7 +225,7 @@ def _save_crops_and_montage(
     return entries
 
 
-def _frame_data_url(rgb: np.ndarray, camera_name: str) -> str:
+def _frame_data_url(rgb: np.ndarray) -> str:
     height, width = rgb.shape[:2]
     frame = RGBFrame(
         camera_name="agentview_image",
@@ -214,38 +237,48 @@ def _frame_data_url(rgb: np.ndarray, camera_name: str) -> str:
 
 
 def _build_payload(
-    backend: Any, instruction: str, original_rgb: np.ndarray, candidates: list[dict[str, Any]]
+    backend: Any,
+    instruction: str,
+    target_description: str | None,
+    original_rgb: np.ndarray,
+    candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    target_description = _validate_target_description(target_description)
+    candidate_indices = [item["candidate_index"] for item in candidates]
+    system_prompt = SYSTEM_PROMPT + f"\nAvailable candidate indices: {json.dumps(candidate_indices)}."
+    user_intro = [f"Task instruction (verbatim): {instruction}"]
+    if target_description is not None:
+        user_intro.append(f"Neutral target description: {target_description}")
     content: list[dict[str, Any]] = [
-        {"type": "text", "text": f"Task instruction (verbatim): {instruction}"},
+        *({"type": "text", "text": text} for text in user_intro),
         {"type": "text", "text": "Image 1: original full-scene RGB."},
-        {"type": "image_url", "image_url": {"url": _frame_data_url(original_rgb, "original_full_scene")}},
+        {"type": "image_url", "image_url": {"url": _frame_data_url(original_rgb)}},
     ]
-    for candidate in candidates:
+    for image_number, candidate in enumerate(candidates, start=2):
         index = candidate["candidate_index"]
         content.extend(
             [
                 {
                     "type": "text",
-                    "text": f"Image {index + 2}: Candidate {index} local crop, automatically generated from this candidate's Mask and Box with surrounding context.",
+                    "text": f"Image {image_number}: Candidate {index}.",
                 },
                 {
                     "type": "image_url",
-                    "image_url": {"url": _frame_data_url(candidate["crop_rgb"], f"candidate_{index}_crop")},
+                    "image_url": {"url": _frame_data_url(candidate["crop_rgb"])},
                 },
             ]
         )
-    text_only = SYSTEM_PROMPT + "\n" + "\n".join(
+    text_only = system_prompt + "\n" + "\n".join(
         block["text"] for block in content if block["type"] == "text"
     )
-    forbidden_terms = ("white book", "black_book", "Body", "Geom", "IoU", "body_id", "geom_id")
+    forbidden_terms = ("black_book", "white_place_box", "body_id", "geom_id", "candidate score")
     leaked = [term for term in forbidden_terms if term.casefold() in text_only.casefold()]
     if leaked:
         raise RuntimeError(f"VLM text includes prohibited metadata terms: {leaked}")
     return {
         "model": backend.model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
         "temperature": backend.temperature,
@@ -332,16 +365,16 @@ def _parse_decision(raw: str, candidates: list[dict[str, Any]]) -> dict[str, Any
 def _read_iou_after_request(
     iou_results_path: Path, decision: dict[str, Any]
 ) -> dict[str, Any]:
-    # This function is intentionally called only after the single request result
-    # and raw model answer have been persisted.
+    # This function is intentionally called only after a VLM response is
+    # available and its raw content or parsed decision has been persisted.
     iou = _read_json(iou_results_path, "Body-level IoU")
     candidate_index = decision.get("candidate_index")
     if decision.get("status") != "selected" or candidate_index is None:
         return {
             "status": "not_compared_unresolved",
             "candidate_index": None,
-            "target_body_23_iou": None,
-            "best_body_match": None,
+            "best_body_geom_overlap": None,
+            "verified_body_geom_match": None,
         }
     entry = next(
         (item for item in iou.get("candidates", []) if item.get("candidate_index") == candidate_index),
@@ -351,29 +384,14 @@ def _read_iou_after_request(
         return {
             "status": "candidate_missing_from_iou_record",
             "candidate_index": candidate_index,
-            "target_body_23_iou": None,
-            "best_body_match": None,
+            "best_body_geom_overlap": None,
+            "verified_body_geom_match": None,
         }
-    all_matches = entry.get("all_body_ious")
-    body_23_iou = None
-    if isinstance(all_matches, list):
-        for item in all_matches:
-            if isinstance(item, dict) and item.get("body_id") == 23:
-                body_23_iou = item.get("iou")
-                break
     best = entry.get("best_match") if isinstance(entry.get("best_match"), dict) else None
-    if body_23_iou is None:
-        overlaps = entry.get("best_overlap_objects")
-        if isinstance(overlaps, list):
-            match = next(
-                (item for item in overlaps if isinstance(item, dict) and item.get("body_id") == 23),
-                None,
-            )
-            if match is not None:
-                body_23_iou = match.get("iou")
-    # Some archived IoU result variants retain a per-Body matrix instead of a
-    # candidate-local all_body_ious array. Inspect it only now, post inference.
-    if body_23_iou is None:
+    overlaps = entry.get("best_overlap_objects")
+    if best is None and isinstance(overlaps, list) and overlaps:
+        best = next((item for item in overlaps if isinstance(item, dict)), None)
+    if best is None:
         matrix = iou.get("iou_matrix")
         if isinstance(matrix, dict):
             candidate_ids = matrix.get("candidate_indices")
@@ -384,55 +402,41 @@ def _read_iou_after_request(
                 and isinstance(physical_ids, list)
                 and isinstance(values, list)
                 and candidate_index in candidate_ids
-                and "body_23" in physical_ids
             ):
                 row_index = candidate_ids.index(candidate_index)
-                column_index = physical_ids.index("body_23")
-                if row_index < len(values) and isinstance(values[row_index], list) and column_index < len(values[row_index]):
-                    body_23_iou = values[row_index][column_index]
-            row = matrix.get(str(candidate_index), matrix.get(f"candidate_{candidate_index}"))
-            if body_23_iou is None and isinstance(row, dict):
-                for key, value in row.items():
-                    if key in ("23", "body_23") or (isinstance(value, dict) and value.get("body_id") == 23):
-                        body_23_iou = value.get("iou") if isinstance(value, dict) else value
-                        break
-        elif isinstance(matrix, list):
-            row = next(
-                (item for item in matrix if isinstance(item, dict) and item.get("candidate_index") == candidate_index),
-                None,
-            )
-            if isinstance(row, dict):
-                for item in row.get("body_ious", []):
-                    if isinstance(item, dict) and item.get("body_id") == 23:
-                        body_23_iou = item.get("iou")
-                        break
+                row = values[row_index] if row_index < len(values) else None
+                if isinstance(row, list) and len(row) == len(physical_ids) and row:
+                    column_index = max(range(len(row)), key=lambda column: row[column])
+                    physical_id = physical_ids[column_index]
+                    physical = next(
+                        (item for item in iou.get("physical_objects", []) if item.get("physical_object_id") == physical_id),
+                        {},
+                    )
+                    if isinstance(physical, dict):
+                        best = {
+                            **physical,
+                            "iou": row[column_index],
+                        }
     best_summary = None
-    if best is not None:
+    if isinstance(best, dict):
         best_summary = {
+            "physical_object_id": best.get("physical_object_id"),
             "body_id": best.get("body_id"),
             "body_name": best.get("body_name"),
-            "iou": best.get("iou"),
             "geom_ids": best.get("geom_ids"),
+            "geom_names": best.get("geom_names"),
+            "iou": best.get("iou", entry.get("best_iou")),
         }
-    target = next(
-        (item for item in iou.get("physical_objects", []) if isinstance(item, dict) and item.get("body_id") == 23),
-        None,
-    )
+    match_status = entry.get("status", iou.get("status", "unknown"))
     return {
-        "status": "compared",
+        "status": match_status,
         "candidate_index": candidate_index,
-        "target_body_23": (
-            {
-                "body_id": 23,
-                "body_name": target.get("body_name") if target else None,
-                "iou": body_23_iou,
-                "matches_best_body": bool(best and best.get("body_id") == 23),
-            }
-        ),
-        "best_body_match": best_summary,
-        "selected_candidate_iou_record_status": entry.get("status"),
+        "sam_score": entry.get("sam_score"),
+        "best_body_geom_overlap": best_summary,
+        "verified_body_geom_match": best_summary if match_status == "matched_by_iou" else None,
+        "iou_threshold": iou.get("min_iou"),
         "interpretation": (
-            "Post-hoc geometric overlap comparison only; it does not establish semantic identity or create a binding."
+            "Post-hoc geometry comparison only; it does not establish target semantics or create a binding."
         ),
     }
 
@@ -442,18 +446,48 @@ def run_smoke(
     sam3_results_path: Path,
     iou_results_path: Path,
     output_dir: Path,
-    instruction: str = DEFAULT_INSTRUCTION,
+    instruction: str,
+    target_description: str | None = None,
 ) -> dict[str, Any]:
+    if not instruction.strip():
+        raise ValueError("Task instruction cannot be empty")
+    target_description = _validate_target_description(target_description)
     output_dir.mkdir(parents=True, exist_ok=True)
     rgb = _read_rgb(rgb_path)
-    if rgb.shape != (1024, 1024, 3):
-        raise RuntimeError(f"Expected native 1024x1024 RGB, got {rgb.shape}")
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or not rgb.shape[0] or not rgb.shape[1]:
+        raise RuntimeError(f"Expected a non-empty HxWx3 RGB image, got {rgb.shape}")
+    height, width = rgb.shape[:2]
     candidates = _candidate_inputs(sam3_results_path, rgb)
-    if len(candidates) != 5:
-        raise RuntimeError(f"Expected all 5 archived SAM candidates, got {len(candidates)}")
     crop_manifest = _save_crops_and_montage(rgb, candidates, output_dir)
-    original_copy = output_dir / "original_rgb_1024.png"
+    original_copy = output_dir / f"original_rgb_{width}x{height}.png"
     Image.fromarray(rgb).save(original_copy)
+
+    if not candidates:
+        decision = {
+            "status": "unresolved",
+            "candidate_index": None,
+            "visual_basis": "SAM returned no candidates; no VLM request was made.",
+        }
+        (output_dir / "candidate_selection.json").write_text(
+            json.dumps(decision, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        result = {
+            "status": "unresolved",
+            "candidate_selection": decision,
+            "posthoc_geometry_association": {"status": "not_compared_no_candidates"},
+            "task_instruction": instruction,
+            "target_description": target_description,
+            "image_width": width,
+            "image_height": height,
+            "candidate_indices_sent": [],
+            "request_count_sent": 0,
+            "teacher_ir_modified": False,
+            "formal_semantic_binding_written": False,
+        }
+        (output_dir / "experiment_result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        return result
 
     # Resolve the model config only after all image preparation is complete.
     backend = create_backend_from_env()
@@ -463,7 +497,7 @@ def run_smoke(
         raise BackendConfigError(
             "Expected the archived non-thinking, temperature=0, max_tokens=4096 configuration"
         )
-    payload = _build_payload(backend, instruction, rgb, candidates)
+    payload = _build_payload(backend, instruction, target_description, rgb, candidates)
     payload_path = output_dir / "actual_vlm_request_payload.json"
     payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -475,8 +509,9 @@ def run_smoke(
         "max_tokens": backend.max_tokens,
         "thinking_enabled": backend.thinking_enabled,
         "instruction": instruction,
-        "system_prompt": SYSTEM_PROMPT,
-        "source_rgb": {"path": str(rgb_path.resolve()), "sha256": _sha256(rgb_path), "width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
+        "target_description": target_description,
+        "system_prompt": payload["messages"][0]["content"],
+        "source_rgb": {"path": str(rgb_path.resolve()), "sha256": _sha256(rgb_path), "width": width, "height": height},
         "source_sam3_results": {"path": str(sam3_results_path.resolve()), "sha256": _sha256(sam3_results_path)},
         "candidate_count": len(candidates),
         "candidate_indices": [item["candidate_index"] for item in candidates],
@@ -516,8 +551,11 @@ def run_smoke(
     result = {
         "status": "completed" if call_result.get("status") == "completed" else call_result.get("status"),
         "candidate_selection": decision,
-        "posthoc_iou_comparison": iou_comparison,
+        "posthoc_geometry_association": iou_comparison,
         "task_instruction": instruction,
+        "target_description": target_description,
+        "image_width": width,
+        "image_height": height,
         "candidate_indices_sent": input_manifest["candidate_indices"],
         "candidate_crop_formula": "union of each full-image Mask bounds and candidate Box; pad each edge by max(24 px, ceil(20% of the larger union dimension)); clamp to image; crop raw RGB without resize",
         "body_iou_source_read_after_vlm": {"path": str(iou_results_path.resolve()), "sha256": _sha256(iou_results_path)},
@@ -533,25 +571,114 @@ def run_smoke(
     return result
 
 
+def run_offline_regression(
+    rgb_path: Path,
+    sam3_results_path: Path,
+    iou_results_path: Path,
+    output_dir: Path,
+    instruction: str,
+    raw_response_path: Path,
+    target_description: str | None = None,
+) -> dict[str, Any]:
+    """Re-evaluate a saved answer without creating a backend or sending a request."""
+    if not instruction.strip():
+        raise ValueError("Task instruction cannot be empty")
+    target_description = _validate_target_description(target_description)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rgb = _read_rgb(rgb_path)
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or not rgb.shape[0] or not rgb.shape[1]:
+        raise RuntimeError(f"Expected a non-empty HxWx3 RGB image, got {rgb.shape}")
+    height, width = rgb.shape[:2]
+    candidates = _candidate_inputs(sam3_results_path, rgb)
+    crops = _save_crops_and_montage(rgb, candidates, output_dir)
+    Image.fromarray(rgb).save(output_dir / f"original_rgb_{width}x{height}.png")
+    raw = raw_response_path.read_text(encoding="utf-8")
+    decision = _parse_decision(raw, candidates)
+    (output_dir / "existing_vlm_response_raw.txt").write_text(raw, encoding="utf-8")
+    (output_dir / "candidate_selection.json").write_text(
+        json.dumps(decision, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    # The archived answer is established before reading geometry results.
+    association = _read_iou_after_request(iou_results_path, decision)
+    result = {
+        "status": "offline_regression_completed",
+        "inference_performed": False,
+        "request_count_sent": 0,
+        "source_response": {"path": str(raw_response_path.resolve()), "sha256": _sha256(raw_response_path)},
+        "source_rgb": {"path": str(rgb_path.resolve()), "sha256": _sha256(rgb_path)},
+        "source_sam3_results": {"path": str(sam3_results_path.resolve()), "sha256": _sha256(sam3_results_path)},
+        "source_iou_results_after_response": {"path": str(iou_results_path.resolve()), "sha256": _sha256(iou_results_path)},
+        "candidate_selection": decision,
+        "posthoc_geometry_association": association,
+        "task_instruction": instruction,
+        "target_description": target_description,
+        "image_width": width,
+        "image_height": height,
+        "candidate_count": len(candidates),
+        "candidate_indices": [item["candidate_index"] for item in candidates],
+        "crops": crops,
+        "teacher_ir_modified": False,
+        "formal_semantic_binding_written": False,
+    }
+    (output_dir / "offline_regression_result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rgb", type=Path, required=True)
     parser.add_argument("--sam3-results", type=Path, required=True)
     parser.add_argument("--iou-results", type=Path, required=True)
-    parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
+    parser.add_argument("--instruction", required=True)
+    parser.add_argument(
+        "--target-description",
+        help="optional neutral description, e.g. book, bottle, caddy; omit Teacher colors and simulator metadata",
+    )
+    parser.add_argument(
+        "--offline-response",
+        type=Path,
+        help="reuse this saved VLM answer without initializing a backend or sending a request",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    for label, path in (("RGB", args.rgb), ("SAM results", args.sam3_results), ("IoU results", args.iou_results)):
+    required_files = [
+        ("RGB", args.rgb),
+        ("SAM results", args.sam3_results),
+        ("IoU results", args.iou_results),
+    ]
+    if args.offline_response is not None:
+        required_files.append(("Saved VLM response", args.offline_response))
+    for label, path in required_files:
         if not path.is_file():
             parser.error(f"{label} file does not exist: {path}")
     try:
-        result = run_smoke(args.rgb, args.sam3_results, args.iou_results, args.out_dir, args.instruction)
+        if args.offline_response is None:
+            result = run_smoke(
+                args.rgb,
+                args.sam3_results,
+                args.iou_results,
+                args.out_dir,
+                args.instruction,
+                target_description=args.target_description,
+            )
+        else:
+            result = run_offline_regression(
+                args.rgb,
+                args.sam3_results,
+                args.iou_results,
+                args.out_dir,
+                args.instruction,
+                args.offline_response,
+                target_description=args.target_description,
+            )
     except (BackendConfigError, TeacherBackendError, OSError, ValueError, RuntimeError) as exc:
         print(f"Task-conditioned candidate verification failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"Saved under: {args.out_dir.resolve()}")
-    return 0 if result["status"] == "completed" else 1
+    return 0 if result["status"] in ("completed", "offline_regression_completed") else 1
 
 
 if __name__ == "__main__":
