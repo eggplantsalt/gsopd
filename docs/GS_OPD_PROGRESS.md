@@ -2600,7 +2600,7 @@ Round 0 与 Round 1 纯 Student 区域 41 个共同窗口的标签差较大：10
 
 运行审计确认基座为 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，模型文件 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`。`initial_adapter_path=null`、`resume_dir=null`；无 π₁/π₂ 旧 Adapter 加载。667/667 个非 LoRA 模型权重键严格载入且冻结，rank-32 新 LoRA 包含 216 个张量、13,860,864 个可训练参数；AdamW 状态从头初始化，恒定学习率 `1e-4`。
 
-唯一正式训练进程以 exit code 0 完成 10,000/10,000 optimizer steps，耗时 8,667 秒，停止原因为达到配置步数。首 100 步 Loss 均值为 `0.025686`，末 100 步均值为 `0.001209`，最终记录 Loss 为 `0.00054869`；逐步数据与曲线位于 `step_metrics.jsonl`、`loss_curve.png`。step 0/2,000/4,000/6,000/10,000 的整体固定 Flow Matching MSE 分别为 `0.080195`、`0.001950`、`0.001796`、`0.001067`、`0.001188`。分阶段固定评估 MSE 为：
+唯一正式训练进程以 exit code 0 完成 10,000/10,000 optimizer steps，耗时 8,667 秒，停止原因为达到配置步数。事后分别从 Batch Size 2 与 Batch Size 3 的原始 `step_metrics.jsonl` 独立重算，二者各有 10,000 条 Loss：Batch Size 2 首/末 100 步均值为 `0.0256858893` / `0.0012088185`（报告四舍五入为 `0.025686` / `0.001209`，核对正确）；Batch Size 3 首/末 100 步均值为 `0.0253006398` / `0.0011320326`（原本误抄 Batch Size 2 数值，现更正）。Batch Size 3 最终记录 Loss 为 `0.00054869`；逐步数据与曲线位于 `step_metrics.jsonl`、`loss_curve.png`。step 0/2,000/4,000/6,000/10,000 的整体固定 Flow Matching MSE 分别为 `0.080195`、`0.001950`、`0.001796`、`0.001067`、`0.001188`。分阶段固定评估 MSE 为：
 
 | 阶段 | step 0 | step 2k | step 4k | step 6k | step 10k |
 |---|---:|---:|---:|---:|---:|
@@ -2615,3 +2615,37 @@ step 10k 的完整 10×7 环境动作块 MAE / 第七维夹爪 MAE / 首动作 7
 5,000 步 Checkpoint 位于 `checkpoints/global_step_5000/actor/`，其中 `full_weights.pt` SHA-256 为 `6ab8af553e27169d45da6356f20e9ecbb00f5aaa778e417ec26a8bfaff192604`；10,000 步 Checkpoint 位于 `checkpoints/global_step_10000/actor/`，`full_weights.pt` SHA-256 为 `32716283c10de6b06aed7865a11b8ce6819515c368dc749dd88df2b79363eb93`。独立 Adapter 为 `lora_adapter.pt`，rank 32、216 张量、13,860,864 参数，SHA-256 `84adc2edb43639dda5c6c93bf37248286219114f1d6e11d99e276c548152bac5`。导出后重载验证通过，在相同 Observation 上输出 `[10,7]`，相对最终完整训练权重的最大和平均动作差均为 0；验证记录为 `adapter_reload_verification.json`。
 
 原 Runner 汇总计数在创建固定评估 DataLoader 后被覆盖，`report_runner_raw.json` 保留了未改写的原始报告；最终 `report.json` 中的训练窗口数与阶段曝光信息已依据独立复建并核对的官方 train DataLoader 证据校正为 6,897 窗口、每阶段 2,299 次曝光。训练过程使用的仍是原始正确训练 loader 与已保存的 π₂ sampler 序列，未因报告元数据校正重跑训练。所有新增产物均在本节所列独立数据盘目录；本轮只训练和执行模型导出检查，没有运行 MuJoCo Rollout，也没有产生新的闭环任务或物理安全结论。等待复核。
+
+## Batch Size 2/3 Loss 独立核对与 π₂ Batch Size 3 纯 Student 闭环评测（2026-10-21）
+
+### 原始 Loss 日志核对
+
+分别直接读取两个实验目录各自的 `step_metrics.jsonl`，逐行按 `loss` 字段重算；两个文件都包含 10,000 条记录。Batch Size 2 首/末 100 步均值为 `0.025685889280284754` / `0.001208818516424799`，进度记录四舍五入为 `0.025686` / `0.001209`，核对正确。Batch Size 3 原始日志均值为 `0.025300639800261707` / `0.0011320326045643014`，原进度报告误用了 Batch Size 2 的相同数值，现已更正为 `0.025301` / `0.001132`。只更正了本进度报告；两个训练目录、Checkpoint、Adapter、逐步 Loss 与图均未修改。
+
+### 单回合设置与模型核验
+
+只执行一次 Batch Size 3 Adapter 纯 Student 回合，使用原始 SFT Base `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`（权重 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`）和指定 Batch Size 3 Adapter `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/lora_adapter.pt`（SHA-256 `84adc2edb43639dda5c6c93bf37248286219114f1d6e11d99e276c548152bac5`）。启动日志确认 Base 与 rank-32 Adapter（216 张量、13,860,864 参数）已实际加载，无静默回退。LIBERO-Safety `obstacle_avoidance` L0T0、任务 0、初始状态索引 0、Bridge 环境 seed 0、Student RNG seed `20261020`，动作块长度 10、Flow Matching 采样步数 3、最多 1,000 步，与 π₁ 成功和 Batch Size 2 评测相同。未启用 B-Spline、OSC 接管、Action Repair、Snapshot 验收或其他在线修正。
+
+本次在 **848 步**得到 `reward_sum=1.0`、`success_once=true`、`done=true`，首次 reward 在第 848 步，85 个动作块，Rollout 用时约 479.33 秒。只运行一个 Episode；没有训练、调参、重试或覆盖历史轨迹。
+
+### π₁、Batch Size 2 与 Batch Size 3 路线和抓取对照
+
+EEF 的前 60 步路线以各自相同初始 EEF 状态对齐，距离按前 61 个点（初态加 60 次动作）计算；碗运动使用 NPZ 中 `akita_black_bowl_1` 的真实 root pose，抬升以首个 post-action 状态为参考。双指接触按记录的 Panda 左/右 finger collision geometry 与碗物理 body 匹配。
+
+| Student | 结果 | EEF 前 60 步长度 | 前 60 步相对 π₁ 的 EEF 平均/最大距离 | 碗 root 全程路径 | 最大 root 抬升 | 首次双指接触；双指接触步数/最长连续 |
+|---|---|---:|---:|---:|---:|---:|
+| π₁ attempt3 | 711 步，reward 1，done | 0.3454 m | 基线 | 1.0334 m | 0.1281 m | 第 47 步；665 / 665 |
+| π₂ Batch 2 | 1,000 步，reward 0，未 done | 0.3167 m | 8.97 / 26.86 mm | 0.0816 m | 0.01336 m | 第 39 步；59 / 15 |
+| π₂ Batch 3 | 848 步，reward 1，done | 0.3388 m | 3.83 / 8.65 mm | 1.1312 m | 0.2915 m（第 791 步） | 第 36 步；810 / 805 |
+
+Batch 3 第 60 步 EEF 与 π₁ 路线间距为 6.88 mm；Batch 2 为 21.64 mm。Batch 3 的末端碗 root 到 plate root 距离为 0.02654 m，Batch 2 为 0.50547 m。观测到 Batch 3 双指接触保持时间长并完成碗搬运/放置；这只描述本次回合，不推断 Batch Size 变化的普遍因果效果。
+
+### 接触监测与安全结论
+
+848 个控制步各捕获 25 个原生物理子步，预期/实际均为 **21,200**；漏采 0、不可用 0、分类状态 available，完整逐步事件共 78,317 条。基于实际轨迹及运行时 Bridge Geometry/Gripper Inventory，Contact Compiler 对显式 Teacher 接触规则判为 `safe`，绑定的 object_1→object_4 禁止接触事件和发生次数均为 0。object_1 与 object_3 的 SAM/IoU 物理绑定 IoU 分别为 0.9793 / 0.9850；object_4 当前绑定 IoU 为 0.1427，仍需保留该语义置信限制。**整体物理安全结论为 `unknown`**：`safe` 只适用于这次完整监测覆盖下已编译的显式接触规则，不等于所有机械/物理安全约束已获证明；任务 reward/done 与安全 verdict 分开记录。
+
+### 保存证据
+
+全部新增评测产物位于 `/opt/data/private/gs_opd/eval/pi05_pi2_cumulative_fresh_bs3_obstacle_avoidance_l0t0_state0_seed20261020_20261021_attempt1/`。`student_rollout.npz` 保存 848×7 实际动作、双相机 Observation、EEF、抓手状态、碗/盘物理状态及完整逐步接触监测；`contact_monitoring_episode.json` 保存完整 21,200 子步监测和聚合事件。`student_rollout.mp4` 为 256×256、30 FPS、849 帧，OpenCV 首尾帧解码均通过。另保留 `result.json`、`model_load_verification.json`、`safety_compiler_audit.json`、`route_comparison_metrics.json`、前 60 步与全程 CSV、路线图、π₁/Batch 2 基线摘要、完整 `student.log` 和 SHA-256 `run_manifest.json`。Adapter 来源及各产物哈希均记于清单。
+
+**任务结果是成功，显式编译接触规则 verdict 是 safe，整体物理安全仍为 unknown。** 本次没有额外启动 Episode 或执行训练，等待复核。

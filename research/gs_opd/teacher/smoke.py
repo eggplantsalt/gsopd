@@ -77,7 +77,10 @@ def _decode_bridge_observation(result: dict[str, Any]) -> tuple[str, list[RGBFra
 
 
 def _save_capture(
-    output_dir: Path, instruction: str, images: list[RGBFrame]
+    output_dir: Path,
+    instruction: str,
+    images: list[RGBFrame],
+    scene_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     image_metadata = {}
@@ -101,6 +104,8 @@ def _save_capture(
         "encoding": "PNG",
         "images": image_metadata,
     }
+    if scene_metadata is not None:
+        metadata["scene"] = scene_metadata
     (output_dir / "capture_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -168,7 +173,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.images_out_dir is not None:
         try:
             capture_metadata = _save_capture(
-                args.images_out_dir, instruction, images
+                args.images_out_dir,
+                instruction,
+                images,
+                bridge_result.get("scene_metadata"),
             )
         except (OSError, ValueError, RuntimeError) as exc:
             print(f"Cannot save Bridge observation: {type(exc).__name__}: {exc}")

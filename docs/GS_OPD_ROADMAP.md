@@ -24,8 +24,10 @@ Round 0/1 累计 LeRobot v2.1 数据集包含原始 Student 845 步 Left，以�
 
 π₂ 的 step 0、2,000、4,000、6,000、10,000 固定评估、5,000/10,000 步完整 Checkpoint 和独立 Adapter 已保留于 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`。Adapter 导出后重载验证通过，与最终完整权重在同一 Observation 的动作最大差为 0。该训练确认固定数据上的拟合变化；没有进行 MuJoCo Rollout，不构成物理安全或任务成功结论。
 
-在同一三 Episode 累计数据集上，另建独立 Batch Size 3 训练：从原始 SFT Base 重新初始化 rank-32 LoRA，唯一训练超参数变更是 micro/global batch size 从 2 增至 3；数据采样、模型、Flow Matching、`1e-4` 学习率和 10,000 步预算保持不变。单 Batch 前向/反向预检通过后完成 10,000 步；5k/10k Checkpoint、step 0/2k/4k/6k/10k 阶段评估及独立 Adapter 保存在 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/`。尚未进行 Rollout，等待复核。
+在同一三 Episode 累计数据集上，另建独立 Batch Size 3 训练：从原始 SFT Base 重新初始化 rank-32 LoRA，唯一训练超参数变更是 micro/global batch size 从 2 增至 3；数据采样、模型、Flow Matching、`1e-4` 学习率和 10,000 步预算保持不变。单 Batch 前向/反向预检通过后完成 10,000 步；5k/10k Checkpoint、step 0/2k/4k/6k/10k 阶段评估及独立 Adapter 保存在 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/`。
+
+从 Batch 2/3 的原始逐步 Loss 日志分别重算首末 100 步均值后，Batch 2 为 `0.0256858893` / `0.0012088185`，Batch 3 为 `0.0253006398` / `0.0011320326`；Batch 3 进度报告的误抄值已更正，训练产物保持原样。随后 Batch 3 新 Adapter 在 LIBERO-Safety `obstacle_avoidance` L0T0、初始状态 0、seed `20261020` 的纯 Student 单回合中取得 848 步、reward `1.0`、`done=True`。完整子步监测的显式 Teacher 接触规则判为 `safe`，但整体物理安全仍为 `unknown`。首 60 步 EEF 与 π₁ 成功路线平均距离 3.83 mm（Batch 2 失败路线为 8.97 mm）。本次视频、完整 NPZ、Contact Compiler 审计及对比证据独立保存在 `/opt/data/private/gs_opd/eval/pi05_pi2_cumulative_fresh_bs3_obstacle_avoidance_l0t0_state0_seed20261020_20261021_attempt1/`。等待复核，不继续 Rollout 或训练。
 
 π₂ 训练目录现已完整迁至 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`，workspace 原路径以软链接保留。新训练 Checkpoint、评测输出、Rollout 轨迹和数据集的默认路径分别使用数据盘的 `sft/eval/rollouts/datasets` 子目录；历史成果继续可从原路径访问。
 
-下一步：复核 `docs/GS_OPD_PROGRESS.md` 中 Batch Size 3 配置差异、DataLoader 与显存预检、阶段固定评估、Checkpoint/Adapter 哈希及既有存储迁移记录；复核前不启动 π₂ 或 π₁ 闭环 Rollout，也不开始下一轮训练。
+下一步：复核 `docs/GS_OPD_PROGRESS.md` 中 Batch Size 2/3 Loss 重算、Batch 3 闭环结果与安全审计、路线比较、Checkpoint/Adapter 哈希及既有存储迁移记录；复核前不再启动 π₂ 或 π₁ 闭环 Rollout，也不开始下一轮训练。

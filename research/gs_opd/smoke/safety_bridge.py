@@ -4,6 +4,7 @@ os.environ["MUJOCO_GL"] = "egl"
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 from multiprocessing.connection import Listener
+import argparse
 import copy
 import hashlib
 import json
@@ -133,22 +134,77 @@ def _configure_pi05_libero_osc_pose(controller):
     }
 
 
-suite = get_benchmark("obstacle_avoidance")()
-task = suite.get_task_by_level_id(0, 0)
-bddl = suite.get_task_bddl_file_path_by_level_id(0, 0)
+def _parse_scene_args():
+    parser = argparse.ArgumentParser(description="LIBERO-Safety scene Bridge")
+    parser.add_argument(
+        "--benchmark", default="obstacle_avoidance",
+        help="registered LIBERO benchmark name (default: obstacle_avoidance)",
+    )
+    parser.add_argument("--level", type=int, default=0, help="benchmark level (default: 0)")
+    parser.add_argument(
+        "--task-id", "--task", dest="task_id", type=int, default=0,
+        help="zero-based task ID within the level (default: 0)",
+    )
+    parser.add_argument(
+        "--init-state", type=int, default=0,
+        help="zero-based task initialization state (default: 0)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="environment seed (default: 0)")
+    parser.add_argument(
+        "--camera-resolution", type=int, default=256,
+        help="square RGB observation resolution for both cameras (default: 256)",
+    )
+    return parser.parse_args()
+
+
+scene_args = _parse_scene_args()
+if scene_args.camera_resolution <= 0:
+    raise ValueError("--camera-resolution must be positive")
+suite = get_benchmark(scene_args.benchmark)()
+task = suite.get_task_by_level_id(scene_args.level, scene_args.task_id)
+if task is None:
+    raise ValueError(
+        f"Unknown LIBERO task: benchmark={scene_args.benchmark!r}, "
+        f"level={scene_args.level}, task_id={scene_args.task_id}"
+    )
+bddl = suite.get_task_bddl_file_path_by_level_id(scene_args.level, scene_args.task_id)
+if not bddl or not Path(bddl).is_file():
+    raise FileNotFoundError(f"LIBERO BDDL file is unavailable: {bddl!r}")
+states = suite.get_task_init_states_by_level_id(scene_args.level, scene_args.task_id)
+if states is None or not 0 <= scene_args.init_state < len(states):
+    state_count = 0 if states is None else len(states)
+    raise IndexError(
+        f"init_state {scene_args.init_state} is out of range for "
+        f"{scene_args.benchmark}/L{scene_args.level}T{scene_args.task_id} "
+        f"({state_count} states)"
+    )
+scene_metadata = {
+    "benchmark": scene_args.benchmark,
+    "level": scene_args.level,
+    "task_id": scene_args.task_id,
+    "task_name": getattr(task, "name", None),
+    "instruction": task.language,
+    "bddl_path": str(Path(bddl).resolve()),
+    "bddl_sha256": hashlib.sha256(Path(bddl).read_bytes()).hexdigest(),
+    "init_state_index": scene_args.init_state,
+    "init_state_count": len(states),
+    "environment_seed": scene_args.seed,
+    "camera_resolution": scene_args.camera_resolution,
+    "camera_names": ["agentview_image", "robot0_eye_in_hand_image"],
+}
 
 print("LOADING SAFETY ENV...", flush=True)
 env = OffScreenRenderEnv(
     bddl_file_name=bddl,
-    camera_heights=256,
-    camera_widths=256,
+    camera_heights=scene_args.camera_resolution,
+    camera_widths=scene_args.camera_resolution,
 )
-env.seed(0)
+env.seed(scene_args.seed)
 env.reset()
-states = suite.get_task_init_states_by_level_id(0, 0)
-obs = env.set_init_state(states[0])
+obs = env.set_init_state(states[scene_args.init_state])
 controller_runtime_config = _configure_pi05_libero_osc_pose(env.env.robots[0].controller)
 print("PI05 LIBERO OSC_POSE RUNTIME CONFIG:", controller_runtime_config, flush=True)
+print("LIBERO SCENE CONFIG:", json.dumps(scene_metadata, ensure_ascii=False), flush=True)
 last_reward = 0.0
 last_done = False
 
@@ -3616,6 +3672,7 @@ def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
         "reward": float(reward),
         "done": bool(done),
         "instruction": task.language,
+        "scene_metadata": scene_metadata,
     }
     if include_snapshot_state:
         result["snapshot_state"] = _snapshot_diagnostics(canonicalize_kinematics=True)
@@ -3641,7 +3698,7 @@ try:
                     # are no longer valid for the new simulation instance.
                     snapshots.clear()
                     env.reset()
-                    obs = env.set_init_state(states[0])
+                    obs = env.set_init_state(states[scene_args.init_state])
                     controller_runtime_config = _configure_pi05_libero_osc_pose(
                         env.env.robots[0].controller
                     )
