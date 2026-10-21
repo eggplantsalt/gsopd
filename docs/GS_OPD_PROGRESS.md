@@ -2,6 +2,41 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 原生 512/1024 分辨率 RGB 与 Geom ID 对照（2026-10-22）
+
+- Safety Bridge 的只读 `render_highres` 与 `geom_segmentation` 接口现在接受可选正整数 `resolution`；省略参数仍为 512。尺寸直接传给 `env.sim.render(width=N, height=N)`，响应标记 `native_resolution=true`、`interpolation_used=false`；其余环境初始化和控制接口未改。
+- `safety_bridge.py` 通过 `py_compile` 与 `git diff --check`。实际 Bridge 启动 obstacle_avoidance/L0T1/state0、seed 0、512 初始化一次。客户端先后请求默认 512 render、512 RGB+Geom ID、1024 RGB+Geom ID，并在渲染前后使用只读观察检查状态；未向 Bridge 发送 reset 或 step。
+- MuJoCo 原生 512 与 1024 均成功：512 RGB `(512,512,3)`、Geom ID `(512,512)`；1024 RGB `(1024,1024,3)`、Geom ID `(1024,1024)`。两尺寸的 RGB/segmentation 同尺寸像素坐标对齐检查均通过，render 前后 RGB 一致，MuJoCo integration state 不变。默认不带尺寸的 `render_highres` 仍为 512，且其 RGB 与 512 segmentation 返回 RGB 逐像素相同。两份 RGB PNG/NPY 与 NPZ 中 RGB，及 Geom ID NPY 与 NPZ 中 Geom ID 均离线逐项相等。
+- 从启动观察至 default 512、512 segmentation、1024 segmentation 后，MuJoCo integration state、canonical Robot/Object snapshot diagnostics 和缓存 agentview Observation 哈希均完全相同；integration state SHA-256 均为 `1ce4e4f1567c46ac0cd3a69dcdc06649aefd1fdc1bd8487457141a45b6c2d49b`。整个过程中未 reset、step 或改变仿真状态。
+- 完整 Geometry Inventory 为 28 Bodies、288 Geoms。Raw RGB 和 Geom ID 均保留 MuJoCo 行列方向；另保存 RGB/ID 同步 180° 旋转副本和逐 Geom overlay。`black_book_1_main` Body 23、`bottle_of_beer__7_1_main` Body 25、`desk_caddy_1_main` Body 26 的 512 与 1024 归一化中心差分别均小于 0.00078；BBox 在缩放 2 倍后最多约 1 像素栅格差。三个对象的原生分辨率局部对照图不缩放图像。
+- 完整原始 RGB、Geom ID、NPZ、180° 衍生数组、overlay、书/瓶/caddy 局部图、完整 Body/Geom Inventory、逐请求响应、各次状态摘要、对齐报告、运行脚本、Bridge 源快照与 36 项 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_native_512_1024_resolution_comparison_20261022_attempt1/`。Bridge 源快照与当前修改后源码 SHA-256 一致：`decb6cb8f1590ff9f74b6403c610f97b09232268ef4ac3f7ecea7f81327159df`。
+- 本轮没有 VLM、SAM3、Student、动作、规划或训练。512/1024 原生渲染、对齐和状态不变性检查均通过；等待复核后再继续。
+
+## L0T1/state0 Task-Conditioned Reference Verification（2026-10-21）
+
+- 基于同一张已归档 512×512 RGB，另存原图和两个相同窗口尺寸、同方向的无语义标签局部放大图：Region A `x=[65,245), y=[299,499)`，Region B `x=[174,354), y=[240,440)`。A/B 和坐标只用于请求顺序/事后对应；请求没带 Teacher 名称、Body/Geom、IoU、SAM 候选编号、旧 VLM 判断或任何预设答案。提示使用原始任务指令，并允许 `neither` / `unresolved`。
+- 冻结 Qwen3.8-27B-FP8 对原图、A、B 只响应一次，HTTP 200，耗时 3.03 秒。返回 `region_a`，视觉依据称该处为带可见页片的黑色书状物。此为一次受任务指令和局部视图影响的模型判断，不是物理身份真值。
+- 离线对应显示 A 包含 Candidate 0 与 Body 23 的完整可见 Mask；B 包含 Body 27 的完整可见 Mask。相对旧 VLM 对 Candidate 0（原 unresolved，描述为黑色餐具类物体）和浅色盒状区域的判断，本次改选 A；Teacher IR `object_1` 仍写 `white book`，外观描述矛盾仍在。单次输出不能消解该矛盾，也未建立 Teacher→Body/Geom 绑定；原始 Safety IR、SAM Mask/IoU 和既有消歧结果均未修改。A/B 裁剪窗口共享 `x=[174,245), y=[299,440)` 的上下文像素，A 先于 B 呈现，单次结果不能排除窗口内容或顺序效应。
+- 完整请求 JSON（包含实际传输图像 data URL）、三张输入图、模型回答/HTTP 原始 JSON、区域对应关系、离线对照、GPU 服务日志和 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_reference_verification_20261021_attempt1/`。另外提供的带 A/B 定位框图只供人工复核，没有发送给 VLM。当前等待复核。
+
+
+## L0T1/state0 Candidate 0 与真实可见 Body Mask 人工对照（2026-10-21）
+
+- 从同一 512×512、180° forward RGB、SAM3 Candidate 0 Mask 和 `geom_ids_rotated_180.npy` 制作静态六面板对照图；未调用 SAM3/VLM、未启动 MuJoCo。图中并排保留原始 RGB、VLM 实际编号图、Candidate 0 Mask 叠加、Body 23/27 逐像素可见 Mask 叠加和书所在区域放大图；全图保持相同方向和像素坐标，Mask 边界分别用红/青/金标识。
+- Candidate 0 编号与位置正确，索引为 0，像素 bbox `[133,331,180,467)`，SAM score `0.1240`。其与 Body 23 `black_book_1_main`（Geom 91/92）有 3,067 个重叠像素，IoU `0.920192`；覆盖 Body 23 可见 Mask 的 99.26%，Candidate 0 区域 92.66% 落在 Body 23 上。与 Body 27 `white_place_box_1_main`（Geom 283–287）没有重叠，IoU `0`。这确认几何重叠真实存在，不构成 `white book` 的语义身份绑定。
+- VLM 编号图中的“0”锚在 Candidate 0 的左上边缘，文字框触及 Mask 29 px（占 Mask 0.876%），其中 27 个候选 Mask 像素被文字实际改变。编号可辨识且未错位；该小范围有遮挡细节的可能，但无法据此认定其改变了 VLM 的 unresolved 判断。原始 VLM 语义结果不变，Teacher→Body 仍 unresolved。
+- PNG、简短报告、逐像素统计、派生可见 Mask、原始 RGB/Mask/Geom ID/Inventory、SAM/IoU 与 VLM 证据副本及 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_candidate_body_mask_review_20261021_attempt1/`。等待人工复核。
+
+
+## L0T1 object_1 VLM 语义消歧（2026-10-21）
+
+- 使用最新通过 Schema 校验的 Safety IR v2、`book`/0.1 已归档 4 个 SAM3 候选及原 Body-level IoU、同帧 512×512 180° RGB、原始任务指令和完整 288-Geom Geometry Inventory。未重跑 SAM3、Teacher 或 MuJoCo；Safety IR 和消歧 Prompt 均未修改。VLM 只处理 `object_1`。
+- 现有 Smoke 使用完整 Inventory 校验物理分类并过滤候选。候选 1–3 的 IoU 状态为 unresolved，按原实现过滤；VLM 看到的候选只剩 Candidate 0。原始 4 个候选、Mask、IoU 和过滤记录均保留。Inventory 有 9 个未命名 Geom 的 `geom_name=null`，Smoke 要求字符串；为兼容输入只另存 `geometry_inventory_vlm_smoke_compat.json`，仅将这些 null 转成按 Geom ID 可追溯的占位名，完整 288 项、分类、所有已命名 Geom 和原始 Inventory 均保留，源文件未改。
+- 冻结本地 Qwen3.8-27B-FP8（配置 SHA-256 `74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc`），vLLM 0.31.0、TP=2、GPU 0/1；temperature 0、non-thinking、max_tokens 4096、JSON Schema。冷启动时默认 `max_num_seqs=256` 超过 137 个 Mamba Cache blocks；随后 FlashInfer JIT 又遇到本地 `nvcc` 不支持 `--compress-mode=size`。两次均在 API ready 前失败，消歧请求数为 0。最终仅为这一次请求以 `max_num_seqs=1`、`VLLM_USE_FLASHINFER_SAMPLER=0` 启动；Checkpoint、Prompt、图片、采样参数和 Smoke 未变。实际 `/v1/chat/completions` 返回 HTTP 200，耗时 4.545 秒，随后服务已关闭。
+- VLM 返回 `unresolved` / `candidate_index=null`：它认为浅色矩形物体是封闭盒子，并把 Candidate 0 描述成带叉子的黑色物体/餐具盒，认为没有候选能证明 Teacher 所说的 white book。独立 IoU 把 Candidate 0 映射到 Body 23 `black_book_1_main` / Geom 91，IoU `0.920192`；两种表述没有形成充分、一致的身份视觉证据。因此 Teacher→Body/Geom 绑定保持 **unresolved**，未因 0.9202 IoU、只剩一个候选或任务需要书而强行关联；Smoke 的 `physical_association.status` 也为 `unresolved`。
+- 原始 VLM 回答、原图、Candidate 0 编号图、结构化结果、独立最终判断、全部源输入副本、原始及兼容 Inventory、SAM/IoU 输入、模型/Prompt/运行清单和 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_vlm_semantic_disambiguation_20261021_attempt1/`。原始回答 SHA-256 `7dbcb3c0bcbb1c725dc37b206f398da7c0b32731f98925322aa8931fff16f56d`；Candidate 编号图 SHA-256 `d1ce16865c8b0f0dd1f81ae8d81639ccb034761fe3f837fb843c91e99ff8fb87`。
+- 本轮无其他物体处理、语义绑定写入、Bridge reset/step、轨迹规划、Student Rollout 或训练。等待复核 `object_1` 仍 unresolved 的结论。
+
 ## L0T1/state0 SAM3 三组检索词/阈值诊断（2026-10-21）
 
 - 对已归档同一张 512×512 180° forward RGB、逐像素对齐 Geom ID、最新通过 Schema 的原始 Teacher IR v2 和本地 SAM3 checkpoint 分别运行三次独立进程；未改输入、权重、Teacher JSON 或 SAM 后处理。权重为 `/workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt`，SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`；每次均确认 GPU 0 RTX 4090 成功加载 `Sam3Image`，使用本地 checkpoint（`load_from_HF=False`）。

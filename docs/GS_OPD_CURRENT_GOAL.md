@@ -1,6 +1,22 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1 SAM3 三组检索诊断完成，等待复核（2026-10-21）
+## 当前状态：L0T1/state0 原生 512/1024 RGB+Geom ID 对照已完成，等待复核（2026-10-22）
+
+- 同一次 obstacle_avoidance/L0T1/state0、seed 0 Bridge 初始化中，完成 512×512 和 1024×1024 `agentview` MuJoCo 原生 RGB 与 Geom ID 采集；1024 使用 MuJoCo 渲染器直接输出，没有插值或放大。
+- 两个分辨率各自的 RGB/Geom ID 像素坐标及方向检查通过。渲染前后完整 integration state、机器人/物体诊断和缓存 agentview 图像哈希完全相同；期间没有 reset 或 step。无参数 `render_highres` 仍返回默认 512×512，并与 512 segmentation RGB 逐像素一致。
+- 已保存 raw 与 180° 同步旋转 RGB/Geom ID、28 Body/288 Geom Inventory、逐 Geom overlay、book/bottle/caddy 原生像素裁剪对照图、请求与状态记录、运行脚本、源码快照和哈希清单。主报告：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_native_512_1024_resolution_comparison_20261022_attempt1/experiment_report.md`。
+- 512/1024 分辨率验证完成；未运行 VLM、SAM3、Student、动作、规划或训练。当前等待复核，不启动后续下游实验。
+
+## 已有参考：Task-Conditioned 复核选 Region A，但语义身份仍 unresolved（2026-10-21）
+
+- 使用最新 Safety IR v2、归档 `book`/0.1 四候选与 Body IoU、同帧 180° RGB、任务指令和完整 288-Geom Inventory，对 `object_1` 调用冻结 Qwen3.8 一次。复用原 VLM Prompt；返回 `unresolved`、`candidate_index=null`，未创建语义绑定。
+- 本轮补做静态人工对照图：Candidate 0 与 Body 23 的真实可见 Mask IoU 为 0.920192、与 Body 27 为 0；编号“0”位于 Mask 左上边缘，文字影响 Mask 内 27 px（0.876%）。遮挡可能影响少量局部细节，但 VLM 判断因果未证实。完整 PNG 与报告位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_candidate_body_mask_review_20261021_attempt1/`；保持 unresolved 并等待复核。
+- 新的独立 Task-Conditioned Reference Verification 只调用冻结 Qwen3.8 一次：用原始任务指令、原 RGB 和无语义标签的 A/B 放大图，模型选 A，称其像有可见页片的黑色书状物。旧 VLM 则把 Candidate 0 看作餐具类并返回 unresolved；Teacher 仍描述 white book。单次判断有差异，不能确证语义或物理身份；A/B 裁剪共享部分画面且 A 先呈现，顺序影响未排除。请求和离线对照在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_task_conditioned_reference_verification_20261021_attempt1/`；Safety IR 不变，绑定继续 unresolved。
+- Smoke 按其原有筛选逻辑剔除了 IoU unresolved 的 Candidate 1–3，VLM 仅看到 Candidate 0。该候选与 Body 23 `black_book_1_main` / Geom 91 的 IoU 为 0.9202；VLM 将它描述为带叉子的黑色物体/餐具盒，并认为浅色矩形物体是盒子。此结果与 `white book` 的 Teacher 描述不能建立充分一致的身份对应；保持 unresolved，不依据高 IoU、唯一候选或任务文字强行绑定。
+- 完整 Inventory 中 9 个 `geom_name=null` 项只在单独兼容副本中替换为按 ID 可追溯的占位名，原始 288 项清单不变。原始 VLM 回答、编号图、最终判断、启动与请求记录、输入副本和 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_vlm_semantic_disambiguation_20261021_attempt1/`。唯一有效 VLM 请求 HTTP 200、耗时 4.545 秒；临时服务已关闭。
+- 本轮未重跑 SAM3/Teacher/MuJoCo，未处理其他物体、写入绑定、规划、运行 Student 或训练；当前等待复核，不进入轨迹规划。
+
+## 已完成：L0T1 SAM3 三组检索诊断（2026-10-21）
 
 - Safety Bridge 已支持 benchmark、level、task、init-state、seed 和相机分辨率参数；默认行为仍是 obstacle_avoidance/L0T0/state0、seed 0、256×256。`reset` 使用同一套场景参数。
 - 本地核验后选用不同 BDDL 的 obstacle_avoidance/L0T1/state0：`pick up the book and place it in the back compartment of the caddy`，50 个 init states。只执行初始化/观察采集，没有 Student、动作 step、规划、Repair 或训练。

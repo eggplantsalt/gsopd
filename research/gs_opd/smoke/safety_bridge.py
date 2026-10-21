@@ -3025,8 +3025,18 @@ def _gripper_geometry_inventory():
     return result
 
 
-def _render_highres():
+def _validated_render_resolution(resolution):
+    """Validate an explicit native square render size without coercion."""
+    if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0:
+        raise ValueError(
+            f"Render resolution must be a positive integer, got {resolution!r}"
+        )
+    return resolution
+
+
+def _render_highres(resolution=512):
     """Render the existing primary camera without advancing or rebuilding sim."""
+    resolution = _validated_render_resolution(resolution)
     sim = env.sim
     if getattr(sim, "_render_context_offscreen", None) is None:
         raise RuntimeError(
@@ -3042,8 +3052,8 @@ def _render_highres():
     try:
         raw_rgb = np.ascontiguousarray(
             sim.render(
-                width=512,
-                height=512,
+                width=resolution,
+                height=resolution,
                 camera_name="agentview",
                 depth=False,
             )
@@ -3060,7 +3070,7 @@ def _render_highres():
             "MuJoCo integration state changed during high-resolution render; "
             "discarding rendered image"
         )
-    if raw_rgb.shape != (512, 512, 3) or raw_rgb.dtype != np.uint8:
+    if raw_rgb.shape != (resolution, resolution, 3) or raw_rgb.dtype != np.uint8:
         raise RuntimeError(
             "Unexpected high-resolution render result: "
             f"shape={raw_rgb.shape}, dtype={raw_rgb.dtype}"
@@ -3077,10 +3087,12 @@ def _render_highres():
 
     return {
         "camera_name": "agentview",
-        "width": 512,
-        "height": 512,
+        "width": resolution,
+        "height": resolution,
         "color_space": "RGB",
         "render_api": "env.sim.render",
+        "native_resolution": True,
+        "interpolation_used": False,
         "raw_orientation": "unmodified offscreen renderer row order",
         "rotated_orientation": "raw RGB rotated 180 degrees",
         "physical_state_unchanged": True,
@@ -3125,8 +3137,9 @@ def _decode_geom_segmentation(object_segmentation, geom_count, geom_object_type)
     return geom_ids
 
 
-def _render_geom_segmentation():
+def _render_geom_segmentation(resolution=512):
     """Capture same-state RGB and object segmentation from the primary camera."""
+    resolution = _validated_render_resolution(resolution)
     sim = env.sim
     if getattr(sim, "_render_context_offscreen", None) is None:
         raise RuntimeError(
@@ -3142,24 +3155,24 @@ def _render_geom_segmentation():
     try:
         rgb_before = np.ascontiguousarray(
             sim.render(
-                width=512,
-                height=512,
+                width=resolution,
+                height=resolution,
                 camera_name="agentview",
                 depth=False,
                 segmentation=False,
             )
         )
         object_segmentation = sim.render(
-            width=512,
-            height=512,
+            width=resolution,
+            height=resolution,
             camera_name="agentview",
             depth=False,
             segmentation=True,
         )
         rgb_after = np.ascontiguousarray(
             sim.render(
-                width=512,
-                height=512,
+                width=resolution,
+                height=resolution,
                 camera_name="agentview",
                 depth=False,
                 segmentation=False,
@@ -3174,7 +3187,7 @@ def _render_geom_segmentation():
         raise RuntimeError(
             "MuJoCo integration state changed during Geom segmentation render"
         )
-    if rgb_before.shape != (512, 512, 3) or rgb_before.dtype != np.uint8:
+    if rgb_before.shape != (resolution, resolution, 3) or rgb_before.dtype != np.uint8:
         raise RuntimeError(
             "Unexpected RGB render result: "
             f"shape={rgb_before.shape}, dtype={rgb_before.dtype}"
@@ -3217,10 +3230,13 @@ def _render_geom_segmentation():
 
     return {
         "camera_name": "agentview",
-        "width": 512,
-        "height": 512,
+        "width": resolution,
+        "height": resolution,
         "color_space": "RGB",
         "render_api": "env.sim.render",
+        "native_resolution": True,
+        "interpolation_used": False,
+        "raw_orientation": "unmodified offscreen renderer row/column order",
         "rgb_segmentation_pixel_consistency": True,
         "physical_state_unchanged": True,
         "geom_id_background_value": -1,
@@ -3921,7 +3937,7 @@ try:
                         }
                 elif request["op"] == "render_highres":
                     try:
-                        result = _render_highres()
+                        result = _render_highres(request.get("resolution", 512))
                     except Exception as exc:
                         result = {
                             "error": (
@@ -3931,7 +3947,7 @@ try:
                         }
                 elif request["op"] == "geom_segmentation":
                     try:
-                        result = _render_geom_segmentation()
+                        result = _render_geom_segmentation(request.get("resolution", 512))
                     except Exception as exc:
                         result = {
                             "error": (
