@@ -2,6 +2,16 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 Geom 对齐 RGB 的 Teacher 再标注（2026-10-21）
+
+- 沿用已归档的 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_geom_grounding_20261021/` 双相机 RGB 和 L0T1 指令，直接调用冻结本地 Qwen3.8 Teacher 一次。没有连接或 reset Safety Bridge，也没有重新采集图像。输入 agentview 与归档 segmentation RGB 在原始方向逐像素相同；两张输入均 512×512 RGB。输入图像 PNG SHA-256：agentview `3b3b1def68143b48132fb7bc92fdd04ea1fb2989807f575309b85bb11592aec7`，eye-in-hand `a6eb1a5afcda3fbc90b87ee6ba6059aaf09cabc0374598848c456c89d8a99bb7`；输出清单另记录解码像素缓冲区和实际 backend PNG data URL 哈希。
+- 使用原 Safety IR v2 Prompt（SHA-256 `c2da53b91e3d92207b88d23487618e304acceb9a152533786153ba48a757b15d`）和原 Schema（SHA-256 `ea57eb3fb7b35ec66e19c908a599a7b5ada2193cef6dd3a2947788a9590be723`）。本地 `/workspace/zy_workspace/checkpoints/gs_opd/Qwen3.8-27B-FP8`，66 个权重分片，vLLM 0.31.0、TP=2、GPU 0/1；请求 temperature 0、thinking disabled、max_tokens 4096、JSON Schema 模式。单次请求耗时 35.471 秒，HTTP 200，原始 JSON SHA-256 `a1a9cae7dd9af9ad051cf44db5e94c02b79b7a0e6ad62baa52a0c361db9646e4`，`parse_teacher_output_v2` 校验通过。
+- 本次 Teacher 输出 6 个物体：white book（target）、brown caddy（placement target）、green bottle（obstacle）、yellow-handled cup、black-handled fork、green plant sprig（后三者 avoid）。输出 3 条 robot-contact 规则：夹爪接触 book 为 allow、接触 caddy 为 unknown、接触 bottle 为 forbid；另有 book→bottle 的 object-contact forbid 规则和 3 条全局不确定性。该 IR 是 Teacher 语义输出，不代表几何绑定或物理安全结论。
+- 与此前 Teacher 结果比较：前 3 个物体名称/角色一致，book→bottle forbid 规则一致；后 3 个名称本次分别为 yellow-handled cup、black-handled fork、green plant sprig，旧结果为 yellow mug、black knife、green plant。robot-contact 规则从此前 6 条变为本次 3 条，本次没有 cup/fork/plant 的夹爪接触规则。两次图像来自不同 capture/reset，不能据此声称模型在同一物理状态上的输出变化；原始旧 JSON 保留为 comparison-only reference。
+- 本次及此前输出均称目标为 “white book”。当前 RGB 可见浅色矩形区域，但场景 BDDL 同时列有 `black_book_1` 和 `white_place_box_1`；图像外观与 BDDL 类名不足以确认 Teacher 的 white book 指向哪个物理实体。没有按 BDDL 名称修改 Teacher JSON，也没有建立 Body/Geom 绑定；该歧义保留待复核。
+- 原始 Teacher JSON、Schema 校验、摘要、旧结果对比、当前输入图像副本及完整文件/像素/backend 输入哈希、Prompt/Schema/Backend 副本、模型与服务配置均保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_teacher_v2_geom_grounding_20261021_attempt1/`；SHA-256 清单 16 项全部核验通过。Teacher 服务在单次请求后关闭。
+- 本轮没有运行 SAM3、语义消歧、Student、训练或规划。等待复核本次对象命名差异、减少的 robot-contact 规则和 white book 身份歧义后，再进入下一步。
+
 ## L0T1/state0 同初始化 RGB 与 Geom Grounding 采集（2026-10-21）
 
 - 使用参数化 Safety Bridge 启动 `obstacle_avoidance/L0T1/state0`、seed 0、512×512 双相机。为读取 Bridge 启动初始化时已缓存的 observation，增加只读 `observe` 操作；采集客户端没有调用 `reset` 或 `step`。同一 Bridge 进程按 `observe → geom_segmentation → geometry_inventory → observe` 读取。

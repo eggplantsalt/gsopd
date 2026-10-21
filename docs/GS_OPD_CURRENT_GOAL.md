@@ -1,6 +1,6 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 几何 Grounding 采集完成，等待复核（2026-10-21）
+## 当前状态：L0T1/state0 Grounding 与对齐 RGB 的 Teacher v2 完成，等待复核（2026-10-21）
 
 - Safety Bridge 已支持 benchmark、level、task、init-state、seed 和相机分辨率参数；默认行为仍是 obstacle_avoidance/L0T0/state0、seed 0、256×256。`reset` 使用同一套场景参数。
 - 本地核验后选用不同 BDDL 的 obstacle_avoidance/L0T1/state0：`pick up the book and place it in the back compartment of the caddy`，50 个 init states。只执行初始化/观察采集，没有 Student、动作 step、规划、Repair 或训练。
@@ -8,7 +8,9 @@
 - 完整 Geometry Inventory 含 28 Bodies、288 Geoms；book/caddy/bottle 的 BDDL 实体名命中三个不同 Body，且各有可见 Geom 像素。Teacher “white book” 与 BDDL `black_book_1` 的颜色/身份关系仍未确认；brown caddy、green bottle 也尚无 Teacher 语义绑定。
 - 前次 Teacher 实际输入图像另存为 `teacher_input_reference/` 并仅作对照。本次与之像素不同，虽 task/init-state 配置相同，不能确认实际物理状态一致，因此不跨 reset 混配。完整 RGB、Geom ID、overlay、Body/Geom 清单和对齐报告在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_geom_grounding_20261021/`。
 - 两相机 512×512 RGB PNG、原始 RGB NPZ、场景元信息、BDDL 对比、冻结 Qwen3.8 Teacher 原始与校验 JSON、Schema 结果和 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_scene_observation_20261021/`。Safety IR v2 输出 6 个语义物体、6 条机器人接触规则、1 条被搬运 book→bottle 禁止接触规则；后侧隔间可见性和 bottle 相对位置仍有不确定性。无任何旧场景 Teacher JSON 或物体绑定参与。
-- 当前等待复核 Grounding 图像、物理对象可分性和书籍颜色/身份差异；复核前不运行 SAM3/VLM 语义消歧，不启动 Student Rollout。
+- 已从同一状态的 Geom 对齐 RGB 离线调用一次冻结 Qwen3.8 Teacher，没有连接/reset Bridge。复用原 Prompt/Schema、temperature 0、non-thinking、4096-token 配置；新 IR v2 通过 Schema，含 6 个对象、3 条机器人接触规则、1 条 book→bottle 规则和 3 条全局不确定性。与前次输出相比，cup/utensil/plant 名称及部分 robot-contact 规则不同，证据分别保存，没有覆盖旧结果。
+- 新旧 Teacher 输出均称目标为 “white book”；当前 RGB 有浅色矩形区域，BDDL 同时列出 `black_book_1` 和 `white_place_box_1`。物理身份仍未确认，未修改 Teacher 输出或创建 Body/Geom 绑定。
+- 新一轮 Teacher 输入、原始响应、Schema 校验、摘要、对比、完整图像哈希和服务配置位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_teacher_v2_geom_grounding_20261021_attempt1/`；等待复核这些结果后再运行 SAM3/VLM 语义消歧，不启动 Student Rollout。
 
 ## 已完成：π₂ Batch Size 3 纯 Student 闭环评测（2026-10-21）
 
