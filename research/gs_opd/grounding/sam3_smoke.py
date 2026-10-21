@@ -125,6 +125,8 @@ def _save_results(
     object_id: str,
     object_name: str,
     text_prompt: str,
+    text_prompt_source: str,
+    text_prompt_override: str | None,
     checkpoint_path: Path,
     confidence_threshold: float,
 ) -> dict[str, Any]:
@@ -175,7 +177,10 @@ def _save_results(
         "teacher_json": str(teacher_json.resolve()),
         "object_id": object_id,
         "object_name": object_name,
+        "teacher_object_name": object_name,
         "text_prompt": text_prompt,
+        "text_prompt_source": text_prompt_source,
+        "text_prompt_override": text_prompt_override,
         "image": str(image_path.resolve()),
         "image_width": width,
         "image_height": height,
@@ -200,6 +205,7 @@ def run_smoke(
     output_dir: Path,
     confidence_threshold: float = 0.5,
     include_visual_facts: bool = False,
+    text_prompt_override: str | None = None,
 ) -> dict[str, Any]:
     import torch
     from PIL import Image
@@ -218,7 +224,13 @@ def run_smoke(
         )
 
     object_name = matched["name"]
-    text_prompt = _teacher_text_prompt(matched, include_visual_facts)
+    if text_prompt_override is not None and not text_prompt_override.strip():
+        raise ValueError("text_prompt_override must be non-empty when provided")
+    text_prompt = (
+        text_prompt_override
+        if text_prompt_override is not None
+        else _teacher_text_prompt(matched, include_visual_facts)
+    )
     with Image.open(image_path) as source_image:
         image = source_image.convert("RGB")
     processor = _load_processor(checkpoint_path, confidence_threshold)
@@ -226,13 +238,13 @@ def run_smoke(
         if torch.cuda.is_available():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 state = processor.set_image(image)
-                # Only the Teacher object's semantic name is sent to SAM 3.
+                # Only the configured retrieval phrase is sent to SAM 3.
                 output = processor.set_text_prompt(
                     state=state, prompt=text_prompt
                 )
         else:
             state = processor.set_image(image)
-            # Only the Teacher object's semantic name is sent to SAM 3.
+            # Only the configured retrieval phrase is sent to SAM 3.
             output = processor.set_text_prompt(state=state, prompt=text_prompt)
     masks, boxes, scores = _normalize_predictions(output, image.size)
     return _save_results(
@@ -246,6 +258,12 @@ def run_smoke(
         object_id=object_id,
         object_name=object_name,
         text_prompt=text_prompt,
+        text_prompt_source=(
+            "cli_override"
+            if text_prompt_override is not None
+            else ("teacher_name_plus_visual_facts" if include_visual_facts else "teacher_name")
+        ),
+        text_prompt_override=text_prompt_override,
         checkpoint_path=checkpoint_path,
         confidence_threshold=confidence_threshold,
     )
@@ -269,6 +287,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="append Teacher agentview visual facts to its object name for SAM 3 text prompting",
     )
+    parser.add_argument(
+        "--text-prompt-override",
+        default=None,
+        help="optional exact SAM 3 retrieval text; when omitted, use the Teacher name (and optional visual facts)",
+    )
     args = parser.parse_args(argv)
 
     for label, path in (
@@ -288,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.out_dir,
             confidence_threshold=args.confidence_threshold,
             include_visual_facts=args.include_visual_facts,
+            text_prompt_override=args.text_prompt_override,
         )
     except Exception as exc:
         print(f"SAM 3 Smoke failed: {type(exc).__name__}: {exc}", file=sys.stderr)

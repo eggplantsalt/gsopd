@@ -1,6 +1,6 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1 object_1 SAM3/Body IoU 检查完成，零候选，等待复核（2026-10-21）
+## 当前状态：L0T1 SAM3 三组检索诊断完成，等待复核（2026-10-21）
 
 - Safety Bridge 已支持 benchmark、level、task、init-state、seed 和相机分辨率参数；默认行为仍是 obstacle_avoidance/L0T0/state0、seed 0、256×256。`reset` 使用同一套场景参数。
 - 本地核验后选用不同 BDDL 的 obstacle_avoidance/L0T1/state0：`pick up the book and place it in the back compartment of the caddy`，50 个 init states。只执行初始化/观察采集，没有 Student、动作 step、规划、Repair 或训练。
@@ -10,8 +10,9 @@
 - 两相机 512×512 RGB PNG、原始 RGB NPZ、场景元信息、BDDL 对比、冻结 Qwen3.8 Teacher 原始与校验 JSON、Schema 结果和 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_scene_observation_20261021/`。Safety IR v2 输出 6 个语义物体、6 条机器人接触规则、1 条被搬运 book→bottle 禁止接触规则；后侧隔间可见性和 bottle 相对位置仍有不确定性。无任何旧场景 Teacher JSON 或物体绑定参与。
 - 已从同一状态的 Geom 对齐 RGB 离线调用一次冻结 Qwen3.8 Teacher，没有连接/reset Bridge。复用原 Prompt/Schema、temperature 0、non-thinking、4096-token 配置；新 IR v2 通过 Schema，含 6 个对象、3 条机器人接触规则、1 条 book→bottle 规则和 3 条全局不确定性。与前次输出相比，cup/utensil/plant 名称及部分 robot-contact 规则不同，证据分别保存，没有覆盖旧结果。
 - 新旧 Teacher 输出均称目标为 “white book”；当前 RGB 有浅色矩形区域，BDDL 同时列出 `black_book_1` 和 `white_place_box_1`。物理身份仍未确认，未修改 Teacher 输出或创建 Body/Geom 绑定。
-- 已对最新 Teacher IR 的 `object_1` 运行现有 SAM3 单对象分割，prompt 原样为 `white book`，使用 archived 180° RGB/Geom ID 对齐输入；未 reset 或重新采图。SAM3 默认 0.5 阈值下返回 0 个候选，Body-level IoU 对 18 个可见 Body 组完成坐标审计但没有候选行。Body 23 `black_book_1_main` 有 3,090 个可见像素，Body 27 `white_place_box_1_main` 有 10,611 个可见像素；因没有 SAM mask，无法比较二者 IoU，object_1 物理绑定保持 unresolved。
-- 结果与输入副本、空候选/IoU 结果、零候选说明 overlay、运行配置及哈希位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_sam3_geom_iou_20261021_attempt1/`。没有运行 VLM 消歧；等待复核零候选和白书歧义后再决定后续工作，不启动 Student Rollout。
+- `white book` 和 `book` 在 0.5 阈值下此前均返回零候选；本轮仅将 `book` 阈值降到 0.1 后获得 4 个低置信候选，其中 Candidate 0 与 Body 23 `black_book_1_main` 的 IoU 为 0.9202、对 Body 27 `white_place_box_1_main` 为 0。低分几何重合不作为 Teacher 身份绑定，`object_1` 仍 unresolved。
+- 另外两组独立运行中，`green bottle`/0.5 得到一个分数 0.9688 的候选，与 Body 25 `bottle_of_beer__7_1_main` IoU 0.9850；`brown caddy`/0.5 无候选，raw combined confidence 最高 0.0986、低于阈值，Body 26 没有候选 IoU 可比。Bottle 的几何匹配同样未自动写成语义绑定。
+- 每次加载本地 SAM3 checkpoint 成功；输入预处理、200-proposal raw output、阈值过滤后的 shape/dtype、所有 Mask/分数/Body IoU 均已分别存档。三组报告和源证据副本位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_sam3_prompt_threshold_diagnostics_20261021_attempt1/`。未运行 VLM、Bridge、Student、动作、规划或训练；等待复核。
 
 ## 已完成：π₂ Batch Size 3 纯 Student 闭环评测（2026-10-21）
 

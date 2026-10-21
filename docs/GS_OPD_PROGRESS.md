@@ -2,6 +2,23 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 SAM3 三组检索词/阈值诊断（2026-10-21）
+
+- 对已归档同一张 512×512 180° forward RGB、逐像素对齐 Geom ID、最新通过 Schema 的原始 Teacher IR v2 和本地 SAM3 checkpoint 分别运行三次独立进程；未改输入、权重、Teacher JSON 或 SAM 后处理。权重为 `/workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt`，SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`；每次均确认 GPU 0 RTX 4090 成功加载 `Sam3Image`，使用本地 checkpoint（`load_from_HF=False`）。
+- `object_1` Teacher 原名 `white book`，仅本次检索词覆写为 `book`，阈值 0.1：4 个候选，分数分别为 0.1240、0.2129、0.2324、0.2383，Mask 面积 3,310、812、417、402 px。Candidate 0 与 `black_book_1_main` Body 23 / Geom 91 的 IoU 为 0.9202，与 `white_place_box_1_main` Body 27 / Geom 283 的 IoU 为 0；Candidate 1–3 的最佳重叠为 world Body 0，IoU 分别 0.0121、0.0062、0.0060，均低于 IoU 工具默认 0.1，状态 unresolved。上述是低置信候选的像素几何证据，不建立 `white book`→Body 语义绑定。
+- `object_3` Teacher 原名和检索词均为 `green bottle`，阈值 0.5：1 个候选，分数 0.9688、Mask 面积 5,982 px；与已知可见的 `bottle_of_beer__7_1_main` Body 25 / Geom 133 IoU 为 0.9850，几何上匹配该物理实例。此诊断也未自动写入 Teacher→Body 绑定。
+- `object_2` Teacher 原名和检索词均为 `brown caddy`，阈值 0.5：SAM3 返回 0 个过滤后候选，没有 Mask、候选分数或 IoU。原始 grounding 输出含 200 个 proposal；按现有 Processor 使用的 `sigmoid(pred_logits) × sigmoid(presence_logit_dec)` 组合分数最高为 0.0986，超过 0.5 的为 0。Body 26 `desk_caddy_1_main` 因无候选而无可比较 IoU。
+- 三次均观察到相同输入预处理：归档 RGB 512×512 经现有 SAM3 transform 变为 CUDA `float32 [1,3,1008,1008]`，归一化范围 `[-1,1]`。每次 raw forward 输出 200 proposals，主要张量包括 `pred_logits [1,200,1]`、`pred_boxes [1,200,4]`、`pred_masks [1,200,288,288]` 和 `presence_logit_dec [1,1]`；另保存 Processor 原有置信度过滤后的张量 shape/dtype。运行时观测器只读并原样返回输入/输出 Tensor，没有修改 SAM3 模型、候选阈值判定或后处理逻辑。三组结果表明模型正常加载与生成输出；brown caddy 在给定 0.5 阈值下最高 combined score 不足阈值，book 仅在 0.1 下保留低置信候选。
+- 三个独立输出目录均保留所有返回 Mask、SAM score、每候选完整 Body IoU 矩阵、IoU 对比图和运行时加载/预处理/raw-output 结构诊断。总摘要、逐候选表、源码快照、原始归档与 Teacher IR 副本及 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_sam3_prompt_threshold_diagnostics_20261021_attempt1/`。没有重跑 Teacher、调用 VLM、启动 Bridge、重新采图、执行 Student/动作/规划或训练；所有 SAM/IoU 结果仅供复核，等待确认后再进入后续语义消歧。
+
+## L0T1 object_1 SAM3 检索词覆盖诊断（2026-10-21）
+
+- 对现有 `research/gs_opd/grounding/sam3_smoke.py` 增加可选 `--text-prompt-override`。未传时仍调用原 `_teacher_text_prompt()`，默认使用 Teacher object name；指定时只覆盖本次 SAM3 retrieval text。`sam3_results.json` 额外写明 `teacher_object_name`、实际 `text_prompt`、`text_prompt_source` 和 override 值，Teacher JSON 保持原样。
+- 使用已归档 L0T1/state0 180° 正向 RGB 与同向 Geom ID、最新通过 Schema 的 Teacher IR v2，仅将 `object_1` 的检索词从 Teacher 原始语义名 `white book` 覆盖为 `book`。Checkpoint 仍是 `/workspace/zy_workspace/checkpoints/gs_opd/sam3/sam3.pt`（SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`），SAM 置信阈值 0.5，IoU 最小阈值 0.1。
+- 与原 `white book` 运行对照，RGB、Geom ID、Teacher IR、Checkpoint 哈希完全一致，SAM 和 IoU 阈值相同；唯一模型输入变化是查询词。SAM3 对 `book` 仍返回 `no_candidates`（0 候选），故没有 Mask、分数或逐候选 IoU。现有 IoU 脚本审计了 18 个可见 Body 组，但矩阵没有候选行。Body 23 `black_book_1_main`（Geom 91，3,090 可见像素）与 Body 27 `white_place_box_1_main`（Geom 283，10,611 可见像素）均无可比较候选；像素面积不代表候选 IoU。
+- Teacher 的语义描述仍是 `white book`，SAM3 检索词是 `book`；此词覆盖不改写 IR，也不建立 Teacher→Body 绑定。两个 Body 的关系、可能误匹配及多候选情况仍为 **unresolved**，因为本次没有候选返回。未重跑 Teacher、未做 VLM 消歧、未 reset/采图，未运行 Student、环境动作、规划或训练。
+- SAM3/IoU 原始 JSON、空候选 Mask/Score 清单、无候选 overlay、Body 23/27 比较摘要、归档输入与 IR 副本、前次 `white book` 运行对照、运行代码快照及 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object1_sam3_book_prompt_20261021_attempt1/`。脚本 `py_compile` 与 CLI `--help` 检查通过；本次真实单次 SAM3 推理及 IoU 输入校验完成。等待复核后再决定后续语义消歧。
+
 ## L0T1 object_1 “white book” SAM3 与 Body IoU 检查（2026-10-21）
 
 - 从已归档的 `obstacle_avoidance_L0T1_init0_geom_grounding_20261021/` 读取 512×512 `agentview_512_rgb_rotated_180.png`、逐像素对齐的 `geom_ids_rotated_180.npy`、完整 Geometry Inventory 和 alignment report；复用最新通过 Safety IR v2 Schema 的 `object_1`，没有重置 Bridge 或重新采图。运行前将原始证据复制到独立输出目录并核对哈希。RGB/Geom ID 方向均由元数据标记为同向 180° forward；归档报告确认本次 segmentation 状态未变化。
