@@ -2,6 +2,17 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 同初始化 RGB 与 Geom Grounding 采集（2026-10-21）
+
+- 使用参数化 Safety Bridge 启动 `obstacle_avoidance/L0T1/state0`、seed 0、512×512 双相机。为读取 Bridge 启动初始化时已缓存的 observation，增加只读 `observe` 操作；采集客户端没有调用 `reset` 或 `step`。同一 Bridge 进程按 `observe → geom_segmentation → geometry_inventory → observe` 读取。
+- `agentview_image` 和 `robot0_eye_in_hand_image` 均为 RGB uint8、512×512。Geom segmentation 的 `agentview` RGB 和启动 observation 在 identity/raw renderer 方向逐像素相同；RGB/Geom ID 各为 512×512，Geom ID 为 int32，地图含 30 个可见 Geom ID。Bridge 渲染前后确认 MuJoCo integration state 未变化，前后完整 Snapshot diagnostics 和缓存双相机像素也相同。
+- Geometry Inventory 扩展为完整列出当前模型 28 个 Body（含父 Body 和所属 Geom ID）及 288 个 Geom；分类完整。原方向 RGB/Geom ID/overlay 和 180° 同步旋转版本均保留，旋转未改变像素坐标对应关系。人工检查 overlay 可见 book、caddy、bottle 区域分别有独立颜色标签。
+- 按 BDDL 实体名核验可见几何：`black_book_1_main` 是 Body 23，3 个 Geom 中 Geom 91 可见 3,090 px；`desk_caddy_1_main` 是 Body 26，18 个 Geom 中 Geom 265 可见 25,581 px；`bottle_of_beer__7_1_main` 是 Body 25，132 个 Geom 中 Geom 133 可见 6,039 px。三者 Body ID 互不相同且各有可见 Geom，故 MuJoCo 分割中是可区分的物理对象。此结论只确认 BDDL 实体名与模型几何的对应，不等于 Teacher 语义绑定。
+- Teacher 实际输入的两张图从前次 `teacher_input_attempt3/` 原样复制并单独保存在 `teacher_input_reference/`，有独立哈希。它们与本次启动状态的图像比较不完全相同：agentview 有 30,907 个不同像素（11.79%，最大通道差 159），eye-in-hand 有 56,768 个（21.66%，最大差 161）。两次虽使用同一 task/init-state 配置，实际物理状态相同无法确认；历史 Teacher 图只作对照，未与本次几何分割配对。
+- 存在一个待复核语义差异：Teacher IR 将目标称为 “white book”，而 L0T1 BDDL/Geom 名称是 `black_book_1`。因此没有断言 Teacher `object_1` 已绑定到 Body 23；brown caddy 与 green bottle 的语义对应也仍待 SAM3/VLM 复核。本轮未运行 SAM3、未重写 Teacher IR、未生成语义绑定或开始规划。
+- 完整原始 RGB、双相机 NPZ、Geom ID `.npy`、raw/180° overlay、全部 Body/Geom 清单、同状态/方向对齐报告、Teacher 对照图和 SHA-256 清单保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_init0_geom_grounding_20261021/`。Safety 环境语法检查及真实只读 Bridge 采集通过；环境动作步数为 0。
+- 下一步等待复核采集、实例区分和 Teacher/BDDL 书籍颜色差异；复核前不进入 SAM3/VLM 语义消歧。
+
 ## 参数化 Safety Bridge 与新任务 Teacher 观察（2026-10-21）
 
 - `research/gs_opd/smoke/safety_bridge.py` 支持 `--benchmark`、`--level`、`--task-id`（兼容别名 `--task`）、`--init-state`、`--seed` 和 `--camera-resolution`。Bridge 启动和 `reset` 都按同一 benchmark/level/task/init-state 取任务、BDDL 和初始化状态；默认仍为 `obstacle_avoidance / L0 / T0 / state 0 / seed 0 / 256×256`，没有改 OSC 配置或动作接口。Teacher Smoke 的图像元信息额外保存 Bridge 场景元数据，Safety IR v2 Prompt 未改。

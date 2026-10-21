@@ -2125,6 +2125,31 @@ def _build_geometry_inventory(
     geometries = []
     has_lookup_errors = False
     body_count = int(model._model.nbody)
+    bodies = []
+    has_body_lookup_errors = False
+
+    for body_id in range(body_count):
+        body = {
+            "body_id": body_id,
+            "body_name": None,
+            "parent_body_id": None,
+            "parent_body_name": None,
+            "geom_ids": [],
+        }
+        try:
+            body["body_name"] = model.body_id2name(body_id)
+        except Exception as exc:
+            body["body_name_error"] = f"{type(exc).__name__}: {exc}"
+            has_body_lookup_errors = True
+        try:
+            parent_id = int(model._model.body_parentid[body_id])
+            body["parent_body_id"] = parent_id
+            if 0 <= parent_id < body_count:
+                body["parent_body_name"] = model.body_id2name(parent_id)
+        except Exception as exc:
+            body["parent_body_error"] = f"{type(exc).__name__}: {exc}"
+            has_body_lookup_errors = True
+        bodies.append(body)
 
     for geom_id in range(geom_count):
         item = {
@@ -2156,6 +2181,8 @@ def _build_geometry_inventory(
                 item["category"] = (
                     "robot" if body_id in robot_body_ids else "scene"
                 )
+            if 0 <= body_id < body_count:
+                bodies[body_id]["geom_ids"].append(geom_id)
         except Exception as exc:
             errors["body_id"] = f"{type(exc).__name__}: {exc}"
 
@@ -2167,7 +2194,9 @@ def _build_geometry_inventory(
     classification_available = robot_body_ids is not None
     status = (
         "complete"
-        if classification_available and not has_lookup_errors
+        if classification_available
+        and not has_lookup_errors
+        and not has_body_lookup_errors
         else "partial"
     )
     result = {
@@ -2176,6 +2205,11 @@ def _build_geometry_inventory(
             "available" if classification_available else "unavailable"
         ),
         "geom_count": geom_count,
+        "body_count": body_count,
+        "body_inventory_status": (
+            "complete" if not has_body_lookup_errors else "partial"
+        ),
+        "bodies": bodies,
         "geometries": geometries,
     }
     if robot_classification_error is not None:
@@ -3693,7 +3727,20 @@ try:
                 except EOFError:
                     break
 
-                if request["op"] == "reset":
+                if request["op"] == "observe":
+                    # Return the observation produced during Bridge startup
+                    # without resetting the environment or advancing physics.
+                    # This is useful for same-initialization RGB/geometry
+                    # capture because reset can sample a different state.
+                    result = pack(
+                        obs,
+                        last_reward,
+                        last_done,
+                        include_snapshot_state=bool(
+                            request.get("include_snapshot_state", False)
+                        ),
+                    )
+                elif request["op"] == "reset":
                     # Reset may hard-rebuild the compiled model; prior snapshots
                     # are no longer valid for the new simulation instance.
                     snapshots.clear()
