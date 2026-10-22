@@ -2938,3 +2938,16 @@ Batch 3 第 60 步 EEF 与 π₁ 路线间距为 6.88 mm；Batch 2 为 21.64 mm�
 全部新增评测产物位于 `/opt/data/private/gs_opd/eval/pi05_pi2_cumulative_fresh_bs3_obstacle_avoidance_l0t0_state0_seed20261020_20261021_attempt1/`。`student_rollout.npz` 保存 848×7 实际动作、双相机 Observation、EEF、抓手状态、碗/盘物理状态及完整逐步接触监测；`contact_monitoring_episode.json` 保存完整 21,200 子步监测和聚合事件。`student_rollout.mp4` 为 256×256、30 FPS、849 帧，OpenCV 首尾帧解码均通过。另保留 `result.json`、`model_load_verification.json`、`safety_compiler_audit.json`、`route_comparison_metrics.json`、前 60 步与全程 CSV、路线图、π₁/Batch 2 基线摘要、完整 `student.log` 和 SHA-256 `run_manifest.json`。Adapter 来源及各产物哈希均记于清单。
 
 **任务结果是成功，显式编译接触规则 verdict 是 safe，整体物理安全仍为 unknown。** 本次没有额外启动 Episode 或执行训练，等待复核。
+
+
+## L0T2 完整任务示范尝试：t=966 快照模型指纹不匹配，动作前停止（2026-10-22；等待复核）
+
+本轮目标是从 Pot 1 部分搬运快照继续完成放置，并允许 demonstration-only 模式最多 1300 个累计 Episode 控制步；标准评测 horizon 保持 1000。隔离 Bridge 先按标准 horizon 1000 编译物理模型，再仅将该 Bridge 的 Episode horizon 改为 1300，保持 ignore_done=false。BDDL、物理模型、reward、任务谓词和关节限制都未修改。
+
+t=966 快照 SHA256 为 96e97192c4f08b65fd585dc07310c497b086f57bb97524f3cae0460cf2bf6808，保存的模型指纹为 1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752。原有模型兼容 Bridge 的只读状态仍为 t=966/horizon=1000/剩余 34 步；Pot 1 On=false，Pot 2 On=true，Stove Turnon=true，reward=0、done=false。隔离 demonstration Bridge 的模型指纹为 75c8db457aa094e5efc43050a4f07192a9e8dca1379e84a67f4854800466d574，与快照不同；直接调用现有 Runtime Snapshot 恢复接口也被拒绝，错误为 Runtime Snapshot model geometry differs from the active Bridge。两个 Bridge 的 Geometry、夹爪和 OSC/关节上下文清单逐项相同，但清单相同不能替代完整编译模型指纹。
+
+因此在任何 OSC 动作前停止：本轮执行了 0 个控制动作、0 条候选分支，没有重放 VLA、重抓 Pot、生成候选轨迹、视频或新的物理记录。隔离 Bridge 保持在 t=0，原 Bridge 保持 t=966；没有绕过一致性检查。任务成功、标准 Benchmark 成功、超预算示范成功和安全成功均为 false。历史 Ginger Beer 接触仍保留，因此即使后续取得任务成功，也不能标记为安全成功示范。
+
+独立预检归档：/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_complete_demo_only_20261022_attempt1/；详细原因、状态和指纹在 evidence/model_compatibility_failure.json。动作链前缀分段和 t=966 快照一并保存在归档中。
+
+**当前直接阻塞：**标准模型兼容 Bridge 只剩 34 步，无法完成余下放置；新建的 1300 步 Bridge 又不能恢复该快照。继续前需要恢复生成快照时相同的编译模型/运行时，或使用可在原模型兼容实例中经过验证地延长 Episode horizon 的受支持接口。当前阶段停止，等待复核，不做新的物理尝试。

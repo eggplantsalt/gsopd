@@ -1,5 +1,10 @@
 # GS-OPD 总体路线
 
+## 最新局部状态（2026-10-22）：L0T2 demonstration-only 续跑受 Snapshot 模型指纹阻塞
+
+本轮拟从 t=966 延续 Pot 1 放置，在隔离 Bridge 中使用最多1300个累计动作；标准 horizon=1000 未变。新 Bridge 在标准 horizon 下编译后切换其 Episode 上限，但新编译模型指纹与 t=966 Runtime Snapshot 不同，Bridge 恢复接口拒绝该 Snapshot。原 Bridge 指纹匹配但只剩34步。未执行控制动作或生成候选，未成功；不属于标准 Benchmark 成功、超预算示范成功或安全成功。下一步先恢复快照创建时一致的编译模型/运行时，或使用经过验证的原实例 horizon 延长接口。详细记录见 GS_OPD_PROGRESS.md 和独立归档 /opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_complete_demo_only_20261022_attempt1/。
+
+
 ## 当前状态（2026-10-22）
 
 GS-OPD 当前继续聚焦 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 的可复现成功数据生成。第一版通用 Grasp Retargeting 已从原始 π₀.₅ Base Moka Pot 2 成功抓取中提取 object-frame EEF 位姿、接近方向和夹爪时序，并从 Pot 2 放置成功快照运行时解析 Pot 1 绑定。首个 OSC_POSE 候选执行 135 步，闭爪前目标未被推移，稳定双指状态达 8 个连续样本，真实抬升 30.657 mm；135/135 子步接触记录完整，关节限位通过且未记录新非目标碰撞。命名抓取后快照通过 Bridge 精确恢复验证。
