@@ -2951,3 +2951,14 @@ t=966 快照 SHA256 为 96e97192c4f08b65fd585dc07310c497b086f57bb97524f3cae0460c
 独立预检归档：/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_complete_demo_only_20261022_attempt1/；详细原因、状态和指纹在 evidence/model_compatibility_failure.json。动作链前缀分段和 t=966 快照一并保存在归档中。
 
 **当前直接阻塞：**标准模型兼容 Bridge 只剩 34 步，无法完成余下放置；新建的 1300 步 Bridge 又不能恢复该快照。继续前需要恢复生成快照时相同的编译模型/运行时，或使用可在原模型兼容实例中经过验证地延长 Episode horizon 的受支持接口。当前阶段停止，等待复核，不做新的物理尝试。
+
+
+## L0T2 demonstration-only Snapshot 恢复与 horizon 扩展已验证（2026-10-22；等待复核）
+
+本轮只处理 t=966 Runtime Snapshot 的兼容恢复及隔离 demonstration horizon，没有执行机器人动作、VLA、抓取、搬运、放置或训练。使用 Pot 1 放置实验的原始 Bridge 源码、原启动参数和初始化顺序：构造环境后 `env.seed(0)`、`env.reset()`、`env.set_init_state(states[0])`，再配置现有 OSC_POSE。新实例首次编译指纹为 `75c8db457aa094e5efc43050a4f07192a9e8dca1379e84a67f4854800466d574`；按此前成功归档的初始化流程执行一次 Bridge reset/set-init-state 后，指纹恢复为快照要求的 `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`。BDDL SHA-256 `901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c` 与完整 scene metadata 均逐字段匹配。
+
+t=966 Runtime Snapshot 随后由原有 `restore_runtime_snapshot` 接口成功恢复。验收确认 MuJoCo Integration State 逐元素完全相等，机器人控制器及完整运行时状态哈希一致，Episode timestep=966；Pot 1 双指稳定抓持检查通过，Pot 2 原生 `On`、Stove `Turnon` 为真，Pot 1 原生 `On` 为假，reward=0、done=false。
+
+仅在恢复并验证后的同一个已编译环境实例中，把底层 `env.env.horizon` 从1000改为1300，`ignore_done=false`。扩展前后几何指纹、Integration State、机器人控制状态、完整运行时状态、timestep、Pot 1 抓持和全部原生谓词均保持不变；扩展后剩余334步。标准 Bridge 独立只读复核仍为 t=966/horizon=1000、剩余34步。没有改 BDDL、MuJoCo 模型、reward、任务判据或快照内容。隔离 Demo Bridge 保持空闲等待后续复核，不代表任务成功、Benchmark 成功或安全认证成功；历史 Ginger Beer 接触继续保留。
+
+独立归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_demo_restore_horizon_20261022_attempt2/`；验收 JSON 为 `evidence/acceptance.json`，复现步骤为 `README.md`，扩展后可恢复状态为 `evidence/extended_t966_runtime_snapshot.pkl`。完整校验清单在 `SHA256SUMS.txt`。下一步经复核后才从该状态继续 Pot 1 的 OSC 放置。

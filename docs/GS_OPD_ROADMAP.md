@@ -1,15 +1,14 @@
 # GS-OPD 总体路线
 
-## 最新局部状态（2026-10-22）：L0T2 demonstration-only 续跑受 Snapshot 模型指纹阻塞
+## 最新局部状态（2026-10-22）：L0T2 demonstration-only Snapshot 恢复和 horizon 扩展通过，等待复核
 
-本轮拟从 t=966 延续 Pot 1 放置，在隔离 Bridge 中使用最多1300个累计动作；标准 horizon=1000 未变。新 Bridge 在标准 horizon 下编译后切换其 Episode 上限，但新编译模型指纹与 t=966 Runtime Snapshot 不同，Bridge 恢复接口拒绝该 Snapshot。原 Bridge 指纹匹配但只剩34步。未执行控制动作或生成候选，未成功；不属于标准 Benchmark 成功、超预算示范成功或安全成功。下一步先恢复快照创建时一致的编译模型/运行时，或使用经过验证的原实例 horizon 延长接口。详细记录见 GS_OPD_PROGRESS.md 和独立归档 /opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_complete_demo_only_20261022_attempt1/。
+从 t=966 Snapshot 重建独立 Bridge 时，首次模型指纹仍为 `75c8…`；复现成功放置实验中的一次 seeded reset / `set_init_state` 顺序后，模型指纹与快照 `1a0c…` 精确匹配。现有恢复接口恢复了完整 Integration State、控制器状态和原生任务状态；同一实例底层 Episode horizon 经隔离 Demo 接口从1000扩展到1300，模型和物理状态前后不变。demo Bridge 当前空闲 t=966/horizon=1300，标准 Bridge 不变 t=966/horizon=1000；尚未执行 Pot 1 放置动作，任务 reward=0。
 
-
+详细验收及复现记录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_demo_restore_horizon_20261022_attempt2/README.md`、`evidence/acceptance.json`。本轮不属于任务或安全成功。经复核后，从保存的 t=966 状态继续 Pot 1 的 OSC 放置。
 ## 当前状态（2026-10-22）
 
-GS-OPD 当前继续聚焦 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 的可复现成功数据生成。第一版通用 Grasp Retargeting 已从原始 π₀.₅ Base Moka Pot 2 成功抓取中提取 object-frame EEF 位姿、接近方向和夹爪时序，并从 Pot 2 放置成功快照运行时解析 Pot 1 绑定。首个 OSC_POSE 候选执行 135 步，闭爪前目标未被推移，稳定双指状态达 8 个连续样本，真实抬升 30.657 mm；135/135 子步接触记录完整，关节限位通过且未记录新非目标碰撞。命名抓取后快照通过 Bridge 精确恢复验证。
+第一版通用 Grasp Retargeting 已成功迁移 Pot 1 抓取，t=966 Pot 1 仍处于稳定双指抓持并已接近 Stove。Pot 2 的原生 On 与 Stove Turnon 保持成立，Pot 1 On 未成立。此次只修复 demonstration-only Snapshot 兼容恢复并扩展隔离 Episode horizon：从原始 t=966 快照成功恢复，在同一个模型兼容实例内将底层 horizon 调至1300；扩展前后物理状态不变。当前 Bridge 已具备334步余量，但没有执行放置动作。标准评测仍为 horizon1000。等待复核后再续做 OSC 放置。
 
-后续 OSC 搬运已于 2026-10-22 从该快照执行一次，但受正常 horizon 约束只达到部分搬运：Pot 1 在 t=966 仍被稳定抓持，离支撑高度约 133 mm；余下 34 步不足以完成估算约 119 步的下降、释放、撤离和稳定。Pot 2 `On` 与 Stove `Turnon` 保持成立，Pot 1 `On` 未成立，reward=0、`done=false`。下降中 Pot 1–Pot 2 峰值接触力 71.20 N，Pot 2 位移仅 0.303 mm；无新增机器人–非目标碰撞。此结果和保留 Ginger Beer 碰撞的历史都不构成安全成功示范。没有修改 horizon/任务状态/关节限制或训练。当前等待复核；下一阶段应从更早 Pot 2 抓持状态压缩完整动作链。独立放置证据见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot1_stove_placement_20261022_attempt1/`。
 ## 总体目标
 
 在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。

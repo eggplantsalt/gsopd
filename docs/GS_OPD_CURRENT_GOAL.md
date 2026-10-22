@@ -1,11 +1,11 @@
 # GS-OPD 当前局部目标
 
-## L0T2 完整任务示范：快照恢复被模型指纹拒绝，等待复核（2026-10-22）
+## L0T2 demonstration-only 快照恢复与 horizon 扩展已通过，等待复核（2026-10-22）
 
-当前原始任务仍是 LIBERO-Safety obstacle_avoidance/L0T2/state0 的完整任务成功示范。Pot 2 已放置，Pot 1 在 t=966 快照中保持稳定抓持；允许后续隔离的 demonstration-only 执行累计至多 1300 步，标准评测仍为 1000 步。
+当前实验仍是 LIBERO-Safety `obstacle_avoidance/L0T2/state0`。t=966 的 Pot 1 抓持/部分搬运 Runtime Snapshot 已在与其完整模型指纹一致的独立 Bridge 中精确恢复。新实例初次编译 hash 不匹配；复现已验证的 reset/set-init-state 流程后恢复到快照 hash，并通过 scene metadata、BDDL、MuJoCo Integration State、机器人控制状态、timestep、Pot 1 双指抓持和原生任务谓词检查。
 
-本轮已尝试创建隔离 Bridge：按 horizon=1000 编译后，仅将 Episode horizon 改为 1300，且 ignore_done=false。但新 Bridge 的模型指纹 75c8db457aa094e5efc43050a4f07192a9e8dca1379e84a67f4854800466d574 与 t=966 快照的 1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752 不同，现有 restore_runtime_snapshot 正确拒绝恢复。原 Bridge 仍与快照指纹相同，但 horizon=1000 且只剩34步。
+同一已恢复实例中的底层 horizon 已从1000扩展到1300，`ignore_done=false`；扩展前后模型和物理运行时状态完全不变。隔离实例当前空闲于 t=966/horizon=1300，Pot 1 尚未放置，reward=0、done=false。标准 Bridge 仍是 t=966/horizon=1000，标准评测默认值未改。
 
-已执行0个物理控制步；没有轨迹候选、碰撞/关节结果或新视频。没有修改标准评测、BDDL、reward、物理位姿、关节限制或快照一致性校验。完整记录见 GS_OPD_PROGRESS.md 与独立归档 /opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_complete_demo_only_20261022_attempt1/。
+本轮执行了0个控制动作、0个VLA动作、0次重新抓取或搬运。完整验收与可复现启动/恢复步骤见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_demo_restore_horizon_20261022_attempt2/README.md` 和 `evidence/acceptance.json`；扩展后快照为 `evidence/extended_t966_runtime_snapshot.pkl`。
 
-当前停止等待复核。继续前需恢复快照生成时的模型/运行时版本，或找到并验证可作用于原模型兼容 Bridge 的 horizon 延长接口；只有完整模型指纹一致、积分状态精确恢复、t=966 谓词和抓持检查通过后，才可继续尝试 Pot 1 的 OSC 放置。不要重新运行 VLA、重新抓取两个 Pot、改变标准 horizon、改任务判据或训练。
+**当前阶段停止等待复核。** 复核后再从保存状态继续剩余 Pot 1 的 OSC 放置；任务成功和安全成功仍须分别判定。
