@@ -6,6 +6,11 @@
 
 ## 阶段与当前状态
 
+## 最新局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22）
+
+使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`；任务未完成、整体物理安全未评估。完整 NPZ、视频、逐状态抓取/接触记录和运行清单位于数据盘独立目录，详见 `docs/GS_OPD_PROGRESS.md`。当前等待复核，不继续 L0T1 实验。
+
+
 - **2026-10-22 最新语义输入状态**：基于同状态归档证据形成独立 reviewed semantic binding 适配：object_1→Body 23/Geom 91（保留 Teacher “white book” 与黑色外观冲突），object_3→Body 25/Geom 133，object_2→Body 26/Geom 265（保留低 SAM score）；object_4–6 unresolved。现有 Contact Safety Compiler 的纯身份解析对三条映射通过静态验证。9 个 null Geom 名仅在独立兼容 Inventory 中用可追溯占位符表达，原始 IR/Inventory 与 Compiler 未改。规则输入就绪不构成轨迹安全结论；接入执行链前等待复核。
 
 1. **安全输入与物体语义**：L0T1/state0 的 512×512 双相机 RGB、Geom segmentation 和完整 Body/Geom Inventory 已从同一次 Bridge 初始化采集并确认像素/状态对齐；book/caddy/bottle 的候选 BDDL 实体各自在独立可见 Body。基于这组 RGB 的一次新 Teacher v2 输出已通过 Schema；与前次输出相比，后 3 个物体命名和 robot-contact 规则数量有差异。两次图像来自不同 capture/reset，差异原因未判定。SAM3 对原始 Teacher `white book` 在阈值 0.5 下无候选；`book` 降至 0.1 时出现 4 个低置信候选，其中一个对 Body 23 `black_book_1_main` IoU 0.9202、对 Body 27 `white_place_box_1_main` IoU 0。随后对 `object_1` 用现有冻结 Qwen3.8 VLM 消歧一次，VLM 返回 unresolved；因原实现将另 3 个 IoU-unresolved 候选过滤，VLM 只见 Candidate 0，并把它描述为黑色带叉子的物体。该描述与 IoU 的 Body 23 `black_book_1_main` 和 Teacher 的 `white book` 均未形成足够一致证据，故不建立绑定。`green bottle`/0.5 候选与 Body 25 几何 IoU 0.9850；`brown caddy`/0.5 无候选，raw combined score max 0.0986。2026-10-22 对 object_3 进行一次真实 Task-Conditioned Verification：原指令 + 中性 `bottle` 下，Qwen 返回 unresolved（唯一候选看起来是瓶子而任务要求书）；回答保存后确认 Candidate 0 与 Body 25 / Geom 133 的几何 IoU 0.98497358，但没有候选被模型选择，不建立 object_3 语义绑定，Safety IR 未修改。SAM/Geom 与 VLM 结论均保留各自证据；`object_1` 与 `object_3` 安全使用在确立语义绑定前继续保持 `unknown`。Candidate 0/Body 23/Body 27 的同坐标静态人工对照图已归档；Candidate 0 与 Body 23 的 IoU 为 0.9202，但 Teacher `white book` 的语义关联仍 unresolved。一次独立 Task-Conditioned VLM 复核在原指令与 A/B 无语义标签局部视图下选择 A；旧 VLM 仍 unresolved，Teacher `white book` 的外观冲突未消解。当前等待人工复核，不据单次模型回答或几何重叠推进语义绑定。

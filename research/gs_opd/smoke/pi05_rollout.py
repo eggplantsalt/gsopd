@@ -71,6 +71,16 @@ def parse_args():
         help="Optional NPZ path for on-policy rollout transitions.",
     )
     parser.add_argument(
+        "--grasp-only-smoke",
+        action="store_true",
+        help="Run an isolated raw-Base grasp Smoke and stop after three distinct stable-grasp states.",
+    )
+    parser.add_argument(
+        "--grasp-smoke-object-id",
+        default="object_1",
+        help="Reviewed semantic object ID used by --grasp-only-smoke (default: object_1).",
+    )
+    parser.add_argument(
         "--contact-safety-probe",
         action="store_true",
         help="Probe the first predicted Action Chunk with Bridge branching, then stop before real actions.",
@@ -153,6 +163,7 @@ def parse_args():
     trajectory_validation_enabled = args.trajectory_bundle_physical_validation
     mink_osc_enabled = args.mink_osc_left
     direct_osc_enabled = args.direct_bspline_osc_left
+    grasp_smoke_enabled = args.grasp_only_smoke
     interpolation_fraction = args.bspline_left_001_toward_004_fraction
     if args.bspline_left_001_toward_004_interp_10pct:
         if interpolation_fraction is not None:
@@ -181,13 +192,59 @@ def parse_args():
         parser.error("--bspline-candidate-id must not be empty")
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
         parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
+    if grasp_smoke_enabled and (
+        probe_enabled
+        or collection_enabled
+        or trajectory_validation_enabled
+        or mink_osc_enabled
+        or direct_osc_enabled
+    ):
+        parser.error("--grasp-only-smoke cannot be combined with probe, collection, trajectory, Mink, or OSC modes")
     if mink_osc_enabled and direct_osc_enabled:
         parser.error("--mink-osc-left and --direct-bspline-osc-left are mutually exclusive")
     if mink_osc_enabled and not trajectory_validation_enabled:
         parser.error("--mink-osc-left requires --trajectory-bundle-physical-validation")
     if direct_osc_enabled and not trajectory_validation_enabled:
         parser.error("--direct-bspline-osc-left requires --trajectory-bundle-physical-validation")
-    if trajectory_validation_enabled:
+    if grasp_smoke_enabled:
+        original_sft_base = Path(
+            "/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft"
+        ).resolve()
+        if args.checkpoint.expanduser().resolve() != original_sft_base:
+            parser.error("--grasp-only-smoke requires the original pi05_rlinf_libero_sft Base")
+        if args.lora_checkpoint is not None:
+            parser.error("--grasp-only-smoke must not load a LoRA Adapter")
+        if args.max_steps == 0 or args.max_steps > 200:
+            parser.error("--grasp-only-smoke requires --max-steps in [1, 200]")
+        if args.teacher_json is None or args.semantic_results_json is None:
+            parser.error("--grasp-only-smoke requires --teacher-json and --semantic-results-json")
+        if args.semantic_result is not None or args.object_id is not None:
+            parser.error("--grasp-only-smoke uses the complete mapping; omit --semantic-result/--object-id")
+        if args.video_out is None or args.trace_out is None:
+            parser.error("--grasp-only-smoke requires --video-out and --trace-out")
+        if not args.record_physical_state:
+            parser.error("--grasp-only-smoke requires --record-physical-state")
+        if any(
+            value is not None
+            for value in (
+                args.probe_out_dir,
+                args.repair_out_dir,
+                args.on_policy_safety_out,
+                args.task_object_id,
+                args.task_object_semantic_result,
+                args.trajectory_subject_object_id,
+                args.trajectory_validation_out,
+                args.mink_python,
+                args.mink_model_binary,
+                args.mink_model_metadata,
+            )
+        ):
+            parser.error("--grasp-only-smoke does not accept unrelated probe or trajectory options")
+        if not args.teacher_json.is_file():
+            parser.error(f"Safety IR v2 file does not exist: {args.teacher_json}")
+        if not args.semantic_results_json.is_file():
+            parser.error(f"Semantic results mapping does not exist: {args.semantic_results_json}")
+    elif trajectory_validation_enabled:
         if args.teacher_json is None or args.semantic_results_json is None:
             parser.error(
                 "--trajectory-bundle-physical-validation requires --teacher-json and --semantic-results-json"
@@ -2015,6 +2072,22 @@ try:
             "env_seed": 0,
             "initial_state_index": 0,
         }
+        if args.grasp_only_smoke:
+            active_scene = data.get("scene_metadata", {})
+            trace_metadata.update({
+                "suite": active_scene.get("benchmark"),
+                "level": active_scene.get("level"),
+                "task_id": active_scene.get("task_id"),
+                "camera_resolution": active_scene.get("camera_resolution"),
+                "env_seed": active_scene.get("environment_seed"),
+                "initial_state_index": active_scene.get("init_state_index"),
+                "experiment_mode": "grasp_only_smoke",
+                "grasp_smoke_object_id": args.grasp_smoke_object_id,
+                "teacher_json_path": str(args.teacher_json.resolve()),
+                "semantic_results_json_path": str(args.semantic_results_json.resolve()),
+                "training_data": False,
+                "model_parameter_source": "original_pi05_rlinf_libero_sft_base_only_no_lora",
+            })
         if collection_enabled:
             trace_metadata.update({
                 "collection_mode": "continuous_on_policy_safety",
@@ -2065,6 +2138,152 @@ try:
             collection_preflight_failure = f"{type(exc).__name__}:{exc}"
             safety_episode_summary["failure_reason_counts"][collection_preflight_failure] = 1
             print("SAFETY COLLECTION PREFLIGHT FAILED:", collection_preflight_failure, flush=True)
+    grasp_smoke_context = None
+    grasp_smoke_monitor = None
+    grasp_smoke_preflight_failure = None
+    grasp_smoke_initial_snapshot = None
+    if args.grasp_only_smoke:
+        def grasp_smoke_bridge_request(payload):
+            conn.send(payload)
+            response = conn.recv()
+            if not isinstance(response, dict):
+                raise RuntimeError("Safety Bridge returned a non-object response")
+            return response
+
+        try:
+            from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                GraspStabilityMonitor,
+                query_live_grasp,
+            )
+
+            expected_instruction = (
+                "pick up the book and place it in the back compartment of the caddy"
+            )
+            scene = data.get("scene_metadata", {})
+            if (
+                scene.get("benchmark") != "obstacle_avoidance"
+                or scene.get("level") != 0
+                or scene.get("task_id") != 1
+                or scene.get("init_state_index") != 0
+                or scene.get("environment_seed") != 0
+                or data.get("instruction") != expected_instruction
+            ):
+                raise ValueError("bridge_reset_did_not_return_obstacle_avoidance_L0T1_state0_seed0")
+
+            teacher = json.loads(args.teacher_json.read_text(encoding="utf-8"))
+            semantic_results = json.loads(
+                args.semantic_results_json.read_text(encoding="utf-8")
+            )
+            semantic = semantic_results.get(args.grasp_smoke_object_id)
+            teacher_object = next(
+                (
+                    item for item in teacher.get("objects", [])
+                    if item.get("id") == args.grasp_smoke_object_id
+                ),
+                None,
+            )
+            decision = semantic.get("semantic_decision") if isinstance(semantic, dict) else None
+            association = semantic.get("physical_association") if isinstance(semantic, dict) else None
+            if (
+                teacher_object is None
+                or teacher_object.get("role") != "target_object"
+                or not isinstance(decision, dict)
+                or decision.get("object_id") != args.grasp_smoke_object_id
+                or decision.get("status") != "resolved"
+                or not str(semantic.get("review_status", "")).startswith("reviewed_")
+                or not isinstance(association, dict)
+                or association.get("status") != "matched_by_iou"
+                or association.get("body_id") != 23
+                or association.get("body_name") != "black_book_1_main"
+                or association.get("geom_ids") != [91]
+                or association.get("geom_names") != ["black_book_1_g0"]
+            ):
+                raise ValueError("reviewed_object_1_to_Body23_Geom91_binding_is_missing_or_inconsistent")
+
+            inventory = grasp_smoke_bridge_request({"op": "geometry_inventory"})
+            if (
+                inventory.get("status") != "complete"
+                or inventory.get("robot_classification_status") != "available"
+            ):
+                raise ValueError("active_bridge_geometry_inventory_is_incomplete")
+            active_geom = next(
+                (
+                    item for item in inventory.get("geometries", [])
+                    if item.get("geom_id") == 91
+                ),
+                None,
+            )
+            if (
+                active_geom is None
+                or active_geom.get("body_id") != 23
+                or active_geom.get("body_name") != "black_book_1_main"
+                or active_geom.get("geom_name") != "black_book_1_g0"
+                or active_geom.get("category") != "scene"
+            ):
+                raise ValueError("reviewed_book_binding_disagrees_with_active_bridge_geometry")
+
+            binding = {
+                "object_id": args.grasp_smoke_object_id,
+                "body_id": association["body_id"],
+                "body_name": association["body_name"],
+                "geom_ids": association["geom_ids"],
+                "geom_names": association["geom_names"],
+            }
+            grasp_smoke_context = {
+                "subject_id": args.grasp_smoke_object_id,
+                "instruction": expected_instruction,
+                "query_payload": {"carried_binding": binding},
+                "review_status": semantic["review_status"],
+                "binding_validation": {
+                    "status": "pass",
+                    "source": str(args.semantic_results_json.resolve()),
+                    "active_geometry_inventory_status": inventory.get("status"),
+                    "active_geom": active_geom,
+                    "current_visual_reidentification_performed": False,
+                },
+            }
+            initial_observation = grasp_smoke_bridge_request(
+                {"op": "observe", "include_snapshot_state": True}
+            )
+            if initial_observation.get("error"):
+                raise ValueError(f"initial_observation_failed:{initial_observation['error']}")
+            if (
+                initial_observation.get("instruction") != expected_instruction
+                or not isinstance(initial_observation.get("snapshot_state"), dict)
+            ):
+                raise ValueError("initial_observation_or_physical_state_snapshot_is_incomplete")
+            data = initial_observation
+            grasp_smoke_initial_snapshot = initial_observation["snapshot_state"]
+            grasp_smoke_monitor = GraspStabilityMonitor(required_samples=3)
+            try:
+                initial_grasp_state = query_live_grasp(conn, grasp_smoke_context)
+            except Exception as exc:
+                initial_grasp_state = {
+                    "status": "unavailable",
+                    "grasp_confirmed": False,
+                    "physical_state_unchanged": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            grasp_smoke_monitor.update(initial_grasp_state, rollout_step=steps)
+            print(
+                "GRASP-ONLY SMOKE PREFLIGHT:",
+                json.dumps(
+                    {
+                        "scene": scene,
+                        "target_binding": binding,
+                        "review_status": semantic["review_status"],
+                        "active_geom": active_geom,
+                        "initial_grasp_status": initial_grasp_state.get("status"),
+                        "initial_grasp_reason": initial_grasp_state.get("reason"),
+                        "required_distinct_states": grasp_smoke_monitor.required_samples,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            grasp_smoke_preflight_failure = f"{type(exc).__name__}: {exc}"
+            print("GRASP-ONLY SMOKE PREFLIGHT FAILED:", grasp_smoke_preflight_failure, flush=True)
     trajectory_validation_context = None
     trajectory_grasp_monitor = None
     trajectory_validation_report = None
@@ -2145,6 +2364,12 @@ try:
         and collection_abort_reason is None
         and not trajectory_validation_restore_abort
         and not direct_execution_stop
+        and grasp_smoke_preflight_failure is None
+        and not (
+            args.grasp_only_smoke
+            and grasp_smoke_monitor is not None
+            and grasp_smoke_monitor.stable
+        )
     ):
         if (
             args.trajectory_bundle_physical_validation
@@ -2471,6 +2696,21 @@ try:
                         "reason": f"{type(exc).__name__}:{exc}",
                     }
                 trajectory_grasp_monitor.update(grasp_state, rollout_step=steps)
+            if args.grasp_only_smoke and grasp_smoke_monitor is not None:
+                try:
+                    from research.gs_opd.repair.trajectory_bundle_acceptance import (
+                        query_live_grasp,
+                    )
+
+                    grasp_state = query_live_grasp(conn, grasp_smoke_context)
+                except Exception as exc:
+                    grasp_state = {
+                        "status": "unavailable",
+                        "grasp_confirmed": False,
+                        "physical_state_unchanged": False,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                grasp_smoke_monitor.update(grasp_state, rollout_step=steps)
             if trace_writer is not None:
                 try:
                     trace_writer.add_step(
@@ -2513,6 +2753,17 @@ try:
                 print(f"STEP={steps} REWARD={data['reward']} DONE={done} SUCCESS={success}", flush=True)
 
             if steps >= args.max_steps or done or success:
+                break
+            if (
+                args.grasp_only_smoke
+                and grasp_smoke_monitor is not None
+                and grasp_smoke_monitor.stable
+            ):
+                print(
+                    "STABLE GRASP DETECTED; STOPPING BEFORE THE NEXT STUDENT ACTION:",
+                    json.dumps(grasp_smoke_monitor.diagnostics(), ensure_ascii=False),
+                    flush=True,
+                )
                 break
 
         if collection_enabled:
@@ -2729,6 +2980,138 @@ try:
             flush=True,
         )
 
+    grasp_smoke_report = None
+    grasp_smoke_report_path = None
+    if args.grasp_only_smoke:
+        diagnostics = (
+            grasp_smoke_monitor.diagnostics()
+            if grasp_smoke_monitor is not None
+            else {
+                "required_distinct_consecutive_states": 3,
+                "current_consecutive_states": 0,
+                "stable_grasp_observed": False,
+                "unique_state_samples": 0,
+                "valid_grasp_samples": 0,
+                "unavailable_sample_count": 0,
+                "samples": [],
+            }
+        )
+        stable = diagnostics.get("stable_grasp_observed") is True
+        samples = diagnostics.get("samples", [])
+        if stable:
+            status = "stable_grasp_detected"
+            failure_category = None
+            stop_reason = "three_distinct_consecutive_closed_bilateral_contact_states"
+        elif grasp_smoke_preflight_failure is not None or any(
+            item.get("status") == "unavailable"
+            or item.get("physical_state_unchanged") is not True
+            or not isinstance(item.get("state_id"), str)
+            or not item.get("state_id")
+            for item in samples
+        ):
+            status = "state_detection_failed"
+            failure_category = "state_detection_failure"
+            stop_reason = grasp_smoke_preflight_failure or "live_grasp_state_evidence_unavailable_or_invalid"
+        elif any(
+            item.get("status") == "pass"
+            and item.get("grasp_confirmed") is True
+            and item.get("gripper_closed") is True
+            and isinstance(item.get("finger_contacts"), dict)
+            and item["finger_contacts"].get("left") is True
+            and item["finger_contacts"].get("right") is True
+            for item in samples
+        ):
+            status = "grasp_unstable"
+            failure_category = "grasp_unstable"
+            stop_reason = "stable_contact_evidence_did_not_reach_three_consecutive_distinct_states"
+        elif any(
+            item.get("gripper_closed") is True
+            and isinstance(item.get("finger_contacts"), dict)
+            and not (
+                item["finger_contacts"].get("left") is True
+                and item["finger_contacts"].get("right") is True
+            )
+            for item in samples
+        ):
+            status = "gripper_contact_insufficient"
+            failure_category = "gripper_contact_insufficient"
+            stop_reason = "closed_gripper_did_not_have_bilateral_opposing_finger_contacts"
+        else:
+            status = "book_not_grasped"
+            failure_category = "model_did_not_grasp_book"
+            stop_reason = (
+                "task_ended_before_stable_grasp"
+                if done or success
+                else "200_action_budget_exhausted_without_stable_grasp"
+                if steps >= args.max_steps
+                else "rollout_stopped_without_stable_grasp"
+            )
+        grasp_smoke_report = {
+            "operation": "L0T1_state0_raw_pi05_base_grasp_only_smoke",
+            "status": status,
+            "failure_category": failure_category,
+            "stop_reason": stop_reason,
+            "scene": data.get("scene_metadata"),
+            "instruction": data.get("instruction"),
+            "target_object_id": args.grasp_smoke_object_id,
+            "review_status": (
+                grasp_smoke_context.get("review_status")
+                if grasp_smoke_context is not None
+                else None
+            ),
+            "binding_validation": (
+                grasp_smoke_context.get("binding_validation")
+                if grasp_smoke_context is not None
+                else None
+            ),
+            "model": {
+                "checkpoint_path": str(ckpt),
+                "checkpoint_file": str(ckpt_file),
+                "lora_adapter_path": None,
+                "parameter_source": "original_pi05_rlinf_libero_sft_base_only",
+            },
+            "action_source": "raw_pi05_student_predicted_action_chunks",
+            "online_route_or_controller_handoff": False,
+            "max_environment_actions": args.max_steps,
+            "executed_environment_actions": steps,
+            "decision_chunks": chunks,
+            "stable_grasp": diagnostics,
+            "task_reward_sum": float(episode_reward_sum),
+            "task_success_once": bool(success),
+            "environment_done": bool(done),
+            "initial_physical_state_snapshot": grasp_smoke_initial_snapshot,
+            "trace_npz": str(trace_output_path),
+            "video_mp4": str(args.video_out),
+            "training_data_created": False,
+            "trajectory_safety_verdict": "not_evaluated",
+        }
+        grasp_smoke_report_path = args.result_out.with_name("grasp_stability_report.json")
+        grasp_smoke_report_path.parent.mkdir(parents=True, exist_ok=True)
+        grasp_smoke_report_path.write_text(
+            json.dumps(grasp_smoke_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if trace_writer is not None:
+            trace_writer.metadata["grasp_only_smoke_status"] = status
+            trace_writer.metadata["grasp_stability_monitor"] = diagnostics
+            trace_writer.metadata["training_data"] = False
+        print(
+            "GRASP-ONLY SMOKE SUMMARY:",
+            json.dumps(
+                {
+                    "status": status,
+                    "failure_category": failure_category,
+                    "steps": steps,
+                    "stable_grasp_observed": stable,
+                    "reward_sum": episode_reward_sum,
+                    "done": done,
+                    "report": str(grasp_smoke_report_path),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
     if trace_writer is not None:
         trace_writer.save(steps=steps, chunks=chunks)
         print("TRACE:" if not collection_enabled else "SAFETY DATA:", trace_output_path, flush=True)
@@ -2754,6 +3137,19 @@ try:
         "substep_contact_recording": bool(args.record_substep_contacts),
         "seed": args.seed,
     }
+    if args.grasp_only_smoke:
+        scene = data.get("scene_metadata", {})
+        result.update({
+            "suite": scene.get("benchmark"),
+            "level": scene.get("level"),
+            "task_id": scene.get("task_id"),
+            "camera_resolution": scene.get("camera_resolution"),
+            "environment_seed": scene.get("environment_seed"),
+            "init_state_index": scene.get("init_state_index"),
+            "checkpoint_file": str(ckpt_file),
+            "grasp_only_smoke": grasp_smoke_report,
+            "grasp_stability_report_path": str(grasp_smoke_report_path),
+        })
     if contact_probe_result is not None:
         if args.contact_safety_probe:
             result["contact_safety_probe"] = contact_probe_result["verdict"]

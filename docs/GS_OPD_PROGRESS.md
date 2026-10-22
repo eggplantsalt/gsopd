@@ -3,6 +3,18 @@
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
 
+## L0T1/state0 C2 原始 π₀.₅ Base 抓取 Smoke（2026-10-22）
+
+- 在 LIBERO-Safety `obstacle_avoidance/L0T1/state0` 使用原始 π₀.₅ SFT Base `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`（SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`）；实际加载日志确认 `lora_checkpoint_path=null`，没有加载 L0T0 的 π₁/π₂ Adapter。Reviewed target `object_1→Body 23 black_book_1_main / Geom 91 black_book_1_g0` 与当前 Bridge Geometry Inventory 核验通过。
+- 使用原始 Student action chunk 和已有 `GraspStabilityMonitor`，在 200 个环境动作后停止（40 chunks），未启用 B-Spline、OSC handoff、避障、放置或数据集生成。reward 为 0、`done=false`，未观察到稳定抓取。监测覆盖初态及每步后的 201 个不同状态：20 个状态确认夹爪闭合，但均无左/右手指接触；另 181 个状态未满足闭合判据；有效抓取样本 0、状态检测不可用 0。因此失败分类为 `gripper_contact_insufficient`，不是状态检测失败或“已有接触但不稳定”。
+- Book Body 23 root 最大位移仅 `2.10e-9 m`；EEF 到 Book root 最近距离 `0.3124 m`。逐步接触记录中没有 robot–book 接触，Book 与桌面接触记录持续存在。该回合只检查抓取阶段，没有运行 Contact Safety Compiler，整体接触安全结论为未评估；不等同于一次完整任务成功。
+- 完整动作/机器人和 Book 状态/接触/图像保存在 `grasp_phase_trace.npz`；视频经 OpenCV 解码核对为 256×256、30 FPS、201 帧；`grasp_stability_report.json` 保存所有 201 次抓取状态判定。`smoke_result.md`、启动清单和文件 SHA-256 位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_state0_base_pi05_grasp_smoke_20261022_attempt1/`。
+- 第一次 Student 启动在动作前因局部适配器 NameError 退出（0 环境步）；零动作产物独立保留。仅补上 Smoke 私有 Bridge 请求函数、完成 `py_compile`/CLI 帮助检查后执行一次有效采集。结束后依据已存的 201 个监测样本将报告分类从摘要中的通用 `model_did_not_grasp_book` 修正为更具体的 `gripper_contact_insufficient`；原始 NPZ 数组未更改。无自动重试或调参。
+
+本次 C2 Smoke 已结束，等待复核后再继续 L0T1 实验。
+
+
+
 ## L0T1 已审核语义绑定与 Contact Safety Compiler 输入适配（2026-10-22）
 
 - 按本轮审核指示，将 `object_1` 作为任务所指的书，基于原始 task-conditioned VLM Candidate 1 选择、原始 SAM Mask 与同状态 Body/Geom 对照，记录为 Body 23 `black_book_1_main` / Geom 91 `black_book_1_g0`。Teacher 原始 Safety IR 仍称 “white book”；与黑色实物外观的冲突保留为未解决属性，映射的依据是任务指代与 VLM 候选视觉选择，IoU 仅作几何佐证。

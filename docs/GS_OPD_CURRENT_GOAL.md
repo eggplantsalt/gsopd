@@ -1,5 +1,14 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：L0T1/state0 C2 原始 π₀.₅ Base 抓取 Smoke 已完成，等待复核（2026-10-22）
+
+- 一次有效 Smoke 使用原始 SFT Base（未加载 π₁/π₂ Adapter），针对 reviewed `object_1→Body 23/Geom 91` 抓取，最多 200 步；本次执行 200 步、reward 0、`done=false`。
+- 未达到 3 个连续不同状态的稳定抓取条件。20 个状态确认夹爪闭合，但左右手指均无目标接触；另 181 个状态未满足闭合判据，状态查询不可用数为 0。失败分类 `gripper_contact_insufficient`；Book 基本未动，未记录 robot–book 接触。该诊断不是完整任务或整体安全判定。
+- 视频、完整 NPZ、每步物理状态/接触、抓取监测报告及清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_state0_base_pi05_grasp_smoke_20261022_attempt1/`。
+- 仅有一次零动作的启动错误，已保留在独立子目录；修正适配器并做静态检查后，仅运行一次有效采集。当前停止，不启动后续 Teacher、规划、避障、训练或额外 Rollout，等待复核。
+
+## 前序局部状态记录（保留）
+
 ## 当前状态：L0T1 reviewed semantic binding 与 Compiler 输入静态验证已完成，等待复核（2026-10-22）
 
 - 已按审核指示生成 object_1→Body 23/Geom 91、object_3→Body 25/Geom 133、object_2→Body 26/Geom 265 的独立 reviewed semantic binding 和 Smoke 可读的 per-object JSON。object_1 的 Teacher “white book” 与黑色实物外观冲突保留；object_2 低 SAM score 0.0986328125 保留；object_4–6 unresolved。
