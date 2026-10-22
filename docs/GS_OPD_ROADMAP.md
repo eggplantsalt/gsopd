@@ -4,7 +4,7 @@
 
 GS-OPD 当前继续聚焦 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 的可复现成功数据生成。第一版通用 Grasp Retargeting 已从原始 π₀.₅ Base Moka Pot 2 成功抓取中提取 object-frame EEF 位姿、接近方向和夹爪时序，并从 Pot 2 放置成功快照运行时解析 Pot 1 绑定。首个 OSC_POSE 候选执行 135 步，闭爪前目标未被推移，稳定双指状态达 8 个连续样本，真实抬升 30.657 mm；135/135 子步接触记录完整，关节限位通过且未记录新非目标碰撞。命名抓取后快照通过 Bridge 精确恢复验证。
 
-这只证明 grasp-retargeting 与 Pot 1 抓持抬升，不代表任务完成：reward 仍为 0、`done=false`，Pot 1 的 Stove `On` 谓词为 false。源 π₀.₅ 前缀含 Ginger Beer 接触，因此组合历史不能标为安全成功示范。没有运行搬运/放置、训练、Teacher/SAM3 或 L0T0，也没有修改 B-Spline 生成器、默认控制配置或模型。当前独立归档 `/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/`，等待复核；后续才从保存快照计划真实 OSC 搬运。
+后续 OSC 搬运已于 2026-10-22 从该快照执行一次，但受正常 horizon 约束只达到部分搬运：Pot 1 在 t=966 仍被稳定抓持，离支撑高度约 133 mm；余下 34 步不足以完成估算约 119 步的下降、释放、撤离和稳定。Pot 2 `On` 与 Stove `Turnon` 保持成立，Pot 1 `On` 未成立，reward=0、`done=false`。下降中 Pot 1–Pot 2 峰值接触力 71.20 N，Pot 2 位移仅 0.303 mm；无新增机器人–非目标碰撞。此结果和保留 Ginger Beer 碰撞的历史都不构成安全成功示范。没有修改 horizon/任务状态/关节限制或训练。当前等待复核；下一阶段应从更早 Pot 2 抓持状态压缩完整动作链。独立放置证据见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot1_stove_placement_20261022_attempt1/`。
 ## 总体目标
 
 在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。
@@ -56,6 +56,8 @@ Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨
 
 
 9. **可复用 Grasp Retargeting（首版物理验证通过，等待复核）**：新增通用物体坐标抓取模板提取、运行时 Body/Geom 绑定和标准化 `expert_osc` action record。Pot 2 来源到 Pot 1 目标实测稳定双指抓持，并抬升 30.657 mm；恢复快照精确验证通过。未搬运/放置，T2 仍未完成；由于源 VLA 前缀已有 Ginger Beer 接触，组合历史不是安全成功示范。证据见 `docs/GS_OPD_PROGRESS.md` 与独立归档 `grasp_retargeting_l0t2_20261022_attempt1`。
+
+10. **L0T2 Pot 1 搬运与 Stove 放置（本轮局部执行因标准 horizon 不足而停止，等待复核）**：从 Pot 1 已验证抓持 Snapshot（t=854）恢复，在正常 horizon 1000 内评估三条由真实 Cook Region 与器物几何构造的 OSC 放置候选。两条 clearance 分支各运行 14 步；`west_north_diagonal` 部分搬运 112 步，至 t=966 时仍抓持 Pot 1，需下降约 133 mm。按实测速率估算下降、释放、撤离及稳定还需约 119 步，剩余 34 步，因此停止。Pot 2 `On` 和 Stove `Turnon` 保持真，Pot 1 `On` 为假，reward=0、`done=false`；下降时 Pot 1–Pot 2 峰值接触力 71.20 N，Pot 2 移动 0.303 mm；无新机器人–非目标碰撞，Panda 限位 112/112 通过。任务成功与安全成功均为 false；历史 Ginger Beer 接触保留。独立数据和报告位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot1_stove_placement_20261022_attempt1/`。下一阶段待复核后从更早的 Pot 2 抓持状态压缩完整搬运链；不继续从 t=966 搜索或扩展 horizon。
 
 ## 主要记录
 

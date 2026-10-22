@@ -2,6 +2,17 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T2 Moka Pot 1 OSC 搬运与放置：受标准 horizon 预算限制而停止（2026-10-22；等待复核）
+
+直接从 Grasp Retargeting 成功快照 `/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/evidence/moka_pot_1_retargeted_stable_grasp_runtime_snapshot.pkl` 恢复，没有重新抓取、重放 294+425 步、运行其他三个抓取候选或调用 VLA/Teacher/SAM3。Bridge 确认恢复在 timestep 854 / horizon 1000：Pot 1 双指稳定抓持通过，Pot 2 原生 `On(moka_pot_2, flat_stove_1_cook_region)` 与 `Turnon(flat_stove_1)` 为真，Pot 1 `On` 为假。放置参考来自真实 `flat_stove_1_cook_region` site 和 Pot 几何，生成了 3 条位置有依据的候选，未修改物体状态、BDDL/reward、horizon 或关节限制。
+
+三条分支均从同一抓持 Snapshot 恢复。候选 1 `northwest_base_clearance` 与候选 2 `west_cook_center` 各执行 14 步抬升后触发内部 clearance waypoint 动作上限，均未到达横向放置点。候选 3 `west_north_diagonal` 是唯一继续到放置区的分支，t=854–966 共 112 步：抬升 27、快速转运 43、末端对准 2、慢速下降 40。t=966 时 Pot 1 根位置为 `[-0.100565, -0.176885, 1.129680] m`，目标根位置 `[-0.101758, -0.172661, 0.996606] m`；横向误差约 4.4 mm，仍需下降约 133.1 mm。最近 40 步实测下降 54.3 mm，估算仅下降尚需约 98 步；加至少 3 步释放、14 步撤离、4 个稳定状态，完整收尾估计约 119 步，剩余 horizon 只有 34 步，故按约束停止，没有释放或撤离。
+
+Pot 1 在下降阶段从 timestep 947 起与 Pot 2 发生真实接触，峰值力 71.20 N；Pot 2 相对起始 Snapshot 位移约 0.303 mm，仍满足原生 `On`。未记录新机器人–非目标碰撞；112/112 Panda 限位检查通过，所有物理子步接触采样完整。终态 Pot 1 仍稳定抓持，环境真实 reward=0、`done=false`、`task_done=false`；Pot 1 `On=false`，Pot 2 `On=true`，Stove `Turnon=true`。任务未成功，不能标注为安全成功示范。此前原始 VLA 前缀 Ginger Beer 接触（动作步 21–56）完整保留，安全成功判定为 false。
+
+真实七维动作、双相机 Observation、物体与机器人状态、真实接触/力/子步监测、逐步规范化 action record、候选 Snapshot 和视频均独立归档于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot1_stove_placement_20261022_attempt1/`。入口 `README.md`；主结果 `evidence/final_report.json` 与 `evidence/placement_attempt_report.json`；连续 966 步动作链索引 `evidence/episode_action_chain_manifest.json` / `evidence/complete_action_chain_index.npz`；t=966 可恢复快照 `evidence/pot1_partial_transport_t966_runtime_snapshot.pkl`，其与 Bridge 终态积分状态差为 0；MP4 位于 `evidence/videos/`。没有训练或修改模型、抓取模块、默认控制配置、任务规则或 horizon。本阶段停止等待复核；下一阶段需从更早 Pot 2 抓持状态压缩完整搬运链，以便在正常 horizon 内完成 Pot 1 放置与释放，同时继续把任务成功和安全成功分开判定。
+
+
 
 ## 首版可复用 Grasp Retargeting：Pot 2 → Pot 1 实际抓持与抬升通过（2026-10-22；等待复核）
 
