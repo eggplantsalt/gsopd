@@ -1,5 +1,11 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：L0T1 三对象候选关联审计完成，待人工复核（2026-10-22）
+
+- 归档证据支持 Book 原生 1024 与 Bottle/Caddy 使用的 512 图像来自同一物理初始状态：配套 512 RGB 与 Geom ID 哈希/数组完全一致；旧归档和原生分辨率采集的 289 项 integration state、机器人状态及所有物体姿态逐项一致。已验证 Safety IR 的运行清单也指向同一 raw RGB。
+- 离线生成 `candidate_semantic_physical_bindings.json` 与 `manual_review_report.md`。候选关联：`object_1`→Candidate 1/Body 23/Geom 91（IoU 0.916855，Teacher “white book” 与黑色外观冲突，继续 unresolved）；`object_3`→Candidate 0/Body 25/Geom 133（0.984974）；`object_2`→Candidate 0/Body 26/Geom 265（0.958812，SAM score 0.098633，低分限制保留）。`object_4`–`object_6` 保持 unresolved。
+- 完整源证据和 SHA-256 清单：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_candidate_binding_evidence_audit_20261022_attempt1/`。Safety IR 和 Compiler 未修改，候选 JSON 仅供审核；等待复核后决定后续语义确认。
+
 ## 当前状态：object_2 Caddy Task-Conditioned Candidate Verification 完成，等待复核（2026-10-22）
 
 - 用同状态归档 512×512 RGB 和最新 `brown caddy`/threshold 0.05 SAM3 候选，仅对整只 Caddy 执行一次 Task-Conditioned Candidate Verification。原始 L0T1 指令不变，`--target-description caddy`；请求包含原图及全部 1 个自动裁剪候选，Prompt 允许 unresolved，不按单候选强制选择。

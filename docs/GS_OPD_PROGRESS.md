@@ -3,6 +3,14 @@
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
 
+## L0T1 Book/Bottle/Caddy 候选关联与跨采集状态离线审计（2026-10-22）
+
+- 对照三组既有 Task-Conditioned Candidate Verification、SAM3、Body-level IoU、Safety IR 和捕获状态记录。Book 的 1024 RGB SHA-256 为 `2b94ccff…a5a7df`，与原生 1024 capture 一致；该次配套 512 RGB SHA-256 为 `ad606f00…82ec16e`，与 Bottle/Caddy 使用的 512 图像一致。旧/新 512 Geom ID 文件 SHA-256 都为 `7a0a12dd…03c661`，数组逐项相等。
+- 旧 512 归档 before/after 与原生分辨率采集 initial/after-512/after-1024 的完整状态记录逐项相同：289 个 integration state 值及机器人/物体状态相同，规范化 SHA-256 `30dcce10…18000e62`；Book、Bottle、Caddy 位姿和四元数完全一致。原生渲染间无 reset/step。使用的通过验证 Safety IR SHA-256 为 `b0bc78a6…ee24bd`，其实际 raw RGB 输入与同一几何归档的 raw RGB 字节一致；较早的 teacher_input_reference 是独立对照图，不是该 IR 的输入。
+- Candidate 记录：Book `object_1` 选 Candidate 1，SAM `book`/0.1 score 0.390625，Body 23 `black_book_1_main` / Geom 91 IoU 0.916855；因 Teacher `white book` 与黑色书/文件夹外观冲突，语义仍 unresolved。Bottle `object_3` 选 Candidate 0，score 0.968750，Body 25 / Geom 133 IoU 0.984974。Caddy `object_2` 选 Candidate 0，score 0.098633（threshold 0.05），Body 26 / Geom 265 IoU 0.958812，保留低 SAM 分数限制。其余 `object_4`–`object_6` 未验证并保持 unresolved。
+- 仅生成数据盘独立待审核 JSON 和人工报告：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_candidate_binding_evidence_audit_20261022_attempt1/`。完整状态核验、Safety IR、三组原始 VLM 请求/回答、SAM Mask/结果、IoU 和源记录均复制并列入 SHA-256 清单。Safety IR 未修改，候选关联未接入 Compiler；本轮未调用 VLM、SAM3 或 MuJoCo。等待人工复核。
+
+
 ## L0T1 object_2 Caddy Task-Conditioned Candidate Verification（2026-10-22）
 
 - 复用最新 `brown caddy`、SAM3 threshold 0.05 的归档候选及其同状态 512×512 RGB。配对记录确认 RGB/Geom ID 使用相同的 180° 方向，采集前后物理状态一致，capture 未 reset/step。原始任务指令保持为 `pick up the book and place it in the back compartment of the caddy`，目标描述为中性 `caddy`，仅识别整个 Caddy。
