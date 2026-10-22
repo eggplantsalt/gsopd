@@ -1,14 +1,13 @@
 # GS-OPD 总体路线
 
+## 当前状态（2026-10-22）
+
+GS-OPD 当前继续聚焦 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 的可复现成功数据生成。第一版通用 Grasp Retargeting 已从原始 π₀.₅ Base Moka Pot 2 成功抓取中提取 object-frame EEF 位姿、接近方向和夹爪时序，并从 Pot 2 放置成功快照运行时解析 Pot 1 绑定。首个 OSC_POSE 候选执行 135 步，闭爪前目标未被推移，稳定双指状态达 8 个连续样本，真实抬升 30.657 mm；135/135 子步接触记录完整，关节限位通过且未记录新非目标碰撞。命名抓取后快照通过 Bridge 精确恢复验证。
+
+这只证明 grasp-retargeting 与 Pot 1 抓持抬升，不代表任务完成：reward 仍为 0、`done=false`，Pot 1 的 Stove `On` 谓词为 false。源 π₀.₅ 前缀含 Ginger Beer 接触，因此组合历史不能标为安全成功示范。没有运行搬运/放置、训练、Teacher/SAM3 或 L0T0，也没有修改 B-Spline 生成器、默认控制配置或模型。当前独立归档 `/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/`，等待复核；后续才从保存快照计划真实 OSC 搬运。
 ## 总体目标
 
 在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。
-
-## 当前路线选择（2026-10-22）
-
-- 最近一轮原始 π₀.₅ Base-only 跨任务筛选覆盖 `obstacle_avoidance/L0` T2/T3/T4，各用 init-state 0、固定 seed 和最多 400 个动作；结果均未完整成功。T2 是唯一出现连续三状态真实双指目标抓取和目标物体搬运的任务，因此**建议在复核后优先作为后续安全轨迹采集候选**。T2 原始回合有 ginger-beer 非目标接触，不是安全轨迹；需单独安全筛选。
-- L0T1 的 attempt6 OSC 辅助 Book 抓取快照和既有 B-Spline/Snapshot 物理实验继续独立保留，但按当前请求暂停该调试，不重新抓取、不运行 L0T0。当前跨任务筛选只用于场景选择；在复核前不启动新的搬运、示范或训练。
-- 当前实验详细记录见 `docs/GS_OPD_PROGRESS.md` 顶部；局部状态见 `docs/GS_OPD_CURRENT_GOAL.md`。本次跨任务运行和完整证据索引见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T234_base_pi05_rollout_400_20261022_attempt1/experiment_report.md`。
 
 ## 阶段与当前状态
 
@@ -54,6 +53,9 @@ attempt6 仅完成抓取：reward 0、done false；未执行 B-Spline、搬运�
 ## 参数化任务语义采集进度（2026-10-21）
 
 Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨率，默认 L0T0 初始化保持原样。已选择不同 BDDL 的 obstacle_avoidance L0T1“pick up the book and place it in the back compartment of the caddy”，state 0；冻结 Qwen3.8 Teacher 已先后对两次独立 capture 生成 Safety IR v2。最近一次使用 Geom 对齐的同状态 RGB 离线调用一次，不连接 Bridge；输出通过 Schema，保留了输入哈希、原始 JSON 和与旧输出的对比。新旧响应对 book/caddy/bottle 语义保持一致，但对 cup/utensil/plant 的命名和 robot-contact 规则覆盖有差异；旧图与本次 RGB 来自不同 reset，不能把此差异归因于同状态重推理。Teacher `white book` 与 BDDL `black_book_1` 及 `white_place_box_1` 的关系仍未确认。本轮在相同归档输入和 Checkpoint 上独立运行 `book`/0.1、`green bottle`/0.5、`brown caddy`/0.5：book 的一个低分候选与 Body 23 IoU 0.9202；bottle 候选与 Body 25 IoU 0.9850；caddy 无候选且 raw combined score max 0.0986。候选与几何重叠仅作诊断，没有建立语义绑定。对 `object_1` 的一次 VLM 消歧已返回 unresolved；Candidate 0 与 Body 23/27 的同坐标人工对照图已归档，当前等待人工复核后再决定下一步。
+
+
+9. **可复用 Grasp Retargeting（首版物理验证通过，等待复核）**：新增通用物体坐标抓取模板提取、运行时 Body/Geom 绑定和标准化 `expert_osc` action record。Pot 2 来源到 Pot 1 目标实测稳定双指抓持，并抬升 30.657 mm；恢复快照精确验证通过。未搬运/放置，T2 仍未完成；由于源 VLA 前缀已有 Ginger Beer 接触，组合历史不是安全成功示范。证据见 `docs/GS_OPD_PROGRESS.md` 与独立归档 `grasp_retargeting_l0t2_20261022_attempt1`。
 
 ## 主要记录
 

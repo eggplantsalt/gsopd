@@ -2,6 +2,29 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+
+## 首版可复用 Grasp Retargeting：Pot 2 → Pot 1 实际抓持与抬升通过（2026-10-22；等待复核）
+
+实现 `research/gs_opd/repair/grasp_retargeting.py`，从已有真实 π₀.₅ Base rollout 提取物体坐标系下的 EEF 抓取位姿、接近方向/距离和夹爪开合时序；目标 Body/Geom 由每次调用提供的 Bridge Snapshot 与 Geometry Inventory 运行时解析。组件不包含 T2 Body ID 或固定世界坐标。实验适配器通过现有 OSC_POSE、Runtime Snapshot 和 `GraspStabilityMonitor` 将 Moka Pot 2 的抓取迁移至 Pot 1。未修改 B-Spline 生成器、默认控制配置、Checkpoint 或环境 reward。
+
+源记录是 L0T2 原始 π₀.₅ Base 回合 `...attempt2/rollout_trace.npz`（SHA-256 `d67aef128fe5a50ed7a3557f86a34b5bb1e127e4a55165c2ce450e4a3015c5df`）；源抓取的闭合双指稳定样本在 139–141 步，模板包含物体相对 EEF 变换、局部接近方向、60.65 mm 接近距离、开指命令和闭指动作序列。目标起点为 Pot 2 放置成功 Runtime Snapshot（SHA-256 `7bb5d4e7fbcbf84570b17e13f6430dfbcf323b7f7a483aea8ff107eb607cfa11`），Episode timestep 719 / horizon 1000。Bridge 首次启动时的模型指纹与保存快照不一致，因此没有绕过 Restore 校验；按原成功归档的恢复流程执行一次带 seed 的 task reset 后，模型几何指纹 `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752` 完全匹配，再由 Bridge 成功恢复快照。
+
+运行时解析出 Pot 1 root Body `moka_pot_1_main`（Body 23）及其 Geom 子树。四个有限抓取位姿候选按固定次序生成；首个 `source_pose` 已成功，因而未执行剩余三项。该隔离分支从 timestep 719 执行至 854，共 135 个真实 OSC_POSE 七维动作：clearance 29、transit 55、pregrasp 27、approach 8、闭指 11、抬升验证 5 步。闭爪前 EEF 位置误差 7.41 mm、旋转误差 0.00054 rad，Pot 1 根部位移为 0 mm。`GraspStabilityMonitor` 要求的 3 个连续不同状态通过，记录到 8 个连续稳定双指闭合样本。Pot 1 根 Z 从 0.966231 m 升至 0.996888 m，实测上升 **30.657 mm**。所有 135 步子步接触采样完整，Panda 限位检查 135/135 通过，没有新机器人–非目标碰撞事件。
+
+真实恢复验证：命名成功快照经 Bridge 再次 Restore 后 MuJoCo integration state 最大绝对差为 0；实时 `grasp_state` 返回 `pass`、gripper closed，左右指分别接触 Pot 1。此阶段任务 reward 仍为 0、`done=false`，原生 `On(moka_pot_1, stove)` 仍为 false；Pot 2 `On` 与 Stove `Turnon` 保持 true。仅证明抓持迁移及至少 30 mm 抬升，未搬运、放置或完成 T2。源 π₀.₅ 前缀存在 Ginger Beer 接触，因此不得把组合历史标记为安全成功示范。
+
+逐步数据包含 `expert_osc` 实际 7D Action、两个相机的动作前/后 Observation、任务和目标物体、Snapshot 来源、物理状态、真实谓词、碰撞/子步数据、GraspStabilityMonitor 样本；MP4 视频 136 帧。完整独立证据目录：`/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/`；入口为 `README.md` 和 `evidence/attempt_report.json`，成功恢复快照为 `evidence/moka_pot_1_retargeted_stable_grasp_runtime_snapshot.pkl`（SHA-256 `6c669a50efeab31e12750db95d22dcae380f2c716af4ae85ac87b4c3502590ea`）。组件位于 `/workspace/zy_workspace/RLinf/research/gs_opd/repair/grasp_retargeting.py`。本轮到此停止并等待复核。
+
+## L0T2 完整 Episode 延续：Moka Pot 1 OSC 抓取探索未成功（2026-10-22；等待复核）
+
+按当前目标，直接用 Moka Pot 2 Near-Goal Recovery 的 `moka_pot_2_native_goal_success_runtime_snapshot.pkl` 恢复真实 MuJoCo 状态；未重放此前 294+425 步。Bridge 在 timestep 719 / 正常 horizon 1000（剩余 281 步）确认 `On(moka_pot_2, flat_stove_1_cook_region)=true`、`Turnon(flat_stove_1)=true`，而 Pot 1 的 `On` 为 false。Stove cook-region 中心为 `[-0.04776,-0.19766,0.905] m`、半尺寸 `[0.075,0.075,0.0025] m`；按 Stove 支撑面与 Pot 1 碰撞几何计算的根部目标高度为 `0.99761 m`，没有把 Caddy/Stove Body 原点当放置点。
+
+从同一快照隔离运行 3 个 OSC_POSE 抓取/放置前置候选，各自均在正常 Episode horizon 内结束，没有改 horizon。候选 1（顶向、夹爪沿 X，cook 区左侧）232 步；候选 2（顶向、夹爪沿 Y，左边缘）212 步；两者均未接触 Pot 1，夹爪在空中闭合，Pot 1 位移为 0。候选 3（Pot 1 中高位置接近）110 步后因下降 waypoint 未到达而停止，EEF 残差为 `[21.99, 8.30, 44.07] mm`。该候选在 timestep 784–829 连续 46 个控制状态出现左右指与 Pot 1 接触，但夹爪开口比例仍为 0（全开），因此是未闭合的接触/推挤，不是稳定抓取；峰值指–Pot 接触力 `172.92 N`，Pot 1 根部最大位移 `13.51 mm`，未被抬起。
+
+三条分支均 reward `0`、`done=false`，均未达到 Pot 1 的 `On`；Pot 2 的 `On` 和 Stove `Turnon` 始终保持。没有记录到机器人–非目标物体/场景碰撞或关节限位越界；Pot 2 位移为 0。接触子步监测覆盖完整。最直接瓶颈是抓取姿态与 OSC 可达性/夹爪时序不匹配：较高抓取高度闭合落空，中高位目标无法被 OSC 到达，导致夹爪全开状态下持续推挤 Pot 1。该实验未完成完整 T2，不能标为成功或安全示范；其历史 π₀.₅ 前缀仍含动作 21–56 的 Ginger Beer 接触。
+
+独立归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot1_complete_episode_osc_20261022_attempt1/`。主报告 `evidence/attempt_report.json`；起始快照与验证前置状态位于 `evidence/preflight/`；每个分支的真实动作/Observation/接触/物体状态、终止快照和视频位于 `evidence/branches/` 与 `evidence/videos/`。本轮未训练、未改模型/horizon/默认控制配置，未调用 Teacher/SAM3，也未重新运行旧动作前缀。当前停止，等待复核。
+
 ## 原始 π₀.₅ Base obstacle_avoidance/L0 T2–T4 跨任务筛选（2026-10-22；完成，待复核）
 
 - 按最新局部指示暂停 L0T1 OSC/B-Spline 调试；未运行 L0T0，未恢复或重做 attempt6 的 408 步抓取。T2、T3、T4 各运行一次有效独立原始 π₀.₅ Base rollout：Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，模型权重 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`，未加载 π₁/π₂ LoRA；init-state 0、Bridge seed 0、VLA RNG seed 20261022、最多 400 步。每回合均执行到 400 步，reward=0、done=false；预算结束不构成模型不能完成任务的结论。
