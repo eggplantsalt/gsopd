@@ -2,11 +2,29 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
-## L0T1 当前状态：`blocked_by_base_grasp`（2026-10-22）
 
-- Base π₀.₅ 在 L0T1/state0 的一次 200 步抓取 Smoke 未触碰 Reviewed Book Body 23，稳定抓持失败；现将该分支明确标记为 `blocked_by_base_grasp`，不继续重试。
+## L0T1/state0 OSC 辅助 Book 抓取可行性实验（2026-10-22；成功，待复核）
+
+- 按当前任务目标回到 `obstacle_avoidance/L0T1/state0`，只验证 Book 抓取，不运行 L0T0。沿用审核绑定 `object_1→Body 23 black_book_1_main / Geom 91 black_book_1_g0`。动作来自脚本化 7D `OSC_POSE` 世界坐标笛卡尔 waypoint 控制器；不调用 VLA。原 π₀.₅ Base、Checkpoint、B-Spline 候选生成器和默认控制配置均未改。
+- 成功回合为 attempt6，共 408 个实际控制动作。动作按安全高度绕过 Bottle 上方；沿 Book 长轴将夹持中心向远离置物盒的一端偏移 25 mm，并使用同一等价 jaw 轴朝向。控制前后保持现有 `GraspStabilityMonitor`：闭合夹爪、Body 23 左右指接触、`grasp_confirmed`，连续 3 个不同物理状态。初次稳定抓取有 3/3 有效连续样本；完整动作/Book 状态/双指接触及每步 25 子步接触记录覆盖全部 408 个控制步，无机器人与非目标物体接触。恢复后另有 4 个连续不同状态通过。
+- 首个稳定抓取及恢复后续检均以外置完整运行时快照完成。新的 Safety Bridge 进程从文件恢复后，289 项 MuJoCo Integration State 最大绝对差为 0，模型几何 SHA-256 一致。Book root 从 `[-0.0457130, 0.1270425, 0.8829599] m` 移至 `[-0.0416613, 0.1198900, 0.8843607] m`，总位移 8.34 mm。抓取完成不等同于提升或任务完成：reward=0、done=false；未执行搬运、放置、B-Spline、训练或训练数据生成，轨迹安全 verdict 未评估。
+- 迭代中的非零动作失败均保留独立目录：quaternion frame/waypoint 预算/jaw 轴识别问题后，attempt4 与 attempt5 分别在下降时发生 Panda 手掌–place box Body 27 接触并立即停止；最终将抓取点沿 Book 长轴远离置物盒偏移后通过。没有放宽接触判据或忽略碰撞。
+- 成功归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/`；包含 408×7 动作与双相机帧的 `osc_assisted_grasp_trace.npz`、逐步 `step_records.json`、409 帧视频、起始/恢复后完整快照、实验报告和 SHA-256 清单。全部尝试索引与复核摘要：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
+- 等待复核。复核后再从此可恢复状态生成 18 条 B-Spline 候选，并按用户指定的宽松工程跟踪阈值开展绕障轨迹采集；本轮没有生成候选或执行下游动作。
+
+## 历史实验：L0T0/state0 trajectory-001 Snapshot 旋转阈值 0.25 对照（2026-10-22；非当前目标）
+
+- 完成一次原始 π₀.₅ Base 回合，未加载 Adapter。Student 运行 60 个动作后达到稳定双指抓持；按当前状态重新生成 18 个 B-Spline 候选并通过几何筛选，只将 Left `trajectory-001` 送入 Snapshot。0.02 m/s、单候选 1200 步，路径计划 815 步，实际 108 步后拒绝；其他 17 条没有物理跟踪。
+- 本次唯一配置变化是 CLI 显式覆盖 `maximum_grasp_relative_rotation_error_rad=0.25`。`TrackingConfig` 默认仍为 0.20 rad；EEF 姿态控制、参考点推进、B-Spline、OSC 和其他安全阈值均未改变。相对旋转误差 0.003585–0.097446 rad，在第 39 个 Snapshot 动作达到峰值后回落，结束为 0.093105 rad；未在 0.21 rad 附近稳定或持续增长，也未触及 0.25。相对位置误差最大 0.004229 m；球心误差最大 0.021525 m。第 108 个动作的 EEF 跟踪误差 0.025477 m 超过保持不变的 0.025 m 阈值，是 tracker 首个失败原因。
+- 逐步记录显示更早的第 97 个 Snapshot 动作中，Geom 71 `gripper0_hand_collision` / Body 12 与 Geom 494 `flat_stove_1_collision_burner` / Body 36 接触，分类 `unknown`（无明确允许规则，最大力范数 116.513 N）。现有验证流程在 Snapshot 分支结束后才汇总全局接触分类，因而没有即时停止，并继续至 EEF 跟踪越限；此为当前运行链的停止能力限制，本轮未改变监测或编译规则。接触子步完整覆盖 2700/2700；左右指抓持 108/108 步保持；Panda 关节限位及 Workspace 每步 pass。Contact Compiler 对显式 object_1/object_3 规则返回局部 `safe`，但总体接触分类 `unknown`、`physical_safety_claim=false`，不能标为整体安全。
+- 与前次 0.20 rad 实验不是严格同起始状态对照：state ID 和 Integration State SHA 均不同，物体起始位置差 0.065975 m，姿态差 0.237539 rad。此次 Snapshot 已精确恢复（Integration State 最大误差 0），主环境后续动作 0 步、reward 0、done false；未执行主环境搬运/放置、未训练、未生成训练数据、不重试。
+- 完整报告 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_rotlimit025_20261022_attempt1/experiment_report.md`；完整 Snapshot JSON、108 行误差/姿态/关节/接触 CSV、前次参考对比图、学生阶段 MP4、命令与 SHA-256 清单均在同目录。`result.json` 顶层 selected candidate 为 null 是因为没有候选验收通过；嵌套验收记录明确表明实际请求并跟踪了 `trajectory-001`。当前等待复核。
+
+## L0T1 原始 π₀.₅ Base 抓取 Smoke 历史结果（2026-10-22）
+
+- Base π₀.₅ 在 L0T1/state0 的一次 200 步抓取 Smoke 未触碰 Reviewed Book Body 23，稳定抓持失败；原始 Smoke 结果仍标记为 `blocked_by_base_grasp`。随后用户将目标明确切回 L0T1，并通过上方独立 OSC 辅助实验验证了抓取。
 - 原始 Smoke 及纯离线诊断证据全部保留在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_state0_base_pi05_grasp_smoke_20261022_attempt1/` 和 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`，没有清理或覆盖；原始 Smoke 目录新增 `status_blocked_by_base_grasp.json` 作为带哈希的状态侧车文件。
-- 后续本轮转向已验证可稳定抓取的 L0T0/state0，进行 Round 0 有界 Snapshot 候选探索预检；L0T1 不参与该回合。
+- 随后的 L0T0 Snapshot 记录仅为历史实验；当前目标以本文件顶部的 L0T1 OSC 抓取状态为准。
 
 ## GS-OPD Round 0：L0T0 广范围候选 Snapshot 预检（2026-10-22）
 

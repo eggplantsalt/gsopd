@@ -6,16 +6,23 @@
 
 ## 阶段与当前状态
 
-### 最新状态：L0T1 `blocked_by_base_grasp`；L0T0 trajectory-001 Snapshot 对照完成待复核（2026-10-22）
+### 最新状态：L0T1/state0 OSC 辅助抓取通过，等待复核（2026-10-22）
 
-L0T1/state0 原始 π₀.₅ Base 的一次 200 步抓取未触及 Book Body 23，失败状态标为 `blocked_by_base_grasp`；所有 NPZ、视频、运行日志和离线诊断保留，原始 Smoke 目录新增带证据哈希的 `status_blocked_by_base_grasp.json`，不继续重试。历史诊断显示 EEF 与 Book 最近相距 0.31244 m、机器人与瓶子有 89 条接触、Book 未动，动作预测与执行一致；策略内部视觉目标错误仍为 unknown。
+当前路线回到 LIBERO-Safety `obstacle_avoidance/L0T1/state0`，目标是取得完整成功轨迹。原始 π₀.₅ Base 的 200 步抓取未接触 Book Body 23；本轮使用一次性脚本控制的现有 7D OSC_POSE 接口，复用已审核的 Body 23 / Geom 91 绑定，解决抓取阶段瓶颈。动作辅助来源、实际动作、状态和接触均逐步记录；未调用 VLA，未改变 VLA Checkpoint、B-Spline 候选生成器或默认控制配置。
 
-L0T0/state0 一次 Round 0 预检以原始 Base 在 50 个 Student 动作后达到稳定双指抓持，生成 18 条候选且几何筛选全部通过。随后针对 `trajectory-001` 做一次慢速 Snapshot 对照（0.02 m/s、1200 步上限）：844 计划步预算通过，实际跟踪 73 步后在 step 72 因相对旋转误差 0.208495 rad 超过原 0.20 rad 阈值拒绝，双指接触仍保持。此前 0.04 m/s / 480 步基线请求 422 步、预算也通过，并在同一控制步因同一姿态条件失败；属于物理跟踪失败而非预算限制。分支接触子步覆盖完整，Compiler 对已观察片段返回 `safe`，但整条路线未通过；Snapshot 恢复完整、主动停止不再误记为恢复失败，主环境搬运为 0 步，整体物理安全仍不得判 `safe`。报告、逐步误差表和哈希见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`。当前等待复核，不继续重试或调参。
+成功回合 attempt6 共 408 个控制动作。以安全高度从 Bottle 一侧绕行，在 Book 长轴上将夹持中心向远离 place box 的一端偏移 25 mm。原有稳定判据要求连续 3 个不同状态中夹爪闭合、左右指接触目标且 `grasp_confirmed`；首次稳定抓取有 3 个有效样本。完整子步接触覆盖为真，没有机器人–非目标物体接触。文件快照在全新 Bridge 进程中恢复，MuJoCo Integration State 最大绝对误差为 0；恢复后另有 4 个连续不同状态通过同一抓取检查。Book root 位移 8.34 mm。
 
+本轮只验证抓取：reward 0、done false；没有执行 B-Spline、搬运、放置、轨迹安全编译或训练，trajectory safety verdict 为 `not_evaluated`。attempt4/5 的手掌–place box Body 27 碰撞及前期控制几何错误均已保留并记录；成功回合没有因这些原因跳过任何接触或放宽判据。完整成功数据在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/`，尝试索引/复核包在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
+
+当前等待复核。复核后下一阶段才从保存的抓取后状态直接生成 18 条候选，并使用用户指定的宽松工程跟踪阈值开展绕障轨迹采集；此阶段尚未启动。
+
+### L0T0 Snapshot 对照（历史记录，非当前目标）
+
+2026-10-22 的 L0T0 trajectory-001 0.25 rad Snapshot 对照执行 108 个动作后因 EEF 跟踪误差 0.025477 m 超过原 0.025 m 限值终止；第 97 个动作发生夹爪手掌–burner 接触，分类 `unknown`、最大力范数 116.513 N。接触子步完整，但存在 unknown 接触，整体物理安全没有通过。此记录不再定义当前路线。报告位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_rotlimit025_20261022_attempt1/`。
 
 ## 历史局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22；`blocked_by_base_grasp`）
 
-使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`，L0T1 随后标记 `blocked_by_base_grasp`。任务未完成、整体物理安全未评估，证据保留，不重试。
+使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`，当时原始 Base-only 分支标记为 `blocked_by_base_grasp`。该条历史只描述 Base-only Smoke；当前 L0T1 路线状态见上方 OSC 辅助抓取记录。任务未完成、整体物理安全未评估，原始证据保留。
 
 
 - **2026-10-22 最新语义输入状态**：基于同状态归档证据形成独立 reviewed semantic binding 适配：object_1→Body 23/Geom 91（保留 Teacher “white book” 与黑色外观冲突），object_3→Body 25/Geom 133，object_2→Body 26/Geom 265（保留低 SAM score）；object_4–6 unresolved。现有 Contact Safety Compiler 的纯身份解析对三条映射通过静态验证。9 个 null Geom 名仅在独立兼容 Inventory 中用可追溯占位符表达，原始 IR/Inventory 与 Compiler 未改。规则输入就绪不构成轨迹安全结论；接入执行链前等待复核。

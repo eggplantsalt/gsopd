@@ -120,6 +120,11 @@ def parse_args():
         type=int,
         help="Optional experiment-only per-candidate Snapshot control-step bound; the default TrackingConfig is unchanged when omitted.",
     )
+    parser.add_argument(
+        "--snapshot-maximum-grasp-relative-rotation-error-rad",
+        type=float,
+        help="Optional experiment-only Snapshot grasp-relative rotation threshold in radians; the default TrackingConfig is unchanged when omitted.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -188,6 +193,7 @@ def parse_args():
         args.snapshot_candidate_id is not None
         or args.snapshot_reference_speed_m_s is not None
         or args.snapshot_max_control_steps_per_candidate is not None
+        or args.snapshot_maximum_grasp_relative_rotation_error_rad is not None
     )
     if args.snapshot_candidate_id is not None and not args.snapshot_candidate_id.strip():
         parser.error("--snapshot-candidate-id must not be empty")
@@ -200,6 +206,13 @@ def parse_args():
         1 <= args.snapshot_max_control_steps_per_candidate <= 1200
     ):
         parser.error("--snapshot-max-control-steps-per-candidate must be in [1, 1200]")
+    if args.snapshot_maximum_grasp_relative_rotation_error_rad is not None and (
+        not np.isfinite(args.snapshot_maximum_grasp_relative_rotation_error_rad)
+        or args.snapshot_maximum_grasp_relative_rotation_error_rad <= 0
+    ):
+        parser.error(
+            "--snapshot-maximum-grasp-relative-rotation-error-rad must be finite and greater than zero"
+        )
     if snapshot_tracking_options and not trajectory_validation_enabled:
         parser.error("Snapshot tracking options require --trajectory-bundle-physical-validation")
     if snapshot_tracking_options and (mink_osc_enabled or direct_osc_enabled):
@@ -2484,6 +2497,12 @@ try:
                             args.snapshot_max_control_steps_per_candidate
                             if args.snapshot_max_control_steps_per_candidate is not None
                             else default_tracking_config.max_control_steps_per_candidate
+                        ),
+                        maximum_grasp_relative_rotation_error_rad=(
+                            args.snapshot_maximum_grasp_relative_rotation_error_rad
+                            if args.snapshot_maximum_grasp_relative_rotation_error_rad
+                            is not None
+                            else default_tracking_config.maximum_grasp_relative_rotation_error_rad
                         ),
                     )
 

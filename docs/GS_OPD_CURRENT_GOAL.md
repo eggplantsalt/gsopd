@@ -1,18 +1,23 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1 阻塞；L0T0 trajectory-001 慢速 Snapshot 对照完成，等待复核（2026-10-22）
+## 当前状态：L0T1/state0 Book OSC 辅助抓取已通过，等待复核（2026-10-22）
 
-- L0T1/state0 原始 π₀.₅ Base 抓取失败现标记为 `blocked_by_base_grasp`；原始 Smoke 目录的 `status_blocked_by_base_grasp.json` 保存状态与关键证据哈希。保留 NPZ/视频/报告及离线诊断归档，不在 L0T1 重试。
-- L0T0 Round 0 初次预检：50 步后稳定抓持，18 条 Left/Right/Above 几何通过；3 条进 Snapshot 物理跟踪、15 条被既有 480 步预算挡在物理分支前，结果已归档。
-- 本次唯一对照只跟踪重新生成的 `trajectory-001`：将 Snapshot 参考速度设为 0.02 m/s、单候选上限设为 1200，844 步计划预算通过；实际 73 步后于 step 72 因相对旋转误差 0.208495 rad 超过原 0.20 rad 阈值失败。左右指接触 73/73 步都保持，Contact Compiler 对已观测片段为 `safe`，但整条路线没有通过。
-- 与 0.04 m/s / 480 步基线相比，原 422 步规划也预算通过且在同一步因同一旋转越限失败；不是预算拒绝。Snapshot 完整恢复（误差 0），主动停止被准确记录为 `snapshot_candidate_validation_complete`，`snapshot_restore_integrity_failure=false`。主环境 B-Spline/放置 0 步，reward=0、done=false，任务未完成，不作整体 safe 结论。
-- 完整归档位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`。当前等待复核，不进行下一次 Rollout、重试或调参。
+- 当前实验目标是 `obstacle_avoidance/L0T1/state0` 的完整成功轨迹采集。本轮仅处理抓取阶段，不运行 L0T0、不执行 B-Spline 搬运/放置或训练。
+- 原始 π₀.₅ Base 的 200 步抓取仍是失败历史（未接触 Body 23），但这不再阻塞当前路线：独立脚本化 OSC_POSE waypoint 辅助控制已实际抓住 reviewed Book Body 23 / Geom 91。抓取点沿 Book 长轴远离 place box 偏移 25 mm，接触判据保持原样。
+- attempt6 共 408 个 OSC 控制动作，全部控制步具有完整子步接触监测；没有机器人–非目标物体接触。原有 `GraspStabilityMonitor` 的 3 个连续不同状态通过；另存首个稳定快照，在新 Bridge 进程恢复后 Integration State 最大绝对差为 0，并在恢复状态上再次通过 4 个连续不同状态。Book root 位移 8.34 mm，未通过放宽阈值认定成功。
+- 可恢复快照：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/recovered_grasp_runtime_snapshot.pkl`。完整实际动作、双相机帧、物理状态、接触证据、视频、初次/恢复后快照及哈希清单均在同目录。尝试历史和索引见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
+- 本轮 reward=0、done=false；未执行 B-Spline、搬运、放置、训练或训练数据生成。trajectory safety verdict 未评估。未修改 VLA Checkpoint、B-Spline 候选生成器或默认控制配置。当前等待复核。
+- 复核通过后的下一步：从已保存抓取后状态直接生成 18 条候选，使用用户指定的宽松工程跟踪阈值开展绕障轨迹采集；尚未生成候选或启动下游执行。
+
+### L0T0 trajectory-001 Snapshot（历史实验，非当前任务）
+
+2026-10-22 的 0.25 rad 显式阈值对照运行 108 个 Snapshot 动作后，因保持不变的 EEF 位置误差上限失败；较早一步还记录到夹爪手掌–炉灶 burner 接触，整体物理安全未通过。它不是当前 L0T1 目标，不再继续该分支。历史报告位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_rotlimit025_20261022_attempt1/`；0.20 rad 参考在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`。
 
 ### 上一 L0T1 C2 离线诊断（保留）
 
 - 归档的 200 步动作序列中，EEF 曾接近并碰动 Body 25 绿色瓶子（89 条机器人–瓶接触），但没有接触 Body 23 Book；Book root 几乎未移动。40 个预测动作块与 NPZ 实际动作完全一致。目标方向/接近失败有外部证据，VLA 内部视觉目标错误仍是 unknown。
 - 抓持代码按 Body 子树动态纳入 collision Geom，不限于语义 Geom 91；但运行时完整 Geom ID 清单未落盘，精确成员仍 unknown。默认关闭 Smoke flag 的 Student 推理和动作发送路径经静态审阅，没有发现被改变；没有运行正常 Rollout A/B。
-- 报告、对照图、视频关键帧、轨迹/动作 CSV 和哈希清单在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`。该诊断已完成；L0T1 当前状态为 `blocked_by_base_grasp`，不继续尝试。
+- 报告、对照图、视频关键帧、轨迹/动作 CSV 和哈希清单在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`。该诊断只描述原始 Base 行为；后续已获用户指示开展的 OSC 辅助抓取见本文件顶部。
 
 ## 前次 C2 抓取 Smoke 记录（2026-10-22）
 
@@ -21,7 +26,7 @@
 - 一次有效 Smoke 使用原始 SFT Base（未加载 π₁/π₂ Adapter），针对 reviewed `object_1→Body 23/Geom 91` 抓取，最多 200 步；本次执行 200 步、reward 0、`done=false`。
 - 未达到 3 个连续不同状态的稳定抓取条件。20 个状态确认夹爪闭合，但左右手指均无目标接触；另 181 个状态未满足闭合判据，状态查询不可用数为 0。失败分类 `gripper_contact_insufficient`；Book 基本未动，未记录 robot–book 接触。该诊断不是完整任务或整体安全判定。
 - 视频、完整 NPZ、每步物理状态/接触、抓取监测报告及清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_state0_base_pi05_grasp_smoke_20261022_attempt1/`。
-- 仅有一次零动作的启动错误，已保留在独立子目录；修正适配器并做静态检查后，仅运行一次有效采集。当前停止，不启动后续 Teacher、规划、避障、训练或额外 Rollout，等待复核。
+- C2 归档保留原始 Base 一次零动作启动错误及一次有效采集；该记录当时没有启动后续阶段。用户随后明确将目标转为 L0T1 OSC 辅助抓取，结果见本文件顶部。
 
 ## 前序局部状态记录（保留）
 

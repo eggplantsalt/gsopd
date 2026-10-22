@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import numpy as np
+import pickle
 import random
 import mujoco
 from pathlib import Path
@@ -494,6 +495,59 @@ def _restore_snapshot(snapshot):
     # not consume the random stream that the next step will use.
     np.random.set_state(copy.deepcopy(snapshot["numpy_rng_state"]))
     random.setstate(snapshot["python_rng_state"])
+
+
+def _export_runtime_snapshot():
+    snapshot = _capture_snapshot()
+    snapshot.pop("mujoco_model", None)
+    envelope = {
+        "schema_version": "gs_opd_runtime_snapshot.v1",
+        "scene_metadata": copy.deepcopy(scene_metadata),
+        "model_geometry_sha256": _planning_model_signature(env.sim.model._model),
+        "snapshot": snapshot,
+    }
+    payload = pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL)
+    return {
+        "status": "complete",
+        "schema_version": envelope["schema_version"],
+        "model_geometry_sha256": envelope["model_geometry_sha256"],
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "payload": payload,
+        "snapshot_state": _snapshot_diagnostics(canonicalize_kinematics=True),
+    }
+
+
+def _restore_runtime_snapshot(payload):
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("Runtime Snapshot payload must be non-empty bytes")
+    envelope = pickle.loads(payload)
+    if not isinstance(envelope, dict) or envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1":
+        raise ValueError("Runtime Snapshot schema is unsupported")
+    expected_scene = envelope.get("scene_metadata")
+    scene_fields = (
+        "benchmark", "level", "task_id", "init_state_index", "environment_seed",
+        "bddl_sha256", "instruction",
+    )
+    if not isinstance(expected_scene, dict) or any(
+        expected_scene.get(field) != scene_metadata.get(field)
+        for field in scene_fields
+    ):
+        raise ValueError("Runtime Snapshot scene metadata differs from the active Bridge")
+    model_signature = _planning_model_signature(env.sim.model._model)
+    if envelope.get("model_geometry_sha256") != model_signature:
+        raise ValueError("Runtime Snapshot model geometry differs from the active Bridge")
+    snapshot = envelope.get("snapshot")
+    if not isinstance(snapshot, dict) or "mujoco_state" not in snapshot:
+        raise ValueError("Runtime Snapshot is missing its physical state")
+    snapshot["mujoco_model"] = env.sim.model._model
+    _restore_snapshot(snapshot)
+    return {
+        "status": "restored",
+        "model_geometry_sha256": model_signature,
+        "snapshot_state": _snapshot_diagnostics(canonicalize_kinematics=True),
+        "reward": float(last_reward),
+        "done": bool(last_done),
+    }
 
 
 def _json_value(value):
@@ -3812,6 +3866,22 @@ try:
                         }
                     except Exception as exc:
                         result = {"error": f"Snapshot failed: {type(exc).__name__}: {exc}"}
+                elif request["op"] == "export_runtime_snapshot":
+                    try:
+                        result = _export_runtime_snapshot()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "error": f"Runtime Snapshot export failed: {type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "restore_runtime_snapshot":
+                    try:
+                        result = _restore_runtime_snapshot(request.get("payload"))
+                    except Exception as exc:
+                        result = {
+                            "status": "restore_failed",
+                            "error": f"Runtime Snapshot restore failed: {type(exc).__name__}: {exc}",
+                        }
                 elif request["op"] == "restore":
                     snapshot_id = request.get("snapshot_id")
                     if not isinstance(snapshot_id, str) or snapshot_id not in snapshots:
