@@ -1,5 +1,13 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：L0T1 reviewed semantic binding 与 Compiler 输入静态验证已完成，等待复核（2026-10-22）
+
+- 已按审核指示生成 object_1→Body 23/Geom 91、object_3→Body 25/Geom 133、object_2→Body 26/Geom 265 的独立 reviewed semantic binding 和 Smoke 可读的 per-object JSON。object_1 的 Teacher “white book” 与黑色实物外观冲突保留；object_2 低 SAM score 0.0986328125 保留；object_4–6 unresolved。
+- 原始 Safety IR 被逐字节保留。Compiler 核心未改。完整 Inventory 为 288 Geoms；9 个空 geom_name 仅在单独兼容副本中替为可追溯的 ID 占位名。现有 `_resolve_target_binding` 对原 Inventory 按预期拒绝，对兼容副本的三条审核映射通过，并保留三条 unresolved。
+- 规则绑定就绪情况与接触结论分开记录：object_1/object_2/object_3 绑定输入可用；rule_2 本身仍是 Teacher unknown；rule_3 与 ocr_1 还需完整运行时接触记录。没有任何轨迹 safe/violation 结论。
+- 19 项静态检查通过；未连接 Bridge、未启动 MuJoCo、未运行完整 Compiler Smoke、VLM、SAM3、Student、规划、Rollout 或训练。结果目录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_reviewed_semantic_compiler_input_20261022_attempt1/`。当前等待复核，不自动接入 Compiler 执行链。
+
+
 ## 当前状态：L0T1 三对象候选关联审计完成，待人工复核（2026-10-22）
 
 - 归档证据支持 Book 原生 1024 与 Bottle/Caddy 使用的 512 图像来自同一物理初始状态：配套 512 RGB 与 Geom ID 哈希/数组完全一致；旧归档和原生分辨率采集的 289 项 integration state、机器人状态及所有物体姿态逐项一致。已验证 Safety IR 的运行清单也指向同一 raw RGB。

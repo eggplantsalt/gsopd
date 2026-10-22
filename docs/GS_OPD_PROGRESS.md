@@ -3,6 +3,14 @@
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
 
+## L0T1 已审核语义绑定与 Contact Safety Compiler 输入适配（2026-10-22）
+
+- 按本轮审核指示，将 `object_1` 作为任务所指的书，基于原始 task-conditioned VLM Candidate 1 选择、原始 SAM Mask 与同状态 Body/Geom 对照，记录为 Body 23 `black_book_1_main` / Geom 91 `black_book_1_g0`。Teacher 原始 Safety IR 仍称 “white book”；与黑色实物外观的冲突保留为未解决属性，映射的依据是任务指代与 VLM 候选视觉选择，IoU 仅作几何佐证。
+- `object_3` → Body 25 `bottle_of_beer__7_1_main` / Geom 133；`object_2` → Body 26 `desk_caddy_1_main` / Geom 265。Caddy SAM score `0.0986328125`（threshold 0.05）保留为低置信限制。`object_4`–`object_6` 仍 unresolved。每项映射都带审核状态、来源证据路径和 SHA-256；三份原始 VLM 回答按原字节复制，没有合成回答。
+- 适配文件按现有 `contact_safety_compiler_smoke.py` 的 `semantic_decision`、`selected_candidate`、`physical_association` 结构生成，未修改 Safety IR 或 Compiler。归档 Geometry Inventory 的 288 个 ID 均完整，但 Geom 2、13–20 共 9 项 `geom_name=null`；原件保持不变，仅在独立兼容副本中把这些名称替换为稳定的 `unnamed_geom_id_NNNN` 标识，并保留明确的占位符说明。验证器对原始清单复现拒绝，对兼容副本完成 Body/Geom 身份解析。
+- Contact 规则状态：`rule_1` 的 object_1 绑定输入齐备（Teacher 明确 allow）；`rule_2` 的 object_2 绑定输入齐备但 Teacher 决策仍为 unknown；`rule_3` 的 object_3 绑定输入齐备但需要运行时子步接触记录；`ocr_1` 的 object_1/object_3 两端绑定输入齐备但需要运行时对象接触记录。object_4–6 当前未被规则引用；任何依赖它们的新规则仍需保持 unknown。
+- 19 项 JSON 与现有 Compiler 纯绑定解析静态检查全部通过。没有连接 Bridge、启动 MuJoCo 或执行完整 Compiler Smoke；未调用 VLM/SAM3，也未运行 Student、规划、Rollout 或训练。没有轨迹安全 verdict。独立结果、源证据副本、规则就绪表、校验报告及 SHA-256 manifest 位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_reviewed_semantic_compiler_input_20261022_attempt1/`，详见 `experiment_report.md`；等待复核后再接入任何执行流程。
+
 ## L0T1 Book/Bottle/Caddy 候选关联与跨采集状态离线审计（2026-10-22）
 
 - 对照三组既有 Task-Conditioned Candidate Verification、SAM3、Body-level IoU、Safety IR 和捕获状态记录。Book 的 1024 RGB SHA-256 为 `2b94ccff…a5a7df`，与原生 1024 capture 一致；该次配套 512 RGB SHA-256 为 `ad606f00…82ec16e`，与 Bottle/Caddy 使用的 512 图像一致。旧/新 512 Geom ID 文件 SHA-256 都为 `7a0a12dd…03c661`，数组逐项相等。
