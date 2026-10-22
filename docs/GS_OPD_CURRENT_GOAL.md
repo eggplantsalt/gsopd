@@ -1,6 +1,14 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 C2 原始 π₀.₅ Base 抓取 Smoke 已完成，等待复核（2026-10-22）
+## 当前状态：L0T1/state0 Base π₀.₅ 抓取失败离线诊断完成，等待复核（2026-10-22）
+
+- 归档的 200 步动作序列中，EEF 曾接近并碰动 Body 25 绿色瓶子（89 条机器人–瓶接触），但没有接触 Body 23 Book；Book root 几乎未移动。40 个预测动作块与 NPZ 实际动作完全一致。目标方向/接近失败有外部证据，VLA 内部视觉目标错误仍是 unknown。
+- 抓持代码按 Body 子树动态纳入 collision Geom，不限于语义 Geom 91；但运行时完整 Geom ID 清单未落盘，精确成员仍 unknown。默认关闭 Smoke flag 的 Student 推理和动作发送路径经静态审阅，没有发现被改变；没有运行正常 Rollout A/B。
+- 报告、对照图、视频关键帧、轨迹/动作 CSV 和哈希清单在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`。全程只读，无 MuJoCo/VLA 调用或代码修改。等待复核后再继续。
+
+## 前次 C2 抓取 Smoke 记录（2026-10-22）
+
+### 运行结果与产物
 
 - 一次有效 Smoke 使用原始 SFT Base（未加载 π₁/π₂ Adapter），针对 reviewed `object_1→Body 23/Geom 91` 抓取，最多 200 步；本次执行 200 步、reward 0、`done=false`。
 - 未达到 3 个连续不同状态的稳定抓取条件。20 个状态确认夹爪闭合，但左右手指均无目标接触；另 181 个状态未满足闭合判据，状态查询不可用数为 0。失败分类 `gripper_contact_insufficient`；Book 基本未动，未记录 robot–book 接触。该诊断不是完整任务或整体安全判定。

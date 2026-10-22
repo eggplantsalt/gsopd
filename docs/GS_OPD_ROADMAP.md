@@ -6,6 +6,11 @@
 
 ## 阶段与当前状态
 
+### 最新：L0T1/state0 Base π₀.₅ 抓取失败离线诊断（2026-10-22）
+
+离线归档证据显示 EEF 与 Body 23 Book root 最近仍相距 0.31244 m，Book 基本未动；轨迹与绿色瓶子发生 89 条机器人接触并使瓶子移动约 0.229 m。40 个预测 Chunk 与执行动作完全一致，支持目标接近/选择偏差，不支持执行传输不一致；VLA 内部视觉目标错误原因仍 unknown。抓持查询源码按 Body 子树纳入全部 collision Geom，但精确运行时 Geom 集合未存档，成员列表为 unknown。默认关闭 `--grasp-only-smoke` 时主推理/动作路径经静态检查未发现变化；无运行时 A/B。产物独立归档，等待复核。
+
+
 ## 最新局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22）
 
 使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`；任务未完成、整体物理安全未评估。完整 NPZ、视频、逐状态抓取/接触记录和运行清单位于数据盘独立目录，详见 `docs/GS_OPD_PROGRESS.md`。当前等待复核，不继续 L0T1 实验。
