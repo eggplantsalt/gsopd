@@ -1,3 +1,21 @@
+# GS-OPD / π₀.₅ × LIBERO-Safety 进度
+
+当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
+
+## L0T2 完整任务成功示范：Pot 1 从 t=854 搬运放置完成（2026-10-22；等待复核）
+
+本轮从已验证的 Pot 1 稳定抓持快照 `/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/evidence/moka_pot_1_retargeted_stable_grasp_runtime_snapshot.pkl` 恢复，episode timestep=854。使用兼容的独立 Demo Bridge，horizon=1300；标准评测 horizon 保持 1000。模型几何指纹、BDDL、积分状态和任务判据保持原样。此前联合布局实验推荐 Pot 1 根目标 `[-0.1127580855, -0.2626613201, 0.996610] m`、yaw 180°；在 scratch 中完成 578 个携物样本、32 个撤离样本的密集几何 sweep，2 mm / 1° 分辨率，Pot 1–Pot 2 最小间隙 15.272 mm，闭合夹爪到非目标场景最小间隙 37.801 mm，IK/关节检查通过。该 sweep 是路径前置检查，最终仍以 MuJoCo 实际接触为准。
+
+实际只执行一条路线：t=854→1021 执行 167 个 `expert_osc` 动作，到达 Pot 1 目标上方；在慢速下降阶段，初始局部 50 动作调用预算耗尽时位置误差为 78.580 mm，未发生失持、碰撞或关节异常。记录并核对同一 t=1021 真实物理状态后，沿原路线继续 72 步：慢降 29、打开夹爪 3、沿抓取轴撤离 16、稳定 24。t=1053 释放；Bridge 在 t=1093 的实际 step return 为 `reward=1.0, done=true`。三个原生目标 `On(moka_pot_1, flat_stove_1_cook_region)`、`On(moka_pot_2, flat_stove_1_cook_region)`、`Turnon(flat_stove_1)` 均为真。5 个终端状态（t=1089–1093）稳定，位置跨度 `1.92e-8 m`，最大线速度 `2.65e-7 m/s`、角速度 `3.79e-6 rad/s`。Pot 2 最终放置段最大位移 0 m；新机器人–非目标碰撞 0；关节限位/检查全部通过。Pot 1 实际终态 root 为 `[-0.1181832,-0.2639169,0.9966066] m`，相对目标有约 5.6 mm 平面偏差但原生 On 成立。
+
+完整动作链共 1093 步：294 步原始 π₀.₅ Base-only 动作（400 步原始 rollout 中使用到第 294 步；与 Near-Goal 档案动作逐步完全相同），425 步 Pot 2 OSC 放置修正，135 步 Pot 1 Grasp Retargeting，239 步 Pot 1 高位绕行与最终放置 OSC。相对标准 horizon=1000 超出 93 步，标记 `demonstration_success_over_budget=true`；不标为标准 Benchmark 成功。隔离 Demo horizon=1300，未变更标准评测配置。
+
+原始 VLA 动作前缀在动作 21–56 有真实机器人–Ginger Beer 接触，峰值 12.096849 N；前缀重放后的 robot/Pot2/静态 fixture 在验证容差内，但此前碰撞 Ginger Beer 的积分状态尾部有数值分歧。接触和拼接限制均留在报告及索引中，`safety_success=false`。Bridge 状态接口的只读 `task_done=false` 与实际 step 返回的 `done=true` 同时记录；成功验收使用本轮明确要求的原生谓词、reward=1、真实 done、释放和稳定证据。
+
+完整证据独立归档于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt3/`：`README.md`、`evidence/success_acceptance_report.json`、`evidence/training_demo_traceability_index.json`、1093 行 `evidence/complete_standardized_action_records.jsonl`、紧凑 `evidence/complete_action_chain_index.npz`、完整 agentview / eye-in-hand / side-by-side 视频、t=1093 Runtime Snapshot 与 `SHA256SUMS.txt`。动作记录逐行映射到源 NPZ 中的双相机 Observation、物理状态、接触、任务谓词、Snapshot 和 source row；没有复制或覆盖原始证据。原始 VLA、Pot 2 OSC、Grasp Retarget、最终放置分支的独立数据均保留。
+
+没有调用 VLA/Teacher/SAM3，没有修改模型或控制配置，没有直接写物体位姿，没有训练。**本轮完成，停止等待复核。**
+
 ## L0T2 双 Moka Pot 联合布局：Pot 2 保持原位时存在可行终点与局部夹爪通道（2026-10-22；诊断完成，等待复核）
 
 本轮针对 t=854 Pot 1 稳定抓持快照做只读环境盘点，并在独立 scratch Bridge 中恢复同一 Runtime Snapshot，MuJoCo Integration State 精确匹配、timestep=854。活动 demonstration-only Bridge（t=854、horizon=1300）、原快照、BDDL、reward、模型均未修改；没有执行机器人控制动作、物理步进、VLA、Teacher/SAM3 或训练。

@@ -1,3 +1,15 @@
+# GS-OPD 总体路线
+
+## 最新总体状态（2026-10-22）：L0T2 首条真实完整任务成功示范已归档，等待复核
+
+从 t=854 Pot 1 稳定抓持 Runtime Snapshot 出发，独立 Demo Bridge 以 horizon=1300 完成 Pot 1 放置。最终 `On(Pot1, CookRegion)`、`On(Pot2, CookRegion)`、`Turnon(Stove)` 均成立；真实 step return `reward=1.0, done=true`；释放后连续 5 个采样状态稳定。完整轨迹 1093 步，超过标准评测 horizon 1000 共 93 步，标记 `demonstration_success_over_budget`，不是标准 Benchmark 成功。VLA 前缀存在 Ginger Beer 实际接触，且回放碰撞物状态有已记录的数值差异，因此不标为安全成功。
+
+完整数据索引、逐步 action/observation 源映射、三路视频、验收 JSON、成功 Snapshot 与 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt3/`。本阶段不启动训练，等待复核；L0T1 和 L0T0 均不运行。
+
+## 总体目标
+
+在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。
+
 ## 最新局部状态（2026-10-22）：L0T2 Stove 双壶终点布局已证实可行；机器人执行暂停等待复核
 
 只读检查 t=854 Demo Snapshot，并从同一 Snapshot 在独立 scratch MuJoCo 副本测试 16 个 Pot1 目标位姿。保持 Pot2 原位时，8 个目标有静态无冲突支撑及同时满足两个原生 On 和 Stove Turnon 的联合状态；3 个还通过了局部夹爪进场/反向撤离几何检查。推荐 Pot1 root `[-0.1127581,-0.2626613,0.9966100] m`、yaw 180°，Pot1–Pot2 完整碰撞几何间隙 15.272 mm；Pot1/Pot2 Burner 支撑接触 30/28 个，局部夹爪最小非目标间隙 37.814 mm，7 点 IK 全部可达、无机器人场景接触。Pot2 不必为终点布局而重新放置。
