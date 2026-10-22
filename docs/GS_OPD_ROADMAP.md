@@ -1,24 +1,24 @@
 # GS-OPD 总体路线
 
-## 最新总体状态（2026-10-22）：L0T2 首条真实完整任务成功示范已归档，等待复核
+## 最新总体状态（2026-10-22）：L0T2 成功示范完成数据验收；候选专家集等待复核
 
-从 t=854 Pot 1 稳定抓持 Runtime Snapshot 出发，独立 Demo Bridge 以 horizon=1300 完成 Pot 1 放置。最终 `On(Pot1, CookRegion)`、`On(Pot2, CookRegion)`、`Turnon(Stove)` 均成立；真实 step return `reward=1.0, done=true`；释放后连续 5 个采样状态稳定。完整轨迹 1093 步，超过标准评测 horizon 1000 共 93 步，标记 `demonstration_success_over_budget`，不是标准 Benchmark 成功。VLA 前缀存在 Ginger Beer 实际接触，且回放碰撞物状态有已记录的数值差异，因此不标为安全成功。
+完整链 1093 步已核对，动作分段为 294 VLA +425 OSC +135 Grasp Retargeting +239 OSC。LeRobot v2.1 独立候选集包括终止前 759 个 `expert_osc` 样本，分成 425/135/199 三个 Snapshot 连续 episode；读回逐帧校验全部通过。VLA 294 步留作原始轨迹与 Ginger Beer 碰撞证据；done 后 40 步留作撤离/稳定证据，不进入任务监督池。所有样本没有安全认证。
 
-完整数据索引、逐步 action/observation 源映射、三路视频、验收 JSON、成功 Snapshot 与 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt3/`。本阶段不启动训练，等待复核；L0T1 和 L0T0 均不运行。
+数据集位于 `/opt/data/private/gs_opd/datasets/lerobot_l0t2_expert_osc_candidate_20261022_attempt1/`；审计、样本索引与转换脚本保存在成功示范归档的 `evidence/`。完整示范仍标记 over-budget（1093 步，标准 horizon=1000，超 93 步），任务成功不等于安全成功。紧凑 action index 的两列路径字符串有定长截断；完整 JSONL 和样本 sidecar 保留全路径，报告已标明该限制。当前只等待复核，不启动训练、Rollout 或其他场景实验。
 
 ## 总体目标
 
 在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。
 
-## 最新局部状态（2026-10-22）：L0T2 Stove 双壶终点布局已证实可行；机器人执行暂停等待复核
+## 历史诊断（2026-10-22）：L0T2 Stove 双壶终点布局已证实静态可行
 
 只读检查 t=854 Demo Snapshot，并从同一 Snapshot 在独立 scratch MuJoCo 副本测试 16 个 Pot1 目标位姿。保持 Pot2 原位时，8 个目标有静态无冲突支撑及同时满足两个原生 On 和 Stove Turnon 的联合状态；3 个还通过了局部夹爪进场/反向撤离几何检查。推荐 Pot1 root `[-0.1127581,-0.2626613,0.9966100] m`、yaw 180°，Pot1–Pot2 完整碰撞几何间隙 15.272 mm；Pot1/Pot2 Burner 支撑接触 30/28 个，局部夹爪最小非目标间隙 37.814 mm，7 点 IK 全部可达、无机器人场景接触。Pot2 不必为终点布局而重新放置。
 
 只在 scratch 中临时改候选 qpos 并作 `mj_forward`/距离/接触/谓词检查，没有物理步进、控制动作或更改主快照/任务。故此结果只说明“静态终点和局部夹爪进出通道可行”，并未验证从 t=854 到目标的完整携物扫掠、动态交互、实际释放或任务 reward；既有 t=967 的 40.139 N 接触仍是实际搬运路径风险。独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_joint_pot_layout_feasibility_20261022_attempt1/`。当前暂停后续 OSC 直到复核。
 
-## 下一总体目标
+## 复核后的下一步
 
-在 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 获取真实完整任务示范。下一次执行计划须使用本轮可行 Pot1 终点作为布局参考，并先解释、验证 t=967 碰撞发生前的完整携物扫掠空间；不得把静态可行状态写作机器人成功示范。保持 BDDL、reward、模型物理、horizon 配置、机械约束与原生任务判据不变；任务成功与安全成功继续分开标注，历史 Ginger Beer 接触不得移除或认证为安全。等待本轮诊断复核后再开展任何 OSC 动作；不启动训练。L0T0 保持暂停。
+先复核 759 条 OSC 专家候选的示范质量、状态起点和路径引用，再决定是否将其并入训练转换。没有复核前不启动训练或 Rollout；不改变原始 VLA 动作/Observation，不认证安全。L0T1 与 L0T0 保持暂停。
 
 # GS-OPD 总体路线
 

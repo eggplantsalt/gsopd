@@ -2,6 +2,20 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T2 成功示范数据验收与 LeRobot v2.1 适配（2026-10-22；完成，等待复核）
+
+对归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt3/` 完成只读验收。1093 个 transition 连续、动作值与源数组一致，四段边界为 294 VLA +425 Pot 2 OSC +135 Grasp Retargeting +239 最终放置 OSC；逐步源引用核验 1093/1093。两路 RGB 为 256×256×3 uint8，状态/接触/任务谓词和 reward/done 均保留引用。t=719、854、1021 的机器人状态及双相机帧与上一段 post 完全一致。t=294 的首个 OSC 输入帧与 VLA 前缀最后 post 帧有 RGB 差异（agentview/wrist 最大绝对像素差 114/117）；保留采集到的真实输入帧，没有用前一帧替换。恢复/回放状态证据单独作为该边界的物理连续性依据。
+
+逐步原生谓词状态 payload 为 406/1093 行非空：VLA 段 294 行为空；Pot 2 Near-Goal OSC 的 425 行中 32 行非空、393 行为空；Grasp Retarget 与最终放置 374 行均非空。候选索引为每条样本标记了 `native_task_status_available`，缺值不补造。1093 行的任务指令、动作、RGB、reward/done、contact payload 均已核对，其中 contact JSON 2290 条全部可解析。
+
+π₀.₅ VLA 前缀每五个控制动作复用一次策略决策观察；294 行逐行动作输入均对应正确决策帧，其中 235 行与前一个物理 post 观察不同。因此不能把这 294 行解释为 294 次新鲜 VLA 决策，也不能直接作为逐步闭环专家监督。该段另有 1-based 动作 21–56 与 Ginger Beer 接触，峰值 12.096849 N，只保留为原始 VLA 轨迹和失败证据，不标安全标签。
+
+首次原生 `reward=1, done=true` 发生在全局 transition t=1053。此后 40 步仍记录 reward/done=true，作用是夹爪撤离和稳定验收，列为物理证据，不作为标准任务动作监督。终止前 OSC 799 步中 759 步进入专家候选池，按快照连续边界拆成 425/135/199 三个 LeRobot episode；最后 199 步包含终止 transition。LeRobot `0.3.3` 输出 v2.1，字段为双图像 256×256×3、state float32[8]、actions float32[7]，759/759 行经 Reader 逐帧比对通过。旧 `npz_to_lerobot.py` 固定了之前 845 步单 episode 与 phase ranges，不能直接承载该混合链；使用独立适配器复用既有 writer、180° RGB 预处理与 EEF 8D state 转换。OSC JSON 的 MuJoCo `mju_mat2Quat` 是 WXYZ，适配器按既有 LIBERO XYZW 约定重排，只变换新数据集，不改源观察/动作或原转换器。
+
+原完整轨迹仍标记 `demonstration_success_over_budget`（1093 步，超过标准 horizon=1000 共 93 步）。VLA 段不进专家池；40 步终止后 OSC 不进任务动作池；759 个 OSC 候选保留 `expert_osc` 来源但未认证安全。发现紧凑 `complete_action_chain_index.npz` 的 `source_npz` 路径列 958/1093 行、`physical_state_npz` 列 664/1093 行存在定长尾部截断；动作、行号和 1093 行 JSONL 完整引用正确，新候选样本索引路径无截断。读取归档路径请用 JSONL/样本索引，不依赖紧凑索引路径列。
+
+验收报告 `evidence/data_integrity_report.json`，样本索引 `evidence/expert_supervision_sample_index.json`，转换报告 `evidence/lerobot_expert_candidate_conversion_report.json`，可复现适配器 `evidence/export_expert_osc_lerobot_candidate.py`，以及新数据/数据集文件校验清单 `evidence/data_acceptance_SHA256SUMS.txt`。候选数据集：`/opt/data/private/gs_opd/datasets/lerobot_l0t2_expert_osc_candidate_20261022_attempt1/`。未训练、未运行 Rollout。等待复核。
+
 ## L0T2 完整任务成功示范：Pot 1 从 t=854 搬运放置完成（2026-10-22；等待复核）
 
 本轮从已验证的 Pot 1 稳定抓持快照 `/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/evidence/moka_pot_1_retargeted_stable_grasp_runtime_snapshot.pkl` 恢复，episode timestep=854。使用兼容的独立 Demo Bridge，horizon=1300；标准评测 horizon 保持 1000。模型几何指纹、BDDL、积分状态和任务判据保持原样。此前联合布局实验推荐 Pot 1 根目标 `[-0.1127580855, -0.2626613201, 0.996610] m`、yaw 180°；在 scratch 中完成 578 个携物样本、32 个撤离样本的密集几何 sweep，2 mm / 1° 分辨率，Pot 1–Pot 2 最小间隙 15.272 mm，闭合夹爪到非目标场景最小间隙 37.801 mm，IK/关节检查通过。该 sweep 是路径前置检查，最终仍以 MuJoCo 实际接触为准。
