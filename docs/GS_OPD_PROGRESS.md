@@ -1,5 +1,23 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## L0T2 Round 1 OSC/B-Spline 首次跟踪失败复核（2026-10-23；只读完成，等待复核）
+
+本轮只读检查 198 条 B-Spline 路线动作/状态记录、实际执行器与 OSC_POSE 映射源码及 t=216 Snapshot；没有恢复/启动 Bridge、物理步进、动作、Rollout 或训练。JSONL、NPZ、视频、快照与先前 1093 步成功示范及 LeRobot 数据集未改；仅新增离线诊断文件。
+
+位置误差：route index 0 / task t=19 为 3.097 mm，索引 20–150 大致稳定在 8.5–9.5 mm；索引 159–162（t=178–181）缓慢升至约 10.0–10.3 mm。明显发散从 index 170 / t=189 开始，连续 5 个控制间隔每步至少增加 0.25 mm；index 176 / t=195 起连续 5 步增幅至少 0.5 mm；index 181 / t=200 起连续 5 步增幅至少 1 mm。误差在 index 170、179、185、190、197 分别为 11.619、15.718、22.309、29.687、40.135 mm；终点残差 XYZ（实际−参考）为 `[-31.74,+5.78,-23.88] mm`，姿态误差 0.14143 rad。
+
+参考固定每步约 3.00 mm（`0.06 m/s × 0.05 s`）。实际单步位移由 index 140–159 的均值 2.962 mm 降至 index 160–169 的 2.880、170–179 的 2.667、180–189 的 2.375 mm；循环在每次 OSC 后无条件推进参考索引。通用跟踪模块的默认/上限为 0.04 m/s；本次执行器复用了单步映射函数，但绕过通用调度，以 0.06 m/s 固定速率运行。终步请求 EEF 增量 `(+33.72,−4.92,+22.57) mm`，实际约 `(+1.98,+0.85,−1.31) mm`。
+
+OSC pose 六维归一化动作最大值 0.674，198 步中没有分量达到 ±1；闭爪维度为预期的 −1。全程 Panda 关节限位合规，最大越限 0。运行时位置动作范围为 ±0.05 m、旋转范围 ±0.5 rad；转换函数根据实时 EEF 计算世界系 `target−current`，robosuite `control_delta` 同样从当前 EEF 更新控制目标，未发现坐标符号/变换错误。t=216 Snapshot 的当前控制器扭矩峰值约 50.07/80 N·m，终点未触限；历史各步扭矩没有记录。路径末段 Jacobian 可操作度和目标 IK 可达性也未记录，因而无法排除奇异位形、局部难达或此前内部力矩饱和。
+
+最直接有证据支持的根因是：**固定时间参考在后段 OSC 响应下降时仍持续前推，且 0.06 m/s 高于通用跟踪配置的 0.04 m/s；位置误差持续积累直至保护停止。** t=10 到 t=216 EEF 实际位移 0.3320 m；到预抓取目标直线距离由 0.3340 m 增至 0.4331 m（增加 99.0 mm）。路线前半段有意远离目标绕过 Bottle，参考游标走到 198/381（51.97%）不代表净接近预抓取点。
+
+t=216 Snapshot SHA-256 `a3757bd…a741b4c415`，timestep 216 / 仿真时间 10.8 s，reward 0、done=false；模型几何指纹及 BDDL 匹配。317 维 Integration State 与最后动作记录最大差 0；快照包含 controller、buffers、torques、仿真/任务状态、observation cache 和 RNG。它是内容完整的候选恢复点，但尚未从 t=216 执行 restore→re-export；后续控制前必须先在兼容 Bridge 核验完整恢复。
+
+唯一建议的最小修改（**未执行、未物理验证**）：保留原 B-Spline 几何，从真实 t=216 EEF 重锚到剩余曲线前向最近参数；连接段重新检查全机器人几何；弧长参考速度不超过 0.04 m/s，并在位置误差超过 10 mm 时暂停游标、追上后再推进。保持 40 mm 保护阈值和 OSC 默认配置。仍缺每步 actuator torque/饱和、末段 Jacobian/IK 以及 t=216 restore roundtrip 证据。
+
+独立报告、误差时间序列 CSV、机器摘要、Snapshot 检查见 `/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/evidence/round1_tracking_failure_diagnostic.md` 及相邻文件。保留原始归档，本轮停止等待复核，不执行新路线。
+
 ## L0T2 Round 1 Safety Recovery：t=10 到预抓取路线物理验证（2026-10-23；失败后停止，等待复核）
 
 本轮从原始 π₀.₅ 的 `executed_actions[0:10]` 重放开始，t=10 原始状态与 Snapshot 字段逐项最大误差均为 0；模型几何 SHA-256 `1a0c219c…f7a9f752`、BDDL SHA-256 `901feec9…315e7d675c` 一致。恢复验收覆盖 MuJoCo Integration State、机器人控制缓冲、task bookkeeping 和 RNG，均精确匹配。t=10 完整机器人到 Ginger Beer/White Place Box 间隙为 65.758/112.217 mm。
@@ -2856,3 +2874,17 @@ t=966 Runtime Snapshot 随后由原有 `restore_runtime_snapshot` 接口成功�
 仅在恢复并验证后的同一个已编译环境实例中，把底层 `env.env.horizon` 从1000改为1300，`ignore_done=false`。扩展前后几何指纹、Integration State、机器人控制状态、完整运行时状态、timestep、Pot 1 抓持和全部原生谓词均保持不变；扩展后剩余334步。标准 Bridge 独立只读复核仍为 t=966/horizon=1000、剩余34步。没有改 BDDL、MuJoCo 模型、reward、任务判据或快照内容。隔离 Demo Bridge 保持空闲等待后续复核，不代表任务成功、Benchmark 成功或安全认证成功；历史 Ginger Beer 接触继续保留。
 
 独立归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_demo_restore_horizon_20261022_attempt2/`；验收 JSON 为 `evidence/acceptance.json`，复现步骤为 `README.md`，扩展后可恢复状态为 `evidence/extended_t966_runtime_snapshot.pkl`。完整校验清单在 `SHA256SUMS.txt`。下一步经复核后才从该状态继续 Pot 1 的 OSC 放置。
+
+## L0T2 Round 1 自适应 B-Spline 跟踪恢复（2026-10-23；追赶预算耗尽后停止，等待复核）
+
+本轮从已归档 t=216 Snapshot 直接恢复，没有重跑 VLA、重抓取、生成候选或改变原绕障方向。兼容 Bridge 的模型指纹 `1a0c219c…f7ea9f752`、BDDL SHA `901feec9…d315e7d675c` 匹配；restore→re-export 后 317 维 Integration State 最大差 0，控制器/缓冲区、机器人与任务状态等组件逐项一致。
+
+沿用原 B-Spline 前向剩余段，基于真实 EEF 重锚，连接段 27.750 mm；离线 scratch 预检通过，最小 Ginger Beer / Place Box 间隙为 178.523 / 207.592 mm。物理跟踪使用 0.020 m/s、1 mm 级参考间距、12 mm 误差门槛、每个参考点 32 步有限追赶预算，并保留 40 mm 硬停止阈值。
+
+隔离 Snapshot 分支实际执行 75 步，t=216→291，推进 38 个参考间隔。t=254 首次超过 12 mm（12.321 mm），游标冻结；t=259 一度回到 11.979 mm 并推进到参考点39；随后误差重新超过门槛，连续追赶32步仍有16.529 mm，故按预算停止。最大误差19.848 mm，未触发40 mm硬停止。六维 OSC 输入最大归一化分量0.2817，关节最大越限0；没有机器人场景接触。全程最小障碍间隙为 Ginger Beer 175.105 mm、Place Box 202.194 mm；Pot 2 位移0。结束时距预抓取位姿直线距离444.244 mm、姿态误差0.63056 rad，未到达预抓取，reward=0、done=false。
+
+直接阻塞为参考点39的闭环位置误差未在32步内收敛；自适应游标冻结正确生效，失败不是碰撞、关节保护或硬阈值。固定目标追赶期间 EEF 沿目标投影方向净退后3.863 mm。没有动作饱和证据；现有数据仍不足以区分 OSC 动态响应、局部姿态/运动学耦合与该参考点的局部可达性。不能据此说目标不可达或完整路线安全。
+
+逐步完整性检查通过：75条动作与前后 RGB、Observation、317维物理状态对齐；每步25个物理子步均有完整接触和间隙检查；两路视频各76帧。t=291 失败分支 Snapshot 已保存；实验后 Bridge 精确恢复到原 t=216 并停止。此前记录器变量错误造成的一步中止（t=216→217）单独隔离保存，不合并进正式75步记录。
+
+独立归档：`/opt/data/private/gs_opd/rollouts/l0t2_round1_adaptive_safety_recovery_20261023_attempt1/`。入口 `README.md`；详细归因 `evidence/adaptive_recovery_report.md`；逐步数据完整性 `evidence/data_integrity.json`；机器摘要 `evidence/adaptive_recovery_execution_summary.json`。任务成功、局部预抓取验收和 Safety Success 均为 false。原1093步成功示范、LeRobot数据、模型和规划源均未改。本轮停止等待复核，不继续执行机器人动作或训练。
