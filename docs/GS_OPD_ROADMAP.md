@@ -4,15 +4,21 @@
 
 在 π₀.₅ 原生动作空间和现有安全约束下，让 Student 从真实成功执行数据学习避障操作，并在 MuJoCo 中完成可复现的 Student 闭环任务。数据来源、动作来源和安全判定要可追溯；Compiler 的 `unknown` 不得伪装成 `safe`，普通行为克隆动作不得误标为安全修正。
 
+## 当前路线选择（2026-10-22）
+
+- 最近一轮原始 π₀.₅ Base-only 跨任务筛选覆盖 `obstacle_avoidance/L0` T2/T3/T4，各用 init-state 0、固定 seed 和最多 400 个动作；结果均未完整成功。T2 是唯一出现连续三状态真实双指目标抓取和目标物体搬运的任务，因此**建议在复核后优先作为后续安全轨迹采集候选**。T2 原始回合有 ginger-beer 非目标接触，不是安全轨迹；需单独安全筛选。
+- L0T1 的 attempt6 OSC 辅助 Book 抓取快照和既有 B-Spline/Snapshot 物理实验继续独立保留，但按当前请求暂停该调试，不重新抓取、不运行 L0T0。当前跨任务筛选只用于场景选择；在复核前不启动新的搬运、示范或训练。
+- 当前实验详细记录见 `docs/GS_OPD_PROGRESS.md` 顶部；局部状态见 `docs/GS_OPD_CURRENT_GOAL.md`。本次跨任务运行和完整证据索引见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T234_base_pi05_rollout_400_20261022_attempt1/experiment_report.md`。
+
 ## 阶段与当前状态
 
-### 最新状态：L0T1/state0 Snapshot 绕障探索未到终点，等待复核（2026-10-22）
+### 暂停分支状态：L0T1/state0 Snapshot 绕障探索未到终点（2026-10-22）
 
-当前路线仍是 LIBERO-Safety `obstacle_avoidance/L0T1/state0` 完整成功轨迹采集。已从 attempt6 恢复成功抓取状态，并以 Bridge 返回的真实 BDDL `In(black_book_1, desk_caddy_1_back_contain_region)` 作为任务语义和最终放置参考；Caddy Body 原点没有当作放置目标。新生成的 18 条 Left/Right/Above 候选与已归档候选逐项一致，几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒。该结果表示证明不充分，不能标 safe；三条方向代表候选仅在隔离 Snapshot 中探索，`passes_geometric_screen` 仍为 false。
+此前 L0T1 分支拟完成 LIBERO-Safety `obstacle_avoidance/L0T1/state0` 全任务轨迹；该分支目前依用户最新指示暂停。该次实验从 attempt6 恢复抓取状态，并以 Bridge 返回的真实 BDDL `In(black_book_1, desk_caddy_1_back_contain_region)` 作为任务语义和最终放置参考；Caddy Body 原点没有当作放置目标。18 条 Left/Right/Above 候选与已归档候选逐项一致，几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒。该结果表示证明不充分，不能标 safe；三条方向代表候选仅在隔离 Snapshot 中探索，`passes_geometric_screen` 仍为 false。
 
 三条候选分别在 Left 5 步后与 study table Body 1 碰撞、Right 17 步后与 place box Body 27 碰撞、Above 139 步后因 Panda `robot0_joint7` 越过上限而停止。均未到绕障终点；接触子步记录完整，停止时双指 Book 接触仍通过。三条 Contact Safety Compiler 结果都是 `unknown`，不得解释为 safe。所有真实动作、Book 状态、接触和稀疏视频已独立归档；最终 Snapshot 恢复误差为 0。`rule_2` 的 Teacher 接触类别仍是 unknown，执行分支对 Caddy Body 26 采用接触即停/拒绝条件，未修改 Teacher 或 Safety Compiler。
 
-候选生成和本轮物理探索均未修改 B-Spline 几何算法、障碍半径或默认控制配置；未运行主环境搬运/放置、VLA 放置或训练，也未生成示范。详细报告在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`。当前等待复核；后续目标是在复核后从 attempt6 抓取状态继续真实 OSC 搬运并最终完成 Caddy 后侧隔间放置。
+候选生成和该次物理探索均未修改 B-Spline 几何算法、障碍半径或默认控制配置；未运行主环境搬运/放置、VLA 放置或训练，也未生成示范。详细报告在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`。attempt6 快照和该物理结果继续保留；是否恢复此分支待复核，不从本轮跨任务筛选自动启动。
 
 ### 已确认的抓取起点：attempt6
 

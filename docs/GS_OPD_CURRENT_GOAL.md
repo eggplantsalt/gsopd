@@ -1,8 +1,21 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 三方向 Snapshot 绕障探索均未到终点，等待复核（2026-10-22）
+## 当前状态：L0 T2/T3/T4 原始 π₀.₅ Base 跨任务筛选完成，待复核（2026-10-22）
 
-当前全局目标是 `obstacle_avoidance/L0T1/state0` 完整成功轨迹采集；后续目标是从 attempt6 抓取快照继续真实 OSC 搬运并最终完成 `In(black_book_1, desk_caddy_1_back_contain_region)`。本轮仅做局部候选筛选与最多三条 Snapshot 物理探索，不运行 L0T0、不重新执行 408 步抓取，也不做主环境搬运/放置、VLA 放置或训练。
+本轮暂停 L0T1 的 OSC/B-Spline 调试，不运行 L0T0，也没有重做 attempt6 抓取。用原始 Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft` 各独立运行 `obstacle_avoidance/L0` T2、T3、T4：init-state 0、环境 seed 0、VLA RNG seed 20261022、最多 400 个 VLA action。三次均执行 400 步、reward=0、`done=false`，不据预算耗尽推断模型完全不会任务。
+
+- 三次均为 π₀.₅ Base-only，Checkpoint 文件 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`；未加载 π₁/π₂ LoRA。模型仅收到 agentview/wrist RGB、EEF 位姿、夹爪 qpos 和原任务指令。BDDL、Body/Geom 及 MuJoCo 物理状态/接触只用于离线评价。未调用 OSC、Teacher、SAM3、轨迹修复或训练。
+- **T2** `put both moka pots on the stove`：Moka pot 2 于第 119 步出现真实指尖接触，第 134 步观察到双指闭合接触，第 141 步满足连续三状态标准；稳定双指抓持持续 156 个动作状态（139–294）。抓持区间中物体根净位移 0.580 m、路径长 0.785 m；对象到 Stove Body 根部的最小距离由初始 0.527 m 降至 0.230 m，仍不是 BDDL `On` 完成。Moka pot 1 未移动；episode 最大位移 0.663 m。另观察到机器人与非目标 ginger-beer bottle 接触 36 个控制步，Bridge 子步记录峰值力 12.10 N。因此这是部分任务进展和唯一自主稳定抓取，不是安全成功轨迹或完整任务成功。
+- **T3** `put both the alphabet soup and the cream cheese box in the basket`：两个目标均未出现双指接触或可测目标位移，EEF 到两个目标根部的最近距离分别为 0.247 m 和 0.223 m。观测到机器人与 ketchup 接触 368 步（峰值 31.74 N），与 carrot-juice bottle 接触 86 步（峰值 20.27 N）。
+- **T4** `put the white yellow mug in the microwave and close it`：mug 根位移仅 0.000003 m，EEF 最近到 mug 根部为 0.248 m；microwave door joint 初始 `-1.6520 rad`，400 步变化 `0 rad`，与 microwave 无机器人接触。BDDL 初态已满足 `Open(microwave_1)`，本回合没有新的开门或关门进展。机器人与 dish-soap bottle 接触 307 步，峰值 48.05 N。
+- 三个任务每个控制步均有 25/25 个 MuJoCo 子步接触记录，覆盖 10,000/10,000 个物理子步；NPZ 含实际 7D 动作、两相机帧、EEF/夹爪、物体根状态及逐步接触，视频各 401 帧、30 fps。接触数据是实测，不作 Safety Compiler 判定。
+- 本轮只为元数据准确性让 Rollout 从 Bridge scene metadata 记录 task ID，并通过现有只读 `observe` 保存初始物理状态；VLA observation builder 和控制路径未变。T2 初次启动的未认证 TCP readiness probe 导致 Bridge 认证 EOF，模型虽加载但执行动作 0 步；已将此作为运维失败独立留档，随后 attempt2 完成有效 T2 rollout。
+- **下一场景建议：T2**，因它是唯一观察到连续三状态真实目标双指抓持及较长真实搬运的场景。必须先针对已有 ginger-beer 接触进行安全筛选；本次原始回合不可直接标作安全轨迹。
+- 总报告：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T234_base_pi05_rollout_400_20261022_attempt1/experiment_report.md`。T2/T3/T4 独立归档及 `experiment_report.json` 分别位于该报告末尾列出的运行目录。当前停止并等待复核。
+
+### 已暂停的上一局部目标：L0T1/state0 Snapshot B-Spline 物理探索（2026-10-22）
+
+这是此前 L0T1/state0 的 Snapshot B-Spline 局部探索记录：其拟从 attempt6 抓取快照继续 OSC 搬运并最终完成 `In(black_book_1, desk_caddy_1_back_contain_region)`。该分支目前暂停；既有 attempt6 抓取快照与 B-Spline 结果均保留。本轮跨任务筛选没有运行 L0T0、没有恢复 attempt6、没有做 OSC/B-Spline/搬运/放置或训练。
 
 - 现有 18 条候选（Left/Right/Above 各 6）几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒：证明不充分，不是已证明安全或碰撞。仅选择最短的 `trajectory-001/002/003`，每方向 1 条；候选 `passes_geometric_screen` 原值保持 false，未修改绕障曲线生成算法、障碍物半径或 Safety Compiler。
 - 三个 Snapshot OSC 分支均未到绕障终点：Left 请求 604 步、执行 5 步，Book 与 study table（Body 1）碰撞后停止，Book 根位移 3.36 mm；Right 请求 604 步、执行 17 步，夹爪与 `white_place_box_1_main`（Body 27）碰撞后停止，Book 根位移 29.91 mm；Above 请求 604 步、执行 139 步，`robot0_joint7=2.900247` 超过上限 2.8973 后停止。没有任何候选被报告为安全成功。
@@ -16,7 +29,7 @@
 - 原始 π₀.₅ Base 的 200 步抓取仍是失败历史（未接触 Body 23），但这不再阻塞当前路线：独立脚本化 OSC_POSE waypoint 辅助控制已实际抓住 reviewed Book Body 23 / Geom 91。抓取点沿 Book 长轴远离 place box 偏移 25 mm，接触判据保持原样。
 - attempt6 共 408 个 OSC 控制动作，全部控制步具有完整子步接触监测；没有机器人–非目标物体接触。原有 `GraspStabilityMonitor` 的 3 个连续不同状态通过；另存首个稳定快照，在新 Bridge 进程恢复后 Integration State 最大绝对差为 0，并在恢复状态上再次通过 4 个连续不同状态。Book root 位移 8.34 mm，未通过放宽阈值认定成功。
 - 可恢复快照：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/recovered_grasp_runtime_snapshot.pkl`。完整实际动作、双相机帧、物理状态、接触证据、视频、初次/恢复后快照及哈希清单均在同目录。尝试历史和索引见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
-- 当前等待复核。复核后从此可恢复状态继续真实 OSC 搬运，再处理局部绕障终点到 Caddy 后侧隔间的路径；绕障 waypoint 不代表最终 `In` 放置完成。
+- 该分支曾计划在复核后从此快照继续真实 OSC 搬运并完成 Caddy 后侧隔间 `In` 放置；目前按最新指示暂停，是否恢复待后续复核决定。绕障 waypoint 不代表最终放置完成。
 
 ### L0T0 trajectory-001 Snapshot（历史实验，非当前任务）
 

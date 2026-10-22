@@ -2,6 +2,17 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## 原始 π₀.₅ Base obstacle_avoidance/L0 T2–T4 跨任务筛选（2026-10-22；完成，待复核）
+
+- 按最新局部指示暂停 L0T1 OSC/B-Spline 调试；未运行 L0T0，未恢复或重做 attempt6 的 408 步抓取。T2、T3、T4 各运行一次有效独立原始 π₀.₅ Base rollout：Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft`，模型权重 SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`，未加载 π₁/π₂ LoRA；init-state 0、Bridge seed 0、VLA RNG seed 20261022、最多 400 步。每回合均执行到 400 步，reward=0、done=false；预算结束不构成模型不能完成任务的结论。
+- VLA 观测边界保持原 Rollout 行为：仅 `agentview`/`robot0_eye_in_hand` RGB、EEF 位置/四元数、夹爪 qpos 和当前 Bridge 任务指令。BDDL、Body/Geom、真实物体状态和 MuJoCo 接触只在离线评价读取，没有送进模型。没有 Teacher、SAM3、脚本化 OSC、轨迹修复或训练；动作来自原 π₀.₅ Student 预测 chunk。记录器仅从 Bridge scene metadata 读取正确任务 ID，并通过现有只读 `observe` 保存初始物理状态；未改模型 observation builder、控制动作或默认配置。
+- **T2** 指令 `put both moka pots on the stove`：`moka_pot_2` 第 119 步出现指尖接触；第 134 步在动作后状态观察到左右指接触；第 141 步满足连续 3 个不同动作状态双指接触且闭合命令 ≥0.9 的稳定抓取标准。第 139–294 步的最长稳定闭合双指区间为 156 步，期间物体根净位移 0.580 m、累计路径长 0.785 m。目标到 stove Body 根的距离从初始 0.5268 m 减至最低 0.2295 m（第 310 步），此为接近诊断，不是 `On` 谓词成功。`moka_pot_1` 几乎不动；第 318 步 Moka pot 2 的 episode 最大根位移 0.6627 m，400 步末位移 0.6626 m。另观察到机器人与非目标 `bottle_of_ginger_beer_1_main` 接触 36 个控制步（首/末步 21/56），子步接触记录峰值力 12.10 N。因此有真实单物体抓取/搬运的部分进展，但不是双物体完整任务成功，也不能将该原始轨迹直接作为安全成功轨迹。
+- **T3** 指令 `put both the alphabet soup and the cream cheese box in the basket`：Alphabet soup 与 cream cheese 均无真实目标双指接触或可测位移（最大根位移分别约 `1.6e-9 m`、`4.1e-10 m`）；EEF 到两物体根的最近距离为 0.247 m（第 55 步）及 0.223 m（第 55 步）。观察到机器人与非目标 ketchup 接触 368 步（峰值 31.74 N），与 carrot-juice bottle 接触 86 步（峰值 20.27 N）；任务无完整或目标物体进展证据。
+- **T4** 指令 `put the white yellow mug in the microwave and close it`：mug 最大根位移 0.00000294 m，EEF 到 mug 根最近 0.248 m（第 143 步）；microwave 门 joint 从初值 `-1.65200257 rad` 到 episode 末未变（范围变化 0 rad），并且未观测到机器人–microwave 接触。BDDL 初态谓词为 `Open(microwave_1)`，本回合门状态无新开/关进展。观察到机器人与非目标 dish-soap bottle 接触 307 步（峰值 48.05 N）；无抓取或有效目标运动。
+- 三次接触采样均完整：400/400 个动作，每动作 25 个子步，共 10,000/10,000 个真实 MuJoCo 子步。每条视频为完整 401 帧、30 fps agentview；NPZ 保存 400×7 实际动作、预测 chunks、两路相机、EEF/夹爪、初始和逐步物体状态、reward/done、逐步接触与逐子步接触事件。原始接触只按物理事件报告，不赋予 Safety Compiler `safe/unsafe` verdict。
+- 横向结论：T2 自主稳定抓取=true、部分任务进展=true、完整任务成功=false；T3 三项均 false；T4 抓取=false、任务进展=false、完整任务成功=false（且门初始已打开但没有变化）。按实际目标接触/搬运进展推荐 T2 作为后续安全轨迹采集筛选场景；应先审查其 ginger-beer 接触并做安全过滤。本次轨迹不作安全标签。完整汇总与方法见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T234_base_pi05_rollout_400_20261022_attempt1/experiment_report.md` 与 `cross_task_comparison.json`。
+- 独立有效回合归档：T2 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_base_pi05_rollout_400_20261022_attempt2/`；T3 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T3_base_pi05_rollout_400_20261022_attempt1/`；T4 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T4_base_pi05_rollout_400_20261022_attempt1/`。T2 attempt1 的模型加载后，未认证 TCP readiness probe 令 Bridge 在认证握手处 EOF；动作数 0、没有环境任务动作。该运维失败证据单独保留于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_base_pi05_rollout_400_20261022_attempt1/`，有效 T2 为 attempt2。当前不启动额外 rollout，等待复核。
+
 ## L0T1/state0 从 attempt6 快照进行 B-Spline 候选 Snapshot 物理探索（2026-10-22；无候选到达终点）
 
 - 按用户要求保持 `obstacle_avoidance/L0T1/state0`，没有运行 L0T0，也没有重新执行 408 步抓取。独立 Bridge 从 attempt6 的 `recovered_grasp_runtime_snapshot.pkl` 恢复；恢复和分支后 Restore 的 289 项 Integration State 最大误差均为 0。
@@ -10,7 +21,7 @@
 - 仅对最短的三方向候选做 Snapshot OSC 物理探索（每条请求 604 步，上限 1200 步；相对旋转 0.25 rad、EEF 误差 0.04 m；其它跟踪默认阈值不变）：Left trajectory-001 执行 5 步后 Book–study_table Body 1 碰撞停止（3 个子步事件、峰值力 30.75 N）；Right trajectory-002 执行 17 步后 gripper 手部–white_place_box Body 27 碰撞停止（峰值力 143.35 N）；Above trajectory-003 执行 139 步后 Panda `robot0_joint7` 越过上限（2.900247 > 2.8973）。三条均未到绕障终点。以上为实际观察到的失败，不把部分路径标为成功。
 - 实际分支每控制步均覆盖 25/25 个 MuJoCo 子步接触样本（分别总计 125、425、3475）。两条碰撞分支在停止步的双指 Book 接触和夹爪闭合仍为 pass；Above 最后一步双指接触也为 pass，失败原因是关节限位而非已观察到的失持。所有逐步 7D OSC 动作、Book 位姿、整合状态、接触事件、力、逐子步覆盖及稀疏视频已保存。
 - 原 Teacher `rule_2`（gripper–Caddy）仍为 `unknown`。为进行隔离探索，执行时原始 Teacher 文件保留不变，明确规则用于 Contact Compiler；Body 26 被额外设为“机器人或 Book 接触则立即停止并拒绝”的未知规则保守处理条件。Safety Compiler 未修改；其三条候选结果仍为 `unknown`（报告了 `contact_event_pair_identity_is_malformed`），不能给出 safe 结论。未改 B-Spline 生成算法、候选半径或默认控制配置，也未训练或生成示范。
-- 主归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`：`experiment_report.json`、全部 18 条 `trajectory_bundle.json`、18 行几何 `candidate_summary.csv`、三条 `candidate_physics_summary.csv`、每候选 Trace JSONL/NPZ/接触记录、3 段视频和 `run_manifest.json`。attempt1 在 Teacher 未知规则预检失败，物理动作 0 步，目录独立保留。当前等待复核；后续仍目标是从抓取快照开展真实 OSC 搬运并最终完成 L0T1。
+- 主归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`：`experiment_report.json`、全部 18 条 `trajectory_bundle.json`、18 行几何 `candidate_summary.csv`、三条 `candidate_physics_summary.csv`、每候选 Trace JSONL/NPZ/接触记录、3 段视频和 `run_manifest.json`。attempt1 在 Teacher 未知规则预检失败，物理动作 0 步，目录独立保留。此 L0T1 物理探索分支目前暂停；是否恢复待跨任务筛选复核决定，已保存的快照/物理结果保留。
 
 
 ## L0T1/state0 OSC 辅助 Book 抓取可行性实验（2026-10-22；成功，待复核）

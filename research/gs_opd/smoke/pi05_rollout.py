@@ -2100,6 +2100,19 @@ start = time.monotonic()
 try:
     conn.send({"op": "reset"})
     data = conn.recv()
+    if args.record_physical_state:
+        # Capture the initialized scene through the existing read-only Bridge
+        # observation path. This augments offline state evidence without
+        # changing the environment or the model's image/state/instruction input.
+        conn.send({"op": "observe", "include_snapshot_state": True})
+        initial_observation = conn.recv()
+        if (
+            not isinstance(initial_observation, dict)
+            or initial_observation.get("error")
+            or not isinstance(initial_observation.get("snapshot_state"), dict)
+        ):
+            raise RuntimeError("Bridge initial physical-state observation is unavailable")
+        data = initial_observation
     trace_writer = None
     collection_enabled = args.on_policy_safety_collection
     trace_output_path = args.on_policy_safety_out if collection_enabled else args.trace_out
@@ -2111,10 +2124,11 @@ try:
             sys.path.insert(0, repo_root)
         from research.gs_opd.data.trajectory_writer import TrajectoryWriter
 
+        active_scene = data.get("scene_metadata", {})
         trace_metadata = {
-            "suite": "obstacle_avoidance",
-            "level": 0,
-            "task_id": 0,
+            "suite": active_scene.get("benchmark", "obstacle_avoidance"),
+            "level": active_scene.get("level", 0),
+            "task_id": active_scene.get("task_id", 0),
             "instruction": data["instruction"],
             "checkpoint_path": str(ckpt),
             "checkpoint_file": str(ckpt_file),
@@ -2125,12 +2139,19 @@ try:
             "substep_contact_recording": bool(args.record_substep_contacts),
             "seed": args.seed,
             "max_steps": args.max_steps,
-            "camera_resolution": 256,
-            "env_seed": 0,
-            "initial_state_index": 0,
+            "camera_resolution": active_scene.get("camera_resolution", 256),
+            "env_seed": active_scene.get("environment_seed", 0),
+            "initial_state_index": active_scene.get("init_state_index", 0),
+            "action_source": "raw_pi05_student_predicted_action_chunks",
+            "model_parameter_source": (
+                "base_checkpoint_only_no_lora"
+                if args.lora_checkpoint is None
+                else "base_checkpoint_plus_explicit_lora_adapter"
+            ),
         }
+        if args.record_physical_state:
+            trace_metadata["initial_physical_state"] = data.get("snapshot_state")
         if args.grasp_only_smoke:
-            active_scene = data.get("scene_metadata", {})
             trace_metadata.update({
                 "suite": active_scene.get("benchmark"),
                 "level": active_scene.get("level"),
@@ -3223,20 +3244,33 @@ try:
         if safety_summary_path is not None:
             print("SAFETY SUMMARY:", safety_summary_path, flush=True)
 
+    active_scene = data.get("scene_metadata", {})
     result = {
-        "suite": "obstacle_avoidance",
-        "level": 0,
-        "task_id": 0,
+        "suite": active_scene.get("benchmark", "obstacle_avoidance"),
+        "level": active_scene.get("level", 0),
+        "task_id": active_scene.get("task_id", 0),
+        "scene_metadata": active_scene,
+        "instruction": data.get("instruction"),
         "steps": steps,
         "chunks": chunks,
         "reward_sum": float(episode_reward_sum),
         "success_once": success,
         "done": done,
         "elapsed_seconds": round(time.monotonic() - start, 2),
-        "camera_resolution": 256,
+        "camera_resolution": active_scene.get("camera_resolution", 256),
+        "environment_seed": active_scene.get("environment_seed", 0),
+        "initial_state_index": active_scene.get("init_state_index", 0),
+        "max_steps": args.max_steps,
         "checkpoint_path": str(ckpt),
+        "checkpoint_file": str(ckpt_file),
         "lora_checkpoint_path": (
             str(args.lora_checkpoint) if args.lora_checkpoint is not None else None
+        ),
+        "action_source": "raw_pi05_student_predicted_action_chunks",
+        "model_parameter_source": (
+            "base_checkpoint_only_no_lora"
+            if args.lora_checkpoint is None
+            else "base_checkpoint_plus_explicit_lora_adapter"
         ),
         "physical_state_recording": bool(args.record_physical_state),
         "substep_contact_recording": bool(args.record_substep_contacts),
