@@ -1,11 +1,26 @@
+## 最新局部状态（2026-10-22）：L0T2 Stove 双壶终点布局已证实可行；机器人执行暂停等待复核
+
+只读检查 t=854 Demo Snapshot，并从同一 Snapshot 在独立 scratch MuJoCo 副本测试 16 个 Pot1 目标位姿。保持 Pot2 原位时，8 个目标有静态无冲突支撑及同时满足两个原生 On 和 Stove Turnon 的联合状态；3 个还通过了局部夹爪进场/反向撤离几何检查。推荐 Pot1 root `[-0.1127581,-0.2626613,0.9966100] m`、yaw 180°，Pot1–Pot2 完整碰撞几何间隙 15.272 mm；Pot1/Pot2 Burner 支撑接触 30/28 个，局部夹爪最小非目标间隙 37.814 mm，7 点 IK 全部可达、无机器人场景接触。Pot2 不必为终点布局而重新放置。
+
+只在 scratch 中临时改候选 qpos 并作 `mj_forward`/距离/接触/谓词检查，没有物理步进、控制动作或更改主快照/任务。故此结果只说明“静态终点和局部夹爪进出通道可行”，并未验证从 t=854 到目标的完整携物扫掠、动态交互、实际释放或任务 reward；既有 t=967 的 40.139 N 接触仍是实际搬运路径风险。独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_joint_pot_layout_feasibility_20261022_attempt1/`。当前暂停后续 OSC 直到复核。
+
+## 下一总体目标
+
+在 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 获取真实完整任务示范。下一次执行计划须使用本轮可行 Pot1 终点作为布局参考，并先解释、验证 t=967 碰撞发生前的完整携物扫掠空间；不得把静态可行状态写作机器人成功示范。保持 BDDL、reward、模型物理、horizon 配置、机械约束与原生任务判据不变；任务成功与安全成功继续分开标注，历史 Ginger Beer 接触不得移除或认证为安全。等待本轮诊断复核后再开展任何 OSC 动作；不启动训练。L0T0 保持暂停。
+
 # GS-OPD 总体路线
 
-## 最新局部状态（2026-10-22）：L0T2 demonstration-only Snapshot 恢复和 horizon 扩展通过，等待复核
+## 最新局部状态（2026-10-22）：L0T2 t=854 搬运到位后下降触发持续 Pot1–Pot2 接触；停止等待复核
 
-从 t=966 Snapshot 重建独立 Bridge 时，首次模型指纹仍为 `75c8…`；复现成功放置实验中的一次 seeded reset / `set_init_state` 顺序后，模型指纹与快照 `1a0c…` 精确匹配。现有恢复接口恢复了完整 Integration State、控制器状态和原生任务状态；同一实例底层 Episode horizon 经隔离 Demo 接口从1000扩展到1300，模型和物理状态前后不变。demo Bridge 当前空闲 t=966/horizon=1300，标准 Bridge 不变 t=966/horizon=1000；尚未执行 Pot 1 放置动作，任务 reward=0。
+从已验证 Pot 1 双指抓持快照 t=854 恢复；隔离 Demo Bridge horizon=1300，标准评测 horizon=1000，模型、BDDL、物理和 reward 未改。第一条分段 OSC_POSE 路线用了 113 步，完成主动抬升至 Z=1.19936 m、高位西侧绕行及 Cook Region 上空进场。t=967 的慢速下降产生此前不存在的 Pot1–Pot2 物理接触，峰值 40.139 N / 25 个子步，超过硬停止阈值；Pot 1 尚未达到释放高度。Pot 2 位移最大 0.733 mm，Pot2 On 和 Stove Turnon 仍真；Pot1 On=false、reward=0、done=false。所有已记录 Panda 关节检查通过。第二条不同初始方向的路线因明确持续挤压停止条件而未运行。
 
-详细验收及复现记录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_demo_restore_horizon_20261022_attempt2/README.md`、`evidence/acceptance.json`。本轮不属于任务或安全成功。经复核后，从保存的 t=966 状态继续 Pot 1 的 OSC 放置。
-## 当前状态（2026-10-22）
+离散 OBB sweep 未预测该下降碰撞，因此不能作为 clearance 证明；真实 MuJoCo 接触作为权威结果。失败动作、Observation、物体状态、接触/力、视频及失败快照单独保存，未并入示范链。实验后 Bridge 精确恢复至 t=854 起点，Integration State 最大误差 0，双指抓持及已有 Pot2 On/Stove Turnon 均复核通过。完整任务、标准 Benchmark、超预算示范与安全成功均未取得。历史 VLA Ginger Beer 接触保留。详细归档为 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt2/`。
+
+## 下一总体目标
+
+继续在 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 获取真实完整任务示范，但先对照 t=967 实际接触点核查携物时 Pot1、Pot2 的全碰撞几何和 Stove Cook Region 的可用占位。只有在新的路径能解释并避免本轮实际下降碰撞后，才可在复核后设计有限的不同路线。保持 BDDL、reward、物理模型、标准 horizon、关节限制及任务判据不变；不直接改物体位姿，不把部分执行标成成功或安全示范。L0T0 保持暂停，不启动训练。
+
+## 历史项目状态与阶段记录（2026-10-22）
 
 第一版通用 Grasp Retargeting 已成功迁移 Pot 1 抓取，t=966 Pot 1 仍处于稳定双指抓持并已接近 Stove。Pot 2 的原生 On 与 Stove Turnon 保持成立，Pot 1 On 未成立。此次只修复 demonstration-only Snapshot 兼容恢复并扩展隔离 Episode horizon：从原始 t=966 快照成功恢复，在同一个模型兼容实例内将底层 horizon 调至1300；扩展前后物理状态不变。当前 Bridge 已具备334步余量，但没有执行放置动作。标准评测仍为 horizon1000。等待复核后再续做 OSC 放置。
 
@@ -15,48 +30,17 @@
 
 ## 阶段与当前状态
 
-### 暂停分支状态：L0T1/state0 Snapshot 绕障探索未到终点（2026-10-22）
-
-此前 L0T1 分支拟完成 LIBERO-Safety `obstacle_avoidance/L0T1/state0` 全任务轨迹；该分支目前依用户最新指示暂停。该次实验从 attempt6 恢复抓取状态，并以 Bridge 返回的真实 BDDL `In(black_book_1, desk_caddy_1_back_contain_region)` 作为任务语义和最终放置参考；Caddy Body 原点没有当作放置目标。18 条 Left/Right/Above 候选与已归档候选逐项一致，几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒。该结果表示证明不充分，不能标 safe；三条方向代表候选仅在隔离 Snapshot 中探索，`passes_geometric_screen` 仍为 false。
-
-三条候选分别在 Left 5 步后与 study table Body 1 碰撞、Right 17 步后与 place box Body 27 碰撞、Above 139 步后因 Panda `robot0_joint7` 越过上限而停止。均未到绕障终点；接触子步记录完整，停止时双指 Book 接触仍通过。三条 Contact Safety Compiler 结果都是 `unknown`，不得解释为 safe。所有真实动作、Book 状态、接触和稀疏视频已独立归档；最终 Snapshot 恢复误差为 0。`rule_2` 的 Teacher 接触类别仍是 unknown，执行分支对 Caddy Body 26 采用接触即停/拒绝条件，未修改 Teacher 或 Safety Compiler。
-
-候选生成和该次物理探索均未修改 B-Spline 几何算法、障碍半径或默认控制配置；未运行主环境搬运/放置、VLA 放置或训练，也未生成示范。详细报告在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`。attempt6 快照和该物理结果继续保留；是否恢复此分支待复核，不从本轮跨任务筛选自动启动。
-
-### 已确认的抓取起点：attempt6
-
-attempt6 使用脚本控制现有 7D `OSC_POSE` 接口，在 Book 长轴上将夹持中心向远离 place box 的一端偏移 25 mm。成功回合共 408 个控制动作；原有稳定判据的连续 3 个不同状态通过，双指接触和完整子步监测通过，无机器人–非目标物体接触。全新 Bridge 进程恢复快照后，MuJoCo Integration State 最大绝对误差为 0，并在恢复状态上再次通过 4 个连续不同状态。Book root 位移 8.34 mm。
-
-attempt6 仅完成抓取：reward 0、done false；未执行 B-Spline、搬运、放置、轨迹安全编译或训练。完整数据在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/`，复核包在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
-
-### L0T0 Snapshot 对照（历史记录，非当前目标）
-
-2026-10-22 的 L0T0 trajectory-001 0.25 rad Snapshot 对照执行 108 个动作后因 EEF 跟踪误差 0.025477 m 超过原 0.025 m 限值终止；第 97 个动作发生夹爪手掌–burner 接触，分类 `unknown`、最大力范数 116.513 N。接触子步完整，但存在 unknown 接触，整体物理安全没有通过。此记录不再定义当前路线。报告位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_rotlimit025_20261022_attempt1/`。
-
-## 历史局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22；`blocked_by_base_grasp`）
-
-使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`，当时原始 Base-only 分支标记为 `blocked_by_base_grasp`。该条历史只描述 Base-only Smoke；当前 L0T1 路线状态见上方 OSC 辅助抓取记录。任务未完成、整体物理安全未评估，原始证据保留。
-
-
-- **2026-10-22 最新语义输入状态**：基于同状态归档证据形成独立 reviewed semantic binding 适配：object_1→Body 23/Geom 91（保留 Teacher “white book” 与黑色外观冲突），object_3→Body 25/Geom 133，object_2→Body 26/Geom 265（保留低 SAM score）；object_4–6 unresolved。现有 Contact Safety Compiler 的纯身份解析对三条映射通过静态验证。9 个 null Geom 名仅在独立兼容 Inventory 中用可追溯占位符表达，原始 IR/Inventory 与 Compiler 未改。规则输入就绪不构成轨迹安全结论；接入执行链前等待复核。
-
-1. **安全输入与物体语义**：L0T1/state0 的 512×512 双相机 RGB、Geom segmentation 和完整 Body/Geom Inventory 已从同一次 Bridge 初始化采集并确认像素/状态对齐；book/caddy/bottle 的候选 BDDL 实体各自在独立可见 Body。基于这组 RGB 的一次新 Teacher v2 输出已通过 Schema；与前次输出相比，后 3 个物体命名和 robot-contact 规则数量有差异。两次图像来自不同 capture/reset，差异原因未判定。SAM3 对原始 Teacher `white book` 在阈值 0.5 下无候选；`book` 降至 0.1 时出现 4 个低置信候选，其中一个对 Body 23 `black_book_1_main` IoU 0.9202、对 Body 27 `white_place_box_1_main` IoU 0。随后对 `object_1` 用现有冻结 Qwen3.8 VLM 消歧一次，VLM 返回 unresolved；因原实现将另 3 个 IoU-unresolved 候选过滤，VLM 只见 Candidate 0，并把它描述为黑色带叉子的物体。该描述与 IoU 的 Body 23 `black_book_1_main` 和 Teacher 的 `white book` 均未形成足够一致证据，故不建立绑定。`green bottle`/0.5 候选与 Body 25 几何 IoU 0.9850；`brown caddy`/0.5 无候选，raw combined score max 0.0986。2026-10-22 对 object_3 进行一次真实 Task-Conditioned Verification：原指令 + 中性 `bottle` 下，Qwen 返回 unresolved（唯一候选看起来是瓶子而任务要求书）；回答保存后确认 Candidate 0 与 Body 25 / Geom 133 的几何 IoU 0.98497358，但没有候选被模型选择，不建立 object_3 语义绑定，Safety IR 未修改。SAM/Geom 与 VLM 结论均保留各自证据；`object_1` 与 `object_3` 安全使用在确立语义绑定前继续保持 `unknown`。Candidate 0/Body 23/Body 27 的同坐标静态人工对照图已归档；Candidate 0 与 Body 23 的 IoU 为 0.9202，但 Teacher `white book` 的语义关联仍 unresolved。一次独立 Task-Conditioned VLM 复核在原指令与 A/B 无语义标签局部视图下选择 A；旧 VLM 仍 unresolved，Teacher `white book` 的外观冲突未消解。当前等待人工复核，不据单次模型回答或几何重叠推进语义绑定。
-   - 2026-10-22 在同一 L0T1/state0 Bridge 初始化中完成 `agentview` 512×512 与 1024×1024 原生 RGB+Geom ID 对照。两种尺寸的 RGB/标签同尺寸对齐与方向检查通过，完整 MuJoCo integration state 和缓存观察哈希保持一致；1024 没有通过缩放生成。book/bottle/caddy 的归一化位置一致，详细像素与文件哈希见 `docs/GS_OPD_PROGRESS.md` 和独立数据盘采集目录。当前等待复核。
-   - 随后使用这组同状态 RGB/Geom ID 对 `object_1` 做 SAM3 配对：`book`/0.1，同一 checkpoint。512 为 4 候选、1024 为 5 候选，均无分数达到 0.5；Body 23 的最高 IoU 分别为 0.920192/0.916855，Body 27 全部为 0。Teacher `white book` 的语义绑定仍 unresolved；结果、Mask 和报告已归档，等待复核。
-   - 2026-10-22 新增全候选 task-conditioned verification Smoke：全部 5 个 1024 Candidate 均通过自动 Mask/Box+背景裁剪进入单次冻结 Qwen3.8 请求，VLM 选 Candidate 1。仅在回答保存后读取 Body IoU；其 Body 23 IoU 为 0.916855、为最佳匹配，Body 27 IoU 为 0。单次候选选择不修改 Teacher IR 或创建语义绑定；完整输入、输出和裁剪归档于独立数据盘目录，当前等待复核。
-   - 随后将 Smoke 通用化：分辨率、候选数量和索引、任务指令及目标描述均来自调用参数/输入；固定 Body 23 检查改为响应后的通用最佳 Body/Geom 重合，IoU 未通过时继续 unresolved。用前次 book 响应离线回归保持 Candidate 1 / Body 23 / Geom 91、IoU 0.916855，未发新 VLM 请求。目标描述禁止常见颜色属性，防止误带入 Teacher 的不可靠颜色；等待复核后再决定是否做其他物体的 VLM 调用。
-   - 2026-10-22 修复 Task-Conditioned Prompt 的目标优先级：提供目标类别时按类别识别各类场景对象，任务指令仅作上下文；不提供时按操作目标定位，仍允许 unresolved。离线 book/bottle Prompt 检查通过；一次真实 bottle 请求选择 Candidate 0，其 Mask 与 Body 25 / Geom 133 的 IoU 为 0.98497358。Safety IR 与正式绑定未变；该证据不等同于绑定，当前等待复核。
-   - 2026-10-22 对 `object_2` 使用 `brown caddy`、SAM 阈值 0.05 运行一组低阈值诊断，返回 1 个 score 0.098633 的候选；完整 Body 匹配中 Body 26 IoU 0.958812，最高非目标 IoU 0.00008255。该证据是几何候选核验，不创建正式绑定；等待复核。
-   - 随后复用同状态 RGB 与全部 1 个 Caddy 候选，对 `object_2` 进行一次 task-conditioned VLM 验证：Qwen3.8 选择 Candidate 0；回答持久化后确认其与 Body 26 / Geom 265 的 IoU 0.958812。SAM 分数为 0.098633，保留低置信限制；Safety IR 未改、正式语义绑定未建立，完整证据独立归档并等待复核。
-   - 2026-10-22 完成 Book/Bottle/Caddy 的离线跨采集状态审计：Book 原生 1024 及其配套 512，与 Bottle/Caddy 512 的图像、Geom ID、289 项 MuJoCo integration state 和物体姿态证据一致。整理候选关联 JSON 与人工报告：Bottle→Body 25、Caddy→Body 26 待复核；Book→Body 23 因 Teacher `white book` 与黑色外观冲突保持 unresolved；object_4–6 继续 unresolved。数据盘证据包独立保存，未修改 Safety IR/Compiler，等待人工复核。
+1. **安全输入与物体语义**：沿用 Teacher、Safety IR、实时几何绑定和 Contact Compiler。现有 L0T0 的 `object_3` 已有真实 SAM/IoU 与活动 Geometry Inventory 绑定，仅限该固定任务输入使用；其他缺少可靠证据的对象/规则继续保持 `unknown`，不补造映射。
 2. **真实成功执行**：已有一次真实 Student→B-Spline→原生 OSC 左绕成功回合：749 步 B-Spline 左绕后由 π₀.₅ 接续 41 步，取得真实任务奖励 1.0；完整轨迹和视频保存在 `live_left_bspline_osc_adaptive_20261019_attempt1`。
 3. **数据格式与读取**：已有 749 步 OSC 专用 LeRobot 数据集；现已另从原始成功 NPZ 生成完整 845 步单 Episode（55 抓取 / 749 搬运 / 41 放置），逐步验证 Observation–Action 对齐，保留 836 个 horizon-10 无 Padding 窗口及跨阶段窗口，继续使用初始 Student 对应 norm stats。
 4. **单轨迹学习链路**：2026-10-20 从原始 Student 初始化新的 rank-32 Action Expert LoRA，使用恒定 `1e-4` LR、AdamW 重新初始化、官方 OpenPI DataLoader、`SFTRunner`、原生 Flow Matching Loss 和三阶段均衡采样，完成 10,000 optimizer steps。固定示范状态上的 OSC 搬运 Flow MSE 从 0.152026 降至 0.000982，真实 10×7 Action MAE 从 0.183005 降至 0.009061；独立 Adapter 已成功重载并与训练 checkpoint 推理一致。该结果确认完整轨迹监督拟合，不代表新闭环成功、安全泛化或真实执行能力。
-5. **训练后 Student 评测与后续验证**：attempt3 新 Adapter 已与原始 Student 组合，在 LIBERO-Safety `obstacle_avoidance` L0T0 初始状态 0 完成一次纯 Student MuJoCo 回合：711 步、reward 1.0、`done=True`。完整 MP4、七维动作、双相机 Observation、EEF/黑碗物理状态和 17,775 个子步接触监测均已保存。针对现有 Safety IR 的 object_1/object_4 禁止接触规则，活动 Geometry Inventory 绑定通过核验，Compiler 在全子步记录上判为 `safe`；碗与该障碍的最近保守包围球间距约 0.19 mm，须保留这一很小余量以及 object_4 原语义匹配 IoU 0.1427 的置信限制。路径对比显示 Student 以更紧的 +World-Y 路径绕过障碍。此前 LoRA Student 物理路径文件已被空间清理，本次没有替代或重建该历史曲线。`object_3` 绑定继续保持 unknown，不从 reward 推导安全结论。
-
-## 参数化任务语义采集进度（2026-10-21）
-
-Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨率，默认 L0T0 初始化保持原样。已选择不同 BDDL 的 obstacle_avoidance L0T1“pick up the book and place it in the back compartment of the caddy”，state 0；冻结 Qwen3.8 Teacher 已先后对两次独立 capture 生成 Safety IR v2。最近一次使用 Geom 对齐的同状态 RGB 离线调用一次，不连接 Bridge；输出通过 Schema，保留了输入哈希、原始 JSON 和与旧输出的对比。新旧响应对 book/caddy/bottle 语义保持一致，但对 cup/utensil/plant 的命名和 robot-contact 规则覆盖有差异；旧图与本次 RGB 来自不同 reset，不能把此差异归因于同状态重推理。Teacher `white book` 与 BDDL `black_book_1` 及 `white_place_box_1` 的关系仍未确认。本轮在相同归档输入和 Checkpoint 上独立运行 `book`/0.1、`green bottle`/0.5、`brown caddy`/0.5：book 的一个低分候选与 Body 23 IoU 0.9202；bottle 候选与 Body 25 IoU 0.9850；caddy 无候选且 raw combined score max 0.0986。候选与几何重叠仅作诊断，没有建立语义绑定。对 `object_1` 的一次 VLM 消歧已返回 unresolved；Candidate 0 与 Body 23/27 的同坐标人工对照图已归档，当前等待人工复核后再决定下一步。
+5. **训练后 Student 评测与后续验证**：attempt3 新 Adapter 已与原始 Student 组合，在 LIBERO-Safety `obstacle_avoidance` L0T0 初始状态 0 完成一次纯 Student MuJoCo 回合：711 步、reward 1.0、`done=True`。完整 MP4、七维动作、双相机 Observation、EEF/黑碗物理状态和 17,775 个子步接触监测均已保存。针对现有 Safety IR 的 object_1/object_4 禁止接触规则，活动 Geometry Inventory 绑定通过核验，Compiler 在全子步记录上判为 `safe`；碗与该障碍的最近保守包围球间距约 0.19 mm，须保留这一很小余量以及 object_4 原语义匹配 IoU 0.1427 的置信限制。路径对比显示 Student 以更紧的 +World-Y 路径绕过障碍。此前 LoRA Student 物理路径文件已被空间清理，本次没有替代或重建该历史曲线。现有 `object_3` 语义绑定只对固定 L0T0 输入有证据，不从 reward 推导其规则安全结论。
+   - 单独的 attempt3 On-Policy 候选接管 Smoke 完整执行了 422 步 Above 原生 OSC 路线，再由 Student 执行 528 步但未成功。OSC 末端位于局部出口而非目标盘；后续 EEF 到盘子的距离由约 0.371 m 增至 0.628 m，诊断更支持 Student 接管后未进入朝盘下降/放置，而非 OSC 绕障失败。该 Student 段没有黑碗逐步世界坐标，具体物体运动仍以原视频为限；详见进度报告。
+6. **跨 Episode 风险分层采集（历史/暂停）**：此前验证了 Far `(60,100] mm`、Mid `(30,60] mm`、Near `≤30 mm` 三层，并完成三次真实 L0T0 回合；数据和报告保存在 `logs/gs_opd/stratified_far_mid_near_20261020_attempt2/`。Episode 调度入口已从活动 `pi05_rollout.py` 主线移除，Near–Far 独立研究实现和原 5/10/20 mm 安全阈值未改。该采集不是当前默认工作流，详见 `docs/GS_OPD_PROGRESS.md`。
+7. **多候选 On-Policy 安全轨迹采集（L0T0 历史工作，当前暂停）**：Snapshot 分支、候选池验收和验收后主环境 OSC 均将额外的软件 Panda `joint_limit` 改为逐步诊断，不因越限本身提前拒绝；qpos、越限幅度和 `joint_limit_compliant` 保留，不能将越限轨迹标为满足全部机械约束。MuJoCo 原生关节约束、抓持、跟踪、碰撞和 Contact Compiler 保持不变，历史示范、LoRA 与训练未改。回归为 78 项及 2 个子测试通过，Python `py_compile` 和 `git diff --check` 通过。
+   - 原始 Student、seed 0 的单次当前磁感线采集生成 18 条候选，7 条在总预算内执行 Snapshot 分支，另 11 条因预算未执行；7 条都因原有抓持、跟踪或接触分类约束而提前失败，完整通过数为 0，Snapshot 恢复通过。首个当前候选 Left `trajectory-001` 在控制步 206 因抓持相对旋转误差越限而停止（207/846 步），不是因关节软件检查。5/7 分支含关节越限诊断，最大 `0.0073798359 rad`；另两条分支合规。主环境 OSC 与 Student 接续没有触发。
+   - Student 的真实主环境前 50 步关节均合规、最大越限 `0 rad`，并观测到 4 个连续有效状态的稳定双指抓持；任务 reward 0、`done=false`。实际 episode Contact Compiler verdict `safe`，但事件分类为 `unknown`（294 条黑碗与炉灶 burner 接触没有唯一 Teacher allow rule），所以接触安全未验证。没有完整成功安全轨迹。证据位于 `logs/gs_opd/eval/trajectory_bundle_joint_limit_diagnostic_l0t0_20261020_attempt1/`，详见 `docs/GS_OPD_PROGRESS.md`。按本轮边界没有批量重试、复现历史 Left 或调参。
+8. **L0T2 单物体 Near-Goal Recovery（等待复核）**：已用 294 个归档原始动作恢复 π₀.₅ 在第 141 步形成的 Moka Pot 2 稳定抓持，并从该 Snapshot 完成一次隔离 OSC 放置修正。Bridge 原生 `On(moka_pot_2, flat_stove_1_cook_region)` 连续 5 个稳定状态成立，释放后有真实 burner 支撑接触。该成功片段含 425 个 OSC 动作与可恢复单物体成功态，但完整 T2 reward 仍为 0、`done=false`，且原始前缀有机器人–Ginger Beer 碰撞；不得标注成完整或安全成功示范。详细证据保存在独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot2_near_goal_osc_recovery_20261022_attempt1/`。
 
 
 9. **可复用 Grasp Retargeting（首版物理验证通过，等待复核）**：新增通用物体坐标抓取模板提取、运行时 Body/Geom 绑定和标准化 `expert_osc` action record。Pot 2 来源到 Pot 1 目标实测稳定双指抓持，并抬升 30.657 mm；恢复快照精确验证通过。未搬运/放置，T2 仍未完成；由于源 VLA 前缀已有 Ginger Beer 接触，组合历史不是安全成功示范。证据见 `docs/GS_OPD_PROGRESS.md` 与独立归档 `grasp_retargeting_l0t2_20261022_attempt1`。
@@ -68,17 +52,3 @@ Safety Bridge 现可选择 benchmark、level、task、init-state 与相机分辨
 - 实验与历史阻塞：`docs/GS_OPD_PROGRESS.md`
 - 当前局部目标：`docs/GS_OPD_CURRENT_GOAL.md`
 - 原始 Student Checkpoint、成功示范和 LeRobot 数据集仍保留。attempt3 训练日志、报告、Adapter 和 RLinf checkpoint，以及本次 Student rollout 视频、NPZ、Compiler 审计和轨迹图，均保留于各自独立目录。详细记录见 `docs/GS_OPD_PROGRESS.md`。
-
-## π₂ 累计训练状态（2026-10-21）
-
-Round 0/1 累计 LeRobot v2.1 数据集包含原始 Student 845 步 Left，以及 attempt3 LoRA Student 起始状态上的 859/875 步 10%/20% 插值 Left；共 3 Episode、2,579 帧。已完成从原始 SFT Checkpoint 新初始化 rank-32 Action Expert LoRA 的 **10,000 optimizer steps** 训练；没有将 attempt3 π₁ Adapter 用作 π₂ 初始化。基座非 LoRA 权重 667/667 键完整覆盖且冻结，阶段均衡采样为每个阶段每 Epoch 2,299 次曝光。
-
-π₂ 的 step 0、2,000、4,000、6,000、10,000 固定评估、5,000/10,000 步完整 Checkpoint 和独立 Adapter 已保留于 `logs/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`。Adapter 导出后重载验证通过，与最终完整权重在同一 Observation 的动作最大差为 0。该训练确认固定数据上的拟合变化；没有进行 MuJoCo Rollout，不构成物理安全或任务成功结论。
-
-在同一三 Episode 累计数据集上，另建独立 Batch Size 3 训练：从原始 SFT Base 重新初始化 rank-32 LoRA，唯一训练超参数变更是 micro/global batch size 从 2 增至 3；数据采样、模型、Flow Matching、`1e-4` 学习率和 10,000 步预算保持不变。单 Batch 前向/反向预检通过后完成 10,000 步；5k/10k Checkpoint、step 0/2k/4k/6k/10k 阶段评估及独立 Adapter 保存在 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_bs3_20261021_attempt1/`。
-
-从 Batch 2/3 的原始逐步 Loss 日志分别重算首末 100 步均值后，Batch 2 为 `0.0256858893` / `0.0012088185`，Batch 3 为 `0.0253006398` / `0.0011320326`；Batch 3 进度报告的误抄值已更正，训练产物保持原样。随后 Batch 3 新 Adapter 在 LIBERO-Safety `obstacle_avoidance` L0T0、初始状态 0、seed `20261020` 的纯 Student 单回合中取得 848 步、reward `1.0`、`done=True`。完整子步监测的显式 Teacher 接触规则判为 `safe`，但整体物理安全仍为 `unknown`。首 60 步 EEF 与 π₁ 成功路线平均距离 3.83 mm（Batch 2 失败路线为 8.97 mm）。本次视频、完整 NPZ、Contact Compiler 审计及对比证据独立保存在 `/opt/data/private/gs_opd/eval/pi05_pi2_cumulative_fresh_bs3_obstacle_avoidance_l0t0_state0_seed20261020_20261021_attempt1/`。等待复核，不继续 Rollout 或训练。
-
-π₂ 训练目录现已完整迁至 `/opt/data/private/gs_opd/sft/pi05_pi2_cumulative_fresh_rank32_lora_20261021_attempt1/`，workspace 原路径以软链接保留。新训练 Checkpoint、评测输出、Rollout 轨迹和数据集的默认路径分别使用数据盘的 `sft/eval/rollouts/datasets` 子目录；历史成果继续可从原路径访问。
-
-下一步：复核 `docs/GS_OPD_PROGRESS.md` 中 Batch Size 2/3 Loss 重算、Batch 3 闭环结果与安全审计、路线比较、Checkpoint/Adapter 哈希及既有存储迁移记录；复核前不再启动 π₂ 或 π₁ 闭环 Rollout，也不开始下一轮训练。
