@@ -1,26 +1,29 @@
 # GS-OPD 总体路线
 
-## 最新局部状态（2026-10-23）：L0T2 Round 1 绕障部分执行，无接触但未到预抓取，等待复核
+## 最新局部状态（2026-10-23）：L0T2 t=10 关节空间 RRT-Connect 获得离线可行路线
 
-以原始 π₀.₅真实 t=10 Snapshot 恢复（前 10 步原动作重放，模型、BDDL、MuJoCo 状态、控制器、任务 bookkeeping、RNG 全部核对通过），并按历史 Pot 2 实际抓取变换构造可重接入的预抓取目标。沿一条先 −World-X/+Z 制动退让、后负 World-Y 外侧 cubic B-Spline 的 EEF 路线执行 206 个 OSC_POSE 控制步，到达 timestep 216 时因 EEF 跟踪误差 40.135 mm（阈值 40 mm）停止；仍距预抓取目标 433.061 mm。关节检查无越限。
+从已验证的原始 π₀.₅ t=10 Runtime Snapshot构造 q_start；从历史 Pot2 成功预抓取的物体相对 EEF 位姿在当前场景重求 q_goal。两端的完整机器人碰撞几何、关节限位、Ginger Beer/Place Box 10 mm余量以及目标 Pot2接近例外均单独核验。固定随机种子20261023的双向7D RRT-Connect第11次迭代连通；Shortcut接受5条边，最终关节路径2.730396 rad、EEF路径0.697530 m，包含4个关节路点和257个密集样本。
 
-每个控制步的 25 个 MuJoCo 子步均保存了全机器人对 Ginger Beer/White Place Box 的接触与几何最小间隙。5150 个物理子步中机器人障碍接触事件为 0；全程最小间隙分别 63.800 mm 和 111.804 mm，Pot 2 位移数值为 0。该结论仅适用于已执行的部分路线：没有到达预抓取，也没有整条路线通过或安全认证。Teacher IR 未找到，Contact Compiler 未运行，语义 verdict 未验证。原 1093 步 L0T2 成功示范及 LeRobot 候选数据保持不变。
+完整路径逐样本复检通过。Bottle和Place Box最小余量为14.879/10.872 mm；目标Pot2最小间隙0.033 mm对应终端指尖无接触近接，其余机械臂部分与Pot2至少128.719 mm；无机器人环境接触、自接触或关节越限。模型和BDDL指纹匹配。独立归档 /opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/。
 
-独立证据：`/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/`。包含机器/文本报告、逐步 Observation–Action 与子步物理记录、视频、路线和源代码副本。当前停止等待复核；复核前不再执行 OSC 避障、不启动训练。
+本结果只说明 offline_feasible，不证明 OSC 动态跟踪或真实抓取可行。没有环境步进、动作、Rollout、训练，未修改成功示范和LeRobot数据集。当前等待复核。
 
 ## 下一总体目标
 
-继续以 L0T2 为目标进行安全恢复研究，但先复核本轮 OSC 中段 40 mm 位置误差的成因和日志。需要决定是从 t=10 起点调整离散速度/路径段落，还是选择更早可行的几何干预点；任何后续动作必须单独审批复核后，在可恢复 Snapshot 分支验证，继续以全机器人几何接触监测和关节限位为约束。Teacher/Compiler 在 L0T2 的状态仍未验证；不得据此将本轮部分无碰撞前缀写成安全示范。原始 1093 步任务成功示范及 LeRobot 候选集不改，不训练。
+复核离线路径及接近例外规则。其后如重新进入物理验证阶段，从同一 t=10 Snapshot 独立恢复，使用原生 OSC_POSE 监测全程接触、EEF误差及关节状态；不得把离线通过自动视作 OSC_executable 或 safety_success。已有1093步任务成功示范及759条LeRobot专家候选保持原样。
 
 
+## 历史局部状态（2026-10-23；上一轮人工构型候选0/3）
 
-## 最新局部状态（2026-10-23）：L0T2 Ginger Beer 干预时机已诊断；退让待物理验证
+正式停止 t=291，复用已验证的原始 π₀.₅ t=10 Runtime Snapshot，在独立 scratch MuJoCo 中以Integration State和原始前10步物理记录构造 q_start。缓存Observation与状态存在1.058 mrad关节及0.586 mm EEF差异，规划采用Integration State并留存该差异。历史成功 state118 的物体相对预抓取位姿用于目标；在当前Pot2 Body上重新求得 q_goal，IK位置/姿态残差低于3 mm/0.03 rad，终端限位余量0.609 rad，目标q数值与历史解相同是同一Body位姿重建后的求解结果。
 
-在原始 π₀.₅ 动作前缀的 t=0/5/10/15/20 状态对全机器人活动碰撞 Geom 作实时 clearance 查询。t=0、t=20 与归档物理状态精确一致；Bottle 间隙由 119.9 mm 递减至 t=20 的 4.4 mm，Place Box 在 t=20 仍有 103.4 mm 机器人间隙。EEF 从 t=0 到 t=20 持续沿 +X/+Y 向 Bottle 靠近，最新区间速度约 0.14 m/s。
+3条完整关节空间候选均经全15个机器人碰撞Geom和Bottle(137)/Place Box(4)/Pot2(15)/Pot1(15)/Stove(21)逐采样检查，EEF采样≤5 mm、Robot Geom中心位移≤4 mm、关节增量≤0.02 rad。直连边穿透Bottle 41.52 mm；西南路线最后一段碰Place Box 4.94 mm并使Bottle余量降到8.15 mm；起点抬升调腕路线穿透Bottle 27.13 mm。路径样本均未越关节限位，最小关节余量0.609 rad，完整候选Jacobian σmin最低0.05455。没有候选通过，也没有OSC、Rollout、VLA或训练。
 
-上一轮三条 OSC 分支的首步只要求约 1–2 mm 位置修正，但继承速度使 EEF 实际前进 4.27–4.52 mm；第二步同一掌部 Geom 74–Bottle Geom 222 发生接触。下一次复核后的实验建议为 t=15 先向 −World-X 退让并略向 +Z 抬升；此时掌部 clearance 为 36.1 mm，OSC 每轴可发出 ±50 mm 的目标变化，但实际退让仍待验证。t=16–19 和 t=20 大幅反向命令没有物理验证，故精确最晚干预点仍不确定，建议路径不能标为安全。
+完整离线证据：`/opt/data/private/gs_opd/rollouts/l0t2_round1_task_directed_jointspace_20261023_attempt1/`。这不是可执行或安全成功认证。1093步任务成功示范与759条LeRobot候选均未改。
 
-本轮只读完成，没有生成新轨迹或动作。独立证据 `/opt/data/private/gs_opd/rollouts/ginger_beer_intervention_timing_l0t2_20261023_attempt1/`，详细结论见 `evidence/intervention_timing_report.md`。当前暂停等待复核。
+## 历史下一步建议（上一轮）
+
+本轮只支持“简单直线关节边及少量人工中间构型不足以连通安全目标”这一结论；没有证明预抓取目标全局不可达。待复核后，可在同一t=10状态和同一完整碰撞距离检查器上实现/评估关节空间RRT-Connect，保持Bottle/Place Box 10 mm余量、原关节限位和3 mm IK残差门槛。RRT-Connect是目前有证据支持的下一项离线搜索方法，但未证明数学上唯一必要；本轮没有安装或运行新规划库。离线通过后仍需独立评审，再以原生OSC_POSE从同一Snapshot进行真实物理可执行性验证。
 
 
 ## 最新总体状态（2026-10-22）：L0T2 示范/数据验收完成；Geometry-Guided 接近修正尚未找到有效路线
@@ -48,11 +51,11 @@ L0T2 的 1093 步真实任务成功示范与 759 条隔离 LeRobot `expert_osc` 
 
 只在 scratch 中临时改候选 qpos 并作 `mj_forward`/距离/接触/谓词检查，没有物理步进、控制动作或更改主快照/任务。故此结果只说明“静态终点和局部夹爪进出通道可行”，并未验证从 t=854 到目标的完整携物扫掠、动态交互、实际释放或任务 reward；既有 t=967 的 40.139 N 接触仍是实际搬运路径风险。独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_joint_pot_layout_feasibility_20261022_attempt1/`。当前暂停后续 OSC 直到复核。
 
-## 复核后的下一步
+## 历史复核建议（截至2026-10-22）
 
 先复核 759 条 OSC 专家候选的示范质量、状态起点和路径引用，再决定是否将其并入训练转换。没有复核前不启动训练或 Rollout；不改变原始 VLA 动作/Observation，不认证安全。L0T1 与 L0T0 保持暂停。
 
-# GS-OPD 总体路线
+## 历史总体路线记录
 
 ## 最新局部状态（2026-10-22）：L0T2 t=854 搬运到位后下降触发持续 Pot1–Pot2 接触；停止等待复核
 
@@ -60,7 +63,7 @@ L0T2 的 1093 步真实任务成功示范与 759 条隔离 LeRobot `expert_osc` 
 
 离散 OBB sweep 未预测该下降碰撞，因此不能作为 clearance 证明；真实 MuJoCo 接触作为权威结果。失败动作、Observation、物体状态、接触/力、视频及失败快照单独保存，未并入示范链。实验后 Bridge 精确恢复至 t=854 起点，Integration State 最大误差 0，双指抓持及已有 Pot2 On/Stove Turnon 均复核通过。完整任务、标准 Benchmark、超预算示范与安全成功均未取得。历史 VLA Ginger Beer 接触保留。详细归档为 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt2/`。
 
-## 下一总体目标
+## 历史下一总体目标（2026-10-22）
 
 继续在 LIBERO-Safety `obstacle_avoidance/L0T2/state0` 获取真实完整任务示范，但先对照 t=967 实际接触点核查携物时 Pot1、Pot2 的全碰撞几何和 Stove Cook Region 的可用占位。只有在新的路径能解释并避免本轮实际下降碰撞后，才可在复核后设计有限的不同路线。保持 BDDL、reward、物理模型、标准 horizon、关节限制及任务判据不变；不直接改物体位姿，不把部分执行标成成功或安全示范。L0T0 保持暂停，不启动训练。
 

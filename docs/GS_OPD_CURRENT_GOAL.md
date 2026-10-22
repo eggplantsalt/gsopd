@@ -1,5 +1,46 @@
 # GS-OPD 当前局部目标
 
+## 当前局部目标：L0T2 RRT q0→q1 OSC 首段验证已停止（2026-10-23；等待复核）
+
+本轮从原始 π₀.₅ Student t=10 Runtime Snapshot 恢复后，只执行离线 Joint-Space RRT 路径的 q0→q1 首段。恢复前按双 reset 初始化顺序核对模型指纹、BDDL、Integration State、控制器/缓冲、task bookkeeping、RNG以及q0/FK，均通过；完整65点保存扫掠的 Bottle/Place Box 最小间隙为38.886/112.217 mm。
+
+正确张开夹爪的原生7D OSC_POSE分支执行163步，至任务t=173、参考弧长76.88%。EEF最大跟踪误差8.997 mm，最大姿态误差0.035743 rad；整段已执行物理状态无Bottle/Place Box接触、无自接触，实测间隙至少38.628/111.011 mm。实际关节逐渐偏离RRT参考，第163步第1关节偏差0.150257 rad触发本轮关节通道硬停止。该末态到q1 EEF仍有51.643 mm/0.128868 rad，q误差L2为0.281536 rad；未到q1，没有执行后续段。
+
+区分结论：EEF参考局部可跟踪；q0→q1的7D关节路径未被OSC跟踪完成；已执行部分无观察到的障碍接触，但不构成整段路径认证或Safety Success。没有证据证明EEF目标不可达；直接瓶颈是原生6D OSC_POSE不约束冗余关节解，在线q偏差达到停止门槛。无需再在本轮扩大动作或放宽阈值。
+
+完整证据：`/opt/data/private/gs_opd/rollouts/l0t2_round1_rrt_q0_q1_osc_validation_20261023_attempt1/`，详见 `evidence/q0_q1_osc_validation_report.md`。t=173末态Snapshot已restore→re-export核验并恢复回t=10；JSONL/NPZ包含动作、双相机Observation、qpos/EEF、4,075个物理子步接触与间隙，两路视频已保存。另有错误夹爪符号的隔离失败记录，不并入正确分支结果。
+
+**本轮工作完成，停止等待复核。**不执行q1→q2/q2→q3、不抓取或放置、不训练、不运行Rollout；既有任务成功示范及LeRobot数据保持不变。
+
+---
+
+## 历史目标：L0T2 t=10 RRT-Connect 路线离线可行（2026-10-23）
+
+t=291分支已停止。本轮在已验证的原始 π₀.₅ t=10 状态上，以当前 Pot2 场景重算历史成功预抓取姿态的 q_goal；q_start、q_goal 的碰撞、关节限位及端点余量检查通过。固定种子双向7D Joint-Space RRT-Connect第11次迭代连通，shortcut后路径2.730396 rad，4个路点、257个密集验证样本。
+
+Bottle/Place Box全机器人最小余量分别14.879/10.872 mm；全程没有机器人–环境或自接触，关节限位和终点FK通过。Pot2为目标物：末端夹爪仅在预抓取目标100 mm、姿态差0.25 rad范围内可进入其10 mm邻域，终段右指尖最小间隙0.033 mm但无穿透/接触，机械臂其余连杆保持至少10 mm。
+
+此路线只标记 offline_feasible，不代表原生 OSC 可执行或安全成功。无环境步进、OSC、Rollout、训练；已有示范和数据集未改。证据归档 /opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/。当前停止等待复核。
+
+
+## 历史局部目标：L0T2 t=10 关节空间任务导向规划（上一轮；离线候选均失败）
+
+正式停止 t=291 分支。从已验证 π₀.₅ t=10 Integration State 构造 q_start；Bridge Observation 缓存值与其有1.058 mrad关节/0.586 mm EEF差异，q_start按Integration State和原始第10步物理状态确认，缓存差异已留档。按成功 Pot2 state118 的物体相对预抓取 EEF 位姿重建当前目标，并在当前场景重新求 q_goal；不直接假定历史绝对关节解。q_goal IK残差小于3 mm/0.03 rad，因Pot2目标Body位姿相同而数值收敛到历史 state118关节解。
+
+3条完整关节空间路线均在离线全几何检查中失败：直连边穿过Bottle；西南通道路线前段有余量，但最后接目标边触碰Place Box且Bottle不足10 mm；起点抬升调腕路线末段穿过Bottle。关节限制和这些完整关节路径上的Jacobian状态合规，终点FK误差在数值精度内；没有任何真实OSC、环境步进、Rollout或训练。完整路径和逐段原因见 `/opt/data/private/gs_opd/rollouts/l0t2_round1_task_directed_jointspace_20261023_attempt1/evidence/jointspace_path_planning_report.md`。
+
+少量中间位姿 IK 探索显示当前指定交越点陷入近奇异局部解；这不证明目标不可达。基于三条直线关节边都失败，RRT-Connect是值得下一轮审核的离线C-space搜索方法，但并非已证明唯一解法，本轮未运行新规划库。等待复核；已有成功示范和数据集保持不变。
+
+---
+## 历史诊断：t=291 首段抬升接入预检（attempt1）
+
+已从 t=291 快照严格恢复并通过完整状态一致性核验。原成功抓取轨迹第118步的真实无接触 EEF 状态重建了 Pot 2 预抓取目标。唯一分阶段路线的离线预检在首段抬升第8/159点未通过 IK 残差要求：位置残差3.646 mm；关节未越限且无环境接触，但 EEF Jacobian 条件数升至约246,237，呈严重腕部病态。没有执行任何 Bridge 控制动作，t=291 原状态已重新导出并确认一致。
+
+该报告仅记录首条固定姿态竖直抬升路线；后续 attempt2 已依照当前目标检查两条替代 IK 接入路线。报告：`/opt/data/private/gs_opd/rollouts/l0t2_round1_pregrasp_reentry_20261023_attempt1/evidence/pregrasp_reentry_report.md`。
+
+---
+
+
 ## L0T2 Round 1 自适应跟踪物理验证（2026-10-23；失败后停止，等待复核）
 
 从兼容恢复后的 t=216 Snapshot 用真实 EEF 跟踪原 B-Spline 前向路线，参数为参考速度 0.020 m/s、12 mm 推进门槛、每点最多32步追赶、40 mm硬停止。75步执行到 t=291，在参考点39因32步追赶用尽、误差仍为16.529 mm停止。该处机器人无碰撞、关节未越限，最大障碍间隙 Ginger Beer 175.105 mm / Place Box 202.194 mm；尚距预抓取位姿444.244 mm，不能验收为局部安全恢复成功。
