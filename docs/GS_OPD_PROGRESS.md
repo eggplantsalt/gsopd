@@ -1,5 +1,55 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## L0T2 Round 1 Safety Recovery：t=10 到预抓取路线物理验证（2026-10-23；失败后停止，等待复核）
+
+本轮从原始 π₀.₅ 的 `executed_actions[0:10]` 重放开始，t=10 原始状态与 Snapshot 字段逐项最大误差均为 0；模型几何 SHA-256 `1a0c219c…f7a9f752`、BDDL SHA-256 `901feec9…315e7d675c` 一致。恢复验收覆盖 MuJoCo Integration State、机器人控制缓冲、task bookkeeping 和 RNG，均精确匹配。t=10 完整机器人到 Ginger Beer/White Place Box 间隙为 65.758/112.217 mm。
+
+以前次 π₀.₅ 在 t=141–143 对 Pot 2 的稳定双指抓取位姿作为物体坐标系参考，结合 t=118 物体局部接近偏移生成预抓取 EEF 目标 `[0.091700, 0.178315, 1.011898] m`。动作来源为 10 个 `pi05_vla_replay` 前缀动作和 206 个 `expert_osc` 控制动作；从 t=10 后不再调用 VLA。路线采用 −World-X/+Z 初始退让、负 World-Y 外侧通道和现有 cubic B-Spline 离散/OSC_POSE 跟踪，未修改生成算法及默认控制配置。
+
+初始退让 8 步完成实际方向反转；单条 381 步 B-Spline 路线执行 198 步后，于 timestep 216 因 EEF 位置误差 40.135 mm 超过 40 mm 阈值停止（仅超 0.135 mm）。此时距预抓取位姿 433.061 mm，未到达、未抓取；旋转误差 0.14143 rad，Panda 关节越限 0；reward 0、done false。最多候选数遵守，本轮只运行 1 条。
+
+完整碰撞几何/接触监测覆盖 206/206 个 OSC 控制、5150/5150 个物理子步；机器人–Ginger Beer 和机器人–Place Box 接触事件均为 0。全路径采样最小间隙分别 63.800 mm（掌部 Geom 74–Bottle Geom 222）与 111.804 mm（指部 Geom 79–Box Geom 283），均出现在 timestep 11。Pot 2 最大位移 5.26e-12 m、Bottle 2.27e-6 m、Box 0。该前缀没有障碍碰撞，但整体路线未到目标，不能标记为安全成功。主要瓶颈是负 World-Y 中段 OSC 跟踪不足，不是关节越限或障碍接触。
+
+t=216 失败分支快照另存后，Bridge 已精确恢复回 t=10 起点。两路视频、逐步 Observation/7D Action/状态、每个物理子步接触与几何间隙、源代码副本和机器可读报告单独归档：`/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/`。报告入口 `evidence/round1_safety_recovery_report.md`；逐步 NPZ、JSONL、起止 Snapshot 及视频索引见归档 `README.md`。Teacher IR 未找到、Contact Compiler 未运行，本轮没有语义 safe/unsafe verdict。没有运行训练；原 1093 步任务成功示范及其 LeRobot 数据未修改。
+
+本轮停止，等待复核。当前证据只支持“t=10 状态可恢复、已执行部分无观察到的障碍接触”；下一路线如何缓解中段 OSC 跟踪误差需复核后决定，不自动重试。
+
+
+
+## L0T2 Ginger Beer 避障：干预时机与候选首段诊断（2026-10-23；只读完成，等待复核）
+
+本轮停止新增 B-Spline 候选和绕障物理执行。使用原始 π₀.₅ `executed_actions[0:20]`，在与归档一致的隔离 Bridge 中检查 t=0/5/10/15/20；t=0 Integration State、模型指纹与 BDDL 匹配，重放到 t=20 的机器人/障碍物状态与已验证快照逐项误差为 0。没有重跑旧任务的后续动作、没有训练或改动归档示范。每个采样点都在线查询完整活动碰撞 Geom，包含左右指腹/指垫、掌部，以及 Ginger Beer 和 White Place Box；完整 20 步接触监测为 25/25 子步覆盖，机器人与两障碍在首次 VLA 前缀中均无碰撞。
+
+Bottle 最近间隙（全机器人碰撞 Geom）依次为 119.9、98.7、65.8、36.1、4.4 mm；Place Box 处最小全机器人间隙在 t=20 仍有 103.4 mm。EEF 在五步区间持续朝 Bottle 移动（+X、+Y），最近速度约 0.14 m/s。t=20 最近对为手掌 `gripper0_hand_collision` (Geom 74) 与 Bottle `bottle_of_ginger_beer_1_g102` (Geom 222)；左右指腹仍各有 29.3/36.8 mm，故首先逼近的是掌部。
+
+对照上一轮 Left/Near、Right/Mid、Above/Far 三个两步分支：三条第一目标都只要求约 1–2 mm 位置调整，实际 EEF 仍沿 +X 前进 4.27/4.52/4.49 mm；第二个 OSC 动作内均以同一掌部–Bottle Geom 首次碰撞，峰值力 0.817/0.936/0.942 N。共同问题是 t=20 只余 4.42 mm 掌部间隙，首步未先制动残余前进速度，后续方向差异来不及发挥作用。
+
+在本轮检查的 5 步采样点中，推荐从 **t=15** 开始干预，第一段沿 **−World-X 后退并略向 +Z 抬升**。t=15 的掌部间隙 36.1 mm，OSC_POSE 每轴位置目标范围 ±0.05 m，可发出大于当前间隙的反向目标指令，实际单步退让仍待物理验证。t=16–19 没有逐步采样；t=20 的强制动反向命令未作物理试验，因此精确的最晚可行步和 t=15 退让结果均 **待物理验证**。
+
+独立归档：`/opt/data/private/gs_opd/rollouts/ginger_beer_intervention_timing_l0t2_20261023_attempt1/`。报告、五时点清单和三候选前两步对照见 `evidence/intervention_timing_report.md`、`evidence/intervention_clearance_diagnostic.json`、`evidence/candidate_first_two_action_comparison.json`；SHA-256 清单为 `SHA256SUMS.txt`。当前停止等待复核，不执行下一次退让。
+
+
+## L0T2 Geometry-Guided 安全局部修正：t=20 快照通过，三条 OSC 路线均早期触发 Ginger Beer 接触（2026-10-22；本轮完成，等待复核）
+
+本轮只处理原始 π₀.₅ 在动作 21–56 与 Ginger Beer Bottle 接触的问题，没有训练、VLA 推理、抓取、搬运或放置。原始 Rollout 的真实动作 1–20 按归档 Bridge 的初始化顺序重放：Bridge `env.seed → env.reset → set_init_state` 后，再执行 Rollout 原有的 `reset` 请求。t=20 运行时快照随后在同一编译模型内导出、恢复并逐位核对 Integration State。模型几何指纹 `1a0c219c…f7a9f752` 与已验证 L0T2 Demo Bridge 一致；BDDL SHA-256 `901feec9…315e7d675c`。前 20 步的机器人、Pot、Bottle、White Place Box 与 Stove 状态逐字段匹配归档，最大差为 0（四元数舍入误差小于 `5e-19`）。动作 21 之前的可恢复 Runtime Snapshot 位于独立归档。
+
+运行时 Body/Geom 核验确认 Moka Pot 2 为 Body 24（15 个碰撞 Geom、17 个绑定 Geom）、Ginger Beer Bottle 为 Body 25（137 个碰撞 Geom、138 个绑定 Geom）、White Place Box 为 Body 31（4 个碰撞 Geom、5 个绑定 Geom）。Bridge 返回的原生目标为两个 Pot 的 `On(..., flat_stove_1_cook_region)` 与 `Turnon(flat_stove_1)`。任务 BDDL 明确禁止机器人接触 Bottle/Place Box，并禁止 Pot 2 与两者接触。归档中没有找到 L0T2 专属 Teacher IR；因此没有套用其他任务语义，也没有编造 Contact Safety Compiler 结论。
+
+使用现有 B-Spline proposal generator 从 t=20 EEF 到 Pot 2 预抓取区域生成 18 条 Left/Right/Above、Near/Mid/Far 路线。预抓取位姿只参考原轨迹第一次 Pot 2 指接触前的真实 EEF 状态，没有执行或拼接动作 21 之后的 VLA 控制。球体几何筛选通过数为 0/18：t=20 起点落在 Bottle 保守包围球内，预抓取点落在 Place Box 保守包围球内；此筛选只针对 10 mm EEF 参考点球和物体包围球，未覆盖整条 Panda，不能独立代表真实碰撞结论。
+
+从同一个 t=20 Snapshot 物理测试 3 条不同绕行候选：
+
+| 候选 | 方向 / 范围 | OSC 步数 | 真实首个阻塞 | 峰值接触力 | Panda 限位 | 预抓取到达 |
+|---|---|---:|---|---:|---|---|
+| `trajectory-001` | Left / Near | 2 | t=22，gripper0_right_gripper–Ginger Beer，触发原生 `CheckRobotContact` | 0.817 N | 通过 | 否，距离目标 0.278 m |
+| `trajectory-008` | Right / Mid | 2 | t=22，gripper0_right_gripper–Ginger Beer，触发原生 `CheckRobotContact` | 0.936 N | 通过 | 否，距离目标 0.278 m |
+| `trajectory-018` | Above / Far | 2 | t=22，gripper0_right_gripper–Ginger Beer，触发原生 `CheckRobotContact` | 0.942 N | 通过 | 否，距离目标 0.278 m |
+
+每条 OSC 动作的 25 个物理子步接触监测均完整。Bottle 最大位移为 1.09/1.42/1.42 mm；Place Box 与 Pot 2 无位移。三条路线均未到达绕障弧段或预抓取位姿，故任务重新进入可行性未验证，也没有路线通过本地物理筛选。最直接的物理阻塞是 t=22 真实夹爪–Bottle 接触。t=20 时机器人关节仍有来自原始前缀的正向速度；首两步 EEF 实际仍朝 Bottle 方向移动，这与碰撞时序一致，但本轮没有单独隔离其因果效应。
+
+所有分支都从同一快照恢复；最后 Bridge 主状态也精确恢复到 t=20。逐步 Observation、实际 OSC 7D Action、双相机视频、MuJoCo 状态、接触力、子步覆盖、动作来源与 BDDL 约束记录保存在独立归档 `/opt/data/private/gs_opd/rollouts/geometry_guided_safety_bundle_l0t2_20261022_attempt1/`。入口为 `README.md`，完整结果为 `evidence/geometry_guided_pregrasp_execution_report.json`，文件 SHA-256 列表为 `SHA256SUMS.txt`。原始成功示范与 759 条 LeRobot 专家候选未修改。任务成功、安全成功均为 false；现等待复核。
+
+
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
 ## L0T2 成功示范数据验收与 LeRobot v2.1 适配（2026-10-22；完成，等待复核）

@@ -1,5 +1,37 @@
 # GS-OPD 总体路线
 
+## 最新局部状态（2026-10-23）：L0T2 Round 1 绕障部分执行，无接触但未到预抓取，等待复核
+
+以原始 π₀.₅真实 t=10 Snapshot 恢复（前 10 步原动作重放，模型、BDDL、MuJoCo 状态、控制器、任务 bookkeeping、RNG 全部核对通过），并按历史 Pot 2 实际抓取变换构造可重接入的预抓取目标。沿一条先 −World-X/+Z 制动退让、后负 World-Y 外侧 cubic B-Spline 的 EEF 路线执行 206 个 OSC_POSE 控制步，到达 timestep 216 时因 EEF 跟踪误差 40.135 mm（阈值 40 mm）停止；仍距预抓取目标 433.061 mm。关节检查无越限。
+
+每个控制步的 25 个 MuJoCo 子步均保存了全机器人对 Ginger Beer/White Place Box 的接触与几何最小间隙。5150 个物理子步中机器人障碍接触事件为 0；全程最小间隙分别 63.800 mm 和 111.804 mm，Pot 2 位移数值为 0。该结论仅适用于已执行的部分路线：没有到达预抓取，也没有整条路线通过或安全认证。Teacher IR 未找到，Contact Compiler 未运行，语义 verdict 未验证。原 1093 步 L0T2 成功示范及 LeRobot 候选数据保持不变。
+
+独立证据：`/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/`。包含机器/文本报告、逐步 Observation–Action 与子步物理记录、视频、路线和源代码副本。当前停止等待复核；复核前不再执行 OSC 避障、不启动训练。
+
+## 下一总体目标
+
+继续以 L0T2 为目标进行安全恢复研究，但先复核本轮 OSC 中段 40 mm 位置误差的成因和日志。需要决定是从 t=10 起点调整离散速度/路径段落，还是选择更早可行的几何干预点；任何后续动作必须单独审批复核后，在可恢复 Snapshot 分支验证，继续以全机器人几何接触监测和关节限位为约束。Teacher/Compiler 在 L0T2 的状态仍未验证；不得据此将本轮部分无碰撞前缀写成安全示范。原始 1093 步任务成功示范及 LeRobot 候选集不改，不训练。
+
+
+
+## 最新局部状态（2026-10-23）：L0T2 Ginger Beer 干预时机已诊断；退让待物理验证
+
+在原始 π₀.₅ 动作前缀的 t=0/5/10/15/20 状态对全机器人活动碰撞 Geom 作实时 clearance 查询。t=0、t=20 与归档物理状态精确一致；Bottle 间隙由 119.9 mm 递减至 t=20 的 4.4 mm，Place Box 在 t=20 仍有 103.4 mm 机器人间隙。EEF 从 t=0 到 t=20 持续沿 +X/+Y 向 Bottle 靠近，最新区间速度约 0.14 m/s。
+
+上一轮三条 OSC 分支的首步只要求约 1–2 mm 位置修正，但继承速度使 EEF 实际前进 4.27–4.52 mm；第二步同一掌部 Geom 74–Bottle Geom 222 发生接触。下一次复核后的实验建议为 t=15 先向 −World-X 退让并略向 +Z 抬升；此时掌部 clearance 为 36.1 mm，OSC 每轴可发出 ±50 mm 的目标变化，但实际退让仍待验证。t=16–19 和 t=20 大幅反向命令没有物理验证，故精确最晚干预点仍不确定，建议路径不能标为安全。
+
+本轮只读完成，没有生成新轨迹或动作。独立证据 `/opt/data/private/gs_opd/rollouts/ginger_beer_intervention_timing_l0t2_20261023_attempt1/`，详细结论见 `evidence/intervention_timing_report.md`。当前暂停等待复核。
+
+
+## 最新总体状态（2026-10-22）：L0T2 示范/数据验收完成；Geometry-Guided 接近修正尚未找到有效路线
+
+L0T2 的 1093 步真实任务成功示范与 759 条隔离 LeRobot `expert_osc` 候选数据已完成验收；完整示范含历史 VLA Ginger Beer 接触，未标安全成功。当前局部安全阶段从原始 π₀.₅ 第 20 步状态开始。已按原始 Bridge 初始化与 Rollout reset 顺序精确重放动作 1–20，导出并成功恢复 t=20 Runtime Snapshot（Integration State 精确一致，模型几何指纹 `1a0c219c…f7a9f752`）。
+
+现有候选生成器输出 18 条 Left/Right/Above、Near/Mid/Far EEF 参考路径；保守球形筛选通过数 0/18。三条不同方向/范围的 OSC Snapshot 分支各在第二个动作与 Ginger Beer 发生接触，触发原生 BDDL `CheckRobotContact`，未进入预抓取区域。联系力峰值分别 0.817、0.936、0.942 N，Contact Monitor 覆盖完整，Panda 关节限位均通过。任务重新进入可行性仍未知，局部安全路线数量为 0；不将局部结果解释为完整任务成功或安全认证。
+
+证据归档 `/opt/data/private/gs_opd/rollouts/geometry_guided_safety_bundle_l0t2_20261022_attempt1/`。本阶段等待复核；后续如获准继续，应先依据 t=20 的实测正向关节速度建立可验证的起始避碰控制，再重新筛选路线，保持 BDDL、模型、OSC 默认控制、抓取模块、成功示范和 LeRobot 数据集不变。
+
+
 ## 最新总体状态（2026-10-22）：L0T2 成功示范完成数据验收；候选专家集等待复核
 
 完整链 1093 步已核对，动作分段为 294 VLA +425 OSC +135 Grasp Retargeting +239 OSC。LeRobot v2.1 独立候选集包括终止前 759 个 `expert_osc` 样本，分成 425/135/199 三个 Snapshot 连续 episode；读回逐帧校验全部通过。VLA 294 步留作原始轨迹与 Ginger Beer 碰撞证据；done 后 40 步留作撤离/稳定证据，不进入任务监督池。所有样本没有安全认证。
