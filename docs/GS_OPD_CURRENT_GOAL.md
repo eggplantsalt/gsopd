@@ -1,5 +1,19 @@
 # GS-OPD 当前局部目标
 
+
+## 当前局部目标：从 t=223 重规划后执行100步，安全到达 t=323 并等待复核
+
+已从严格验证的 t=223快照恢复。旧RRT剩余路径与真实7D qpos不一致，故从实际状态用同一MuJoCo RRT-Connect重新生成一条161点 `offline_feasible` 全路径；Ginger Beer/Place Box离线全几何最小间隙21.278/12.722 mm，保持10 mm门槛。
+
+原生OSC_POSE在隔离Bridge执行100步至t=323，达到预算即停。EEF最大误差3.256 mm/0.007034 rad，预抓取距离减少69.453 mm至302.023 mm。2,500物理子步全量监测无环境/自接触、无障碍接触、无限位违规；真实最小间隙29.568/174.958 mm。Pot 1/Pot 2位姿未变，环境reward=0、done=false，预抓取尚未到达。t=323 Runtime Snapshot和Bridge末态导出逐字节匹配，SHA-256 `c333a23a…f818f410`；隔离Bridge已关闭。
+
+本段仅为通过物理监测的有限安全进展，不是完整路线认证或Safety Success。完整路径的 Place Box 最小离线余量为12.722 mm；本轮前缀实测仍为174.958 mm，因此窄余量段尚未在线验证。末态可供复核后续续接。完整报告：`/opt/data/private/gs_opd/rollouts/l0t2_round1_t223_replan_osc100_20261023_attempt1/evidence/t223_replanned_osc100_execution_report.md`；Observation–Action JSONL/NPZ、视频、路径、物体位移审计、恢复检查及终态快照均在同一归档。
+
+**本轮结束，停止等待复核。**不执行后续抓取、放置、VLA、Rollout或训练，不修改既有示范/LeRobot数据。
+
+---
+
+
 ## 当前局部目标：t=223 OSC 恢复状态已保存（2026-10-23；等待复核）
 
 本轮已从上一轮真实 `t=173` Runtime Snapshot 恢复并完成严格逐字段 roundtrip。旧 RRT 关节偏差为0.209865 rad L2，其中0.209718 rad（99.93%）处于EEF Jacobian零空间；EEF任务分量仅0.007858 rad，实际位置/姿态误差2.830 mm/0.007704 rad。原joint1停止门槛主要捕获冗余解漂移。

@@ -1,5 +1,17 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+
+## L0T2 Round 1：t=223 重规划后 OSC 前缀（2026-10-23；100步到 t=323，等待复核）
+
+已严格恢复 t=223 Runtime Snapshot：Integration State 与逐字段 Snapshot 匹配，模型指纹 `1a0c219c…f7a9f752`、BDDL 与控制器/缓冲状态一致。审计旧路径后发现实际关节状态不等于旧 RRT 节点，因此从真实 qpos 使用同一 RRT-Connect 检查器重规划；161个密集全机器人样本、3个关节路点通过离线完整几何复查，关节路径1.908481 rad、EEF弧长0.439147 m。全路径 Ginger Beer/Place Box 最小间隙21.278/12.722 mm，均满足10 mm门槛。
+
+隔离 Bridge 上用原生 OSC_POSE执行最多100步，t=223→323，按预算立即停止。EEF最大误差3.256 mm/0.007034 rad；预抓取距离371.476→302.023 mm，减少69.453 mm，仍未到达。2,500/2,500子步记录完整；真实最小间隙 Ginger Beer/Place Box为29.568/174.958 mm，所有机器人环境接触、自接触、关节越限均为0。Pot 1/Pot 2位姿未移动。reward=0、done=false。t=323 Snapshot与活动 Bridge完整payload逐字节一致，SHA-256已验证；Bridge已关闭。
+
+结果仅证明该100步实际前缀安全且取得有限进展，不代表完整路径通过、预抓取到达、Safety Success或任务成功。完整离线路径Place Box最小间隙12.722 mm的窄余量区尚未被本轮前缀实际到达，保留下一阶段在线验证。完整证据入口：`/opt/data/private/gs_opd/rollouts/l0t2_round1_t223_replan_osc100_20261023_attempt1/evidence/t223_replanned_osc100_execution_report.md`。含逐步Observation–Action、双相机RGB、完整子步接触与间隙、两路视频、RRT路径、t=323可恢复快照及SHA256清单。没有VLA/Teacher/SAM3、抓取/放置/Rollout/训练；未修改规划器、控制默认值、原成功示范或LeRobot数据。当前停止等待复核。
+
+---
+
+
 ## L0T2 Round 1：t=173 关节偏差分解、重规划及 OSC 前缀执行（2026-10-23；50步后停止，等待复核）
 
 从上轮正确 OSC 分支的 `recovered` t=173 Runtime Snapshot 恢复。Jacobian 分解显示 q 与旧 RRT 参考差异 L2=0.209865 rad，其中零空间0.209718 rad（99.93%），任务行空间仅0.007858 rad；EEF误差2.830 mm/0.007704 rad。旧0.1503 rad joint1门槛主要捕获冗余构型变化，不等于末端跟踪失败。
