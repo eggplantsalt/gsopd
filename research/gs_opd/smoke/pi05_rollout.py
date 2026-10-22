@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from multiprocessing.connection import Client
 
@@ -105,6 +106,20 @@ def parse_args():
         action="store_true",
         help="Stop before the next Student action after Snapshot candidate validation; requires the plain trajectory validation mode.",
     )
+    parser.add_argument(
+        "--snapshot-candidate-id",
+        help="Optional single B-Spline candidate to physically track in the Snapshot branch; geometric screening still runs on the full bundle.",
+    )
+    parser.add_argument(
+        "--snapshot-reference-speed-m-s",
+        type=float,
+        help="Optional experiment-only Snapshot reference speed in m/s; the default TrackingConfig is unchanged when omitted.",
+    )
+    parser.add_argument(
+        "--snapshot-max-control-steps-per-candidate",
+        type=int,
+        help="Optional experiment-only per-candidate Snapshot control-step bound; the default TrackingConfig is unchanged when omitted.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -169,6 +184,26 @@ def parse_args():
     mink_osc_enabled = args.mink_osc_left
     direct_osc_enabled = args.direct_bspline_osc_left
     grasp_smoke_enabled = args.grasp_only_smoke
+    snapshot_tracking_options = (
+        args.snapshot_candidate_id is not None
+        or args.snapshot_reference_speed_m_s is not None
+        or args.snapshot_max_control_steps_per_candidate is not None
+    )
+    if args.snapshot_candidate_id is not None and not args.snapshot_candidate_id.strip():
+        parser.error("--snapshot-candidate-id must not be empty")
+    if args.snapshot_reference_speed_m_s is not None and (
+        not np.isfinite(args.snapshot_reference_speed_m_s)
+        or args.snapshot_reference_speed_m_s <= 0
+    ):
+        parser.error("--snapshot-reference-speed-m-s must be finite and greater than zero")
+    if args.snapshot_max_control_steps_per_candidate is not None and not (
+        1 <= args.snapshot_max_control_steps_per_candidate <= 1200
+    ):
+        parser.error("--snapshot-max-control-steps-per-candidate must be in [1, 1200]")
+    if snapshot_tracking_options and not trajectory_validation_enabled:
+        parser.error("Snapshot tracking options require --trajectory-bundle-physical-validation")
+    if snapshot_tracking_options and (mink_osc_enabled or direct_osc_enabled):
+        parser.error("Snapshot tracking options apply only to plain trajectory candidate exploration")
     interpolation_fraction = args.bspline_left_001_toward_004_fraction
     if args.bspline_left_001_toward_004_interp_10pct:
         if interpolation_fraction is not None:
@@ -2298,6 +2333,7 @@ try:
     trajectory_validation_report = None
     trajectory_validation_attempted = False
     trajectory_validation_restore_abort = False
+    trajectory_validation_stopped_by_request = False
     direct_execution_stop = False
     trajectory_validation_preflight_failure = None
     if args.trajectory_bundle_physical_validation:
@@ -2434,6 +2470,22 @@ try:
                     from research.gs_opd.repair.trajectory_bundle_acceptance import (
                         run_snapshot_trajectory_acceptance,
                     )
+                    from research.gs_opd.repair.trajectory_tracking import TrackingConfig
+
+                    default_tracking_config = TrackingConfig()
+                    tracking_config = replace(
+                        default_tracking_config,
+                        reference_speed_m_s=(
+                            args.snapshot_reference_speed_m_s
+                            if args.snapshot_reference_speed_m_s is not None
+                            else default_tracking_config.reference_speed_m_s
+                        ),
+                        max_control_steps_per_candidate=(
+                            args.snapshot_max_control_steps_per_candidate
+                            if args.snapshot_max_control_steps_per_candidate is not None
+                            else default_tracking_config.max_control_steps_per_candidate
+                        ),
+                    )
 
                     trajectory_validation_report = run_snapshot_trajectory_acceptance(
                         conn,
@@ -2442,6 +2494,8 @@ try:
                         args.trajectory_validation_out,
                         decision_step=steps,
                         grasp_stability=trajectory_grasp_monitor.diagnostics(),
+                        tracking_config=tracking_config,
+                        candidate_id=args.snapshot_candidate_id,
                     )
             except Exception as exc:
                 trajectory_validation_report = {
@@ -2493,7 +2547,7 @@ try:
                 flush=True,
             )
             if args.stop_after_snapshot_candidate_validation:
-                trajectory_validation_restore_abort = True
+                trajectory_validation_stopped_by_request = True
                 print(
                     "SNAPSHOT CANDIDATE EXPLORATION STOPPED BEFORE NEXT STUDENT ACTION:",
                     (trajectory_validation_report or {}).get("status"),
@@ -2534,12 +2588,20 @@ try:
                 if not route_completed or done or success:
                     break
                 continue
-            if args.mink_osc_left or must_stop_rollout_after_acceptance(trajectory_validation_report):
+            if must_stop_rollout_after_acceptance(trajectory_validation_report):
                 trajectory_validation_restore_abort = True
                 print(
                     "TRAJECTORY VALIDATION STOPPED ROLLOUT BEFORE NEXT STUDENT ACTION:",
                     trajectory_validation_report.get("status"),
                     trajectory_validation_report.get("failure_reasons", []),
+                    flush=True,
+                )
+                break
+            if args.mink_osc_left:
+                trajectory_validation_stopped_by_request = True
+                print(
+                    "TRAJECTORY VALIDATION STOPPED BY MINK SNAPSHOT MODE BEFORE NEXT STUDENT ACTION:",
+                    trajectory_validation_report.get("status"),
                     flush=True,
                 )
                 break
@@ -2918,11 +2980,18 @@ try:
                 "trajectory_validation_state_integrity_failure"
                 if trajectory_validation_restore_abort
                 else
+                "snapshot_candidate_validation_complete"
+                if trajectory_validation_stopped_by_request
+                else
                 "success" if success else "environment_done" if done else "max_steps"
             ),
             "rollout_stopped_before_next_student_action": (
-                trajectory_validation_restore_abort or direct_execution_stop
+                trajectory_validation_restore_abort
+                or trajectory_validation_stopped_by_request
+                or direct_execution_stop
             ),
+            "snapshot_restore_integrity_failure": trajectory_validation_restore_abort,
+            "snapshot_restore_verified": trajectory_validation_report.get("main_state_restored"),
             "direct_route_student_continuation": {
                 "route_completed": bool(trajectory_validation_report.get("route_completed")),
                 "student_steps_after_route": max(
@@ -3196,12 +3265,22 @@ try:
             "reference_speed_m_s": trajectory_validation_report.get(
                 "reference_speed_m_s"
             ),
+            "tracking_config": trajectory_validation_report.get("tracking_config"),
+            "snapshot_candidate_selection": trajectory_validation_report.get(
+                "snapshot_candidate_selection"
+            ),
             "branch_candidate_count": trajectory_validation_report.get("branch_candidate_count", 0),
             "restore_verified": trajectory_validation_report.get("main_state_restored"),
             "real_execution_steps": trajectory_validation_report.get("real_execution_steps", 0),
             "route_completed": trajectory_validation_report.get("route_completed", False),
             "first_failure_reason": trajectory_validation_report.get("failure_reason"),
             "failure_reasons": trajectory_validation_report.get("failure_reasons", []),
+            "episode_end_reason": trajectory_validation_report.get(
+                "episode_rollout", {}
+            ).get("episode_end_reason"),
+            "snapshot_restore_integrity_failure": trajectory_validation_report.get(
+                "episode_rollout", {}
+            ).get("snapshot_restore_integrity_failure"),
         }
 
     args.result_out.parent.mkdir(parents=True, exist_ok=True)

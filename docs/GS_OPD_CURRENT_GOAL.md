@@ -1,11 +1,12 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1 阻塞；L0T0 Round 0 候选预检完成，等待复核（2026-10-22）
+## 当前状态：L0T1 阻塞；L0T0 trajectory-001 慢速 Snapshot 对照完成，等待复核（2026-10-22）
 
 - L0T1/state0 原始 π₀.₅ Base 抓取失败现标记为 `blocked_by_base_grasp`；原始 Smoke 目录的 `status_blocked_by_base_grasp.json` 保存状态与关键证据哈希。保留 NPZ/视频/报告及离线诊断归档，不在 L0T1 重试。
-- L0T0/state0 已完成一次原始 π₀.₅ Base 预检：50 个 Student 抓取动作后通过 3 状态稳定抓持检查，候选生成器产生 18 条（Left/Right/Above 各 6），几何筛选 18/18 通过。
-- 现有 Snapshot 预算放行 3 条进行分支物理跟踪，214 个分支控制步后均拒绝（2 条相对旋转越限，1 条双指接触丢失）；其余 15 条因估计控制步数超过既有 480 上限而未进入物理分支。主 Snapshot 精确恢复，主环境路线执行 0 步；reward=0、done=false，未完成任务，也未获得 safe 结论。
-- 完整数据位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`。结果等待复核；不继续批量尝试或调参。默认关闭的 `--stop-after-snapshot-candidate-validation` 只控制验收后的退出时机。
+- L0T0 Round 0 初次预检：50 步后稳定抓持，18 条 Left/Right/Above 几何通过；3 条进 Snapshot 物理跟踪、15 条被既有 480 步预算挡在物理分支前，结果已归档。
+- 本次唯一对照只跟踪重新生成的 `trajectory-001`：将 Snapshot 参考速度设为 0.02 m/s、单候选上限设为 1200，844 步计划预算通过；实际 73 步后于 step 72 因相对旋转误差 0.208495 rad 超过原 0.20 rad 阈值失败。左右指接触 73/73 步都保持，Contact Compiler 对已观测片段为 `safe`，但整条路线没有通过。
+- 与 0.04 m/s / 480 步基线相比，原 422 步规划也预算通过且在同一步因同一旋转越限失败；不是预算拒绝。Snapshot 完整恢复（误差 0），主动停止被准确记录为 `snapshot_candidate_validation_complete`，`snapshot_restore_integrity_failure=false`。主环境 B-Spline/放置 0 步，reward=0、done=false，任务未完成，不作整体 safe 结论。
+- 完整归档位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`。当前等待复核，不进行下一次 Rollout、重试或调参。
 
 ### 上一 L0T1 C2 离线诊断（保留）
 

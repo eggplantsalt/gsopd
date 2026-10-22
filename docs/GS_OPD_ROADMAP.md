@@ -6,11 +6,11 @@
 
 ## 阶段与当前状态
 
-### 最新状态：L0T1 `blocked_by_base_grasp`；L0T0 Round 0 预检完成待复核（2026-10-22）
+### 最新状态：L0T1 `blocked_by_base_grasp`；L0T0 trajectory-001 Snapshot 对照完成待复核（2026-10-22）
 
 L0T1/state0 原始 π₀.₅ Base 的一次 200 步抓取未触及 Book Body 23，失败状态标为 `blocked_by_base_grasp`；所有 NPZ、视频、运行日志和离线诊断保留，原始 Smoke 目录新增带证据哈希的 `status_blocked_by_base_grasp.json`，不继续重试。历史诊断显示 EEF 与 Book 最近相距 0.31244 m、机器人与瓶子有 89 条接触、Book 未动，动作预测与执行一致；策略内部视觉目标错误仍为 unknown。
 
-L0T0/state0 一次 Round 0 预检以原始 Base 在 50 个 Student 动作后达到稳定双指抓持，生成 18 条 Left/Right/Above 候选且几何筛选 18/18 通过。Snapshot 步数预算放行 3 条进行分支物理跟踪，214 分支控制步后因抓持姿态/双指接触失效而全部拒绝；其余 15 条因现有单候选 480 步预算未进入物理执行。Snapshot 恢复通过、主环境 B-Spline 执行 0 步，reward=0、done=false，任务搬运未执行，物理安全保持 unknown。完整报告与哈希清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`；当前等待复核，不继续试错。
+L0T0/state0 一次 Round 0 预检以原始 Base 在 50 个 Student 动作后达到稳定双指抓持，生成 18 条候选且几何筛选全部通过。随后针对 `trajectory-001` 做一次慢速 Snapshot 对照（0.02 m/s、1200 步上限）：844 计划步预算通过，实际跟踪 73 步后在 step 72 因相对旋转误差 0.208495 rad 超过原 0.20 rad 阈值拒绝，双指接触仍保持。此前 0.04 m/s / 480 步基线请求 422 步、预算也通过，并在同一控制步因同一姿态条件失败；属于物理跟踪失败而非预算限制。分支接触子步覆盖完整，Compiler 对已观察片段返回 `safe`，但整条路线未通过；Snapshot 恢复完整、主动停止不再误记为恢复失败，主环境搬运为 0 步，整体物理安全仍不得判 `safe`。报告、逐步误差表和哈希见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`。当前等待复核，不继续重试或调参。
 
 
 ## 历史局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22；`blocked_by_base_grasp`）

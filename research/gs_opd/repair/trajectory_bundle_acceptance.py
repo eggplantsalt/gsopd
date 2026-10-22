@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +353,7 @@ def run_snapshot_trajectory_acceptance(
     decision_step: int,
     grasp_stability: dict[str, Any],
     tracking_config: TrackingConfig = TrackingConfig(),
+    candidate_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate and track the complete live geometry bundle in isolated branches."""
     output_path = Path(output_json)
@@ -375,6 +377,9 @@ def run_snapshot_trajectory_acceptance(
         "current_visual_reidentification_performed": False,
         "candidate_count": 0,
         "geometric_screen_pass_count": None,
+        "requested_snapshot_candidate_id": candidate_id,
+        "tracking_config": asdict(tracking_config),
+        "snapshot_candidate_selection": None,
         "branch_candidate_count": 0,
         "candidates": [],
         "snapshot": None,
@@ -513,6 +518,44 @@ def run_snapshot_trajectory_acceptance(
         report["geometric_screen_pass_count"] = bundle.get("screen_pass_count")
         bundle_outputs = save_trajectory_bundle(bundle, bundle_dir)
         report["bundle_outputs"] = bundle_outputs
+        tracking_bundle = bundle
+        if candidate_id is not None:
+            selected = next(
+                (
+                    item
+                    for item in bundle.get("candidates", [])
+                    if item.get("candidate_id") == candidate_id
+                ),
+                None,
+            )
+            unselected_ids = [
+                item.get("candidate_id")
+                for item in bundle.get("candidates", [])
+                if item.get("candidate_id") != candidate_id
+            ]
+            report["snapshot_candidate_selection"] = {
+                "requested_candidate_id": candidate_id,
+                "candidate_found": isinstance(selected, dict),
+                "passes_geometric_screen": (
+                    selected.get("passes_geometric_screen") is True
+                    if isinstance(selected, dict)
+                    else False
+                ),
+                "physical_tracking_candidate_ids": (
+                    [candidate_id]
+                    if isinstance(selected, dict)
+                    and selected.get("passes_geometric_screen") is True
+                    else []
+                ),
+                "unselected_candidate_ids_not_physically_tracked": unselected_ids,
+            }
+            if not isinstance(selected, dict):
+                raise ValueError(f"requested_snapshot_candidate_not_found:{candidate_id}")
+            if selected.get("passes_geometric_screen") is not True:
+                raise ValueError(
+                    f"requested_snapshot_candidate_failed_geometry_screen:{candidate_id}"
+                )
+            tracking_bundle = {**bundle, "candidates": [selected]}
         carried_binding = geometry_before.get("objects", {}).get(context["subject_id"])
         if not isinstance(carried_binding, dict):
             raise ValueError("same_state_carried_object_geometry_missing")
@@ -520,7 +563,7 @@ def run_snapshot_trajectory_acceptance(
         tracking = track_trajectory_bundle(
             connection=connection,
             snapshot_id=snapshot_id,
-            bundle=bundle,
+            bundle=tracking_bundle,
             carried_binding=carried_binding,
             repair_context=repair_context,
             teacher=context["teacher"],

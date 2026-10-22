@@ -17,6 +17,18 @@
 - 为避免 Snapshot 验收后默认继续一个 Student 动作，`research/gs_opd/smoke/pi05_rollout.py` 增加默认关闭的 `--stop-after-snapshot-candidate-validation` 执行退出开关；仅在 plain trajectory validation 模式接受，生成、几何筛选、物理跟踪与 Compiler 逻辑不变。完成 `py_compile` 和 CLI 帮助检查；没有运行 LoRA 训练、写 NPZ/训练数据、修改轨迹生成算法或 Safety Compiler。
 - 独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`：`trajectory_validation.json`（完整候选/分支步与拒绝证据）、`candidate_disposition.csv`、`exploration_summary.json`、`exploration_report.md`、抓取阶段 `student_rollout.mp4`、`student.log`、输入副本、`bridge_session_record.json`、`run_manifest.json` 和 `sha256_manifest.json`。等待复核；不追加 Rollout 或参数尝试。
 
+## GS-OPD Round 0：trajectory-001 慢速 Snapshot 对照（2026-10-22）
+
+- 复用原始 π₀.₅ SFT Base（model SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`，无 LoRA）、现有 L0T0 Teacher 和 `semantic_bindings_l0t0.json`；同一回合先由 Student 执行 50 个抓取动作，在 decision step 50 达到连续 4 个不同状态的稳定抓持。随后从当前抓取状态重新生成现有 18 条候选，几何筛选 18/18 通过，只选择 `trajectory-001` 进入 Snapshot 物理跟踪。
+- 本次只覆盖 Snapshot TrackingConfig 的 reference speed `0.02 m/s` 与单候选控制步上限 `1200`；全局 7200 步预算、EEF/球心跟踪误差阈值、夹持物相对位置/旋转阈值、OSC 动作语义、接触约束和 Safety Compiler 均未变。代码保留原默认值 `0.04 m/s` / `480`；新增候选/配置 CLI 仅为显式可选项。
+- `trajectory-001` 按当前参考速度预计需要 844 步（小于 1200，预算接受），Snapshot 分支实际执行 73 步；在 step index 72 首次因相对旋转误差 `0.20849497 rad` 超过既有 `0.20 rad` 阈值而拒绝。最大相对位置误差 `0.007434 m`（阈值 0.012 m），最大 EEF 误差 `0.003703 m`、球心误差 `0.009905 m`（各自阈值 0.025 m）。73/73 步左右手指均保持接触，每步 6–10 个匹配接触；因此本次首个阻塞是物体相对旋转越限，不是双指失持或步数预算。
+- 分支接触监测完整覆盖 1825/1825 个物理子步，无未观测子步，Panda 分类可用。对已执行片段，Contact Compiler verdict 为 `safe`；规则 `ocr_1`（object_1 与 object_4 禁止接触）未发现绑定物体对接触，两条 Teacher 允许的 gripper-target 规则保持允许。轨迹在 73/844 步处已拒绝，完整路线未验证，故 `executable_safe=false` 且整体 `physical_safety_claim=false`，不得把片段接触 verdict 外推为整条路线 safe。
+- 与此前默认 `0.04 m/s` / `480` 步的 `trajectory-001` 对比：原参考长度请求 422 步（预算通过），实际 73 步，同样在 step index 72 因相对旋转越过阈值失败；本次 844/1200 同样预算通过，也在 step index 72 因同一物理约束失败。两次都是**已进入物理分支后的跟踪失败**，不是预算拒绝；降速未消除早期姿态误差。
+- Snapshot 恢复已核验：完整状态比较 matched，最大数值误差 0、差异数 0。主动停止写入独立字段 `episode_end_reason=snapshot_candidate_validation_complete`、`snapshot_restore_integrity_failure=false`、`snapshot_restore_verified=true`，主环境下一步动作前停止；主环境 B-Spline 搬运和放置均为 0 步，Episode 仅有 50 个抓取动作、reward `0.0`、`done=false`。
+- 归档于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_trajectory001_snapshot_speed0020_cap1200_20261022_attempt1/`，包括完整 `trajectory_validation.json`、`trajectory001_step_metrics.csv`、`comparison_summary.json`、`stop_and_restore_audit.json`、抓取视频、Bridge/Student 日志和哈希清单。未写 rollout NPZ/训练数据，未训练 LoRA。
+- 另外，前次 Round 0 归档中的主动停止原因曾复用恢复失败标记；其 `main_state_restored=true` 且状态误差为 0。原报告保持不变，已在前次实验目录新增 `stop_classification_correction.json` 更正解释；本次运行使用独立 stop/integrity 字段，避免再混淆。
+- 本轮必要实现仅在现有 Snapshot 验收入口增加单候选选择和可选 TrackingConfig 覆盖，候选仍先完整生成和几何筛选；默认行为保持原值。完成 `py_compile`、CLI 帮助检查和配置字段等价核对，没有修改 B-Spline 生成算法、OSC 语义、约束或 Compiler。结果等待复核，不继续调参或重试。
+
 
 ## L0T1/state0 Base π₀.₅ 抓取失败离线诊断（2026-10-22）
 
