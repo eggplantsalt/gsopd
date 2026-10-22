@@ -1,6 +1,16 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## L0T2 Round 1：RRT q0→q1 原生 OSC_POSE 物理验证（2026-10-23；部分执行后停止，等待复核）
+## L0T2 Round 1：t=173 关节偏差分解、重规划及 OSC 前缀执行（2026-10-23；50步后停止，等待复核）
+
+从上轮正确 OSC 分支的 `recovered` t=173 Runtime Snapshot 恢复。Jacobian 分解显示 q 与旧 RRT 参考差异 L2=0.209865 rad，其中零空间0.209718 rad（99.93%），任务行空间仅0.007858 rad；EEF误差2.830 mm/0.007704 rad。旧0.1503 rad joint1门槛主要捕获冗余构型变化，不等于末端跟踪失败。
+
+严格恢复与 re-export 对所有 Snapshot 字段逐项精确匹配；模型指纹、BDDL、控制器/缓冲、task、RNG及t=173均一致。以当前真实关节状态和Pot 2实际几何重新求解原物体坐标系预抓取EEF目标，固定种子20261024运行同一 MuJoCo 检查器下的离线7D RRT-Connect。150个密集全机器人采样、3个路点通过；关节路径2.212285 rad、EEF路径0.458119 m。Bottle/Place Box最小间隙14.289/12.722 mm；搜索要求12 mm优选余量，10 mm硬门槛未放宽，旧路径Place Box最小值为10.872 mm。全程关节限位通过，未有环境/自接触。
+
+在已恢复的隔离 Bridge 上仅执行重规划路径前50步原生OSC_POSE，使用0.02 m/s参考推进和真实每子步监测。时间步t=173→223；到预抓取目标直线距离408.794→371.476 mm，实得37.318 mm进展。EEF误差最大3.344 mm/0.008186 rad；重新规划参考的7D q差最大L∞0.014924 rad，末步任务/零空间分量L2为0.018161/0.007075 rad。1,250/1,250物理子步记录完整；Bottle/Place Box真实最小间隙33.291/205.137 mm；全部机器人环境接触、障碍接触、自接触、关节越限均为0。reward=0、done=false。末端尚距预抓取371.476 mm，没有抓取，也不构成完整路线、安全成功或任务成功。
+
+t=223 Runtime Snapshot已在Bridge中restore→re-export逐字段精确验证，Bridge已关闭。50步Observation–Action、双相机RGB、qpos/EEF、Jacobian分解、接触/间隙、视频和源脚本独立归档：`/opt/data/private/gs_opd/rollouts/l0t2_round1_t173_replan_osc50_20261023_attempt1/`；报告入口 `evidence/t173_replanned_osc_execution_report.md`。无VLA、Teacher/SAM3、训练、抓取/放置；未改模型、原示范、数据集、OSC默认配置或旧规划器。当前停止等待复核。
+
+## 历史：L0T2 Round 1 RRT q0→q1 原生 OSC_POSE 物理验证（2026-10-23；部分执行后停止）
 
 本轮仅验证离线7D RRT路径第一段 q0→q1。按规划归档顺序启动隔离 Bridge 并恢复原始 Student t=10 Runtime Snapshot；双reset前的首次启动指纹为 `75c8…80046d574`，因此没有动作，复现 `seed → reset → set_init_state → reset → set_init_state` 后模型指纹、BDDL、Integration State、控制器/缓冲、task bookkeeping 与 RNG 全部匹配，q0及其FK与归档一致，误差均为0。动作前重新逐点审计q0→q1的65个全机器人密集扫掠样本，Bottle/Place Box最小间隙38.886/112.217 mm，均超过10 mm。
 

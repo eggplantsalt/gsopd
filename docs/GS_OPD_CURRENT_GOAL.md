@@ -1,6 +1,20 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：L0T2 RRT q0→q1 OSC 首段验证已停止（2026-10-23；等待复核）
+## 当前局部目标：t=223 OSC 恢复状态已保存（2026-10-23；等待复核）
+
+本轮已从上一轮真实 `t=173` Runtime Snapshot 恢复并完成严格逐字段 roundtrip。旧 RRT 关节偏差为0.209865 rad L2，其中0.209718 rad（99.93%）处于EEF Jacobian零空间；EEF任务分量仅0.007858 rad，实际位置/姿态误差2.830 mm/0.007704 rad。原joint1停止门槛主要捕获冗余解漂移。
+
+从真实t=173状态重解预抓取目标IK，并使用固定种子20261024的7D Joint-Space RRT-Connect得到150点 `offline_feasible` 路径。Bottle/Place Box密集全几何间隙14.289/12.722 mm，满足未修改的10 mm硬门槛，也超过旧路径10.872 mm的最小障碍间隙。通过原生OSC_POSE只执行前50步至t=223；实际到目标距离减少37.318 mm，最大EEF误差3.344 mm；1,250个物理子步监测无机器人环境接触、自接触或限位违规。t=223快照restore→re-export全部字段精确匹配，文件可用于恢复。
+
+当前末端距离预抓取目标371.476 mm，尚未抵达、未抓取Pot 2；reward=0、done=false。本段只证明有限的安全物理进展，不能标记为预抓取到达、完整Safety Recovery或任务成功。新Bridge已关闭，不继续执行其余路径。
+
+完整报告：`/opt/data/private/gs_opd/rollouts/l0t2_round1_t173_replan_osc50_20261023_attempt1/evidence/t173_replanned_osc_execution_report.md`；末态快照：同目录 `evidence/t173_replanned_osc_terminal_runtime_snapshot.pkl`。下一步待复核后再决定是否从可恢复t=223快照继续沿路线执行；不运行VLA、训练、抓取或放置。
+
+**本轮结束，等待复核。**
+
+---
+
+## 历史局部目标：L0T2 RRT q0→q1 OSC 首段验证已停止（2026-10-23）
 
 本轮从原始 π₀.₅ Student t=10 Runtime Snapshot 恢复后，只执行离线 Joint-Space RRT 路径的 q0→q1 首段。恢复前按双 reset 初始化顺序核对模型指纹、BDDL、Integration State、控制器/缓冲、task bookkeeping、RNG以及q0/FK，均通过；完整65点保存扫掠的 Bottle/Place Box 最小间隙为38.886/112.217 mm。
 
