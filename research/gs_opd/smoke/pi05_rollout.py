@@ -100,6 +100,11 @@ def parse_args():
         action="store_true",
         help="Run one Snapshot-only trajectory tracking acceptance after a live stable grasp is observed.",
     )
+    parser.add_argument(
+        "--stop-after-snapshot-candidate-validation",
+        action="store_true",
+        help="Stop before the next Student action after Snapshot candidate validation; requires the plain trajectory validation mode.",
+    )
     parser.add_argument("--teacher-json", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--semantic-result", type=Path)
@@ -206,6 +211,10 @@ def parse_args():
         parser.error("--mink-osc-left requires --trajectory-bundle-physical-validation")
     if direct_osc_enabled and not trajectory_validation_enabled:
         parser.error("--direct-bspline-osc-left requires --trajectory-bundle-physical-validation")
+    if args.stop_after_snapshot_candidate_validation and not trajectory_validation_enabled:
+        parser.error("--stop-after-snapshot-candidate-validation requires --trajectory-bundle-physical-validation")
+    if args.stop_after_snapshot_candidate_validation and (mink_osc_enabled or direct_osc_enabled):
+        parser.error("--stop-after-snapshot-candidate-validation is only available for plain Snapshot candidate exploration")
     if grasp_smoke_enabled:
         original_sft_base = Path(
             "/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft"
@@ -2483,6 +2492,14 @@ try:
                 ),
                 flush=True,
             )
+            if args.stop_after_snapshot_candidate_validation:
+                trajectory_validation_restore_abort = True
+                print(
+                    "SNAPSHOT CANDIDATE EXPLORATION STOPPED BEFORE NEXT STUDENT ACTION:",
+                    (trajectory_validation_report or {}).get("status"),
+                    flush=True,
+                )
+                break
             from research.gs_opd.repair.trajectory_bundle_acceptance import (
                 must_stop_rollout_after_acceptance,
             )

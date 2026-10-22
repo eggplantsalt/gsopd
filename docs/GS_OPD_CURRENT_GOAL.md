@@ -1,10 +1,17 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 Base π₀.₅ 抓取失败离线诊断完成，等待复核（2026-10-22）
+## 当前状态：L0T1 阻塞；L0T0 Round 0 候选预检完成，等待复核（2026-10-22）
+
+- L0T1/state0 原始 π₀.₅ Base 抓取失败现标记为 `blocked_by_base_grasp`；原始 Smoke 目录的 `status_blocked_by_base_grasp.json` 保存状态与关键证据哈希。保留 NPZ/视频/报告及离线诊断归档，不在 L0T1 重试。
+- L0T0/state0 已完成一次原始 π₀.₅ Base 预检：50 个 Student 抓取动作后通过 3 状态稳定抓持检查，候选生成器产生 18 条（Left/Right/Above 各 6），几何筛选 18/18 通过。
+- 现有 Snapshot 预算放行 3 条进行分支物理跟踪，214 个分支控制步后均拒绝（2 条相对旋转越限，1 条双指接触丢失）；其余 15 条因估计控制步数超过既有 480 上限而未进入物理分支。主 Snapshot 精确恢复，主环境路线执行 0 步；reward=0、done=false，未完成任务，也未获得 safe 结论。
+- 完整数据位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`。结果等待复核；不继续批量尝试或调参。默认关闭的 `--stop-after-snapshot-candidate-validation` 只控制验收后的退出时机。
+
+### 上一 L0T1 C2 离线诊断（保留）
 
 - 归档的 200 步动作序列中，EEF 曾接近并碰动 Body 25 绿色瓶子（89 条机器人–瓶接触），但没有接触 Body 23 Book；Book root 几乎未移动。40 个预测动作块与 NPZ 实际动作完全一致。目标方向/接近失败有外部证据，VLA 内部视觉目标错误仍是 unknown。
 - 抓持代码按 Body 子树动态纳入 collision Geom，不限于语义 Geom 91；但运行时完整 Geom ID 清单未落盘，精确成员仍 unknown。默认关闭 Smoke flag 的 Student 推理和动作发送路径经静态审阅，没有发现被改变；没有运行正常 Rollout A/B。
-- 报告、对照图、视频关键帧、轨迹/动作 CSV 和哈希清单在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`。全程只读，无 MuJoCo/VLA 调用或代码修改。等待复核后再继续。
+- 报告、对照图、视频关键帧、轨迹/动作 CSV 和哈希清单在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`。该诊断已完成；L0T1 当前状态为 `blocked_by_base_grasp`，不继续尝试。
 
 ## 前次 C2 抓取 Smoke 记录（2026-10-22）
 

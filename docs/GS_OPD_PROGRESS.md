@@ -2,6 +2,21 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1 当前状态：`blocked_by_base_grasp`（2026-10-22）
+
+- Base π₀.₅ 在 L0T1/state0 的一次 200 步抓取 Smoke 未触碰 Reviewed Book Body 23，稳定抓持失败；现将该分支明确标记为 `blocked_by_base_grasp`，不继续重试。
+- 原始 Smoke 及纯离线诊断证据全部保留在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_state0_base_pi05_grasp_smoke_20261022_attempt1/` 和 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_base_pi05_grasp_offline_diagnostic_20261022_attempt1/`，没有清理或覆盖；原始 Smoke 目录新增 `status_blocked_by_base_grasp.json` 作为带哈希的状态侧车文件。
+- 后续本轮转向已验证可稳定抓取的 L0T0/state0，进行 Round 0 有界 Snapshot 候选探索预检；L0T1 不参与该回合。
+
+## GS-OPD Round 0：L0T0 广范围候选 Snapshot 预检（2026-10-22）
+
+- 只执行一次 LIBERO-Safety `obstacle_avoidance/L0T0/state0` Episode，task seed 0 / Student seed `20261020`。加载原始 SFT Base `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`，SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`；运行日志为 `lora_checkpoint_path=null`。复用原始 Teacher `/workspace/zy_workspace/RLinf/logs/gs_opd/teacher/initial_center_distinction_teacher_raw.txt`（SHA-256 `11922aab623df50b8f055ad649f8d053cea71e15a5f1850b987aad66068dbfea`）和 `/workspace/zy_workspace/RLinf/logs/gs_opd/semantic_bindings_l0t0.json`（SHA-256 `a90f5119fee6d6d2f26d7420a610979abaa019c5c247d07d8bcc98330e001620`）。活动 Bridge 的 520 Geom Inventory 将搬运目标 `object_1` 核验为 Body 23 `akita_black_bowl_1_main` / Geom 83；`object_4` obstacle 核验为 Body 27 / Geom 193。
+- Base Student 共执行 50 步；在 decision step 50，`GraspStabilityMonitor` 观察到连续 4 个不同状态稳定抓持（要求 3），抓取检查 `pass`。候选生成器按现有 `BundleConfig(candidate_count=18)` 生成 18 条：Left、Right、Above 各 6 条，几何筛选 18/18 通过、0 条几何拒绝。
+- Snapshot 物理跟踪使用原有预算和 Contact Compiler。18 条中有 3 条通过现有单候选步数预检并进入 Snapshot 分支，合计执行 214 个分支控制步，均未达到可执行条件：trajectory-001/003 因夹持物相对旋转越限，trajectory-002 因 Panda 双指接触丢失。其余 15 条在物理分支前按现有单候选 480 控制步上限拒绝，预测长度分别为 495、506、583、593、673 步（每种长度对应 Left/Right/Above 各一条）；这些候选物理结果为未运行，而非判为物理失败。最终 `executable_safe_candidate_ids=[]`，没有候选可标为物理可执行。
+- Snapshot 主状态恢复检查通过（数值最大误差 0），主环境候选 B-Spline 执行 0 步，停止开关在下一次 Student 动作前退出。Episode 汇总为 50 步、reward `0.0`、`done=false`；主环境搬运/放置没有运行，因此任务未完成，也不能由候选几何通过推断任务成功。`physical_safety_claim=false`，未给轨迹 `safe` 结论。
+- 为避免 Snapshot 验收后默认继续一个 Student 动作，`research/gs_opd/smoke/pi05_rollout.py` 增加默认关闭的 `--stop-after-snapshot-candidate-validation` 执行退出开关；仅在 plain trajectory validation 模式接受，生成、几何筛选、物理跟踪与 Compiler 逻辑不变。完成 `py_compile` 和 CLI 帮助检查；没有运行 LoRA 训练、写 NPZ/训练数据、修改轨迹生成算法或 Safety Compiler。
+- 独立归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`：`trajectory_validation.json`（完整候选/分支步与拒绝证据）、`candidate_disposition.csv`、`exploration_summary.json`、`exploration_report.md`、抓取阶段 `student_rollout.mp4`、`student.log`、输入副本、`bridge_session_record.json`、`run_manifest.json` 和 `sha256_manifest.json`。等待复核；不追加 Rollout 或参数尝试。
+
 
 ## L0T1/state0 Base π₀.₅ 抓取失败离线诊断（2026-10-22）
 

@@ -6,14 +6,16 @@
 
 ## 阶段与当前状态
 
-### 最新：L0T1/state0 Base π₀.₅ 抓取失败离线诊断（2026-10-22）
+### 最新状态：L0T1 `blocked_by_base_grasp`；L0T0 Round 0 预检完成待复核（2026-10-22）
 
-离线归档证据显示 EEF 与 Body 23 Book root 最近仍相距 0.31244 m，Book 基本未动；轨迹与绿色瓶子发生 89 条机器人接触并使瓶子移动约 0.229 m。40 个预测 Chunk 与执行动作完全一致，支持目标接近/选择偏差，不支持执行传输不一致；VLA 内部视觉目标错误原因仍 unknown。抓持查询源码按 Body 子树纳入全部 collision Geom，但精确运行时 Geom 集合未存档，成员列表为 unknown。默认关闭 `--grasp-only-smoke` 时主推理/动作路径经静态检查未发现变化；无运行时 A/B。产物独立归档，等待复核。
+L0T1/state0 原始 π₀.₅ Base 的一次 200 步抓取未触及 Book Body 23，失败状态标为 `blocked_by_base_grasp`；所有 NPZ、视频、运行日志和离线诊断保留，原始 Smoke 目录新增带证据哈希的 `status_blocked_by_base_grasp.json`，不继续重试。历史诊断显示 EEF 与 Book 最近相距 0.31244 m、机器人与瓶子有 89 条接触、Book 未动，动作预测与执行一致；策略内部视觉目标错误仍为 unknown。
+
+L0T0/state0 一次 Round 0 预检以原始 Base 在 50 个 Student 动作后达到稳定双指抓持，生成 18 条 Left/Right/Above 候选且几何筛选 18/18 通过。Snapshot 步数预算放行 3 条进行分支物理跟踪，214 分支控制步后因抓持姿态/双指接触失效而全部拒绝；其余 15 条因现有单候选 480 步预算未进入物理执行。Snapshot 恢复通过、主环境 B-Spline 执行 0 步，reward=0、done=false，任务搬运未执行，物理安全保持 unknown。完整报告与哈希清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T0_round0_wide_candidate_snapshot_20261022_attempt1/`；当前等待复核，不继续试错。
 
 
-## 最新局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22）
+## 历史局部验证：L0T1/state0 C2 抓取能力 Smoke（2026-10-22；`blocked_by_base_grasp`）
 
-使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`；任务未完成、整体物理安全未评估。完整 NPZ、视频、逐状态抓取/接触记录和运行清单位于数据盘独立目录，详见 `docs/GS_OPD_PROGRESS.md`。当前等待复核，不继续 L0T1 实验。
+使用原始 π₀.₅ SFT Base（无 π₁/π₂ Adapter）与已审核 Book→Body 23/Geom 91 绑定，执行一次抓取阶段评测。200 个环境动作后 reward=0、done=false；20 个状态虽确认夹爪闭合但均无双指接触，Book 几乎未移动，未达到三状态稳定抓持标准。分类为 `gripper_contact_insufficient`，L0T1 随后标记 `blocked_by_base_grasp`。任务未完成、整体物理安全未评估，证据保留，不重试。
 
 
 - **2026-10-22 最新语义输入状态**：基于同状态归档证据形成独立 reviewed semantic binding 适配：object_1→Body 23/Geom 91（保留 Teacher “white book” 与黑色外观冲突），object_3→Body 25/Geom 133，object_2→Body 26/Geom 265（保留低 SAM score）；object_4–6 unresolved。现有 Contact Safety Compiler 的纯身份解析对三条映射通过静态验证。9 个 null Geom 名仅在独立兼容 Inventory 中用可追溯占位符表达，原始 IR/Inventory 与 Compiler 未改。规则输入就绪不构成轨迹安全结论；接入执行链前等待复核。
