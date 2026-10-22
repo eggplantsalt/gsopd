@@ -2,6 +2,14 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+
+## L0T1 object_2 Caddy Task-Conditioned Candidate Verification（2026-10-22）
+
+- 复用最新 `brown caddy`、SAM3 threshold 0.05 的归档候选及其同状态 512×512 RGB。配对记录确认 RGB/Geom ID 使用相同的 180° 方向，采集前后物理状态一致，capture 未 reset/step。原始任务指令保持为 `pick up the book and place it in the back compartment of the caddy`，目标描述为中性 `caddy`，仅识别整个 Caddy。
+- 冻结 `Qwen3.8-27B-FP8`（Checkpoint `/workspace/zy_workspace/checkpoints/gs_opd/Qwen3.8-27B-FP8`，non-thinking，temperature 0，4096 tokens）只请求一次，HTTP 200、3.120 秒。VLM 收到原图与全部自动候选局部图（1 个候选：Candidate 0），提示允许 `unresolved`，并明确单候选不构成选择理由。实际请求不含 Teacher 颜色属性、SAM 分数、Body/Geom/IoU 或预期候选。完整 data-URL payload、输入审计和原始回答均已保存。
+- 原始回答为 `selected`, Candidate 0；理由称其视觉上是多格 Caddy，前侧可见一个瓶子。回答和候选决定落盘后才打开 IoU 文件。后验几何关联为 Body 26 `desk_caddy_1_main` / Geom 265，IoU **0.958812**。SAM score 为 **0.098633**，来自阈值 0.05 的低置信候选；高 IoU 不消除这个分数限制。
+- 该结果为一次候选级 VLM 选择及后验 Mask–Geom 重叠证据，没有写入正式 Teacher–Body 语义绑定，也没有修改原 Safety IR。只存在一个候选，模型间候选比较能力有限，结果等待复核。完整源文件副本、自动裁剪、请求/响应、模型清单、代码快照和 SHA-256 清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object2_caddy_task_conditioned_candidate_verification_20261022_attempt1/`；主报告为 `experiment_report.md`。Qwen 服务已关闭；本轮未运行 SAM3、Teacher、MuJoCo、Student、规划或训练。
+
 ## L0T1 object_2 brown caddy SAM3 低阈值候选与 Body IoU 诊断（2026-10-22）
 
 - 复用与 Teacher IR 同一采集状态的 512×512 L0T1/state0 图像。Teacher 的原始 agentview RGB 与几何归档 raw RGB SHA-256 一致；SAM 输入与配对 Geom ID 使用已核验的 180° forward 坐标。采集记录确认 capture 客户端未 reset/step、前后仿真状态一致。

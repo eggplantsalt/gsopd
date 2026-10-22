@@ -1,5 +1,11 @@
 # GS-OPD 当前局部目标
 
+## 当前状态：object_2 Caddy Task-Conditioned Candidate Verification 完成，等待复核（2026-10-22）
+
+- 用同状态归档 512×512 RGB 和最新 `brown caddy`/threshold 0.05 SAM3 候选，仅对整只 Caddy 执行一次 Task-Conditioned Candidate Verification。原始 L0T1 指令不变，`--target-description caddy`；请求包含原图及全部 1 个自动裁剪候选，Prompt 允许 unresolved，不按单候选强制选择。
+- 冻结 Qwen3.8 一次选择 Candidate 0。模型回答和选择落盘后再读取 IoU：Candidate 0 与 Body 26 `desk_caddy_1_main` / Geom 265 的 IoU 为 0.958812；SAM score 仅 0.098633，保留低分限制。
+- 输入未含 Teacher 颜色描述、SAM score、Body/Geom/IoU 或预期答案。原 Safety IR 未修改，没有建立正式语义绑定。完整报告及请求、回答、候选裁剪、输入源副本与哈希清单位于 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_object2_caddy_task_conditioned_candidate_verification_20261022_attempt1/`。服务已关闭；等待复核后再继续语义核验。
+
 ## 当前状态：object_2 caddy SAM3/Body IoU 低阈值诊断完成，等待复核（2026-10-22）
 
 - 使用 Teacher 同状态的归档 512×512 RGB、Geom ID 和完整 Inventory；SAM 检索词 `brown caddy`、置信阈值 0.05，原有 Body-level IoU 阈值 0.1。没有 Body 预筛。
