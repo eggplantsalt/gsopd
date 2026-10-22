@@ -6,15 +6,19 @@
 
 ## 阶段与当前状态
 
-### 最新状态：L0T1/state0 OSC 辅助抓取通过，等待复核（2026-10-22）
+### 最新状态：L0T1/state0 Snapshot 绕障探索未到终点，等待复核（2026-10-22）
 
-当前路线回到 LIBERO-Safety `obstacle_avoidance/L0T1/state0`，目标是取得完整成功轨迹。原始 π₀.₅ Base 的 200 步抓取未接触 Book Body 23；本轮使用一次性脚本控制的现有 7D OSC_POSE 接口，复用已审核的 Body 23 / Geom 91 绑定，解决抓取阶段瓶颈。动作辅助来源、实际动作、状态和接触均逐步记录；未调用 VLA，未改变 VLA Checkpoint、B-Spline 候选生成器或默认控制配置。
+当前路线仍是 LIBERO-Safety `obstacle_avoidance/L0T1/state0` 完整成功轨迹采集。已从 attempt6 恢复成功抓取状态，并以 Bridge 返回的真实 BDDL `In(black_book_1, desk_caddy_1_back_contain_region)` 作为任务语义和最终放置参考；Caddy Body 原点没有当作放置目标。新生成的 18 条 Left/Right/Above 候选与已归档候选逐项一致，几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒。该结果表示证明不充分，不能标 safe；三条方向代表候选仅在隔离 Snapshot 中探索，`passes_geometric_screen` 仍为 false。
 
-成功回合 attempt6 共 408 个控制动作。以安全高度从 Bottle 一侧绕行，在 Book 长轴上将夹持中心向远离 place box 的一端偏移 25 mm。原有稳定判据要求连续 3 个不同状态中夹爪闭合、左右指接触目标且 `grasp_confirmed`；首次稳定抓取有 3 个有效样本。完整子步接触覆盖为真，没有机器人–非目标物体接触。文件快照在全新 Bridge 进程中恢复，MuJoCo Integration State 最大绝对误差为 0；恢复后另有 4 个连续不同状态通过同一抓取检查。Book root 位移 8.34 mm。
+三条候选分别在 Left 5 步后与 study table Body 1 碰撞、Right 17 步后与 place box Body 27 碰撞、Above 139 步后因 Panda `robot0_joint7` 越过上限而停止。均未到绕障终点；接触子步记录完整，停止时双指 Book 接触仍通过。三条 Contact Safety Compiler 结果都是 `unknown`，不得解释为 safe。所有真实动作、Book 状态、接触和稀疏视频已独立归档；最终 Snapshot 恢复误差为 0。`rule_2` 的 Teacher 接触类别仍是 unknown，执行分支对 Caddy Body 26 采用接触即停/拒绝条件，未修改 Teacher 或 Safety Compiler。
 
-本轮只验证抓取：reward 0、done false；没有执行 B-Spline、搬运、放置、轨迹安全编译或训练，trajectory safety verdict 为 `not_evaluated`。attempt4/5 的手掌–place box Body 27 碰撞及前期控制几何错误均已保留并记录；成功回合没有因这些原因跳过任何接触或放宽判据。完整成功数据在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/`，尝试索引/复核包在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
+候选生成和本轮物理探索均未修改 B-Spline 几何算法、障碍半径或默认控制配置；未运行主环境搬运/放置、VLA 放置或训练，也未生成示范。详细报告在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`。当前等待复核；后续目标是在复核后从 attempt6 抓取状态继续真实 OSC 搬运并最终完成 Caddy 后侧隔间放置。
 
-当前等待复核。复核后下一阶段才从保存的抓取后状态直接生成 18 条候选，并使用用户指定的宽松工程跟踪阈值开展绕障轨迹采集；此阶段尚未启动。
+### 已确认的抓取起点：attempt6
+
+attempt6 使用脚本控制现有 7D `OSC_POSE` 接口，在 Book 长轴上将夹持中心向远离 place box 的一端偏移 25 mm。成功回合共 408 个控制动作；原有稳定判据的连续 3 个不同状态通过，双指接触和完整子步监测通过，无机器人–非目标物体接触。全新 Bridge 进程恢复快照后，MuJoCo Integration State 最大绝对误差为 0，并在恢复状态上再次通过 4 个连续不同状态。Book root 位移 8.34 mm。
+
+attempt6 仅完成抓取：reward 0、done false；未执行 B-Spline、搬运、放置、轨迹安全编译或训练。完整数据在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/`，复核包在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
 
 ### L0T0 Snapshot 对照（历史记录，非当前目标）
 

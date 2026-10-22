@@ -1,13 +1,22 @@
 # GS-OPD 当前局部目标
 
-## 当前状态：L0T1/state0 Book OSC 辅助抓取已通过，等待复核（2026-10-22）
+## 当前状态：L0T1/state0 三方向 Snapshot 绕障探索均未到终点，等待复核（2026-10-22）
+
+当前全局目标是 `obstacle_avoidance/L0T1/state0` 完整成功轨迹采集；后续目标是从 attempt6 抓取快照继续真实 OSC 搬运并最终完成 `In(black_book_1, desk_caddy_1_back_contain_region)`。本轮仅做局部候选筛选与最多三条 Snapshot 物理探索，不运行 L0T0、不重新执行 408 步抓取，也不做主环境搬运/放置、VLA 放置或训练。
+
+- 现有 18 条候选（Left/Right/Above 各 6）几何通过 0 条，全部因 `curve_clearance_bound_inconclusive:object_3` 被拒：证明不充分，不是已证明安全或碰撞。仅选择最短的 `trajectory-001/002/003`，每方向 1 条；候选 `passes_geometric_screen` 原值保持 false，未修改绕障曲线生成算法、障碍物半径或 Safety Compiler。
+- 三个 Snapshot OSC 分支均未到绕障终点：Left 请求 604 步、执行 5 步，Book 与 study table（Body 1）碰撞后停止，Book 根位移 3.36 mm；Right 请求 604 步、执行 17 步，夹爪与 `white_place_box_1_main`（Body 27）碰撞后停止，Book 根位移 29.91 mm；Above 请求 604 步、执行 139 步，`robot0_joint7=2.900247` 超过上限 2.8973 后停止。没有任何候选被报告为安全成功。
+- 已执行控制步的物理子步接触采样完整，分别 125/125、425/425、3475/3475；每步动作、Book 位姿、接触和 integration state，以及每候选视频均已保存。分支后 Restore 的 Integration State 与起始快照最大误差为 0。Safety Compiler 三条均返回 `unknown`（接触事件身份不完整），未解释为 `safe`。
+- Teacher `rule_2`（夹爪–Caddy）仍为 `unknown`。本次隔离分支保留原始 Teacher，并将 Caddy Body 26 接触设为停止/拒绝条件；编译器输入只保留明确规则，完整 Teacher 未修改。
+- 独立归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`；含全部候选、18 行几何筛选 CSV、三条物理摘要、逐步 NPZ/JSONL、子步接触证据、视频和 SHA-256 清单。attempt1 在未知规则预检处阻塞，物理动作 0 步，单独保留。
+
+### 已确认的抓取起点（attempt6）
 
 - 当前实验目标是 `obstacle_avoidance/L0T1/state0` 的完整成功轨迹采集。本轮仅处理抓取阶段，不运行 L0T0、不执行 B-Spline 搬运/放置或训练。
 - 原始 π₀.₅ Base 的 200 步抓取仍是失败历史（未接触 Body 23），但这不再阻塞当前路线：独立脚本化 OSC_POSE waypoint 辅助控制已实际抓住 reviewed Book Body 23 / Geom 91。抓取点沿 Book 长轴远离 place box 偏移 25 mm，接触判据保持原样。
 - attempt6 共 408 个 OSC 控制动作，全部控制步具有完整子步接触监测；没有机器人–非目标物体接触。原有 `GraspStabilityMonitor` 的 3 个连续不同状态通过；另存首个稳定快照，在新 Bridge 进程恢复后 Integration State 最大绝对差为 0，并在恢复状态上再次通过 4 个连续不同状态。Book root 位移 8.34 mm，未通过放宽阈值认定成功。
 - 可恢复快照：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_attempt6/recovered_grasp_runtime_snapshot.pkl`。完整实际动作、双相机帧、物理状态、接触证据、视频、初次/恢复后快照及哈希清单均在同目录。尝试历史和索引见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_osc_assisted_book_grasp_20261022_review_packet/`。
-- 本轮 reward=0、done=false；未执行 B-Spline、搬运、放置、训练或训练数据生成。trajectory safety verdict 未评估。未修改 VLA Checkpoint、B-Spline 候选生成器或默认控制配置。当前等待复核。
-- 复核通过后的下一步：从已保存抓取后状态直接生成 18 条候选，使用用户指定的宽松工程跟踪阈值开展绕障轨迹采集；尚未生成候选或启动下游执行。
+- 当前等待复核。复核后从此可恢复状态继续真实 OSC 搬运，再处理局部绕障终点到 Caddy 后侧隔间的路径；绕障 waypoint 不代表最终 `In` 放置完成。
 
 ### L0T0 trajectory-001 Snapshot（历史实验，非当前任务）
 

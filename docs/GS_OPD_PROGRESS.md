@@ -2,6 +2,16 @@
 
 当前局部目标见 `docs/GS_OPD_CURRENT_GOAL.md`；总体路线见 `docs/GS_OPD_ROADMAP.md`。
 
+## L0T1/state0 从 attempt6 快照进行 B-Spline 候选 Snapshot 物理探索（2026-10-22；无候选到达终点）
+
+- 按用户要求保持 `obstacle_avoidance/L0T1/state0`，没有运行 L0T0，也没有重新执行 408 步抓取。独立 Bridge 从 attempt6 的 `recovered_grasp_runtime_snapshot.pkl` 恢复；恢复和分支后 Restore 的 289 项 Integration State 最大误差均为 0。
+- 从原场景烟测读取并再次验证真实 BDDL `In(black_book_1, desk_caddy_1_back_contain_region)`。新增的 smoke 适配使用精确 Region Site 19 及其中心/尺寸作为语义和区域参考；Caddy Body 26 原点只作诊断，不作为最终放置点。左/右/上局部绕障几何规则和候选算法保持不变。重新生成候选与既有 18 条的 ID、方向、控制点、曲线点、筛选结果逐项相同。
+- 18 条候选 Left/Right/Above 各 6 条，几何通过 0 条、拒绝 18 条；全部拒绝原因是 `curve_clearance_bound_inconclusive:object_3`。这类结果仅证明不足，未改写通过标志。没有 `sphere_clearance_below_margin` 等明确低于安全余量的候选进入物理实验。
+- 仅对最短的三方向候选做 Snapshot OSC 物理探索（每条请求 604 步，上限 1200 步；相对旋转 0.25 rad、EEF 误差 0.04 m；其它跟踪默认阈值不变）：Left trajectory-001 执行 5 步后 Book–study_table Body 1 碰撞停止（3 个子步事件、峰值力 30.75 N）；Right trajectory-002 执行 17 步后 gripper 手部–white_place_box Body 27 碰撞停止（峰值力 143.35 N）；Above trajectory-003 执行 139 步后 Panda `robot0_joint7` 越过上限（2.900247 > 2.8973）。三条均未到绕障终点。以上为实际观察到的失败，不把部分路径标为成功。
+- 实际分支每控制步均覆盖 25/25 个 MuJoCo 子步接触样本（分别总计 125、425、3475）。两条碰撞分支在停止步的双指 Book 接触和夹爪闭合仍为 pass；Above 最后一步双指接触也为 pass，失败原因是关节限位而非已观察到的失持。所有逐步 7D OSC 动作、Book 位姿、整合状态、接触事件、力、逐子步覆盖及稀疏视频已保存。
+- 原 Teacher `rule_2`（gripper–Caddy）仍为 `unknown`。为进行隔离探索，执行时原始 Teacher 文件保留不变，明确规则用于 Contact Compiler；Body 26 被额外设为“机器人或 Book 接触则立即停止并拒绝”的未知规则保守处理条件。Safety Compiler 未修改；其三条候选结果仍为 `unknown`（报告了 `contact_event_pair_identity_is_malformed`），不能给出 safe 结论。未改 B-Spline 生成算法、候选半径或默认控制配置，也未训练或生成示范。
+- 主归档 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_snapshot_exploratory_bspline_physics_20261022_attempt2/`：`experiment_report.json`、全部 18 条 `trajectory_bundle.json`、18 行几何 `candidate_summary.csv`、三条 `candidate_physics_summary.csv`、每候选 Trace JSONL/NPZ/接触记录、3 段视频和 `run_manifest.json`。attempt1 在 Teacher 未知规则预检失败，物理动作 0 步，目录独立保留。当前等待复核；后续仍目标是从抓取快照开展真实 OSC 搬运并最终完成 L0T1。
+
 
 ## L0T1/state0 OSC 辅助 Book 抓取可行性实验（2026-10-22；成功，待复核）
 

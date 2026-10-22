@@ -237,13 +237,6 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             raise ValueError(
                 "local_bypass_goal direction must be derived from the carried and obstacle sphere centers"
             )
-        if (
-            construction.get("task_reference_source")
-            != "active_bddl_on_target_body_origin_semantic_reference_only"
-        ):
-            raise ValueError(
-                "local_bypass_goal must retain the active BDDL target as semantic context"
-            )
         carried_task_object = _text(
             construction.get("carried_registered_task_object"),
             "goal.construction.carried_registered_task_object",
@@ -257,17 +250,96 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             "goal.construction.placement_target_direction_reference.native_target_key",
         )
         predicate = target.get("native_predicate")
+        predicate_name = (
+            str(predicate[0]).lower()
+            if isinstance(predicate, list) and len(predicate) == 3
+            else None
+        )
         if (
             not isinstance(predicate, list)
             or len(predicate) != 3
-            or str(predicate[0]).lower() != "on"
+            or predicate_name not in ("on", "in")
             or predicate[1] != carried_task_object
             or predicate[2] != native_target_key
             or target.get("used_as_final_goal") is not False
         ):
             raise ValueError(
-                "local_bypass_goal target reference must match the active BDDL On relation"
+                "local_bypass_goal target reference must match the active BDDL On/In relation"
             )
+        expected_reference_source = {
+            "on": "active_bddl_on_target_body_origin_semantic_reference_only",
+            "in": "active_bddl_in_target_region_site_semantic_reference_only",
+        }[predicate_name]
+        if construction.get("task_reference_source") != expected_reference_source:
+            raise ValueError(
+                "local_bypass_goal must retain the active BDDL target as semantic context"
+            )
+        target_reference_position = _vector(
+            target.get("reference_position_world_m", target_position.tolist()),
+            "goal.construction.placement_target_direction_reference.reference_position_world_m",
+        )
+        reference_semantics = _text(
+            target.get(
+                "reference_position_semantics",
+                "target_body_origin_diagnostic_reference_only",
+            ),
+            "goal.construction.placement_target_direction_reference.reference_position_semantics",
+        )
+        normalized_target_reference = {
+            "body_id": target_body_id,
+            "body_name": target_body_name,
+            "body_origin_world_m": target_position.tolist(),
+            "reference_position_world_m": target_reference_position.tolist(),
+            "reference_position_semantics": reference_semantics,
+            "used_as_final_goal": False,
+            "state_id": state_id,
+        }
+        native_region = target.get("native_target_region")
+        if predicate_name == "in":
+            if (
+                reference_semantics
+                != "native_in_region_site_center_diagnostic_reference_only"
+                or not isinstance(native_region, dict)
+            ):
+                raise ValueError(
+                    "local_bypass_goal In target requires its exact native region site"
+                )
+            site_position = _vector(
+                native_region.get("center_world_m"),
+                "goal.construction.placement_target_direction_reference.native_target_region.center_world_m",
+            )
+            site_size = _vector(
+                native_region.get("half_size_site_frame_m"),
+                "goal.construction.placement_target_direction_reference.native_target_region.half_size_site_frame_m",
+            )
+            site_id = native_region.get("site_id")
+            if (
+                native_region.get("native_target_key") != native_target_key
+                or native_region.get("site_name") != native_target_key
+                or native_region.get("site_type") != "box"
+                or native_region.get("safe_center_region_verified") is not False
+                or native_region.get("used_as_final_goal") is not False
+                or site_id != target.get("native_region_site_id")
+                or np.any(site_size <= 0)
+                or not np.array_equal(site_position, target_reference_position)
+            ):
+                raise ValueError(
+                    "local_bypass_goal In target region diagnostics are inconsistent"
+                )
+            normalized_target_reference["native_target_region"] = {
+                "native_target_key": native_target_key,
+                "site_id": site_id,
+                "site_name": native_target_key,
+                "site_type_id": native_region.get("site_type_id"),
+                "site_type": "box",
+                "center_world_m": site_position.tolist(),
+                "half_size_site_frame_m": site_size.tolist(),
+                "safe_center_region_verified": False,
+                "used_as_final_goal": False,
+                "source": native_region.get("source"),
+            }
+        elif native_region is not None:
+            raise ValueError("local_bypass_goal On target cannot carry an In region")
         start = np.asarray(carried["center_world_m"], dtype=float)
         carried_to_obstacle = obstacle_center - start
         obstacle_distance = float(np.linalg.norm(carried_to_obstacle))
@@ -315,16 +387,15 @@ def _scene_input(scene: Any, config: BundleConfig) -> dict[str, Any]:
             "obstacle_object_id": obstacle_id,
             "obstacle_center_world_m": obstacle_center.tolist(),
             "forward_world": forward.tolist(),
-            "placement_target_direction_reference": {
-                "body_id": target_body_id,
-                "body_name": target_body_name,
-                "body_origin_world_m": target_position.tolist(),
-                "used_as_final_goal": False,
-                "state_id": state_id,
-            },
+            "placement_target_direction_reference": normalized_target_reference,
             "direction_source": construction["direction_source"],
             "task_reference_source": construction["task_reference_source"],
-            "native_bddl_on_predicate": predicate,
+            "native_bddl_predicate": predicate,
+            **(
+                {"native_bddl_on_predicate": predicate}
+                if predicate_name == "on"
+                else {"native_bddl_in_predicate": predicate}
+            ),
             "carried_registered_task_object": carried_task_object,
             "placement_target_registered_task_object": target_task_object,
             "native_target_key": native_target_key,
@@ -764,7 +835,7 @@ def generate_trajectory_bundle(
         "executable": False,
         "limitations": [
             "Caller must supply conservative enclosures of the entire carried object and every relevant obstacle in the same state.",
-            "A local_bypass_goal is the center of a bounded geometry-derived exit region behind an obstacle; its BDDL On target is task context and is not the final placement location.",
+            "A local_bypass_goal is the center of a bounded geometry-derived exit region behind an obstacle; its native BDDL On/In target is task context and is not the final placement location.",
             "B-spline control waypoints are not interpolation constraints; the sampled curve and its bound are screened.",
             "Static sphere geometry omits the robot/gripper, orientation, support contacts, dynamics and task feasibility.",
             "No control, time parameterization, Snapshot, contact verification or action execution is performed.",

@@ -1564,14 +1564,19 @@ def track_trajectory_bundle(
     geometry_inventory: dict[str, Any],
     gripper_inventory: dict[str, Any],
     config: TrackingConfig = TrackingConfig(),
+    exploratory_candidate_ids: set[str] | None = None,
+    video_capture_stride: int | None = None,
+    unresolved_contact_body_ids: set[int] | None = None,
 ) -> dict[str, Any]:
-    """Track all geometry-screened paths in isolated Bridge Snapshot branches.
+    """Track geometry-screened paths and explicitly selected exploratory paths.
 
     Call only with a Snapshot captured at the same On-Policy decision state as
     the bundle and a current full-object planning-geometry binding. The helper
     never sends an action to the main environment. Each branch's feedback loop
     runs inside the Bridge and the Contact Compiler evaluates its full substep
-    record after the Bridge restores the caller's state.
+    record after the Bridge restores the caller's state. Exploratory IDs may
+    select only candidates rejected solely for an inconclusive curve-clearance
+    bound; such candidates are never promoted to a safe status.
     """
     config.validate()
     if not isinstance(snapshot_id, str) or not snapshot_id:
@@ -1586,6 +1591,30 @@ def track_trajectory_bundle(
     collision_geom_names = carried_binding["geom_names"]
     semantic_geom_names = carried_binding["semantic_binding_geom_names"]
     allow_rule_id = _validate_grasp_rule(teacher, object_id)
+    if exploratory_candidate_ids is None:
+        exploratory_candidate_ids = set()
+    if not isinstance(exploratory_candidate_ids, (set, frozenset)) or any(
+        not isinstance(value, str) or not value
+        for value in exploratory_candidate_ids
+    ):
+        raise ValueError(
+            "exploratory_candidate_ids must be a set of nonempty candidate IDs"
+        )
+    exploratory_candidate_ids = set(exploratory_candidate_ids)
+    if video_capture_stride is not None and (
+        isinstance(video_capture_stride, bool)
+        or not isinstance(video_capture_stride, int)
+        or not 1 <= video_capture_stride <= 100
+    ):
+        raise ValueError("video_capture_stride must be an integer in 1..100")
+    if unresolved_contact_body_ids is None:
+        unresolved_contact_body_ids = set()
+    if not isinstance(unresolved_contact_body_ids, (set, frozenset)) or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in unresolved_contact_body_ids
+    ):
+        raise ValueError("unresolved_contact_body_ids must be a set of positive Body IDs")
+    unresolved_contact_body_ids = set(unresolved_contact_body_ids)
     if (
         not isinstance(repair_context, dict)
         or repair_context.get("status") != "available"
@@ -1617,6 +1646,7 @@ def track_trajectory_bundle(
     records_by_id: dict[str, dict[str, Any]] = {}
     request_candidates = []
     original_candidates_by_id: dict[str, dict[str, Any]] = {}
+    exploratory_ids_seen: set[str] = set()
     for original_index, candidate in enumerate(candidates):
         if not isinstance(candidate, dict):
             raise ValueError(f"trajectory candidate {original_index} must be an object")
@@ -1629,21 +1659,36 @@ def track_trajectory_bundle(
             reasons = candidate.get("rejection_reasons")
             if not isinstance(reasons, list) or not reasons:
                 reasons = ["geometric_screen_not_passed"]
-            records_by_id[candidate_id] = {
-                "candidate_id": candidate_id,
-                "direction": candidate.get("direction"),
-                "path_length_m": candidate.get("length_m"),
-                "requested_steps": None,
-                "budget_status": "not_evaluated_geometry_screen_failed",
-                "status": "rejected",
-                "executable_safe": False,
-                "physical_tracking_performed": False,
-                "physical_safety_verified": False,
-                "training_label_created": False,
-                "rejection_reasons": reasons,
-                "geometric_candidate": candidate,
-            }
-            continue
+            inconclusive_only = all(
+                isinstance(reason, str)
+                and reason.startswith("curve_clearance_bound_inconclusive:")
+                for reason in reasons
+            )
+            if candidate_id in exploratory_candidate_ids and inconclusive_only:
+                exploratory_ids_seen.add(candidate_id)
+            else:
+                records_by_id[candidate_id] = {
+                    "candidate_id": candidate_id,
+                    "direction": candidate.get("direction"),
+                    "path_length_m": candidate.get("length_m"),
+                    "requested_steps": None,
+                    "budget_status": "not_evaluated_geometry_screen_failed",
+                    "status": "rejected",
+                    "executable_safe": False,
+                    "physical_tracking_performed": False,
+                    "physical_safety_verified": False,
+                    "training_label_created": False,
+                    "geometric_screen_status": "rejected",
+                    "geometric_rejection_reasons": reasons,
+                    "rejection_reasons": reasons,
+                    "geometric_candidate": candidate,
+                }
+                continue
+        elif candidate_id in exploratory_candidate_ids:
+            raise ValueError(
+                "exploratory_candidate_must_remain_geometrically_inconclusive:"
+                f"{candidate_id}"
+            )
         if candidate.get("executable") is not False or candidate.get(
             "physical_safety_verified"
         ) is not False:
@@ -1707,6 +1752,11 @@ def track_trajectory_bundle(
             {
                 "candidate_id": candidate_id,
                 "direction": candidate.get("direction"),
+                "status": (
+                    "exploratory_inconclusive"
+                    if candidate_id in exploratory_ids_seen
+                    else "geometric_candidate"
+                ),
                 "goal_sphere_center_world_m": candidate["goal_world_m"],
                 "control_points_world_m": candidate.get("control_points_world_m"),
                 "points_world_m": points.tolist(),
@@ -1720,6 +1770,12 @@ def track_trajectory_bundle(
 
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("trajectory candidate IDs must be unique")
+    if exploratory_ids_seen != exploratory_candidate_ids:
+        missing = sorted(exploratory_candidate_ids - exploratory_ids_seen)
+        raise ValueError(
+            "exploratory_candidate_ids_must_name_only_present_inconclusive_candidates:"
+            + ",".join(missing)
+        )
 
     geometric_screen_pass_count = sum(
         candidate.get("passes_geometric_screen") is True for candidate in candidates
@@ -1780,6 +1836,12 @@ def track_trajectory_bundle(
             "requested_steps": plan["requested_steps"],
             "budget_status": plan["budget_status"],
             "budget_rejection_reason": plan["budget_rejection_reason"],
+            "geometric_screen_status": (
+                "inconclusive_exploratory"
+                if candidate_id in exploratory_ids_seen
+                else "passed"
+            ),
+            "geometric_rejection_reasons": source.get("rejection_reasons", []),
             "geometric_candidate": source,
         }
         if plan["budget_status"] != "accepted":
@@ -1826,6 +1888,8 @@ def track_trajectory_bundle(
             "snapshot_restore_status": "not_required_no_candidate_sent_to_bridge",
             "candidates": [records_by_id[item] for item in candidate_ids],
             "executable_safe_candidate_ids": [],
+            "exploratory_candidate_ids": sorted(exploratory_ids_seen),
+            "safety_status_promotion_for_exploratory_candidates": False,
             "final_task_success_confirmed": False,
             "training_label_created": False,
         }
@@ -1840,11 +1904,35 @@ def track_trajectory_bundle(
                 "control_points_world_m",
                 "points_world_m",
                 "eef_reference_poses_world",
+                "status",
             )
             if key in candidate
         }
         for candidate in budget_qualified_candidates
     ]
+    target_reference = (
+        scene.get("goal", {})
+        .get("construction", {})
+        .get("placement_target_direction_reference", {})
+    )
+    target_body_id = target_reference.get("body_id")
+    forbidden_scene_body_ids = (
+        sorted(
+            {
+                item.get("body_id")
+                for item in geometry_inventory.get("geometries", [])
+                if isinstance(item, dict)
+                and item.get("category") == "scene"
+                and isinstance(item.get("body_id"), int)
+                and not isinstance(item.get("body_id"), bool)
+                and item.get("body_id") > 0
+                and item.get("body_id") not in set(carried_binding.get("body_ids", []))
+                and item.get("body_id") != target_body_id
+            }
+        )
+        if exploratory_ids_seen
+        else []
+    )
 
     connection.send(
         {
@@ -1871,6 +1959,13 @@ def track_trajectory_bundle(
             "repair_context": repair_context,
             "options": asdict(config),
             "candidates": physical_request_candidates,
+            **(
+                {"video_capture_stride": video_capture_stride}
+                if video_capture_stride is not None
+                else {}
+            ),
+            "forbidden_scene_body_ids": forbidden_scene_body_ids,
+            "unresolved_contact_body_ids": sorted(unresolved_contact_body_ids),
         }
     )
     response = connection.recv()
@@ -1931,6 +2026,25 @@ def track_trajectory_bundle(
             config=config,
             controller_bounds=controller_bounds,
         )
+        exploratory = candidate_id in exploratory_ids_seen
+        if exploratory:
+            physics_checks_passed = assessment.get("executable_safe") is True
+            assessment = dict(assessment)
+            assessment["exploratory_physics_checks_passed"] = physics_checks_passed
+            assessment["geometric_screen_status"] = "inconclusive_exploratory"
+            assessment["geometric_rejection_reasons"] = original_candidates_by_id[
+                candidate_id
+            ].get("rejection_reasons", [])
+            assessment["executable_safe"] = False
+            assessment["physical_safety_verified"] = False
+            assessment["status"] = (
+                "exploratory_physical_execution_complete"
+                if branch_candidate.get("execution_complete") is True
+                else "exploratory_physical_execution_rejected"
+            )
+            assessment["rejection_reasons"] = list(
+                assessment.get("rejection_reasons", [])
+            ) + ["geometry_screen_inconclusive_no_safety_promotion"]
         if branch_candidate.get("requested_steps") != planned_steps_by_id[candidate_id]:
             assessment["executable_safe"] = False
             assessment["status"] = "rejected"
@@ -2036,6 +2150,8 @@ def track_trajectory_bundle(
         "response_errors": response_errors,
         "candidates": assessed,
         "executable_safe_candidate_ids": eligible_ids if restored else [],
+        "exploratory_candidate_ids": sorted(exploratory_ids_seen),
+        "safety_status_promotion_for_exploratory_candidates": False,
         "final_task_success_confirmed": False,
         "training_label_created": False,
     }

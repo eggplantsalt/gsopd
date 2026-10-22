@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -209,6 +210,79 @@ def _check_query(query, teacher, semantic_results, payload):
     return checked
 
 
+def _geometry_inventory_validation_copy(raw_inventory, reviewed_compatibility_inventory):
+    """Normalize only reviewed null Geom names for identity-table validation."""
+    if not isinstance(raw_inventory, dict) or not isinstance(reviewed_compatibility_inventory, dict):
+        raise ValueError("planning_geometry_compat_inventory_unavailable")
+    raw_items = raw_inventory.get("geometries")
+    reviewed_items = reviewed_compatibility_inventory.get("geometries")
+    if (
+        raw_inventory.get("status") != "complete"
+        or reviewed_compatibility_inventory.get("status") != "complete"
+        or raw_inventory.get("geom_count") != reviewed_compatibility_inventory.get("geom_count")
+        or not isinstance(raw_items, list)
+        or not isinstance(reviewed_items, list)
+        or len(raw_items) != raw_inventory.get("geom_count")
+        or len(reviewed_items) != reviewed_compatibility_inventory.get("geom_count")
+    ):
+        raise ValueError("planning_geometry_compat_inventory_is_incomplete_or_mismatched")
+    raw_by_id = {item.get("geom_id"): item for item in raw_items if isinstance(item, dict)}
+    reviewed_by_id = {
+        item.get("geom_id"): item for item in reviewed_items if isinstance(item, dict)
+    }
+    expected_ids = set(range(raw_inventory["geom_count"]))
+    if set(raw_by_id) != expected_ids or set(reviewed_by_id) != expected_ids:
+        raise ValueError("planning_geometry_compat_inventory_geom_id_coverage_mismatch")
+    result = copy.deepcopy(raw_inventory)
+    result_by_id = {item["geom_id"]: item for item in result["geometries"]}
+    replacements = []
+    for geom_id in sorted(expected_ids):
+        active = raw_by_id[geom_id]
+        reviewed = reviewed_by_id[geom_id]
+        if any(
+            active.get(key) != reviewed.get(key)
+            for key in ("body_id", "body_name", "category")
+        ):
+            raise ValueError(f"planning_geometry_compat_inventory_body_identity_mismatch:{geom_id}")
+        active_name = active.get("geom_name")
+        reviewed_name = reviewed.get("geom_name")
+        if active_name is None:
+            expected_placeholder = f"unnamed_geom_id_{geom_id:04d}"
+            if reviewed_name != expected_placeholder:
+                raise ValueError(f"planning_geometry_compat_inventory_placeholder_mismatch:{geom_id}")
+            result_by_id[geom_id]["geom_name"] = reviewed_name
+            replacements.append({"geom_id": geom_id, "geom_name": reviewed_name})
+        elif active_name != reviewed_name:
+            raise ValueError(f"planning_geometry_compat_inventory_name_mismatch:{geom_id}")
+    return result, replacements
+
+
+def _query_with_inventory_validation_copy(query, reviewed_compatibility_inventory):
+    """Return a copy with the same audited placeholders in inventory/components."""
+    result = copy.deepcopy(query)
+    normalized, replacements = _geometry_inventory_validation_copy(
+        result.get("geometry_inventory"), reviewed_compatibility_inventory
+    )
+    result["geometry_inventory"] = normalized
+    geom_names = {
+        item["geom_id"]: item["geom_name"] for item in normalized["geometries"]
+    }
+    for obj in result.get("objects", {}).values():
+        if not isinstance(obj, dict):
+            continue
+        ids = obj.get("geom_ids")
+        names = obj.get("geom_names")
+        if isinstance(ids, list) and isinstance(names, list) and len(ids) == len(names):
+            obj["geom_names"] = [
+                geom_names[geom_id] if name is None else name
+                for geom_id, name in zip(ids, names)
+            ]
+        for component in obj.get("components", []):
+            if isinstance(component, dict) and component.get("geom_name") is None:
+                component["geom_name"] = geom_names[component["geom_id"]]
+    return result, replacements
+
+
 def _compare_queries(before, after):
     left = np.asarray(before["mujoco_integration_state"], dtype=float)
     right = np.asarray(after["mujoco_integration_state"], dtype=float)
@@ -244,7 +318,7 @@ class _LocalGoalUnavailable(ValueError):
 def _build_local_bypass_scene(
     query, payload, *, clearance_m=0.01, exit_clearance_m=0.02
 ):
-    """Build a local endpoint from same-state spheres and the active BDDL On target."""
+    """Build a local endpoint from same-state spheres and the active BDDL On/In target."""
     if (
         isinstance(clearance_m, bool)
         or not isinstance(clearance_m, (int, float))
@@ -272,19 +346,20 @@ def _build_local_bypass_scene(
     native_goals = goal_diagnostics.get("native_goal_predicates")
     if not isinstance(native_goals, list):
         raise ValueError("local_bypass_goal_unavailable:active_bddl_goals_missing")
-    on_goals = [
+    placement_goals = [
         item
         for item in native_goals
         if isinstance(item, (list, tuple))
         and len(item) == 3
-        and str(item[0]).lower() == "on"
+        and str(item[0]).lower() in ("on", "in")
         and item[1] == carried_task_key
     ]
-    if len(on_goals) != 1:
+    if len(placement_goals) != 1:
         raise ValueError(
-            "local_bypass_goal_unavailable:active_bddl_on_target_missing_or_ambiguous"
+            "local_bypass_goal_unavailable:active_bddl_on_in_target_missing_or_ambiguous"
         )
-    predicate = list(on_goals[0])
+    predicate = list(placement_goals[0])
+    predicate_name = str(predicate[0]).lower()
     target_key = predicate[2]
     target_diagnostics = [
         item
@@ -317,6 +392,63 @@ def _build_local_bypass_scene(
         or target.get("body_origin_is_carried_center_goal") is not False
     ):
         raise ValueError("local_bypass_goal_unavailable:target_body_diagnostic_invalid")
+    target_reference = {
+        "reference_position_world_m": target_position.tolist(),
+        "reference_position_semantics": "target_body_origin_diagnostic_reference_only",
+        "native_target_region": None,
+    }
+    if predicate_name == "in":
+        if target.get("native_target_site_key") != target_key:
+            raise ValueError(
+                "local_bypass_goal_unavailable:in_target_does_not_resolve_to_exact_native_region_site"
+            )
+        matching_sites = [
+            site
+            for site in target.get("sites_diagnostic_only", [])
+            if isinstance(site, dict) and site.get("site_name") == target_key
+        ]
+        if len(matching_sites) != 1:
+            raise ValueError(
+                "local_bypass_goal_unavailable:in_target_region_site_missing_or_ambiguous"
+            )
+        site = matching_sites[0]
+        site_position = np.asarray(site.get("position_world_m"), dtype=np.float64)
+        site_size = np.asarray(site.get("size"), dtype=np.float64)
+        site_id = site.get("site_id")
+        site_type_id = site.get("type_id")
+        if (
+            isinstance(site_id, bool)
+            or not isinstance(site_id, int)
+            or site_id < 0
+            or isinstance(site_type_id, bool)
+            or not isinstance(site_type_id, int)
+            or site_type_id != 6  # MuJoCo mjGEOM_BOX site.
+            or site_position.shape != (3,)
+            or not np.isfinite(site_position).all()
+            or site_size.shape != (3,)
+            or not np.isfinite(site_size).all()
+            or np.any(site_size <= 0)
+        ):
+            raise ValueError(
+                "local_bypass_goal_unavailable:in_target_region_site_geometry_invalid_or_unsupported"
+            )
+        target_reference = {
+            "reference_position_world_m": site_position.tolist(),
+            "reference_position_semantics": "native_in_region_site_center_diagnostic_reference_only",
+            "native_region_site_id": site_id,
+            "native_target_region": {
+                "native_target_key": target_key,
+                "site_id": site_id,
+                "site_name": target_key,
+                "site_type_id": site_type_id,
+                "site_type": "box",
+                "center_world_m": site_position.tolist(),
+                "half_size_site_frame_m": site_size.tolist(),
+                "safe_center_region_verified": False,
+                "used_as_final_goal": False,
+                "source": "active Bridge native BDDL In target site diagnostics",
+            },
+        }
     inventory_geometries = query.get("geometry_inventory", {}).get("geometries", [])
     if not any(
         entry.get("body_id") == target_body_id
@@ -409,6 +541,11 @@ def _build_local_bypass_scene(
             "local_bypass_goal_unavailable:computed_endpoint_geometry_is_invalid"
         )
 
+    task_reference_source = (
+        "active_bddl_in_target_region_site_semantic_reference_only"
+        if predicate_name == "in"
+        else "active_bddl_on_target_body_origin_semantic_reference_only"
+    )
     goal = {
         "goal_type": "local_bypass_goal",
         "position_world_m": local_goal_position.tolist(),
@@ -425,6 +562,7 @@ def _build_local_bypass_scene(
                 "body_id": target_body_id,
                 "body_name": target_body_name,
                 "body_origin_world_m": target_position.tolist(),
+                **target_reference,
                 "used_as_final_goal": False,
                 "state_id": state_id,
                 "registered_task_object": target_registered_key,
@@ -433,7 +571,8 @@ def _build_local_bypass_scene(
             },
             "carried_registered_task_object": carried_task_key,
             "direction_source": "same_state_carried_sphere_center_to_obstacle_sphere_center",
-            "task_reference_source": "active_bddl_on_target_body_origin_semantic_reference_only",
+            "task_reference_source": task_reference_source,
+            "native_bddl_predicate": predicate,
             "obstacle_center_distance_from_start_m": actual_obstacle_distance,
             "obstacle_selection_rule": "nearest_bound_forbidden_obstacle_by_center_distance",
             "required_sphere_center_separation_m": required_separation,
@@ -470,6 +609,7 @@ def run_scene_smoke(
     expected_instruction: str | None = None,
     exit_clearance_m: float = 0.02,
     local_exit_region_scale: float = 0.5,
+    geometry_inventory_compatibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Query twice without reset/step; screen local bypass proposals if derivable."""
     directory = Path(out_dir)
@@ -506,15 +646,46 @@ def run_scene_smoke(
     first_valid = False
     try:
         teacher = validate_teacher_output_v2(teacher)
-        inventory = _bridge_request(connection, {"op": "geometry_inventory"})
+        raw_inventory = _bridge_request(connection, {"op": "geometry_inventory"})
+        if geometry_inventory_compatibility is None:
+            inventory = raw_inventory
+            placeholder_map = []
+        else:
+            inventory, placeholder_map = _geometry_inventory_validation_copy(
+                raw_inventory, geometry_inventory_compatibility
+            )
+            report["geometry_inventory_name_compatibility"] = {
+                "status": "validated_identity_copy",
+                "raw_bridge_inventory_preserved": True,
+                "only_null_geom_name_fields_normalized": True,
+                "placeholder_geoms": placeholder_map,
+            }
+        (directory / "geometry_inventory_raw.json").write_text(
+            json.dumps(raw_inventory, ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n",
+            encoding="utf-8",
+        )
+        if geometry_inventory_compatibility is not None:
+            (directory / "geometry_inventory_validation_copy.json").write_text(
+                json.dumps(inventory, ensure_ascii=False, indent=2, allow_nan=False)
+                + "\n",
+                encoding="utf-8",
+            )
         payload, validation = _selected_bindings(
             teacher, semantic_results, inventory, subject_id, expected_instruction
         )
         report.update({"binding_validation": validation, "query_payload": payload})
         first = _bridge_request(connection, payload)
         report["planning_geometry"] = first
+        first_validation_copy = first
+        if geometry_inventory_compatibility is not None:
+            first_validation_copy, query_placeholder_map = _query_with_inventory_validation_copy(
+                first, geometry_inventory_compatibility
+            )
+            if query_placeholder_map != placeholder_map:
+                raise ValueError("planning_geometry_inventory_placeholder_map_changed")
         report["same_query_binding_validation"] = _check_query(
-            first, teacher, semantic_results, payload
+            first_validation_copy, teacher, semantic_results, payload
         )
         first_valid = True
         bundle_config = BundleConfig(
@@ -563,7 +734,14 @@ def run_scene_smoke(
             try:
                 after = _bridge_request(connection, payload)
                 report["planning_geometry_after"] = after
-                _check_query(after, teacher, semantic_results, payload)
+                after_validation_copy = after
+                if geometry_inventory_compatibility is not None:
+                    after_validation_copy, after_placeholder_map = _query_with_inventory_validation_copy(
+                        after, geometry_inventory_compatibility
+                    )
+                    if after_placeholder_map != placeholder_map:
+                        raise ValueError("planning_geometry_after_placeholder_map_changed")
+                _check_query(after_validation_copy, teacher, semantic_results, payload)
                 comparison = _compare_queries(first, after)
                 report["state_consistency"] = comparison
                 if comparison["matched"] is not True:
@@ -637,6 +815,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=38567)
     parser.add_argument("--teacher-json", type=Path, required=True)
     parser.add_argument("--semantic-results-json", type=Path, required=True)
+    parser.add_argument(
+        "--geometry-inventory-compatibility-json",
+        type=Path,
+        help="reviewed identity-only inventory copy used to fill null geom_name values for validation",
+    )
     parser.add_argument("--subject-object-id")
     parser.add_argument("--expected-instruction")
     parser.add_argument(
@@ -655,6 +838,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     teacher = parse_teacher_output_v2(args.teacher_json.read_text(encoding="utf-8"))
     semantic = json.loads(args.semantic_results_json.read_text(encoding="utf-8"))
+    geometry_compat = (
+        json.loads(args.geometry_inventory_compatibility_json.read_text(encoding="utf-8"))
+        if args.geometry_inventory_compatibility_json
+        else None
+    )
     connection = Client((args.host, args.port), authkey=b"gs-opd-local")
     try:
         report = run_scene_smoke(
@@ -666,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_instruction=args.expected_instruction,
             exit_clearance_m=args.exit_clearance_m,
             local_exit_region_scale=args.local_exit_region_scale,
+            geometry_inventory_compatibility=geometry_compat,
         )
     finally:
         connection.close()

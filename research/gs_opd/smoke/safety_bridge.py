@@ -1289,6 +1289,7 @@ def _track_trajectory_candidate(
     result = {
         "candidate_id": candidate_id,
         "direction": candidate.get("direction"),
+        "candidate_execution_mode": candidate.get("status", "geometric_candidate"),
         "goal_sphere_center_world_m": candidate.get(
             "goal_sphere_center_world_m"
         ),
@@ -1303,6 +1304,11 @@ def _track_trajectory_candidate(
         "executed_steps": 0,
         "execution_complete": False,
         "snapshot_start_state_match": False,
+        "non_target_collision_detected": False,
+        "non_target_collision_events": [],
+        "unresolved_target_contact_detected": False,
+        "unresolved_target_contact_events": [],
+        "video_frames": [],
         "steps": [],
         "failure_reason": None,
         "task_feasibility": {
@@ -1411,6 +1417,31 @@ def _track_trajectory_candidate(
             grasp.update({"status": start_sides.get("status", "unavailable"), "reason": "initial_opposing_finger_contacts_missing"})
             result["grasp_evidence"] = grasp
             raise RuntimeError("initial_grasp_evidence_unavailable: both Panda fingers do not contact the carried object")
+        video_stride = options.get("__video_capture_stride")
+
+        def capture_video_frame(frame_step, *, force=False):
+            if video_stride is None:
+                return
+            if (
+                not force
+                and frame_step != sampled["requested_steps"]
+                and frame_step % video_stride != 0
+            ):
+                return
+            rendered = _render_highres(256)
+            image = rendered["images"]["rotated_180_rgb"]
+            result["video_frames"].append(
+                {
+                    "step_index": int(frame_step),
+                    "width": int(rendered["width"]),
+                    "height": int(rendered["height"]),
+                    "color_space": rendered["color_space"],
+                    "orientation": "rotated_180_rgb",
+                    "rgb_bytes": image["data"],
+                }
+            )
+
+        capture_video_frame(0, force=True)
         robot_state = diagnostic["robot_states"][0]
         explicit_eef_poses = sampled.get("eef_reference_poses_world")
         if explicit_eef_poses is not None:
@@ -1570,6 +1601,51 @@ def _track_trajectory_candidate(
                     quaternion_to_rotation_vector(relative_rot_delta)
                 ))
                 step_contacts = _collect_contacts()
+                forbidden_scene_ids = set(
+                    options.get("__forbidden_scene_body_ids", [])
+                )
+                unresolved_contact_ids = set(
+                    options.get("__unresolved_contact_body_ids", [])
+                )
+                current_non_target_events = []
+                current_unresolved_target_events = []
+                for event in monitor.get("_events", {}).values():
+                    if event.get("first_control_step") != step_index:
+                        continue
+                    body_pair = event.get("body_pair")
+                    if not isinstance(body_pair, list):
+                        continue
+                    event_body_ids = {
+                        body.get("id")
+                        for body in body_pair
+                        if isinstance(body, dict)
+                        and isinstance(body.get("id"), int)
+                        and not isinstance(body.get("id"), bool)
+                    }
+                    has_forbidden_scene_body = bool(
+                        event_body_ids & forbidden_scene_ids
+                    )
+                    involves_robot_or_carried_book = bool(
+                        event.get("robot_involved") is True
+                        or binding.get("body_id") in event_body_ids
+                    )
+                    if has_forbidden_scene_body and involves_robot_or_carried_book:
+                        current_non_target_events.append(event)
+                    if (
+                        event_body_ids & unresolved_contact_ids
+                        and involves_robot_or_carried_book
+                    ):
+                        current_unresolved_target_events.append(event)
+                if current_non_target_events:
+                    result["non_target_collision_detected"] = True
+                    result["non_target_collision_events"].extend(
+                        current_non_target_events
+                    )
+                if current_unresolved_target_events:
+                    result["unresolved_target_contact_detected"] = True
+                    result["unresolved_target_contact_events"].extend(
+                        current_unresolved_target_events
+                    )
                 finger_sides = _tracking_contact_sides(step_contacts, binding, gripper_groups)
                 step_gripper_closure = _parse_tracking_gripper_closure(
                     getattr(robot.gripper, "current_action", None)
@@ -1601,7 +1677,11 @@ def _track_trajectory_candidate(
                     else "fail"
                 )
                 reason = None
-                if joint_limits["status"] != "pass":
+                if current_non_target_events:
+                    reason = "actual_non_target_scene_collision"
+                elif current_unresolved_target_events:
+                    reason = "unresolved_target_contact_during_local_segment"
+                elif joint_limits["status"] != "pass":
                     reason = "active_Panda_joint_limit_violated"
                 elif workspace_status != "pass":
                     reason = "Panda_EEF_left_conservative_workspace"
@@ -1649,6 +1729,8 @@ def _track_trajectory_candidate(
                     "done": bool(done),
                     "state": diagnostic,
                     "contacts": step_contacts,
+                    "non_target_collision_events": current_non_target_events,
+                    "unresolved_target_contact_events": current_unresolved_target_events,
                     "substep_contact_coverage": monitor["control_steps"][-1],
                     "joint_limits": joint_limits,
                     "workspace": {
@@ -1662,6 +1744,9 @@ def _track_trajectory_candidate(
                 }
                 result["steps"].append(step)
                 result["executed_steps"] += 1
+                capture_video_frame(
+                    step_index + 1, force=bool(reason is not None or done)
+                )
                 if bool(done):
                     tracking_status = "fail"
                     tracking_reason = "environment_terminated_during_trajectory_tracking"
@@ -1760,6 +1845,9 @@ def _track_trajectory_bundle(request):
     candidates = request.get("candidates")
     binding = request.get("carried_binding")
     options = request.get("options")
+    video_capture_stride = request.get("video_capture_stride")
+    forbidden_scene_body_ids = request.get("forbidden_scene_body_ids")
+    unresolved_contact_body_ids = request.get("unresolved_contact_body_ids")
     if not isinstance(candidates, list) or not candidates or len(candidates) > 24:
         return {
             "status": "unavailable",
@@ -1774,6 +1862,62 @@ def _track_trajectory_bundle(request):
             "main_state_restored": False,
             "candidates": [],
         }
+    if video_capture_stride is not None and (
+        isinstance(video_capture_stride, bool)
+        or not isinstance(video_capture_stride, int)
+        or not 1 <= video_capture_stride <= 100
+    ):
+        return {
+            "status": "unavailable",
+            "error": "video_capture_stride_must_be_an_integer_in_1_to_100",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    branch_options = dict(options)
+    if video_capture_stride is not None:
+        branch_options["__video_capture_stride"] = video_capture_stride
+    if (
+        not isinstance(forbidden_scene_body_ids, list)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value >= int(env.sim.model._model.nbody)
+            for value in forbidden_scene_body_ids
+        )
+        or len(set(forbidden_scene_body_ids)) != len(forbidden_scene_body_ids)
+        or not isinstance(binding, dict)
+        or set(forbidden_scene_body_ids).intersection(
+            binding.get("body_ids", [])
+            if isinstance(binding.get("body_ids"), list)
+            else []
+        )
+    ):
+        return {
+            "status": "unavailable",
+            "error": "forbidden_scene_body_ids_are_missing_or_malformed",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    branch_options["__forbidden_scene_body_ids"] = forbidden_scene_body_ids
+    if (
+        not isinstance(unresolved_contact_body_ids, list)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value >= int(env.sim.model._model.nbody)
+            for value in unresolved_contact_body_ids
+        )
+        or len(set(unresolved_contact_body_ids)) != len(unresolved_contact_body_ids)
+    ):
+        return {
+            "status": "unavailable",
+            "error": "unresolved_contact_body_ids_are_missing_or_malformed",
+            "main_state_restored": False,
+            "candidates": [],
+        }
+    branch_options["__unresolved_contact_body_ids"] = unresolved_contact_body_ids
     expected_context = request.get("repair_context")
     try:
         from research.gs_opd.repair.trajectory_tracking import (
@@ -1848,7 +1992,8 @@ def _track_trajectory_bundle(request):
                 not isinstance(candidate, dict)
                 or not isinstance(candidate.get("candidate_id"), str)
                 or not candidate["candidate_id"]
-                or candidate.get("status") not in (None, "geometric_candidate")
+                or candidate.get("status")
+                not in (None, "geometric_candidate", "exploratory_inconclusive")
             ):
                 raise ValueError("candidate_identity_or_status_is_malformed")
             points = np.asarray(candidate.get("points_world_m"), dtype=np.float64)
@@ -1957,13 +2102,17 @@ def _track_trajectory_bundle(request):
             try:
                 if not isinstance(candidate, dict) or not isinstance(candidate.get("candidate_id"), str):
                     raise ValueError("candidate identity is malformed")
-                if candidate.get("status") not in (None, "geometric_candidate"):
+                if candidate.get("status") not in (
+                    None,
+                    "geometric_candidate",
+                    "exploratory_inconclusive",
+                ):
                     raise ValueError("candidate has an unsupported execution status")
                 item = _track_trajectory_candidate(
                     candidate,
                     target_snapshot,
                     binding,
-                    options,
+                    branch_options,
                     candidate_index,
                     reference_plans_by_id[candidate["candidate_id"]],
                 )
