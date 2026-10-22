@@ -1,6 +1,16 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
 
+## L0T2 Round 1：t=323 接续重规划与150步 OSC 前缀（2026-10-23；t=473，等待复核）
+
+从上一轮可恢复 t=323 Snapshot 恢复；模型指纹、BDDL、Integration State、完整 Snapshot 字段、task timestep与前一段物理末态均精确匹配。旧路线下一个参考点EEF差4.033 mm，但当前真实qpos对旧下一个路点偏差L2/L∞为0.067703/0.044073 rad，因此从实际qpos用同一RRT-Connect做了一次有限重规划。新路线113个密集点通过离线完整几何检查，关节路径1.397851 rad、EEF弧长0.320735 m，Ginger Beer/Place Box全路径最低余量17.957/12.556 mm，仍大于10 mm硬门槛。首次低于20 mm处在参考索引205、弧长0.204831 m。
+
+隔离Bridge原生OSC_POSE执行150步，t=323→473后达到预算停下；距预抓取点302.023→166.034 mm。EEF误差峰值2.937 mm/0.008320 rad；实际最小间隙33.962/80.286 mm。3,750/3,750物理子步记录完整，机器人场景接触、自接触、关节越限均为0。只到参考索引150，未进入离线间隙低于20 mm的窄段；因此该窄段仍未获得OSC验证。Pot1/Pot2根位置未变化，reward=0、done=false，预抓取/抓取均未完成。t=473 Snapshot逐字节核验匹配并可恢复，Bridge已关闭。
+
+完整证据：`/opt/data/private/gs_opd/rollouts/l0t2_round1_t323_replan_osc150_20261023_attempt1/evidence/t323_replanned_osc150_execution_report.md`，含完整动作/Observation、7D关节状态、逐子步接触、路径与视频、可恢复终态和SHA256。此结果仅为安全执行前缀，不是完整路线认证或Safety Success。未执行放置、Student Rollout或训练，既有示范和数据集未改。当前停止等待复核。
+
+---
+
 ## L0T2 Round 1：t=223 重规划后 OSC 前缀（2026-10-23；100步到 t=323，等待复核）
 
 已严格恢复 t=223 Runtime Snapshot：Integration State 与逐字段 Snapshot 匹配，模型指纹 `1a0c219c…f7a9f752`、BDDL 与控制器/缓冲状态一致。审计旧路径后发现实际关节状态不等于旧 RRT 节点，因此从真实 qpos 使用同一 RRT-Connect 检查器重规划；161个密集全机器人样本、3个关节路点通过离线完整几何复查，关节路径1.908481 rad、EEF弧长0.439147 m。全路径 Ginger Beer/Place Box 最小间隙21.278/12.722 mm，均满足10 mm门槛。

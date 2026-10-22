@@ -1,6 +1,18 @@
 # GS-OPD 当前局部目标
 
 
+## 当前局部目标：t=323 接续完成150步并安全停在窄段前（2026-10-23；等待复核）
+
+严格恢复t=323 Snapshot后，同一RRT-Connect从真实7D qpos重规划；旧路线偏差使直接复用关节游标不合适。新的113点 `offline_feasible` 路线满足Ginger Beer/Place Box 10 mm离线门槛，全程最小17.957/12.556 mm；路径首次低于20 mm处为参考索引205。
+
+本轮用原生OSC_POSE执行150步至t=473，步数上限先于窄段边界触发。预抓取距离缩短135.989 mm至166.034 mm；EEF误差最大2.937 mm/0.008320 rad；真实障碍间隙最低33.962/80.286 mm，3,750物理子步没有禁止接触、自碰撞或关节越限。Pot未移动，未到预抓取或抓取，reward=0、done=false。终态快照与活动Bridge导出逐字节一致并可恢复，Bridge已关闭。
+
+窄余量段仍须在后续获准物理执行中单独验证；当前结果不能标为完整Safety Success。证据位于`/opt/data/private/gs_opd/rollouts/l0t2_round1_t323_replan_osc150_20261023_attempt1/`，报告`evidence/t323_replanned_osc150_execution_report.md`。
+
+**本轮结束，等待复核。**没有执行Student Rollout、放置或训练，历史成功示范和LeRobot数据未修改。
+
+---
+
 ## 当前局部目标：从 t=223 重规划后执行100步，安全到达 t=323 并等待复核
 
 已从严格验证的 t=223快照恢复。旧RRT剩余路径与真实7D qpos不一致，故从实际状态用同一MuJoCo RRT-Connect重新生成一条161点 `offline_feasible` 全路径；Ginger Beer/Place Box离线全几何最小间隙21.278/12.722 mm，保持10 mm门槛。
