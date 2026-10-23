@@ -1,16 +1,43 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## Automatic task-phase recovery follow-up（2026-10-23；阶段控制已接入，L0T2 阻塞于预抓取规划预算）
+## Task Phase Controller 回归修复与 Pot 2 抓取验证（2026-10-23；首次阻塞在安全抓取位姿）
 
-新增通用实时阶段控制器 `research/gs_opd/repair/task_phase_controller.py`，并接入 Automatic Safety Recovery Engine。阶段接口包含预抓取、接近、闭爪、稳定双指抓持、抬升、持物转运、精确放置、释放、撤离、稳定、第二物体恢复和原生任务谓词核验。复核归档中 Pot 2 的 t=118–141 成功抓取、425步 Pot 2 放置修正、135步 Pot 1 Grasp Retargeting 和239步最终放置；抽取并复用的只有 `grasp_retargeting.py` 历史物体坐标变换/接近方向/距离与阶段先验。它们会在当前实时物体位姿上重新计算，动作由当前 EEF/物理状态通过原生 7D OSC_POSE 生成；没有拼接历史动作。L0T2 两个原生 `On` 目标、区域位姿、接触几何和阶段顺序来自已存档 BDDL 与人工整理的成功示范先验，不是 VLM Teacher 生成。`Turnon` 若未满足且没有可信激活控制器会 fail-closed。
+### 回归根因与修复
 
-先试用旧归档中标作 Pot 2 预抓取的 t=238 Snapshot。全机器人几何检查发现非指部 robot geom 到 Pot 2 只有 0.419 mm，小于配置的 10 mm 余量；引擎在执行动作前拒绝，0 个真实动作。复核后发现该 Snapshot 对应的旧目标其实是 t=118 近接姿态，不是可通过当前完整几何门槛的预抓取点。已将预抓取目标改为历史已验证抓取模板中的物体坐标接近方向和 60.648 mm 接近距离，并按实时 Pot 位姿变换；没有放宽任何安全距离。
+对比旧完整 Episode run9 与新阶段目标，确认二者不是同一个预抓取构型。run9 目标位置为 [0.09170, 0.17832, 1.01190] m，新目标按历史抓取模板的物体坐标接近变换、当前 Pot 位姿重算为 [0.09307, 0.15600, 1.06023] m，两者相差约53.2 mm。run9 目标声明允许 Pot 2 接触；新预抓取目标的允许目标接触为空，满足新规则对目标物全部机器人几何也保留 10 mm 门槛。接近/抓取阶段只给已识别的目标手指接触开例外，Ginger Beer 与 Place Box 始终是禁触对象。
 
-再从经核验的原始 t=10 Snapshot 启动独立 Bridge。t=10 的归档 Student 动作前缀经隔离 Snapshot 风险预测后触发自动接管，预测最小余量17.586 mm；没有在主环境执行这段前缀。此后 RRT-Connect 以实时关节状态规划，OSC_POSE 经隔离候选控制前缀验证后在主分支执行。累计118个真实控制转换，2,950/2,950个物理子步检查完整，没有发生不安全转换；实际禁触对象最小余量36.534 mm（episode t=90）。动作、前后 Observation/物理状态、原生谓词、任务阶段、接触监控、RGB 视频和119个主 Snapshot均保存在 `automatic_task_execution_l0t2_t10_seed_20261023_attempt2/`。三次自动规划在跟踪偏差、50 mm风险边界和窄通道入口后均从真实状态重新规划。第三次重规划请求触发每阶段三次规划预算上限；引擎以 `task_phase_planning_attempt_budget_exhausted:pregrasp` 确定失败。失败时 EEF 距预抓取目标232.6 mm，episode t=128，禁触对象余量49.761 mm。没有达到局部恢复成功，未进入抓取/搬运/放置。
+run9 通过的三条 7D RRT 路线分别有193/225/65个关节样本，累计关节路径长2.136/2.697/0.510 rad；全路径最小禁触间隙12.054/11.283/12.471 mm。它触发了 risk_margin_approaching 与 narrow_channel_entry_replan 两次滚动重规划，最终于 t=258 到达旧目标。新 t=10 目标的三条已接受路线有193/159/193个样本、关节长度2.504/2.101/2.126 rad，最小间隙19.571/18.485/18.448 mm；事件顺序为 preview_tracking_deviation、risk_margin_approaching、narrow_channel_entry_replan。因此三次成功规划不是“单次规划仅有三候选”的上限，而是三个连续控制段后的实际重规划；第三段后发生第四次规划请求时，旧 maximum_plan_attempts_per_phase=3 错误地把规划调用数当作阶段预算，t=128、EEF 距目标232.6 mm即失败。两次运行的事件都只记录一次窄通道入口触发；风险边界和入口位于同一狭窄路段附近，但日志没有证明同一个风险事件被反复触发。新路径的余量更大，却仍会在50 mm风险带及参考跟踪变化时触发滚动重规划。
 
-结果分类：局部恢复成功=false，完整任务成功=false，完整安全成功=false，标准1000步 Horizon成功=false，扩展 Horizon示范成功=false。t=238预抓取候选和t=10自动恢复都没有完成；因此按用户要求没有启动依赖其成功的原生t=0完整任务实验，也没有生成安全示范候选或训练。已有1093步示范及LeRobot数据未改。
+已移除阶段规划调用数三次硬门槛。每次 RRT-Connect 内最多保留3条候选；跨控制过程仅在有真实进展时计入重规划，单阶段最多12次、全局最多72次，并在停滞、连续重复原因或预算不足时 fail-closed。风险边界采用实际几何间隙的状态化滞回：低于50 mm进入后失效，只有真实间隙达到60 mm才重新武装。每个控制仍保留完整25物理子步监测及10 mm硬余量。没有改动 RRT 算法、Student 接管判据、OSC_POSE 控制语义或物理子步检查。
 
-验证：抓取 retargeting、阶段状态机、恢复状态机/预算、逐物理子步覆盖、7D RRT、携物几何、Panda 夹爪、Safety Bridge Snapshot/controller、Observation–Action Writer 定向测试共41项通过；相关模块 `compileall` 通过。用法、输入来源、失败判据和本轮CLI见 [`research/gs_opd/AUTOMATIC_TASK_RECOVERY.md`](../research/gs_opd/AUTOMATIC_TASK_RECOVERY.md)。独立运行归档：t=238几何拒绝 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_runtime_snapshot_20261023_attempt1/`；t=10旧目标被 RRT 端点检查拒绝 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt1/`；修正预抓取目标后的执行前缀 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt2/`。所有 Bridge 使用独立端口并在进程结束时关闭。
+### 从 run9 选择真实安全恢复状态并续跑
+
+归档 run9 的末端 t=258 状态在当前目标物几何规则下不合格：实时验证的 Pot 2 最近 robot 几何余量为2.277 mm；更早标为 t=238 预抓取的 Snapshot 也只有0.419 mm，均小于10 mm，且没有通过放宽接触例外。逐步接触/几何记录筛选后选用 t=240 Snapshot：Pot 2 全机器人几何间隙30.9 mm，Ginger Beer/Place Box机器人间隙至少24.4 mm，逐控制25子步记录完整。该 Snapshot 经独立 Bridge 严格恢复与当前安全策略检查通过。
+
+以 t=240 为起点，新阶段目标在30个真实 OSC_POSE 控制内到达；随后又执行18个经过逐子步检查的接近控制，状态到 t=287。t=287 的实测 Ginger Beer 间隙为10.49 mm。下一 OSC 前缀在隔离 Snapshot 中预测 robot link5 到 Ginger Beer 只有9.83 mm，因此整个候选前缀被拒绝，未提交到主环境；硬余量未放宽。新阶段恢复规划从真实7D qpos开始，并依次评估历史抓取模板本身、按实时最近禁触物几何方向计算的1.634 mm横移，以及历史记录中的0.04 rad接近轴旋转。三种有来源的候选终端构型均被全机器人 RRT 端点检查以 goal_configuration_is_unsafe 拒绝；最多3候选后立即停止，没有继续搜索。
+
+抓取验证结果：t=270 到达预抓取，因此该次局部恢复成功=true；之后安全接近至 t=287。**没有完成闭爪、稳定双指抓持或30 mm抬升验证**。此处是当前首个确定阻塞，不是预抓取不可达或全局抓取不可达的证明。下一步需要一条来源可信且经完整几何验证的不同抓取姿态/接近方向输入；不能仅扩大搜索预算。
+
+### 历史任务阶段先验复核
+
+- 原 π₀.₅ 归档 t=118–141 形成 Pot 2 稳定抓取（稳定双指状态记录于139–141）。
+- 425步 Pot 2 放置修正到达并核验 Pot 2 的原生 On，但明确未声称完整 episode 成功。
+- 135步 Grasp Retargeting 实例达到稳定抓持与抬升；仅验证抓取迁移，不代表完整任务或安全示范。
+- 239步最终放置接续在 episode t=1093 满足两个 Pot 的 On、炉具 Turnon 和任务成功判据；它使用1300步 demonstration-only horizon，比标准1000步多93步，且来源前缀有 Ginger Beer 物理接触，故不是完整安全成功示范。
+
+这些记录及 grasp_retargeting.py 只提供物体相对姿态、接近方向/距离、夹爪控制与放置阶段先验。当前位姿和动作均由实时 Observation、物体姿态和原生 OSC_POSE 控制重新计算；不复制历史动作序列。L0T2 目标来自原生 BDDL 和历史成功先验，未声称由 VLM Teacher 自动生成。炉具若需要重新激活但没有可信控制方式，最终验收仍 fail-closed。
+
+### 运行结果与验收边界
+
+验收分类：t=240→270 预抓取局部恢复成功=true；完整任务成功=false、完整安全成功=false、标准1000步 Horizon成功=false、扩展示范 Horizon成功=false。独立续接未通过闭爪/抬升关卡，按实验门槛没有从 t=10 或 t=0 启动完整任务接续。Pot 2 放置、Pot 1 抓取/放置、炉具激活与完整原生谓词验收都未在本轮运行。任务成功=false，完整安全成功=false，标准1000步 Horizon成功=false，扩展示范 Horizon成功=false；没有建立安全成功示范候选，没有修改1093步历史示范或 LeRobot 数据，也没有启动 LoRA。
+
+全 repair 单元测试：174项通过；修改模块 Python 编译检查通过。独立运行证据保存在：
+- run9 原始完整轨迹与逐步 Snapshot：/opt/data/private/gs_opd/rollouts/automatic_safety_recovery_l0t2_episode_20261023_run9/
+- 新目标触发三次调用上限的对照运行：/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt2/
+- t=258 / t=238严格接触规则拒绝、t=240安全状态恢复及 t=287阶段续跑：/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_run9_grasp_validation_20261023_attempt1/ 至 attempt5/
+- t=287三个抓取目标端点验证：/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_approach_replan_20261023_attempt2/
+
+所有本轮运行均使用独立 Bridge 与端口，并在拥有的进程退出后才关闭；归档、历史示范和既有 LeRobot 数据未覆盖。完整接口及复现说明见 [research/gs_opd/AUTOMATIC_TASK_RECOVERY.md](../research/gs_opd/AUTOMATIC_TASK_RECOVERY.md)。
 
 ## Previous checkpoint: Automatic Safety Recovery handoff boundary（2026-10-23；historical result, superseded by the follow-up above）
 

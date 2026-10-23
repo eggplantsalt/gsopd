@@ -68,31 +68,71 @@ demonstration-only and are limited to 1800; benchmark evaluation remains at
 
 ## Current validation boundary
 
-The archived timestep-238 state previously labeled pregrasp is not a safe
-start under the full target-object geometry rule: the closest non-finger robot
-geom was 0.419 mm from Pot 2 against a 10 mm clearance requirement. The engine
-rejected it before executing any action. The pregrasp goal was corrected to
-use the verified object-relative approach distance and live Pot pose.
+The old run9 pregrasp pose and the new phase-controller pregrasp pose are
+different by about 53.2 mm. The old goal allowed Pot 2 contact, while the new
+pregrasp target allows no target-object contact. Its source is the archived
+object-frame grasp/approach transform retargeted to the live Pot pose; this is
+an expert prior, not a VLM Teacher output.
 
-From the verified timestep-10 state, predictive risk takeover occurred before
-executing the archived Student prefix. The engine then executed 118 real
-OSC_POSE transitions, with complete 25-substep safety records and no unsafe
-transition; the measured minimum forbidden-object clearance was 36.534 mm.
-It selected three RRT-Connect routes over three planning attempts
-and replanned from live state after tracking deviation, a risk boundary, and
-narrow-channel entry. The third replan request exhausted the configured
-pregrasp planning-attempt budget while the EEF was still 232.6 mm from the
-pregrasp goal. No grasp phase or placement phase was reached.
+The t=10 comparison run accepted three rolling RRT routes with minimum
+forbidden clearances 19.571, 18.485, and 18.448 mm. Tracking deviation,
+risk-margin approach, and narrow-channel entry triggered replans after
+separate control segments. The former three planning-call phase cap stopped
+the run at t=128, 232.6 mm from the goal. That hard call-count cap is removed:
+each RRT invocation still has at most three routes; productive replans are
+counted only after real physical progress and capped at 12 per phase / 72
+overall. Repeated identical reasons and physical stagnation still fail closed.
+Risk-boundary rearming uses measured geometry: enter at 50 mm and rearm only
+after measured clearance reaches 60 mm. Every committed transition still has
+complete 25-substep checks and the hard 10 mm margin.
 
-This is a local, safe executed prefix only. It is not a local-recovery success,
-task success, complete safety success, standard-horizon success, or safe
-demonstration. Since pregrasp continuation did not complete, the dependent
-native t=0 full-task run was not launched. The traces and Snapshots remain in
-their unique run directories and are not demonstration candidates.
+The archived run9 t=238 and t=258 states fail the current Pot 2 full-robot
+clearance rule at 0.419 mm and 2.277 mm. A scan of the archived observations
+and contact records selected t=240 as a safe resumable state: Pot 2 clearance
+30.9 mm and Ginger Beer / Place Box clearance at least 24.4 mm. Strict
+Snapshot restore and current-policy checks passed. From t=240 the new
+controller reached pregrasp in 30 real OSC_POSE controls, then executed 18
+safe approach controls through t=287.
 
-Each run used a separately spawned and closed Bridge process. Port 38731 was
-used for the archived t=238 pregrasp audit, 38732 for read-only geometry
-diagnostics, and 38733 for the t=10 continuation runs. Port ownership was
-checked before each Bridge start. The second t=10 run reused 38733 only after
-the preceding owned Bridge had exited and the port was confirmed free; no
-pre-existing user process was stopped or modified.
+At t=287, isolated Snapshot preview predicted a 9.83 mm robot link5–Ginger
+Beer clearance for the next control prefix. That prefix was rejected before
+commit. RRT then checked three provenance-backed approach/grasp variants:
+the archived source pose, a 1.634 mm live-geometry-directed lateral shift,
+and a 0.04 rad archived approach-axis rotation. All three goal configurations
+were rejected by the full-robot endpoint check as unsafe. The run stopped
+after that bounded candidate set. It did not close the gripper, verify a stable
+bilateral grasp, or lift the pot by 30 mm.
+
+Historical phase evidence was also reviewed: source π₀.₅ Pot 2 grasp at
+t=118–141; a 425-control Pot 2 placement correction verifying only the Pot 2
+On subgoal; a 135-control Grasp Retargeting grasp/lift trial; and a 239-control
+final placement continuation reaching t=1093 with both On predicates,
+Turnon, and native task success. That final continuation used a 1300-step
+demonstration-only horizon and its source prefix contains Ginger Beer contact,
+so it is not a safety-success demonstration. These records provide grasp,
+object-relative pose, and stage-control priors only. New actions are generated
+from live observations and object poses.
+
+Because the isolated grasp/lift gate did not pass, dependent t=10 task
+continuation and native t=0 full Episode execution were not started. Pot 2
+placement, Pot 1 pick/place, fixture activation, and complete native predicate
+acceptance were not run. Task success, complete safety success, standard
+1000-step horizon success, and extended-horizon demonstration success are all
+false. No safety-success candidate was created; existing demonstrations and
+LeRobot data were preserved; LoRA was not run.
+
+All 174 repair unit tests passed. The changed Python modules compile. Detailed
+evidence remains in the independent run directories:
+- run9 source trajectory and per-step Snapshots:
+  /opt/data/private/gs_opd/rollouts/automatic_safety_recovery_l0t2_episode_20261023_run9/
+- t=10 three-call-cap regression comparison:
+  /opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt2/
+- strict t=238/t=258 rejection, safe t=240 restore, and t=287 stage continuation:
+  /opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_run9_grasp_validation_20261023_attempt1/ through attempt5/
+- three bounded unsafe grasp endpoints:
+  /opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_approach_replan_20261023_attempt2/
+
+Each experiment used an independent Bridge after checking that its port was
+free, and closed only the Bridge process it owned. Earlier validations used
+ports 38731–38733; the current bounded recovery runs used independent ports
+38741–38747. No pre-existing user process was stopped or modified.

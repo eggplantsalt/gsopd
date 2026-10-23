@@ -18,8 +18,10 @@
   "recovery": {
     "segment_control_steps": 8,
     "risk_trigger_distance_m": 0.05,
+    "risk_rearm_distance_m": 0.06,
     "hard_minimum_clearance_m": 0.01,
     "maximum_replans": 8,
+    "maximum_replans_per_phase": 12,
     "planning_time_budget_s": 360.0,
     "execution_step_budget": 1000,
     "total_wall_budget_s": 3600.0,

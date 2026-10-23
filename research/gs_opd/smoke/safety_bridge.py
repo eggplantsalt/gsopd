@@ -4644,6 +4644,8 @@ def _osc_prefix_probe(request):
     max_steps = request.get("max_control_steps")
     gripper_action = request.get("gripper_action")
     risk_trigger = request.get("risk_trigger_distance_m")
+    risk_rearm = request.get("risk_rearm_distance_m")
+    risk_crossing_armed = request.get("risk_crossing_armed")
     max_joint_error = request.get("maximum_joint_path_deviation_rad")
     max_eef_error = request.get("maximum_eef_tracking_error_m")
     max_orientation_error = request.get("maximum_eef_orientation_error_rad")
@@ -4674,12 +4676,17 @@ def _osc_prefix_probe(request):
         raise ValueError("native_7d_gripper_action_must_be_explicit_and_finite")
     for name, value in (
         ("risk_trigger_distance_m", risk_trigger),
+        ("risk_rearm_distance_m", risk_rearm),
         ("maximum_joint_path_deviation_rad", max_joint_error),
         ("maximum_eef_tracking_error_m", max_eef_error),
         ("maximum_eef_orientation_error_rad", max_orientation_error),
     ):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)) or float(value) <= 0:
             raise ValueError(f"{name}_must_be_finite_and_positive")
+    if float(risk_rearm) <= float(risk_trigger):
+        raise ValueError("risk_rearm_distance_m_must_exceed_entry_distance")
+    if not isinstance(risk_crossing_armed, bool):
+        raise ValueError("risk_crossing_armed_must_be_an_explicit_boolean")
     policy = _normalize_safety_geometry_policy(request.get("safety_geometry_policy"))
     expected_state_hash = request.get("current_state_sha256")
     live_state = _mujoco_integration_state(env.sim)
@@ -4738,7 +4745,7 @@ def _osc_prefix_probe(request):
     initial_clearance = request.get("current_minimum_forbidden_clearance_m")
     if initial_clearance is None or not np.isfinite(float(initial_clearance)):
         raise ValueError("current_forbidden_object_clearance_is_unknown")
-    risk_crossing_pending = float(initial_clearance) > float(risk_trigger)
+    risk_crossing_pending = bool(risk_crossing_armed)
     try:
         _restore_snapshot(target_snapshot)
         if not _tracking_value_equal(target_snapshot, _capture_snapshot()):
@@ -4821,10 +4828,13 @@ def _osc_prefix_probe(request):
             if q_error > float(max_joint_error) or eef_error > float(max_eef_error) or eef_rotation_error > float(max_orientation_error):
                 result["stop_reason"] = "planned_joint_or_eef_reference_deviation"
                 break
-            if risk_crossing_pending and current_margin is not None and current_margin <= float(risk_trigger):
-                risk_crossing_pending = False
-                result["stop_reason"] = "narrow_channel_entry_replan"
-                break
+            if current_margin is not None:
+                if not risk_crossing_pending and current_margin >= float(risk_rearm):
+                    risk_crossing_pending = True
+                if risk_crossing_pending and current_margin <= float(risk_trigger):
+                    risk_crossing_pending = False
+                    result["stop_reason"] = "narrow_channel_entry_replan"
+                    break
             movement_history.append(float(np.linalg.norm(eef_position - np.asarray(before["eef_pos"], dtype=np.float64))))
             if len(movement_history) >= 12 and sum(movement_history[-12:]) < 0.002:
                 result["stop_reason"] = "motion_stagnation"

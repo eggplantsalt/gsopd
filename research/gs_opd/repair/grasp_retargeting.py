@@ -34,6 +34,47 @@ def _json_array(value: np.ndarray) -> list[list[float]] | list[float]:
     return value.tolist()
 
 
+def lateral_direction_away_from_nearest_obstacle_object_frame(
+    object_position_world_m: Any,
+    object_quaternion_world_wxyz: Any,
+    obstacle_positions_world_m: Any,
+    approach_direction_object: Any,
+) -> np.ndarray:
+    """Return a live, object-relative lateral direction away from an obstacle.
+
+    The nearest obstacle is selected from caller-verified forbidden-object
+    bindings. The result is projected off the demonstrated approach axis, so
+    the retargeting candidate shifts the grasp laterally without changing its
+    approach distance. Missing or degenerate evidence fails closed.
+    """
+    object_pose = _transform(object_position_world_m, object_quaternion_world_wxyz)
+    obstacle_positions = np.asarray(obstacle_positions_world_m, dtype=np.float64)
+    approach = np.asarray(approach_direction_object, dtype=np.float64)
+    if obstacle_positions.size == 0:
+        raise ValueError("verified_forbidden_obstacle_positions_are_unavailable")
+    if obstacle_positions.ndim != 2 or obstacle_positions.shape[1:] != (3,):
+        raise ValueError("forbidden_obstacle_positions_must_be_an_N_by_3_array")
+    if not len(obstacle_positions) or not np.isfinite(obstacle_positions).all():
+        raise ValueError("verified_forbidden_obstacle_positions_are_unavailable")
+    if approach.shape != (3,) or not np.isfinite(approach).all():
+        raise ValueError("demonstrated_object_relative_approach_direction_is_invalid")
+    norm = float(np.linalg.norm(approach))
+    if norm <= 1e-12:
+        raise ValueError("demonstrated_object_relative_approach_direction_is_degenerate")
+    approach = approach / norm
+    object_rotation = object_pose[:3, :3]
+    object_position = object_pose[:3, 3]
+    nearest = obstacle_positions[
+        int(np.argmin(np.linalg.norm(obstacle_positions - object_position[None, :], axis=1)))
+    ]
+    away_object = object_rotation.T @ (object_position - nearest)
+    lateral = away_object - float(np.dot(away_object, approach)) * approach
+    lateral_norm = float(np.linalg.norm(lateral))
+    if not np.isfinite(lateral_norm) or lateral_norm <= 1e-8:
+        raise ValueError("nearest_forbidden_obstacle_has_no_resolvable_lateral_direction")
+    return lateral / lateral_norm
+
+
 @dataclass(frozen=True)
 class RuntimeObjectBinding:
     """A task object's active Body/Geom identity supplied by the caller."""

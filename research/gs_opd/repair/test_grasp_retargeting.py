@@ -11,7 +11,10 @@ import unittest
 
 import numpy as np
 
-from research.gs_opd.repair.grasp_retargeting import GraspRetargetingTemplate
+from research.gs_opd.repair.grasp_retargeting import (
+    GraspRetargetingTemplate,
+    lateral_direction_away_from_nearest_obstacle_object_frame,
+)
 
 
 def _template():
@@ -41,6 +44,30 @@ def _template():
 
 
 class GraspRetargetingTests(unittest.TestCase):
+    def test_lateral_candidate_points_away_from_nearest_live_obstacle(self):
+        approach = np.asarray([0.1, -0.2, -0.97], dtype=np.float64)
+        approach /= np.linalg.norm(approach)
+        obstacle = np.asarray([-1.0, -1.0, 0.8], dtype=np.float64)
+        direction = lateral_direction_away_from_nearest_obstacle_object_frame(
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [obstacle],
+            approach,
+        )
+        expected_away = -obstacle
+        expected_lateral = expected_away - np.dot(expected_away, approach) * approach
+        self.assertGreater(float(np.dot(direction, expected_lateral)), 0.0)
+        self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0)
+
+    def test_away_offset_fails_closed_without_verified_obstacle_positions(self):
+        with self.assertRaisesRegex(ValueError, "positions_are_unavailable"):
+            lateral_direction_away_from_nearest_obstacle_object_frame(
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [],
+                [0.0, 0.0, -1.0],
+            )
+
     def test_pregrasp_uses_live_object_pose_and_verified_approach_distance(self):
         template = _template()
         first = template.retarget([1.0, 2.0, 3.0], [1.0, 0.0, 0.0, 0.0])

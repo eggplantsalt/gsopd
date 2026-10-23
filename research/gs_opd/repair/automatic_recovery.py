@@ -135,8 +135,10 @@ class RecoveryConfig:
 
     segment_control_steps: int = 8
     risk_trigger_distance_m: float = 0.05
+    risk_rearm_distance_m: float = 0.06
     hard_minimum_clearance_m: float = 0.01
     maximum_replans: int = 8
+    maximum_replans_per_phase: int = 12
     planning_time_budget_s: float = 360.0
     execution_step_budget: int = 1200
     total_wall_budget_s: float = 1800.0
@@ -153,6 +155,7 @@ class RecoveryConfig:
         for name in (
             "segment_control_steps",
             "maximum_replans",
+            "maximum_replans_per_phase",
             "execution_step_budget",
             "stagnation_window_steps",
             "horizon_steps",
@@ -163,6 +166,7 @@ class RecoveryConfig:
                 raise ValueError(f"{name} must be a positive integer")
         for name in (
             "risk_trigger_distance_m",
+            "risk_rearm_distance_m",
             "hard_minimum_clearance_m",
             "planning_time_budget_s",
             "total_wall_budget_s",
@@ -178,6 +182,48 @@ class RecoveryConfig:
             raise ValueError("hard_minimum_clearance_m cannot be below 10 mm")
         if self.risk_trigger_distance_m <= self.hard_minimum_clearance_m:
             raise ValueError("risk trigger must be greater than the hard clearance")
+        if self.risk_rearm_distance_m <= self.risk_trigger_distance_m:
+            raise ValueError("risk rearm distance must be greater than the entry distance")
+
+
+@dataclass
+class RiskBoundaryState:
+    """Hysteretic entry/exit state for one continuously monitored risk band.
+
+    The state persists across route replans. Entering the risk band can request
+    one replan; another request is armed only after measured clearance exits
+    beyond ``exit_distance_m``. Collision monitoring itself remains active on
+    every physical substep regardless of this state.
+    """
+
+    entry_distance_m: float
+    exit_distance_m: float
+    armed: bool
+
+    @classmethod
+    def from_clearance(
+        cls, clearance_m: float, entry_distance_m: float, exit_distance_m: float
+    ) -> "RiskBoundaryState":
+        return cls(
+            entry_distance_m=float(entry_distance_m),
+            exit_distance_m=float(exit_distance_m),
+            armed=bool(float(clearance_m) > float(entry_distance_m)),
+        )
+
+    def update(self, clearance_m: float) -> str | None:
+        """Report entry or exit from the risk band using live clearance."""
+        clearance = float(clearance_m)
+        if not math.isfinite(clearance):
+            raise ValueError("risk_boundary_clearance_is_not_finite")
+        if not self.armed:
+            if clearance >= self.exit_distance_m:
+                self.armed = True
+                return "exited"
+            return None
+        if clearance <= self.entry_distance_m:
+            self.armed = False
+            return "entered"
+        return None
 
 
 @dataclass
@@ -298,6 +344,8 @@ class RecoveryBackend(Protocol):
         plan: JointSpacePlan,
         context: TaskContext,
         config: RecoveryConfig,
+        *,
+        risk_boundary_armed: bool = True,
     ) -> PrefixPreview: ...
 
     def task_expert_action(
@@ -543,7 +591,67 @@ class AutomaticSafetyRecoveryEngine:
                 self._fail("student_risk_distance_unknown", risk=risk)
                 raise RuntimeError(self._failure_reason)
             self._event(f"{policy}_risk_assessed", risk=risk)
-            if float(distance) <= self.config.risk_trigger_distance_m:
+            if policy == "expert":
+                coverage = risk.get("substep_coverage")
+                geometry = (
+                    coverage.get("geometry_monitoring", {})
+                    if isinstance(coverage, dict) else {}
+                )
+                expected_substeps = (
+                    int(coverage.get("expected_physics_substeps_total", 0))
+                    if isinstance(coverage, dict) else 0
+                )
+                all_contacts_observed = (
+                    isinstance(coverage, dict)
+                    and int(coverage.get("captured_physics_substeps", -1)) == expected_substeps
+                    and int(coverage.get("contact_substeps", -1)) == expected_substeps
+                )
+                known_unsafe_prefix = bool(
+                    all_contacts_observed
+                    and expected_substeps > 0
+                    and risk.get("main_state_restored_verified") is True
+                    and risk.get("predicted_safety_status") == "unsafe"
+                    and geometry.get("status") == "unsafe"
+                    and len(geometry.get("substeps", [])) == expected_substeps
+                )
+                if known_unsafe_prefix:
+                    self._event(
+                        "automatic_takeover",
+                        reason="task_expert_prefix_known_unsafe_replan_from_live_state",
+                        risk=risk,
+                    )
+                    return observation
+                if (
+                    risk.get("main_state_restored_verified") is not True
+                    or not isinstance(coverage, dict)
+                    or coverage.get("status") != "complete"
+                    or geometry.get("status") != "complete"
+                    or not all_contacts_observed
+                ):
+                    self._fail(
+                        "task_expert_isolated_prefix_validation_unknown",
+                        risk=risk,
+                    )
+                    raise RuntimeError(self._failure_reason)
+                if float(distance) < self.config.hard_minimum_clearance_m:
+                    self._event(
+                        "automatic_takeover",
+                        reason="task_expert_prefix_requires_replanning",
+                        risk=risk,
+                    )
+                    return observation
+                if risk.get("predicted_safety_status") != "complete":
+                    self._fail("task_expert_predicted_safety_status_unknown", risk=risk)
+                    raise RuntimeError(self._failure_reason)
+                if float(distance) <= self.config.risk_trigger_distance_m:
+                    self._event(
+                        "task_expert_safe_action_inside_risk_band",
+                        clearance_m=float(distance),
+                        entry_distance_m=self.config.risk_trigger_distance_m,
+                        hard_minimum_clearance_m=self.config.hard_minimum_clearance_m,
+                        phase=context.phase,
+                    )
+            elif float(distance) <= self.config.risk_trigger_distance_m:
                 self._event("automatic_takeover", risk=risk)
                 return observation
             next_observation = self.backend.execute_action(action, context)
@@ -571,19 +679,55 @@ class AutomaticSafetyRecoveryEngine:
             self._local_recovery_success = True
             self._ever_local_recovery_success = True
             return observation
+        risk_boundary = RiskBoundaryState.from_clearance(
+            observation.minimum_forbidden_clearance_m,
+            self.config.risk_trigger_distance_m,
+            self.config.risk_rearm_distance_m,
+        )
+        phase_replans: dict[str, int] = {}
+        last_replan_reason: dict[str, str] = {}
         while not self.backend.is_recovery_goal_reached(observation, goal):
             exhausted = self._budget_exhausted()
             if exhausted:
                 self._fail(exhausted)
                 break
-            if self.replans > self.config.maximum_replans:
+            if self.replans >= self.config.maximum_replans:
                 self._fail("maximum_replanning_attempts_exhausted")
                 break
+            plan_start_observation = observation
             self.state = RecoveryState.PLAN
             plan_started = time.monotonic()
             try:
                 plan = self.backend.plan_rrt_connect(observation, goal, context, self.config)
             except Exception as exc:
+                advance_candidate = getattr(
+                    self.backend, "advance_task_goal_candidate", None
+                )
+                if (
+                    "goal_configuration_is_unsafe" in str(exc)
+                    and callable(advance_candidate)
+                    and advance_candidate(context, str(exc))
+                ):
+                    previous_goal = goal
+                    context = self.backend.current_context()
+                    context.validate()
+                    goal = self.backend.resolve_goal(observation, context)
+                    goal.validate()
+                    self._phase = context.phase
+                    self._active_goal_position = np.asarray(
+                        goal.position_world_m, dtype=np.float64
+                    )
+                    self._progress_distances = []
+                    self._last_progress_eef_position = np.asarray(
+                        observation.eef_position_world_m, dtype=np.float64
+                    ).copy()
+                    self._event(
+                        "task_goal_candidate_advanced_after_known_unsafe_goal",
+                        previous_goal=asdict(previous_goal),
+                        next_goal=asdict(goal),
+                        failure_reason=str(exc),
+                    )
+                    continue
                 self._fail(f"rrt_connect_failed:{type(exc).__name__}:{exc}")
                 break
             planning_seconds = time.monotonic() - plan_started
@@ -609,13 +753,15 @@ class AutomaticSafetyRecoveryEngine:
             self._last_progress_eef_position = np.asarray(
                 observation.eef_position_world_m, dtype=np.float64
             ).copy()
-            risk_crossing_pending = (
-                observation.minimum_forbidden_clearance_m
-                > self.config.risk_trigger_distance_m
-            )
             while not self.backend.is_recovery_goal_reached(observation, goal):
                 self.state = RecoveryState.PREVIEW
-                preview = self.backend.preview_prefix(observation, plan, context, self.config)
+                preview = self.backend.preview_prefix(
+                    observation,
+                    plan,
+                    context,
+                    self.config,
+                    risk_boundary_armed=risk_boundary.armed,
+                )
                 actions = np.asarray(preview.actions, dtype=np.float32)
                 if (
                     not preview.complete
@@ -669,6 +815,7 @@ class AutomaticSafetyRecoveryEngine:
                 )
                 self.state = RecoveryState.EXECUTE
                 replan_required = False
+                replan_reason: str | None = None
                 for index, action in enumerate(actions):
                     exhausted = self._budget_exhausted()
                     if exhausted:
@@ -679,6 +826,21 @@ class AutomaticSafetyRecoveryEngine:
                     self._record_transition(action, actual, "safety_recovery_osc_pose")
                     if self.state is RecoveryState.FAILED:
                         break
+                    risk_transition = risk_boundary.update(
+                        actual.minimum_forbidden_clearance_m
+                    )
+                    if risk_transition == "exited":
+                        self._event(
+                            "risk_boundary_exited_and_rearmed",
+                            clearance_m=actual.minimum_forbidden_clearance_m,
+                            exit_distance_m=risk_boundary.exit_distance_m,
+                        )
+                    elif risk_transition == "entered":
+                        self._event(
+                            "risk_boundary_entered",
+                            clearance_m=actual.minimum_forbidden_clearance_m,
+                            entry_distance_m=risk_boundary.entry_distance_m,
+                        )
                     commit_q_deviation = float(np.linalg.norm(actual.qpos - expected.qpos))
                     commit_eef_deviation = float(
                         np.linalg.norm(actual.eef_position_world_m - expected.eef_position_world_m)
@@ -722,15 +884,13 @@ class AutomaticSafetyRecoveryEngine:
                         self._event("automatic_replan_triggered", reason="preview_tracking_deviation")
                         observation = actual
                         replan_required = True
+                        replan_reason = "preview_tracking_deviation"
                         break
-                    if (
-                        risk_crossing_pending
-                        and actual.minimum_forbidden_clearance_m <= self.config.risk_trigger_distance_m
-                    ):
+                    if risk_transition == "entered":
                         self._event("automatic_replan_triggered", reason="risk_margin_approaching")
                         observation = actual
                         replan_required = True
-                        risk_crossing_pending = False
+                        replan_reason = "risk_margin_approaching"
                         break
                     observation = actual
                     if self.backend.is_recovery_goal_reached(observation, goal):
@@ -747,6 +907,7 @@ class AutomaticSafetyRecoveryEngine:
                         self._event("automatic_replan_triggered", reason="motion_stagnation",
                                     eef_travel_window_m=self._progress_distances)
                         replan_required = True
+                        replan_reason = "motion_stagnation"
                         break
                 if self.state is RecoveryState.FAILED:
                     break
@@ -762,6 +923,7 @@ class AutomaticSafetyRecoveryEngine:
                         source="isolated_prefix_validation",
                     )
                     replan_required = True
+                    replan_reason = str(preview_stop_reason)
                 path_exhausted = (
                     preview.artifacts.get("last_path_index")
                     == len(plan.qpos_path) - 1
@@ -773,8 +935,65 @@ class AutomaticSafetyRecoveryEngine:
                         reason="planned_route_exhausted_before_goal",
                     )
                     replan_required = True
+                    replan_reason = "planned_route_exhausted_before_goal"
                 if replan_required:
+                    if replan_reason is None:
+                        self._fail("replan_reason_unknown_fail_closed", phase=context.phase)
+                        break
+                    phase = context.phase
+                    moved_eef = float(
+                        np.linalg.norm(
+                            observation.eef_position_world_m
+                            - plan_start_observation.eef_position_world_m
+                        )
+                    )
+                    moved_qpos = float(
+                        np.linalg.norm(observation.qpos - plan_start_observation.qpos)
+                    )
+                    clearance_change = abs(
+                        observation.minimum_forbidden_clearance_m
+                        - plan_start_observation.minimum_forbidden_clearance_m
+                    )
+                    progressed = max(moved_eef, clearance_change) >= self.config.minimum_progress_m or moved_qpos >= 0.01
+                    if not progressed:
+                        self._fail(
+                            "replan_without_physical_progress",
+                            phase=phase,
+                            reason=replan_reason,
+                            eef_displacement_m=moved_eef,
+                            qpos_displacement_rad=moved_qpos,
+                            clearance_change_m=clearance_change,
+                        )
+                        break
+                    if last_replan_reason.get(phase) == replan_reason:
+                        self._fail(
+                            "repeated_replan_failure_reason",
+                            phase=phase,
+                            reason=replan_reason,
+                        )
+                        break
+                    used = phase_replans.get(phase, 0)
+                    if used >= self.config.maximum_replans_per_phase:
+                        self._fail(
+                            "phase_replanning_budget_exhausted",
+                            phase=phase,
+                            maximum_replans_per_phase=self.config.maximum_replans_per_phase,
+                        )
+                        break
+                    phase_replans[phase] = used + 1
+                    last_replan_reason[phase] = replan_reason
                     self.replans += 1
+                    self._event(
+                        "productive_phase_replan_budget_consumed",
+                        phase=phase,
+                        reason=replan_reason,
+                        phase_replans=phase_replans[phase],
+                        maximum_replans_per_phase=self.config.maximum_replans_per_phase,
+                        moved_eef_m=moved_eef,
+                        moved_qpos_rad=moved_qpos,
+                        clearance_change_m=clearance_change,
+                        risk_boundary_armed=risk_boundary.armed,
+                    )
                     break
                 if not self.backend.is_recovery_goal_reached(observation, goal):
                     self._event(
@@ -806,8 +1025,18 @@ class AutomaticSafetyRecoveryEngine:
             self._initial_history_safety_verified = bool(
                 context.metadata.get("initial_history_safety_verified", self.steps == 0)
             )
-            if self._safety_check(observation, self.config):
-                self._fail(self._safety_check(observation, self.config) or "initial_state_unknown")
+            initial_safety_failure = self._safety_check(observation, self.config)
+            if initial_safety_failure:
+                self._fail(
+                    initial_safety_failure,
+                    initial_state_safety={
+                        "minimum_forbidden_clearance_m": observation.minimum_forbidden_clearance_m,
+                        "forbidden_contacts": observation.forbidden_contacts,
+                        "self_contacts": observation.self_contacts,
+                        "raw_safety_geometry": observation.raw.get("safety_geometry"),
+                        "raw_contact_monitoring": observation.raw.get("contact_monitoring"),
+                    },
+                )
             elif observation.task_success is not True:
                 initial_goal = context.goal_for_phase(context.phase)
                 if self.backend.is_recovery_goal_reached(observation, initial_goal):

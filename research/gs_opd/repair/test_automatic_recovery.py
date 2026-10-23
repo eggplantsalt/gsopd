@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 import unittest
 
 import numpy as np
@@ -23,6 +24,7 @@ from research.gs_opd.repair.automatic_recovery import (
     PrefixPreview,
     RecoveryConfig,
     RecoveryState,
+    RiskBoundaryState,
     TaskContext,
 )
 
@@ -111,7 +113,7 @@ class FakeBackend:
             planning_seconds=0.0,
         )
 
-    def preview_prefix(self, observation, plan, context, config):
+    def preview_prefix(self, observation, plan, context, config, *, risk_boundary_armed=True):
         self.preview_calls += 1
         if self.reject_first_prefix and self.preview_calls == 1:
             return PrefixPreview(
@@ -165,7 +167,7 @@ class SegmentedRouteBackend(FakeBackend):
             planning_seconds=0.0,
         )
 
-    def preview_prefix(self, observation, plan, context, config):
+    def preview_prefix(self, observation, plan, context, config, *, risk_boundary_armed=True):
         self.preview_calls += 1
         next_step = self.state.timestep + 1
         position = [0.0, -next_step / 1000.0, 0.0]
@@ -218,7 +220,105 @@ class MissingPostGraspGoalBackend(FakeBackend):
         )) <= 0.01
 
 
+class SafeTaskExpertBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.context = replace(
+            self.context,
+            handoff_policy="expert",
+            expert_handoff_available=True,
+        )
+
+    def task_expert_action(self, observation, context):
+        return np.zeros(7, dtype=np.float32)
+
+    def predict_student_risk(self, observation, action, context):
+        return {
+            "status": "complete",
+            "minimum_predicted_forbidden_clearance_m": 0.02,
+            "predicted_safety_status": "complete",
+            "main_state_restored_verified": True,
+            "substep_coverage": {
+                "status": "complete",
+                "expected_physics_substeps_total": 25,
+                "captured_physics_substeps": 25,
+                "contact_substeps": 25,
+                "geometry_monitoring": {"status": "complete", "substeps": [{}] * 25},
+            },
+        }
+
+
+class UnsafeTaskExpertBackend(SafeTaskExpertBackend):
+    def predict_student_risk(self, observation, action, context):
+        return {
+            "status": "complete",
+            "minimum_predicted_forbidden_clearance_m": 0.0,
+            "predicted_safety_status": "unsafe",
+            "main_state_restored_verified": True,
+            "substep_coverage": {
+                "status": "incomplete",
+                "expected_physics_substeps_total": 25,
+                "captured_physics_substeps": 25,
+                "contact_substeps": 25,
+                "geometry_monitoring": {"status": "unsafe", "substeps": [{}] * 25},
+            },
+        }
+
+
+class ExpertRiskHandlingTests(unittest.TestCase):
+    def test_verified_expert_action_can_continue_inside_risk_band(self):
+        backend = SafeTaskExpertBackend()
+        engine = AutomaticSafetyRecoveryEngine(backend, RecoveryConfig())
+        engine._start_time = time.monotonic()
+
+        result = engine._run_policy_until_risk(backend.context, "expert")
+
+        self.assertEqual(result.timestep, 1)
+        self.assertEqual(len(backend.executed_actions), 1)
+        self.assertIn(
+            "task_expert_safe_action_inside_risk_band",
+            [event["event"] for event in engine._events],
+        )
+        self.assertNotIn(
+            "automatic_takeover",
+            [event["event"] for event in engine._events],
+        )
+
+    def test_known_unsafe_expert_prefix_is_replanned_without_commit(self):
+        backend = UnsafeTaskExpertBackend()
+        engine = AutomaticSafetyRecoveryEngine(backend, RecoveryConfig())
+        engine._start_time = time.monotonic()
+
+        result = engine._run_policy_until_risk(backend.context, "expert")
+
+        self.assertEqual(result.timestep, 0)
+        self.assertEqual(backend.executed_actions, [])
+        self.assertIn(
+            "automatic_takeover",
+            [event["event"] for event in engine._events],
+        )
+        self.assertNotEqual(engine.state, RecoveryState.FAILED)
+
+
 class AutomaticRecoveryTests(unittest.TestCase):
+    def test_risk_boundary_requires_live_exit_before_rearming(self):
+        state = RiskBoundaryState.from_clearance(0.049, 0.05, 0.06)
+        self.assertFalse(state.armed)
+        self.assertIsNone(state.update(0.051))
+        self.assertIsNone(state.update(0.0599))
+        self.assertEqual(state.update(0.060), "exited")
+        self.assertTrue(state.armed)
+        self.assertEqual(state.update(0.050), "entered")
+        self.assertFalse(state.armed)
+        self.assertIsNone(state.update(0.049))
+        self.assertIsNone(state.update(0.055))
+        self.assertIsNone(state.update(0.050))
+
+    def test_risk_boundary_rejects_nonfinite_clearance(self):
+        state = RiskBoundaryState.from_clearance(0.08, 0.05, 0.06)
+        with self.assertRaisesRegex(ValueError, "not_finite"):
+            state.update(float("nan"))
+
     def test_unknown_student_risk_fails_closed_before_execution(self):
         backend = FakeBackend(unknown_risk=True)
         result = AutomaticSafetyRecoveryEngine(

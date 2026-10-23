@@ -41,6 +41,7 @@ class PhaseEvidence:
     fixture_predicate_satisfied: bool | None
     trusted_fixture_activation_available: bool
     task_success: bool | None
+    count_phase_control: bool = True
 
 
 class TaskPhaseController:
@@ -79,7 +80,24 @@ class TaskPhaseController:
         if any(not item.get("predicate") or not item.get("goal_source") for item in self.objects):
             raise ValueError("each_task_object_requires_a_goal_predicate_and_provenance")
         self.config = dict(config)
-        self.phase = "pregrasp"
+        self.grasp_pose_candidates = [
+            dict(item)
+            for item in self.config.get(
+                "grasp_pose_candidates",
+                [{"candidate_id": "archived_source_pose"}],
+            )
+        ]
+        if not 1 <= len(self.grasp_pose_candidates) <= 3:
+            raise ValueError("task_phase_program_requires_one_to_three_grasp_pose_candidates")
+        candidate_ids = [item.get("candidate_id") for item in self.grasp_pose_candidates]
+        if any(not isinstance(item, str) or not item for item in candidate_ids):
+            raise ValueError("grasp_pose_candidate_ids_must_be_explicit")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("grasp_pose_candidate_ids_must_be_unique")
+        self.grasp_pose_candidate_index = 0
+        self.phase = str(config.get("initial_phase", "pregrasp"))
+        if self.phase not in self._PHASES:
+            raise ValueError(f"task_phase_program_initial_phase_is_unknown:{self.phase}")
         self.object_index = 0
         self._expert_handoff = False
         self._last_timestep = -1
@@ -94,6 +112,17 @@ class TaskPhaseController:
     @property
     def current_object(self) -> dict[str, Any]:
         return self.objects[self.object_index]
+
+    @property
+    def current_grasp_pose_candidate(self) -> dict[str, Any]:
+        return self.grasp_pose_candidates[self.grasp_pose_candidate_index]
+
+    def advance_grasp_pose_candidate(self) -> dict[str, Any] | None:
+        """Move to the next bounded grasp prior after a known unsafe target."""
+        if self.grasp_pose_candidate_index + 1 >= len(self.grasp_pose_candidates):
+            return None
+        self.grasp_pose_candidate_index += 1
+        return self.current_grasp_pose_candidate
 
     @property
     def complete(self) -> bool:
@@ -130,7 +159,7 @@ class TaskPhaseController:
         """Advance one stage if its observed success condition is satisfied."""
         if evidence.task_success is None:
             raise ValueError("native_task_success_is_unknown")
-        if evidence.timestep != self._last_timestep:
+        if evidence.count_phase_control and evidence.timestep != self._last_timestep:
             self._last_timestep = evidence.timestep
             self._phase_steps += 1
         limits = self.config.get("phase_control_step_limits", {})
@@ -233,6 +262,7 @@ class TaskPhaseController:
                 )
                 if next_index is not None:
                     self.object_index = next_index
+                    self.grasp_pose_candidate_index = 0
                     self._transition("second_object_recovery")
                 elif evidence.all_task_goals_satisfied and evidence.task_success is True:
                     self._transition("verify_task")

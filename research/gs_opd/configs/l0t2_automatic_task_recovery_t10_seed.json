@@ -34,10 +34,12 @@
     "maximum_eef_orientation_error_rad": 0.08,
     "maximum_eef_tracking_error_m": 0.025,
     "maximum_joint_path_deviation_rad": 0.18,
-    "maximum_replans": 12,
+    "maximum_replans": 72,
+    "maximum_replans_per_phase": 12,
     "minimum_progress_m": 0.002,
     "planning_time_budget_s": 360.0,
     "risk_trigger_distance_m": 0.05,
+    "risk_rearm_distance_m": 0.06,
     "segment_control_steps": 8,
     "stagnation_window_steps": 12,
     "standard_horizon_steps": 1000,
@@ -74,10 +76,30 @@
     "goal_object_order_source": "verified_archived_episode_phase_order_pot2_then_pot1",
     "goal_source_is_vlm_teacher": false,
     "grasp_template_source": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/source_grasp_template.json",
+    "grasp_pose_candidates": [
+      {
+        "candidate_id": "archived_successful_source_pose",
+        "rotation_delta_object_rad": [0.0, 0.0, 0.0],
+        "source_artifact": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/source_grasp_template.json",
+        "translation_offset_object_m": [0.0, 0.0, 0.0]
+      },
+      {
+        "candidate_id": "archived_geometry_scaled_lateral_retargeted_away_from_live_forbidden_geometry",
+        "rotation_delta_object_rad": [0.0, 0.0, 0.0],
+        "source_artifact": "/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/source/run_grasp_retargeting.py",
+        "translation_offset_m": 0.001634,
+        "translation_offset_policy": "lateral_away_from_nearest_forbidden_geometry"
+      },
+      {
+        "candidate_id": "archived_small_approach_axis_rotation",
+        "rotation_delta_about_approach_rad": 0.04,
+        "source_artifact": "/opt/data/private/gs_opd/rollouts/grasp_retargeting_l0t2_20261022_attempt1/source/run_grasp_retargeting.py",
+        "translation_offset_object_m": [0.0, 0.0, 0.0]
+      }
+    ],
     "lift_height_m": 0.045,
     "lift_stride_m": 0.025,
     "lift_validation_height_m": 0.03,
-    "maximum_plan_attempts_per_phase": 3,
     "objects": [
       {
         "goal_source": "archived_candidate_07_native_On_success_and_geometry_derived_region_target",

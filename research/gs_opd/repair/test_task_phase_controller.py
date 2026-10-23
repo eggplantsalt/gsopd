@@ -45,6 +45,7 @@ def _evidence(
     satisfied_object_ids=(),
     fixture_predicate_satisfied=True,
     task_success=False,
+    count_phase_control=True,
 ):
     return PhaseEvidence(
         timestep=timestep,
@@ -61,10 +62,44 @@ def _evidence(
         fixture_predicate_satisfied=fixture_predicate_satisfied,
         trusted_fixture_activation_available=False,
         task_success=task_success,
+        count_phase_control=count_phase_control,
     )
 
 
 class TaskPhaseControllerTests(unittest.TestCase):
+    def test_grasp_pose_candidate_budget_is_bounded_and_advancement_explicit(self):
+        config = _config(("object_a",))
+        config["grasp_pose_candidates"] = [
+            {"candidate_id": f"candidate_{index}"} for index in range(3)
+        ]
+        controller = TaskPhaseController(config)
+        self.assertEqual(controller.current_grasp_pose_candidate["candidate_id"], "candidate_0")
+        self.assertEqual(controller.advance_grasp_pose_candidate()["candidate_id"], "candidate_1")
+        self.assertEqual(controller.advance_grasp_pose_candidate()["candidate_id"], "candidate_2")
+        self.assertIsNone(controller.advance_grasp_pose_candidate())
+
+        config["grasp_pose_candidates"].append({"candidate_id": "candidate_3"})
+        with self.assertRaisesRegex(ValueError, "one_to_three"):
+            TaskPhaseController(config)
+
+    def test_configured_resume_phase_is_explicit_and_validated(self):
+        config = _config(("object_a",))
+        config["initial_phase"] = "approach"
+        controller = TaskPhaseController(config)
+        self.assertEqual(controller.phase, "approach")
+
+        config["initial_phase"] = "invented_phase"
+        with self.assertRaisesRegex(ValueError, "initial_phase_is_unknown"):
+            TaskPhaseController(config)
+
+    def test_route_execution_does_not_consume_task_expert_phase_budget(self):
+        controller = TaskPhaseController(_config())
+        controller.config["phase_control_step_limits"] = {"pregrasp": 1}
+        for timestep in range(25):
+            evidence = _evidence(timestep=timestep, count_phase_control=False)
+            self.assertIsNone(controller.update(evidence))
+        self.assertEqual(controller.phase, "pregrasp")
+
     def test_grasp_requires_stable_bilateral_contact_and_verified_lift(self):
         controller = TaskPhaseController(_config())
         controller.handoff_after_pregrasp()
