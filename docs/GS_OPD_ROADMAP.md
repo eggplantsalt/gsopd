@@ -1,5 +1,17 @@
 # GS-OPD 总体路线
 
+## Automatic Safety Recovery 路线状态（2026-10-23）
+
+1. **通用安全恢复机制：已实现。** 状态机、7D 当前状态 RRT-Connect、隔离控制前缀 Snapshot 预演、原生 OSC_POSE 分段执行、全 Geom / 25子步监测、偏差/停滞/窄通道自主重规划、预算和 fail-closed 状态已集成。10 mm 禁止接触硬余量不可降低。完整当前状态和可复现 CLI 见 [`research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md`](../research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md)。
+2. **L0T2 预抓取自动避障：已验证到局部目标。** t=10 Snapshot运行228控制步/3次重规划；Episode从 t=0运行258控制步/2次重规划。均自动到达按 Pot 2 实时位姿重算的历史成功抓取预抓取先验，Episode 的结果为 `local_recovery_success=true`。完整任务、完整安全和标准1000步 Horizon均未成功。
+3. **L0T2 抓取/转运/放置：待任务专家输入。** 当前必须提供基于真实现态的抓取控制目标、held-object转运与放置目标/控制器、阶段转移、容许的目标接触对象/Geom及其可追溯来源。当前对 `grasp` 阶段显式失败，不复制历史动作、不猜目标。不得将历史先验说成 VLM Teacher输出。
+4. **携物绕障：通用几何接口已补，L0T0 任务实测待做。** Bridge验证实时双指抓持，从实际 EEF–物体变换在 RRT scratch中移动物体，并对真实物体 Geom逐个物理子步监测。该绑定已经在归档 L0T2 Pot 2 双指抓持状态通过只读 Bridge 集成检查，完整查询 Ginger Beer、Place Box、Pot 1、Stove 与其余场景对象，禁止对象最小间隙204.2 mm；未推进物理状态。需要 L0T0 活动任务约束、禁止/允许接触的可靠映射和阶段目标后，才可运行端到端验证。这不等于 L0T0 任务验证成功。
+5. **安全示范与训练：暂缓。** 目前没有完整任务成功且满足禁止接触约束的样本，故没有安全成功候选，不启动LoRA；1093步历史示范和其它记录不覆盖。
+
+**验收分类固定区分：** 局部恢复成功 ≠ 完整任务成功 ≠ 完整安全成功 ≠ 标准1000步 Horizon内成功。未来仅在真实任务成功、完整禁止接触约束有全程证据且物理子步覆盖完整时，才可标记安全成功候选；扩展 Horizon必须单独标注。
+
+---
+
 ## 最新局部状态（2026-10-23）：L0T2 t=10 关节空间 RRT-Connect 获得离线可行路线
 
 从已验证的原始 π₀.₅ t=10 Runtime Snapshot构造 q_start；从历史 Pot2 成功预抓取的物体相对 EEF 位姿在当前场景重求 q_goal。两端的完整机器人碰撞几何、关节限位、Ginger Beer/Place Box 10 mm余量以及目标 Pot2接近例外均单独核验。固定随机种子20261023的双向7D RRT-Connect第11次迭代连通；Shortcut接受5条边，最终关节路径2.730396 rad、EEF路径0.697530 m，包含4个关节路点和257个密集样本。

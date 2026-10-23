@@ -151,6 +151,7 @@ def _parse_scene_args():
         help="zero-based task initialization state (default: 0)",
     )
     parser.add_argument("--seed", type=int, default=0, help="environment seed (default: 0)")
+    parser.add_argument("--port", type=int, default=38567, help="local Bridge TCP port (default: 38567)")
     parser.add_argument(
         "--camera-resolution", type=int, default=256,
         help="square RGB observation resolution for both cameras (default: 256)",
@@ -2328,6 +2329,11 @@ def _build_geometry_inventory(
     geometries = []
     has_lookup_errors = False
     body_count = int(model._model.nbody)
+    compiled_model = model._model
+    explicit_pair_geoms = set()
+    for pair_index in range(int(compiled_model.npair)):
+        explicit_pair_geoms.add(int(compiled_model.pair_geom1[pair_index]))
+        explicit_pair_geoms.add(int(compiled_model.pair_geom2[pair_index]))
     bodies = []
     has_body_lookup_errors = False
 
@@ -2361,6 +2367,9 @@ def _build_geometry_inventory(
             "body_id": None,
             "body_name": None,
             "category": "unknown",
+            "collision_enabled": False,
+            "contype": None,
+            "conaffinity": None,
         }
         errors = {}
 
@@ -2386,6 +2395,13 @@ def _build_geometry_inventory(
                 )
             if 0 <= body_id < body_count:
                 bodies[body_id]["geom_ids"].append(geom_id)
+            contype = int(compiled_model.geom_contype[geom_id])
+            conaffinity = int(compiled_model.geom_conaffinity[geom_id])
+            item["contype"] = contype
+            item["conaffinity"] = conaffinity
+            item["collision_enabled"] = bool(
+                contype != 0 or conaffinity != 0 or geom_id in explicit_pair_geoms
+            )
         except Exception as exc:
             errors["body_id"] = f"{type(exc).__name__}: {exc}"
 
@@ -2447,6 +2463,80 @@ def _geometry_inventory():
         robot_body_ids,
         robot_classification_error=robot_classification_error,
     )
+
+
+def _task_semantic_geometry_bindings():
+    """Bind registered BDDL objects to every compiled collision Geom."""
+    model = env.sim.model._model
+    inventory = _geometry_inventory()
+    if inventory.get("status") != "complete":
+        raise ValueError("complete_geometry_inventory_unavailable")
+    bindings = {}
+    for mapping_name in ("objects_dict", "fixtures_dict"):
+        for object_name, obj in getattr(env.env, mapping_name, {}).items():
+            root_name = getattr(obj, "root_body", None)
+            if not isinstance(root_name, str) or not root_name:
+                raise ValueError(f"registered_task_object_{object_name}_has_no_root_body")
+            root_id = int(env.sim.model.body_name2id(root_name))
+            if root_id <= 0 or root_id >= int(model.nbody):
+                raise ValueError(f"registered_task_object_{object_name}_root_body_is_invalid")
+            subtree = _planning_body_subtree(model, root_id)
+            collision_geoms = _collision_geom_ids(subtree)
+            root_geoms = _collision_geom_ids({root_id})
+            semantic_geoms = {
+                geom_id
+                for geom_id in range(int(model.ngeom))
+                if int(model.geom_bodyid[geom_id]) in subtree
+            }
+            root_semantic_geoms = {
+                geom_id
+                for geom_id in range(int(model.ngeom))
+                if int(model.geom_bodyid[geom_id]) == root_id
+            }
+            body_names = {
+                int(body_id): env.sim.model.body_id2name(int(body_id))
+                for body_id in sorted(subtree)
+            }
+            collision_body_ids = sorted(
+                {int(model.geom_bodyid[geom_id]) for geom_id in collision_geoms}
+            )
+            geometry_names = {
+                int(item["geom_id"]): item["geom_name"]
+                for item in inventory["geometries"]
+                if item.get("geom_id") in semantic_geoms
+            }
+            if set(geometry_names) != semantic_geoms:
+                raise ValueError(f"registered_task_object_{object_name}_geometry_binding_is_incomplete")
+            bindings[object_name] = {
+                "object_id": str(object_name),
+                "mapping_name": mapping_name,
+                "root_body_id": root_id,
+                "root_body_name": root_name,
+                "root_geom_ids": sorted(root_geoms),
+                "root_geom_names": [geometry_names[item] for item in sorted(root_geoms)],
+                "root_semantic_geom_ids": sorted(root_semantic_geoms),
+                "body_ids": sorted(subtree),
+                "body_names": [body_names[item] for item in sorted(subtree)],
+                "collision_body_ids": collision_body_ids,
+                "collision_body_names": [body_names[item] for item in collision_body_ids],
+                "geom_ids": sorted(collision_geoms),
+                "geom_names": [geometry_names[item] for item in sorted(collision_geoms)],
+                "semantic_geom_ids": sorted(semantic_geoms),
+                "semantic_geom_names": [geometry_names[item] for item in sorted(semantic_geoms)],
+                "collision_geometry_complete": bool(collision_geoms),
+                "geometry_presence": (
+                    "compiled_geometry_present"
+                    if semantic_geoms
+                    else "registered_semantic_body_has_no_compiled_geometry"
+                ),
+            }
+    if not bindings:
+        raise ValueError("active_task_has_no_registered_semantic_objects")
+    return {
+        "status": "complete",
+        "bindings": bindings,
+        "model_geometry_sha256": _planning_model_signature(model),
+    }
 
 
 def _planning_model_signature(model):
@@ -3455,7 +3545,579 @@ def _render_geom_segmentation(resolution=512):
     }
 
 
-def _new_contact_monitor():
+def _collision_geom_ids(body_ids):
+    """Return every active collision Geom attached to the selected Bodies."""
+    model = env.sim.model._model
+    body_ids = set(int(value) for value in body_ids)
+    explicit_pair_geoms = set()
+    for pair_index in range(int(model.npair)):
+        explicit_pair_geoms.add(int(model.pair_geom1[pair_index]))
+        explicit_pair_geoms.add(int(model.pair_geom2[pair_index]))
+    return {
+        geom_id
+        for geom_id in range(int(model.ngeom))
+        if int(model.geom_bodyid[geom_id]) in body_ids
+        and (
+            int(model.geom_contype[geom_id]) != 0
+            or int(model.geom_conaffinity[geom_id]) != 0
+            or geom_id in explicit_pair_geoms
+        )
+    }
+
+
+def _normalize_safety_geometry_policy(raw_policy):
+    """Verify semantic Body/Geom bindings before substep safety checks."""
+    model = env.sim.model._model
+    if not isinstance(raw_policy, dict):
+        raise ValueError("safety_geometry_policy_is_missing")
+    margin = raw_policy.get("minimum_clearance_m")
+    if (
+        isinstance(margin, bool)
+        or not isinstance(margin, (int, float))
+        or not np.isfinite(float(margin))
+        or float(margin) < 0.010
+    ):
+        raise ValueError("minimum_clearance_m_must_be_at_least_10_mm")
+    robot_bodies = _robot_body_ids()
+    if not robot_bodies:
+        raise ValueError("complete_robot_body_inventory_unavailable")
+    robot_geoms = _collision_geom_ids(robot_bodies)
+    if not robot_geoms:
+        raise ValueError("complete_robot_collision_geom_inventory_unavailable")
+    inventory = _geometry_inventory()
+    if inventory.get("status") != "complete":
+        raise ValueError("complete_geometry_inventory_unavailable")
+    inventory_by_id = {
+        item.get("geom_id"): item
+        for item in inventory.get("geometries", [])
+        if isinstance(item, dict)
+    }
+    groups = []
+    seen_body_ids = set()
+    seen_geom_ids = set()
+
+    def parse_groups(raw_groups, group_name, minimum_default):
+        if not isinstance(raw_groups, list):
+            raise ValueError(f"{group_name}_must_be_an_explicit_array")
+        parsed = []
+        for index, item in enumerate(raw_groups):
+            if not isinstance(item, dict):
+                raise ValueError(f"{group_name}[{index}]_must_be_an_object")
+            object_id = item.get("object_id")
+            body_ids = item.get("body_ids")
+            body_names = item.get("body_names")
+            geom_ids = item.get("geom_ids")
+            if (
+                not isinstance(object_id, str)
+                or not object_id
+                or not isinstance(body_ids, list)
+                or not body_ids
+                or not isinstance(body_names, list)
+                or len(body_names) != len(body_ids)
+                or not isinstance(geom_ids, list)
+                or not geom_ids
+            ):
+                raise ValueError(f"{group_name}[{index}]_binding_is_incomplete")
+            minimum_body_id = 0 if group_name == "other_scene_objects" else 1
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum_body_id
+                or value >= int(env.sim.model._model.nbody)
+                for value in body_ids
+            ) or len(set(body_ids)) != len(body_ids):
+                raise ValueError(f"{group_name}[{index}]_body_ids_are_invalid")
+            if any(
+                not isinstance(name, str)
+                or env.sim.model.body_id2name(body_id) != name
+                for body_id, name in zip(body_ids, body_names)
+            ):
+                raise ValueError(f"{group_name}[{index}]_body_names_do_not_match_model")
+            if set(body_ids) & (robot_bodies | seen_body_ids):
+                raise ValueError(f"{group_name}[{index}]_overlaps_robot_or_prior_binding")
+            expected_geoms = _collision_geom_ids(body_ids)
+            if set(geom_ids) != expected_geoms or not expected_geoms:
+                raise ValueError(f"{group_name}[{index}]_does_not_cover_all_collision_geoms")
+            if any(
+                inventory_by_id.get(geom_id, {}).get("category") != "scene"
+                or inventory_by_id.get(geom_id, {}).get("body_id") not in set(body_ids)
+                for geom_id in geom_ids
+            ):
+                raise ValueError(f"{group_name}[{index}]_geom_identity_is_unverified")
+            if set(geom_ids) & seen_geom_ids:
+                raise ValueError(f"{group_name}[{index}]_duplicates_prior_geometry")
+            object_margin = item.get("minimum_clearance_m", minimum_default)
+            if (
+                isinstance(object_margin, bool)
+                or not isinstance(object_margin, (int, float))
+                or not np.isfinite(float(object_margin))
+                or float(object_margin) < minimum_default
+            ):
+                raise ValueError(f"{group_name}[{index}]_clearance_is_below_its_required_minimum")
+            group = {
+                "object_id": object_id,
+                "body_ids": set(body_ids),
+                "geom_ids": set(geom_ids),
+                "minimum_clearance_m": float(object_margin),
+                "policy_class": group_name,
+            }
+            parsed.append(group)
+            groups.append(group)
+            seen_body_ids.update(body_ids)
+            seen_geom_ids.update(geom_ids)
+        return parsed
+
+    forbidden_groups = parse_groups(raw_policy.get("forbidden_objects"), "forbidden_objects", 0.010)
+    target_groups = parse_groups(raw_policy.get("allowed_target_objects", []), "allowed_target_objects", 0.010)
+    other_groups = parse_groups(raw_policy.get("other_scene_objects", []), "other_scene_objects", 0.0)
+    if not forbidden_groups:
+        raise ValueError("at_least_one_forbidden_contact_object_is_required_for_takeover")
+    allowed_body_ids = set().union(*(item["body_ids"] for item in target_groups)) if target_groups else set()
+    allowed_pairs = raw_policy.get("allowed_contact_pairs", [])
+    if not isinstance(allowed_pairs, list):
+        raise ValueError("allowed_contact_pairs_must_be_an_array")
+    pair_ids = set()
+    allowed_pair_min_clearance = {}
+    for index, pair in enumerate(allowed_pairs):
+        if not isinstance(pair, dict):
+            raise ValueError(f"allowed_contact_pairs[{index}]_must_be_an_object")
+        robot_geom = pair.get("robot_geom_id")
+        scene_geom = pair.get("scene_geom_id")
+        if (
+            isinstance(robot_geom, bool)
+            or not isinstance(robot_geom, int)
+            or robot_geom not in robot_geoms
+            or isinstance(scene_geom, bool)
+            or not isinstance(scene_geom, int)
+            or scene_geom < 0
+            or scene_geom >= int(env.sim.model._model.ngeom)
+            or int(env.sim.model._model.geom_bodyid[scene_geom]) not in allowed_body_ids
+        ):
+            raise ValueError(f"allowed_contact_pairs[{index}]_does_not_match_verified_objects")
+        pair_key = tuple(sorted((robot_geom, scene_geom)))
+        minimum = pair.get("minimum_clearance_m", -0.002)
+        if (
+            isinstance(minimum, bool)
+            or not isinstance(minimum, (int, float))
+            or not np.isfinite(float(minimum))
+            or float(minimum) < -0.002
+        ):
+            raise ValueError(
+                f"allowed_contact_pairs[{index}]_penetration_tolerance_exceeds_2mm"
+            )
+        pair_ids.add(pair_key)
+        allowed_pair_min_clearance[pair_key] = float(minimum)
+    object_groups = {item["object_id"]: item for item in groups}
+    forbidden_pairs = raw_policy.get("forbidden_object_pairs", [])
+    if not isinstance(forbidden_pairs, list):
+        raise ValueError("forbidden_object_pairs_must_be_an_array")
+    normalized_forbidden_pairs = []
+    seen_forbidden_body_pairs = set()
+    for index, pair in enumerate(forbidden_pairs):
+        if not isinstance(pair, dict):
+            raise ValueError(f"forbidden_object_pairs[{index}]_must_be_an_object")
+        object_a = object_groups.get(pair.get("object_id_a"))
+        object_b = object_groups.get(pair.get("object_id_b"))
+        if (
+            object_a is None
+            or object_b is None
+            or object_a is object_b
+            or set(pair.get("geom_ids_a", [])) != object_a["geom_ids"]
+            or set(pair.get("geom_ids_b", [])) != object_b["geom_ids"]
+            or set(pair.get("body_ids_a", [])) != object_a["body_ids"]
+            or set(pair.get("body_ids_b", [])) != object_b["body_ids"]
+        ):
+            raise ValueError(f"forbidden_object_pairs[{index}]_does_not_match_verified_bindings")
+        body_pair = tuple(sorted((tuple(sorted(object_a["body_ids"])), tuple(sorted(object_b["body_ids"])))) )
+        if body_pair in seen_forbidden_body_pairs:
+            raise ValueError(f"forbidden_object_pairs[{index}]_is_duplicated")
+        seen_forbidden_body_pairs.add(body_pair)
+        normalized_forbidden_pairs.append({
+            "object_id_a": object_a["object_id"],
+            "object_id_b": object_b["object_id"],
+            "body_ids_a": object_a["body_ids"],
+            "body_ids_b": object_b["body_ids"],
+            "geom_ids_a": object_a["geom_ids"],
+            "geom_ids_b": object_b["geom_ids"],
+        })
+
+    carried_raw = raw_policy.get("carried_object")
+    carried_object = None
+    if carried_raw is not None:
+        if not isinstance(carried_raw, dict):
+            raise ValueError("carried_object_must_be_an_object_or_null")
+        carried_group = object_groups.get(carried_raw.get("object_id"))
+        binding = carried_raw.get("grasp_binding")
+        if carried_group is None or not isinstance(binding, dict):
+            raise ValueError("carried_object_must_match_a_verified_scene_binding")
+        if (
+            binding.get("object_id") != carried_group["object_id"]
+            or binding.get("body_id") not in carried_group["body_ids"]
+            or not isinstance(binding.get("body_name"), str)
+            or set(binding.get("geom_ids", [])) != _collision_geom_ids({binding.get("body_id")})
+            or len(binding.get("geom_names", [])) != len(binding.get("geom_ids", []))
+        ):
+            raise ValueError("carried_object_grasp_binding_is_incomplete_or_mismatched")
+        body_id = int(binding["body_id"])
+        if env.sim.model.body_id2name(body_id) != binding["body_name"]:
+            raise ValueError("carried_object_body_name_does_not_match_model")
+        grasp = _live_grasp_state(binding, task.language)
+        if grasp.get("status") != "pass" or grasp.get("physical_state_unchanged") is not True:
+            raise ValueError(f"carried_object_grasp_is_not_verified:{grasp.get('reason')}")
+        free_joints = [
+            int(model.body_jntadr[body_id]) + offset
+            for offset in range(int(model.body_jntnum[body_id]))
+            if int(model.jnt_type[int(model.body_jntadr[body_id]) + offset])
+            == int(mujoco.mjtJoint.mjJNT_FREE)
+        ]
+        if len(free_joints) != 1:
+            raise ValueError("carried_object_root_must_have_exactly_one_free_joint")
+        eef_site_id = int(env.robots[0].eef_site_id)
+        live = env.sim.data._data
+        eef_rotation = np.asarray(live.site_xmat[eef_site_id], dtype=np.float64).reshape(3, 3)
+        object_rotation = np.asarray(live.xmat[body_id], dtype=np.float64).reshape(3, 3)
+        world_eef = np.eye(4, dtype=np.float64)
+        world_eef[:3, :3] = eef_rotation
+        world_eef[:3, 3] = live.site_xpos[eef_site_id]
+        world_object = np.eye(4, dtype=np.float64)
+        world_object[:3, :3] = object_rotation
+        world_object[:3, 3] = live.xpos[body_id]
+        eef_object = np.linalg.inv(world_eef) @ world_object
+        allowed_carried_pairs = carried_raw.get("allowed_contact_pairs", [])
+        if not isinstance(allowed_carried_pairs, list):
+            raise ValueError("carried_object_allowed_contact_pairs_must_be_an_array")
+        carried_pair_ids = set()
+        carried_pair_minimum = {}
+        for pair_index, pair in enumerate(allowed_carried_pairs):
+            if not isinstance(pair, dict):
+                raise ValueError(f"carried_object_allowed_contact_pairs[{pair_index}]_must_be_an_object")
+            carried_geom = pair.get("carried_geom_id")
+            scene_geom = pair.get("scene_geom_id")
+            required = pair.get("minimum_clearance_m", -0.002)
+            if (
+                isinstance(carried_geom, bool) or not isinstance(carried_geom, int)
+                or carried_geom not in carried_group["geom_ids"]
+                or isinstance(scene_geom, bool) or not isinstance(scene_geom, int)
+                or scene_geom not in set().union(*(item["geom_ids"] for item in groups))
+                or isinstance(required, bool) or not isinstance(required, (int, float))
+                or not np.isfinite(float(required)) or float(required) < -0.002
+            ):
+                raise ValueError(f"carried_object_allowed_contact_pairs[{pair_index}]_is_invalid")
+            scene_group = next(item for item in groups if scene_geom in item["geom_ids"])
+            if (
+                scene_group["object_id"] == carried_group["object_id"]
+                or scene_group["policy_class"] != "allowed_target_objects"
+            ):
+                raise ValueError(f"carried_object_allowed_contact_pairs[{pair_index}]_is_not_a_declared_target")
+            key = tuple(sorted((carried_geom, scene_geom)))
+            carried_pair_ids.add(key)
+            carried_pair_minimum[key] = float(required)
+        finger_groups, _ = _tracking_gripper_sides(env.robots[0])
+        expected_gripper_geoms = set().union(*finger_groups.values())
+        carried_object = {
+            "object_id": carried_group["object_id"],
+            "body_id": body_id,
+            "free_joint_id": free_joints[0],
+            "free_joint_qpos_adr": int(model.jnt_qposadr[free_joints[0]]),
+            "free_joint_dof_adr": int(model.jnt_dofadr[free_joints[0]]),
+            "geom_ids": set(carried_group["geom_ids"]),
+            "gripper_geom_ids": expected_gripper_geoms,
+            "eef_to_object_transform": eef_object,
+            "allowed_contact_pair_ids": carried_pair_ids,
+            "allowed_pair_minimum_clearance_m": carried_pair_minimum,
+            "minimum_clearance_m": carried_group["minimum_clearance_m"],
+            "binding": binding,
+        }
+        if not carried_object["gripper_geom_ids"].issubset(robot_geoms):
+            raise ValueError("carried_object_gripper_geoms_do_not_match_the_active_robot")
+    classified_scene_body_ids = set().union(*(item["body_ids"] for item in groups)) if groups else set()
+    all_active_collision_geoms = _collision_geom_ids(range(int(model.nbody)))
+    all_scene_collision_body_ids = {
+        int(model.geom_bodyid[geom_id])
+        for geom_id in all_active_collision_geoms
+        if int(model.geom_bodyid[geom_id]) not in robot_bodies
+    }
+    if all_scene_collision_body_ids != classified_scene_body_ids:
+        missing = sorted(all_scene_collision_body_ids - classified_scene_body_ids)
+        extra = sorted(classified_scene_body_ids - all_scene_collision_body_ids)
+        raise ValueError(
+            f"scene_collision_body_classification_incomplete:missing={missing},extra={extra}"
+        )
+    return {
+        "minimum_clearance_m": float(margin),
+        "robot_body_ids": robot_bodies,
+        "robot_geom_ids": robot_geoms,
+        "forbidden_objects": forbidden_groups,
+        "checked_objects": groups,
+        "allowed_target_objects": target_groups,
+        "other_scene_objects": other_groups,
+        "allowed_contact_pair_ids": pair_ids,
+        "allowed_pair_minimum_clearance_m": allowed_pair_min_clearance,
+        "allowed_target_body_ids": allowed_body_ids,
+        "classified_scene_body_ids": classified_scene_body_ids,
+        "forbidden_scene_body_ids": set().union(*(item["body_ids"] for item in forbidden_groups)) if forbidden_groups else set(),
+        "other_scene_body_ids": set().union(*(item["body_ids"] for item in other_groups)) if other_groups else set(),
+        "forbidden_object_pairs": normalized_forbidden_pairs,
+        "carried_object": carried_object,
+        "source": raw_policy.get("source"),
+    }
+
+
+def _minimum_geom_clearance(model, data, geom_ids_a, geom_ids_b, excluded_pairs=None):
+    """Use conservative rbound pruning and exact MuJoCo distances for the minimum."""
+    if not geom_ids_a or not geom_ids_b:
+        return {"status": "incomplete", "minimum_distance_m": None, "pair": None}
+    excluded_pairs = excluded_pairs or set()
+    pairs = []
+    for geom_a in geom_ids_a:
+        for geom_b in geom_ids_b:
+            if tuple(sorted((int(geom_a), int(geom_b)))) in excluded_pairs:
+                continue
+            lower_bound = float(
+                np.linalg.norm(data.geom_xpos[geom_a] - data.geom_xpos[geom_b])
+                - model.geom_rbound[geom_a]
+                - model.geom_rbound[geom_b]
+            )
+            pairs.append((lower_bound, int(geom_a), int(geom_b)))
+    if not pairs:
+        return {"status": "complete", "minimum_distance_m": None, "pair": None,
+                "attempted_pairs": 0, "requested_pairs": 0}
+    pairs.sort(key=lambda item: item[0])
+    minimum = None
+    minimum_pair = None
+    attempted = 0
+    censored_pairs = 0
+    for lower_bound, geom_a, geom_b in pairs:
+        if minimum is not None and lower_bound >= minimum:
+            break
+        segment = np.zeros(6, dtype=np.float64)
+        distance = float(mujoco.mj_geomDistance(model, data, geom_a, geom_b, 10.0, segment))
+        attempted += 1
+        if not np.isfinite(distance) or not np.isfinite(segment).all():
+            return {"status": "incomplete", "minimum_distance_m": None, "pair": None,
+                    "attempted_pairs": attempted, "requested_pairs": len(pairs)}
+        if distance >= 10.0:
+            censored_pairs += 1
+            continue
+        if minimum is None or distance < minimum:
+            minimum = distance
+            minimum_pair = {
+                "robot_geom_id": geom_a,
+                "robot_geom_name": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_a),
+                "object_geom_id": geom_b,
+                "object_geom_name": mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_b),
+                "closest_points_world": segment.tolist(),
+            }
+    if minimum is None:
+        complete = censored_pairs == len(pairs)
+    else:
+        complete = all(lower_bound >= minimum for lower_bound, _, _ in pairs[attempted:])
+    return {
+        "status": "complete" if complete else "incomplete",
+        "minimum_distance_m": minimum if minimum is not None else 10.0 if complete else None,
+        "pair": minimum_pair,
+        "attempted_pairs": attempted,
+        "requested_pairs": len(pairs),
+        "minimum_is_lower_bound": minimum is None and complete,
+        "distance_censored_pairs": censored_pairs,
+    }
+
+
+def _exact_geom_pair_distance(model, data, geom_a, geom_b):
+    segment = np.zeros(6, dtype=np.float64)
+    distance = float(mujoco.mj_geomDistance(model, data, int(geom_a), int(geom_b), 10.0, segment))
+    if not np.isfinite(distance) or not np.isfinite(segment).all():
+        return None
+    return distance
+
+
+def _substep_safety_geometry(monitor, contact_result):
+    """Measure all robot-to-forbidden Geom clearances after each physical substep."""
+    policy = monitor.get("safety_policy")
+    if policy is None:
+        return None
+    sim = env.sim
+    model = sim.model._model
+    item = {
+        "status": "complete",
+        "minimum_clearance_m": None,
+        "minimum_all_clearance_m": None,
+        "minimum_carried_forbidden_clearance_m": None,
+        "clearances_by_object": {},
+        "carried_clearances_by_object": {},
+        "forbidden_contacts": [],
+        "self_contacts": [],
+        "unresolved_contacts": [],
+        "forbidden_object_contacts": [],
+        "unallowed_scene_contacts": [],
+    }
+    try:
+        if contact_result.get("status") not in ("contact", "no_contact"):
+            item["status"] = "incomplete"
+        for group in policy["checked_objects"]:
+            allowed_pairs = {
+                pair for pair in policy["allowed_contact_pair_ids"]
+                if next(
+                    geom_id for geom_id in pair
+                    if geom_id not in policy["robot_geom_ids"]
+                ) in group["geom_ids"]
+            } if group["policy_class"] == "allowed_target_objects" else set()
+            clearance = _minimum_geom_clearance(
+                model,
+                sim.data._data,
+                policy["robot_geom_ids"],
+                group["geom_ids"],
+                allowed_pairs,
+            )
+            item["clearances_by_object"][group["object_id"]] = clearance
+            if clearance.get("status") != "complete":
+                item["status"] = "incomplete"
+            distance = clearance.get("minimum_distance_m")
+            if distance is not None:
+                if item["minimum_all_clearance_m"] is None or distance < item["minimum_all_clearance_m"]:
+                    item["minimum_all_clearance_m"] = distance
+                if group["policy_class"] == "forbidden_objects" and (
+                    item["minimum_clearance_m"] is None or distance < item["minimum_clearance_m"]
+                ):
+                    item["minimum_clearance_m"] = distance
+                if distance < group["minimum_clearance_m"]:
+                    item["status"] = "unsafe"
+                    item["forbidden_contacts"].append({
+                        "geometry_clearance_requirement_violated": True,
+                        "object_id": group["object_id"],
+                        "distance_m": distance,
+                        "minimum_required_m": group["minimum_clearance_m"],
+                    })
+            for pair in allowed_pairs:
+                distance = _exact_geom_pair_distance(model, sim.data._data, *pair)
+                required = policy["allowed_pair_minimum_clearance_m"].get(pair)
+                if distance is None or required is None:
+                    item["status"] = "incomplete"
+                else:
+                    item.setdefault("allowed_contact_clearances_m", {})[
+                        f"{pair[0]}:{pair[1]}"
+                    ] = distance
+                    if distance < required:
+                        item["status"] = "unsafe"
+                        item["forbidden_contacts"].append({
+                            "allowed_pair_penetration_exceeded": True,
+                            "geom_ids": list(pair),
+                            "distance_m": distance,
+                            "minimum_allowed_distance_m": required,
+                        })
+        carried = policy.get("carried_object")
+        if carried is not None:
+            for group in policy["checked_objects"]:
+                if group["object_id"] == carried["object_id"]:
+                    continue
+                allowed_pairs = {
+                    pair for pair in carried["allowed_contact_pair_ids"]
+                    if next(geom_id for geom_id in pair if geom_id in carried["geom_ids"])
+                    in carried["geom_ids"]
+                    and next(geom_id for geom_id in pair if geom_id not in carried["geom_ids"])
+                    in group["geom_ids"]
+                }
+                clearance = _minimum_geom_clearance(
+                    model,
+                    sim.data._data,
+                    carried["geom_ids"],
+                    group["geom_ids"],
+                    allowed_pairs,
+                )
+                item["carried_clearances_by_object"][group["object_id"]] = clearance
+                if clearance.get("status") != "complete":
+                    item["status"] = "incomplete"
+                distance = clearance.get("minimum_distance_m")
+                required = (
+                    group["minimum_clearance_m"]
+                    if group["policy_class"] == "forbidden_objects"
+                    else 0.0
+                )
+                if distance is not None:
+                    if item["minimum_all_clearance_m"] is None or distance < item["minimum_all_clearance_m"]:
+                        item["minimum_all_clearance_m"] = distance
+                    if group["policy_class"] == "forbidden_objects" and (
+                        item["minimum_carried_forbidden_clearance_m"] is None
+                        or distance < item["minimum_carried_forbidden_clearance_m"]
+                    ):
+                        item["minimum_carried_forbidden_clearance_m"] = distance
+                    if distance < required:
+                        item["status"] = "unsafe"
+                        item["forbidden_contacts"].append({
+                            "carried_object_clearance_requirement_violated": True,
+                            "carried_object_id": carried["object_id"],
+                            "object_id": group["object_id"],
+                            "distance_m": distance,
+                            "minimum_required_m": required,
+                        })
+                for pair in allowed_pairs:
+                    distance = _exact_geom_pair_distance(model, sim.data._data, *pair)
+                    required_pair = carried["allowed_pair_minimum_clearance_m"].get(pair)
+                    if distance is None or required_pair is None:
+                        item["status"] = "incomplete"
+                    elif distance < required_pair:
+                        item["status"] = "unsafe"
+                        item["forbidden_contacts"].append({
+                            "carried_object_allowed_pair_penetration_exceeded": True,
+                            "geom_ids": list(pair),
+                            "distance_m": distance,
+                            "minimum_allowed_distance_m": required_pair,
+                        })
+        for contact in contact_result.get("contacts", []):
+            geom_a = int(contact["geom1"]["id"])
+            geom_b = int(contact["geom2"]["id"])
+            body_a = int(contact["body1"]["id"])
+            body_b = int(contact["body2"]["id"])
+            pair_key = tuple(sorted((geom_a, geom_b)))
+            if body_a in policy["robot_body_ids"] and body_b in policy["robot_body_ids"]:
+                item["self_contacts"].append(contact)
+            elif body_a in policy["robot_body_ids"] or body_b in policy["robot_body_ids"]:
+                scene_body = body_b if body_a in policy["robot_body_ids"] else body_a
+                if scene_body in policy["forbidden_scene_body_ids"]:
+                    item["forbidden_contacts"].append(contact)
+                elif scene_body in policy["allowed_target_body_ids"]:
+                    if pair_key not in policy["allowed_contact_pair_ids"]:
+                        item["forbidden_contacts"].append(contact)
+                elif scene_body in policy["other_scene_body_ids"]:
+                    item["unallowed_scene_contacts"].append(contact)
+                else:
+                    item["unresolved_contacts"].append(contact)
+            else:
+                bodies = {body_a, body_b}
+                if any(
+                    bodies & pair["body_ids_a"] and bodies & pair["body_ids_b"]
+                    for pair in policy["forbidden_object_pairs"]
+                ):
+                    item["forbidden_object_contacts"].append(contact)
+        if item["forbidden_contacts"] or item["self_contacts"]:
+            item["status"] = "unsafe"
+        if item["forbidden_object_contacts"]:
+            item["status"] = "unsafe"
+        if item["unallowed_scene_contacts"]:
+            item["status"] = "unsafe"
+        if item["unresolved_contacts"]:
+            item["status"] = "incomplete"
+        if item["minimum_clearance_m"] is None and policy["forbidden_objects"]:
+            item["status"] = "incomplete"
+    except Exception as exc:
+        item.update({"status": "incomplete", "error": f"{type(exc).__name__}: {exc}"})
+    monitor["geometry_substeps"].append(item)
+    return item
+
+
+def _safety_geometry_at_current_state(raw_policy):
+    """Read current full-Geom margin and contact policy without advancing physics."""
+    policy = _normalize_safety_geometry_policy(raw_policy)
+    monitor = {"safety_policy": policy, "geometry_substeps": []}
+    result = _substep_safety_geometry(monitor, _collect_contacts())
+    result["sampling_point"] = "current_live_MuJoCo_state"
+    result["minimum_forbidden_clearance_m"] = result.get("minimum_clearance_m")
+    result["policy_source"] = policy["source"]
+    return result
+
+
+def _new_contact_monitor(safety_policy=None):
+    normalized_policy = _normalize_safety_geometry_policy(safety_policy) if safety_policy is not None else None
     robot_body_ids = None
     robot_classification_error = None
     try:
@@ -3488,6 +4150,8 @@ def _new_contact_monitor():
         "no_contact_substeps": 0,
         "unavailable_contact_substeps": 0,
         "control_steps": [],
+        "geometry_substeps": [],
+        "safety_policy": normalized_policy,
         "_events": {},
     }
 
@@ -3703,6 +4367,13 @@ def _run_env_step_with_contact_monitor(action, action_index, monitor):
             control_step["capture_error"] = (
                 f"{type(exc).__name__}: {exc}"
             )
+            contacts = {"status": "unavailable", "contacts": []}
+        geometry = _substep_safety_geometry(monitor, contacts)
+        if geometry is not None and geometry.get("status") != "complete":
+            control_step["capture_error"] = (
+                control_step.get("capture_error")
+                or "substep_geometry_safety_" + str(geometry.get("status"))
+            )
         control_step["contact_samples"][sample_status] += 1
         return result
 
@@ -3780,6 +4451,24 @@ def _contact_monitor_result(monitor):
         "robot_classification_status": monitor["robot_classification_status"],
         "robot_classification_error": monitor["robot_classification_error"],
         "control_steps": control_steps,
+        "geometry_monitoring": {
+            "status": (
+                "unavailable"
+                if monitor.get("safety_policy") is None
+                else "complete"
+                if len(monitor.get("geometry_substeps", [])) == monitor["captured_physics_substeps"]
+                and all(item.get("status") == "complete" for item in monitor.get("geometry_substeps", []))
+                else "unsafe"
+                if any(item.get("status") == "unsafe" for item in monitor.get("geometry_substeps", []))
+                else "incomplete"
+            ),
+            "minimum_clearance_m": min(
+                (item["minimum_clearance_m"] for item in monitor.get("geometry_substeps", [])
+                 if item.get("minimum_clearance_m") is not None),
+                default=None,
+            ),
+            "substeps": monitor.get("geometry_substeps", []),
+        },
         "events": events,
         "interpretation": "Observed physical contacts only; no safety verdict is assigned.",
     }
@@ -3830,7 +4519,8 @@ def _normalize_branch_candidates(raw_candidates):
     return normalized
 
 
-def _branch_rollout(snapshot_id, raw_candidates):
+def _branch_rollout(snapshot_id, raw_candidates, safety_policy=None,
+                    capture_runtime_snapshots=False):
     global obs, last_reward, last_done
 
     if not isinstance(snapshot_id, str) or snapshot_id not in snapshots:
@@ -3842,6 +4532,7 @@ def _branch_rollout(snapshot_id, raw_candidates):
     # candidate restores target_snapshot, and this finally block restores the
     # state that was active when branch_rollout was requested.
     main_snapshot = _capture_snapshot()
+    main_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
     result = {
         "snapshot_id": snapshot_id,
         "candidates": [],
@@ -3856,7 +4547,7 @@ def _branch_rollout(snapshot_id, raw_candidates):
                 "executed_steps": 0,
                 "steps": [],
             }
-            contact_monitor = _new_contact_monitor()
+            contact_monitor = _new_contact_monitor(safety_policy)
             try:
                 _restore_snapshot(target_snapshot)
                 candidate_result["start_state"] = _snapshot_diagnostics()
@@ -3868,19 +4559,24 @@ def _branch_rollout(snapshot_id, raw_candidates):
                     last_done = done
                     state = _snapshot_diagnostics()
                     contacts = _collect_contacts()
-                    candidate_result["steps"].append(
-                        {
+                    step_record = {
                             "step_index": action_index,
                             "action": action.tolist(),
                             "reward": float(reward),
                             "done": bool(done),
                             "state": state,
                             "contacts": contacts,
+                            "observation": pack(obs, reward, done),
+                            "safety_geometry": contact_monitor["geometry_substeps"][-1]
+                            if contact_monitor.get("geometry_substeps")
+                            else None,
                             "substep_contact_coverage": contact_monitor[
                                 "control_steps"
                             ][-1],
                         }
-                    )
+                    if capture_runtime_snapshots:
+                        step_record["terminal_runtime_snapshot"] = _export_runtime_snapshot()["payload"]
+                    candidate_result["steps"].append(step_record)
                     candidate_result["executed_steps"] += 1
                     if done:
                         break
@@ -3897,11 +4593,258 @@ def _branch_rollout(snapshot_id, raw_candidates):
     finally:
         try:
             _restore_snapshot(main_snapshot)
-            result["main_state_restored"] = True
+            restored_snapshot = _capture_snapshot()
+            restored_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+            result["main_state_restored"] = bool(
+                _tracking_value_equal(main_snapshot, restored_snapshot)
+                and _tracking_value_equal(main_diagnostic, restored_diagnostic)
+            )
+            result["main_restore_verified"] = result["main_state_restored"]
+            if not result["main_state_restored"]:
+                result["main_restore_error"] = "caller_snapshot_or_diagnostic_mismatch"
         except Exception as exc:
             result["main_state_restored"] = False
+            result["main_restore_verified"] = False
             result["main_restore_error"] = f"{type(exc).__name__}: {exc}"
 
+    return result
+
+
+def _osc_prefix_probe(request):
+    """Preview a feedback OSC_POSE prefix in an isolated, fully monitored branch."""
+    from research.gs_opd.repair.trajectory_tracking import (
+        quaternion_conjugate,
+        quaternion_multiply,
+        quaternion_to_rotation_vector,
+        world_pose_tracking_action,
+    )
+
+    snapshot_id = request.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or snapshot_id not in snapshots:
+        raise ValueError("unknown_or_expired_snapshot_id")
+    target_snapshot = snapshots[snapshot_id]
+    path_qpos = np.asarray(request.get("jointspace_path_qpos"), dtype=np.float64)
+    path_poses = np.asarray(request.get("eef_reference_poses_world"), dtype=np.float64)
+    start_index = request.get("path_start_index")
+    max_steps = request.get("max_control_steps")
+    gripper_action = request.get("gripper_action")
+    risk_trigger = request.get("risk_trigger_distance_m")
+    max_joint_error = request.get("maximum_joint_path_deviation_rad")
+    max_eef_error = request.get("maximum_eef_tracking_error_m")
+    max_orientation_error = request.get("maximum_eef_orientation_error_rad")
+    if (
+        path_qpos.ndim != 2
+        or path_qpos.shape[1:] != (7,)
+        or len(path_qpos) < 2
+        or not np.isfinite(path_qpos).all()
+        or path_poses.shape != (len(path_qpos), 7)
+        or not np.isfinite(path_poses).all()
+        or np.any(np.abs(np.linalg.norm(path_poses[:, 3:], axis=1) - 1.0) > 1e-5)
+    ):
+        raise ValueError("jointspace_path_or_eef_reference_poses_are_malformed")
+    if (
+        isinstance(start_index, bool)
+        or not isinstance(start_index, int)
+        or not 0 <= start_index < len(path_qpos) - 1
+        or isinstance(max_steps, bool)
+        or not isinstance(max_steps, int)
+        or not 1 <= max_steps <= 1200
+    ):
+        raise ValueError("path_start_index_or_max_control_steps_are_invalid")
+    if (
+        isinstance(gripper_action, bool)
+        or not isinstance(gripper_action, (int, float))
+        or not np.isfinite(float(gripper_action))
+    ):
+        raise ValueError("native_7d_gripper_action_must_be_explicit_and_finite")
+    for name, value in (
+        ("risk_trigger_distance_m", risk_trigger),
+        ("maximum_joint_path_deviation_rad", max_joint_error),
+        ("maximum_eef_tracking_error_m", max_eef_error),
+        ("maximum_eef_orientation_error_rad", max_orientation_error),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"{name}_must_be_finite_and_positive")
+    policy = _normalize_safety_geometry_policy(request.get("safety_geometry_policy"))
+    expected_state_hash = request.get("current_state_sha256")
+    live_state = _mujoco_integration_state(env.sim)
+    live_state_hash = hashlib.sha256(live_state.tobytes()).hexdigest()
+    if expected_state_hash != live_state_hash:
+        raise ValueError("active_environment_state_changed_before_snapshot_prefix_probe")
+    if not _tracking_value_equal(_capture_snapshot(), target_snapshot):
+        raise ValueError("active_main_state_does_not_match_prefix_probe_snapshot")
+    model, sim = env.sim.model._model, env.sim
+    robot = env.robots[0]
+    qpos_addresses = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
+    if len(qpos_addresses) != 7:
+        raise ValueError("active_robot_arm_qpos_is_not_7d")
+    if np.linalg.norm(np.asarray(sim.data.qpos[qpos_addresses]) - path_qpos[start_index]) > float(max_joint_error):
+        raise ValueError("path_cursor_does_not_match_current_real_qpos_within_limit")
+    if getattr(robot.controller, "name", type(robot.controller).__name__) != "OSC_POSE":
+        raise ValueError("active_robot_controller_is_not_native_OSC_POSE")
+    if int(getattr(robot, "action_dim", 0)) != 7:
+        raise ValueError("active_robot_action_space_is_not_native_7d")
+
+    scratch = mujoco.MjData(model)
+    integration_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+    mujoco.mj_setState(model, scratch, live_state, integration_spec)
+    q_path_fk_errors = []
+    for index in range(start_index, min(len(path_qpos), start_index + max_steps + 1)):
+        scratch.qpos[qpos_addresses] = path_qpos[index]
+        mujoco.mj_forward(model, scratch)
+        quaternion = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quaternion, np.asarray(scratch.site_xmat[robot.eef_site_id]).reshape(9))
+        quaternion /= np.linalg.norm(quaternion)
+        position_error = float(np.linalg.norm(scratch.site_xpos[robot.eef_site_id] - path_poses[index, :3]))
+        orientation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
+            quaternion_multiply(path_poses[index, 3:], quaternion_conjugate(quaternion))
+        )))
+        q_path_fk_errors.append(max(position_error, orientation_error))
+    if max(q_path_fk_errors, default=math.inf) > 1e-6:
+        raise ValueError("RRT_EEF_reference_does_not_match_current_compiled_model_FK")
+
+    caller_snapshot = _capture_snapshot()
+    caller_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+    result = {
+        "operation": "osc_prefix_probe",
+        "status": "incomplete",
+        "complete": False,
+        "safe": False,
+        "snapshot_id": snapshot_id,
+        "current_state_sha256": live_state_hash,
+        "path_start_index": start_index,
+        "requested_steps": min(max_steps, len(path_qpos) - 1 - start_index),
+        "executed_steps": 0,
+        "actions": [],
+        "steps": [],
+        "main_state_restored_verified": False,
+        "stop_reason": None,
+    }
+    initial_clearance = request.get("current_minimum_forbidden_clearance_m")
+    if initial_clearance is None or not np.isfinite(float(initial_clearance)):
+        raise ValueError("current_forbidden_object_clearance_is_unknown")
+    risk_crossing_pending = float(initial_clearance) > float(risk_trigger)
+    try:
+        _restore_snapshot(target_snapshot)
+        if not _tracking_value_equal(target_snapshot, _capture_snapshot()):
+            raise RuntimeError("Snapshot_restore_did_not_reproduce_prefix_start_state")
+        fields = _repair_context()["robots"][0]["fields"]
+        monitor = _new_contact_monitor(request.get("safety_geometry_policy"))
+        action_low, action_high = _active_environment_action_bounds(env, robot)
+        movement_history = []
+        goal_position = path_poses[-1, :3]
+        for local_index in range(result["requested_steps"]):
+            path_index = start_index + local_index + 1
+            before = _snapshot_diagnostics(canonicalize_kinematics=True)["robot_states"][0]
+            target_pose = path_poses[path_index]
+            action = world_pose_tracking_action(
+                before["eef_pos"],
+                before["eef_quat"],
+                target_pose[:3],
+                target_pose[3:],
+                fields,
+                gripper_action=float(gripper_action),
+            )
+            action = _validate_tracking_action(action, action_low, action_high).astype(np.float32)
+            obs, reward, done, _info = _run_env_step_with_contact_monitor(action, local_index, monitor)
+            last_reward = reward
+            last_done = done
+            post = _snapshot_diagnostics(canonicalize_kinematics=True)
+            robot_state = post["robot_states"][0]
+            qpos = np.asarray(robot_state["joint_qpos"], dtype=np.float64)
+            eef_position = np.asarray(robot_state["eef_pos"], dtype=np.float64)
+            eef_quaternion = np.asarray(robot_state["eef_quat"], dtype=np.float64)
+            q_error = float(np.linalg.norm(qpos - path_qpos[path_index]))
+            eef_error = float(np.linalg.norm(eef_position - target_pose[:3]))
+            eef_rotation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
+                quaternion_multiply(target_pose[3:], quaternion_conjugate(eef_quaternion))
+            )))
+            geom_samples = monitor["geometry_substeps"][-monitor["expected_substeps_per_control_step"]:]
+            geom_status = (
+                "complete"
+                if len(geom_samples) == monitor["expected_substeps_per_control_step"]
+                and all(sample.get("status") == "complete" for sample in geom_samples)
+                else "unsafe"
+                if any(sample.get("status") == "unsafe" for sample in geom_samples)
+                else "incomplete"
+            )
+            if geom_status != "complete":
+                result["stop_reason"] = "substep_geometry_safety_" + geom_status
+            observation = pack(obs, reward, done, include_snapshot_state=True)
+            step = {
+                "step_index": local_index,
+                "path_index": path_index,
+                "action": action.tolist(),
+                "reference_qpos": path_qpos[path_index].tolist(),
+                "reference_eef_pose": target_pose.tolist(),
+                "actual_qpos": qpos.tolist(),
+                "actual_eef_position_world_m": eef_position.tolist(),
+                "actual_eef_quaternion_wxyz": eef_quaternion.tolist(),
+                "joint_path_deviation_rad": q_error,
+                "eef_tracking_error_m": eef_error,
+                "eef_orientation_error_rad": eef_rotation_error,
+                "reward": float(reward),
+                "done": bool(done),
+                "observation": observation,
+                "contacts": _collect_contacts(),
+                "safety_geometry_substeps": geom_samples,
+                "terminal_runtime_snapshot": _export_runtime_snapshot()["payload"],
+            }
+            result["steps"].append(step)
+            result["actions"].append(action.tolist())
+            result["executed_steps"] += 1
+            current_margin = min(
+                (sample.get("minimum_clearance_m") for sample in geom_samples
+                 if sample.get("minimum_clearance_m") is not None),
+                default=None,
+            )
+            if done:
+                result["stop_reason"] = "environment_terminated_during_isolated_prefix"
+                break
+            if geom_status != "complete":
+                break
+            if q_error > float(max_joint_error) or eef_error > float(max_eef_error) or eef_rotation_error > float(max_orientation_error):
+                result["stop_reason"] = "planned_joint_or_eef_reference_deviation"
+                break
+            if risk_crossing_pending and current_margin is not None and current_margin <= float(risk_trigger):
+                risk_crossing_pending = False
+                result["stop_reason"] = "narrow_channel_entry_replan"
+                break
+            movement_history.append(float(np.linalg.norm(eef_position - np.asarray(before["eef_pos"], dtype=np.float64))))
+            if len(movement_history) >= 12 and sum(movement_history[-12:]) < 0.002:
+                result["stop_reason"] = "motion_stagnation"
+                break
+        result["contact_monitoring"] = _contact_monitor_result(monitor)
+        result["status"] = "complete"
+        result["complete"] = result["executed_steps"] > 0
+        result["safe"] = bool(
+            result["complete"]
+            and result["contact_monitoring"].get("status") == "complete"
+            and result["contact_monitoring"].get("geometry_monitoring", {}).get("status") == "complete"
+            and all(not step["done"] for step in result["steps"])
+        )
+        result["last_path_index"] = result["steps"][-1]["path_index"] if result["steps"] else start_index
+    except Exception as exc:
+        result["status"] = "incomplete"
+        result["failure_reason"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            _restore_snapshot(caller_snapshot)
+            restored_snapshot = _capture_snapshot()
+            restored_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+            result["main_state_restored_verified"] = bool(
+                _tracking_value_equal(caller_snapshot, restored_snapshot)
+                and _tracking_value_equal(caller_diagnostic, restored_diagnostic)
+            )
+            if not result["main_state_restored_verified"]:
+                result["main_restore_error"] = "caller_state_or_diagnostic_mismatch"
+        except Exception as exc:
+            result["main_state_restored_verified"] = False
+            result["main_restore_error"] = f"{type(exc).__name__}: {exc}"
+    if not result["main_state_restored_verified"]:
+        result["status"] = "incomplete"
+        result["complete"] = False
+        result["safe"] = False
     return result
 
 
@@ -3919,11 +4862,17 @@ def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
     for k in ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"):
         if k in obs:
             state[k] = np.asarray(obs[k]).tolist()
+    try:
+        native_task_success = bool(env.env._check_success())
+    except Exception:
+        native_task_success = None
     result = {
         "images": images,
         "state": state,
         "reward": float(reward),
         "done": bool(done),
+        "task_success": native_task_success,
+        "timestep": int(env.env.timestep),
         "instruction": task.language,
         "scene_metadata": scene_metadata,
     }
@@ -3931,7 +4880,8 @@ def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
         result["snapshot_state"] = _snapshot_diagnostics(canonicalize_kinematics=True)
     return result
 
-listener = Listener(("127.0.0.1", 38567), authkey=b"gs-opd-local")
+scene_metadata["model_geometry_sha256"] = _planning_model_signature(env.sim.model._model)
+listener = Listener(("127.0.0.1", scene_args.port), authkey=b"gs-opd-local")
 print("SAFETY BRIDGE READY", flush=True)
 snapshots = {}
 next_snapshot_id = 1
@@ -3959,12 +4909,28 @@ try:
                             request.get("include_snapshot_state", False)
                         ),
                     )
+                    if request.get("safety_geometry_policy") is not None:
+                        try:
+                            result["safety_geometry"] = _safety_geometry_at_current_state(
+                                request.get("safety_geometry_policy")
+                            )
+                        except Exception as exc:
+                            result["safety_geometry"] = {
+                                "status": "incomplete",
+                                "minimum_forbidden_clearance_m": None,
+                                "forbidden_contacts": [],
+                                "self_contacts": [],
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
                 elif request["op"] == "reset":
                     # Reset may hard-rebuild the compiled model; prior snapshots
                     # are no longer valid for the new simulation instance.
                     snapshots.clear()
                     env.reset()
                     obs = env.set_init_state(states[scene_args.init_state])
+                    scene_metadata["model_geometry_sha256"] = _planning_model_signature(
+                        env.sim.model._model
+                    )
                     controller_runtime_config = _configure_pi05_libero_osc_pose(
                         env.env.robots[0].controller
                     )
@@ -3994,7 +4960,7 @@ try:
                     action = np.asarray(request["action"], dtype=np.float32)
                     assert action.shape == (7,)
                     start_contacts = _collect_contacts()
-                    monitor = _new_contact_monitor()
+                    monitor = _new_contact_monitor(request.get("safety_geometry_policy"))
                     obs, reward, done, info = _run_env_step_with_contact_monitor(
                         action, int(request.get("action_index", 0)), monitor
                     )
@@ -4004,6 +4970,7 @@ try:
                     result["contact_monitoring"] = _contact_monitor_result(monitor)
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
+                    result["safety_geometry"] = monitor["geometry_substeps"][-1] if monitor.get("geometry_substeps") else None
                 elif request["op"] == "snapshot":
                     try:
                         snapshot_id = f"snapshot-{next_snapshot_id:06d}"
@@ -4052,6 +5019,8 @@ try:
                         result = _branch_rollout(
                             request.get("snapshot_id"),
                             request.get("candidates"),
+                            request.get("safety_geometry_policy"),
+                            bool(request.get("capture_runtime_snapshots", False)),
                         )
                     except Exception as exc:
                         result = {
@@ -4095,6 +5064,18 @@ try:
                                 f"{type(exc).__name__}: {exc}"
                             ),
                         }
+                elif request["op"] == "task_semantic_geometry_bindings":
+                    try:
+                        result = _task_semantic_geometry_bindings()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "bindings": {},
+                            "error": (
+                                "Task semantic geometry binding failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
                 elif request["op"] == "geom_set_min_distance":
                     try:
                         result = _geom_set_min_distance(
@@ -4113,6 +5094,19 @@ try:
                             "error": f"Geom distance query failed: {type(exc).__name__}: {exc}",
                             "not_a_safety_proof": True,
                         }
+                elif request["op"] == "safety_geometry_check":
+                    try:
+                        result = _safety_geometry_at_current_state(
+                            request.get("safety_geometry_policy")
+                        )
+                    except Exception as exc:
+                        result = {
+                            "status": "incomplete",
+                            "minimum_forbidden_clearance_m": None,
+                            "forbidden_contacts": [],
+                            "self_contacts": [],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
                 elif request["op"] == "planning_geometry":
                     try:
                         result = _planning_geometry(
@@ -4124,6 +5118,60 @@ try:
                         result = {"operation": "planning_geometry", "status": "unavailable",
                                   "query_complete": False, "physical_state_unchanged": False,
                                   "error": f"Planning geometry failed: {type(exc).__name__}: {exc}"}
+                elif request["op"] == "rrt_connect":
+                    try:
+                        import hashlib
+                        from research.gs_opd.repair.mujoco_jointspace_planning import plan_current_scene
+
+                        expected_instruction = request.get("expected_instruction")
+                        if expected_instruction != task.language:
+                            raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+                        expected_model = request.get("model_geometry_sha256")
+                        actual_model = _planning_model_signature(env.sim.model._model)
+                        if expected_model != actual_model:
+                            raise ValueError("compiled_model_geometry_signature_changed")
+                        current_state = _mujoco_integration_state(env.sim)
+                        current_state_hash = hashlib.sha256(current_state.tobytes()).hexdigest()
+                        if request.get("start_state_sha256") != current_state_hash:
+                            raise ValueError("active_7d_qpos_start_state_changed_before_planning")
+                        policy = _normalize_safety_geometry_policy(
+                            request.get("safety_geometry_policy")
+                        )
+                        result = plan_current_scene(
+                            env,
+                            request.get("goal_pose_world"),
+                            policy,
+                            start_state_sha256=current_state_hash,
+                            expected_instruction=expected_instruction,
+                            actual_instruction=task.language,
+                            ik_seed_qpos=request.get("ik_seed_qpos"),
+                            planner_config=request.get("planner_config"),
+                        )
+                        result["operation"] = "rrt_connect"
+                        result["start_state_sha256"] = current_state_hash
+                        result["model_geometry_sha256"] = actual_model
+                        result["safety_policy_source"] = request.get("safety_geometry_policy", {}).get("source")
+                    except Exception as exc:
+                        result = {
+                            "operation": "rrt_connect",
+                            "status": "unavailable",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": None,
+                        }
+                elif request["op"] == "osc_prefix_probe":
+                    try:
+                        result = _osc_prefix_probe(request)
+                    except Exception as exc:
+                        result = {
+                            "operation": "osc_prefix_probe",
+                            "status": "incomplete",
+                            "complete": False,
+                            "safe": False,
+                            "main_state_restored_verified": False,
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "actions": [],
+                            "steps": [],
+                        }
                 elif request["op"] == "gripper_geometry_inventory":
                     try:
                         result = _gripper_geometry_inventory()

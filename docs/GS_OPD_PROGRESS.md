@@ -1,5 +1,23 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## Automatic Safety Recovery Engine（2026-10-23；t=10 与完整 Episode 验证完成）
+
+已在 `research/gs_opd/repair/` 实现可复用恢复状态机、7D RRT-Connect 规划适配器、L0T2 Safety Bridge/Student 运行时与 CLI。引擎从真实状态预测 Student 风险，隔离 Snapshot 预演候选控制前缀；风险触发后用实时 7D qpos 求解、规划及 OSC_POSE 分段执行，逐物理子步检查全机器人几何、接触、EEF/关节跟踪和任务进展，并在停滞、窄通道及偏离时自动重规划。时间、规划、段长、重规划和执行预算均由配置控制。Ginger Beer / Place Box 的10 mm硬余量不能配置降低。主分支只执行通过隔离预演的真实控制，不直接改 qpos 或物体位置。
+
+任务上下文显式携带禁止接触对象、允许目标接触、真实抓持状态、任务阶段、目标和目标来源。持物后，Bridge 需验证双指抓持，从实时 EEF–物体位姿计算刚体关系；RRT scratch 副本会随候选 EEF 路径移动物体根节点并检查全物体几何，OSC 分支和主分支按实际模拟状态逐子步检查携物几何。该通用接口已由 MuJoCo scratch 单测验证，但尚未用 L0T0 实际任务验证。L0T2 预抓取目标来自历史成功抓取先验并按当前 Pot 2 位姿重算；不是 VLM Teacher 输出。
+
+从归档 t=10 Snapshot 启动后，Pi0.5 风险预测触发自动接管，RRT-Connect 与 OSC_POSE 连续执行228步，自动重规划3次，在 episode t=238 到达 Pot 2 历史预抓取位置，`local_recovery_success=true`。5,700/5,700个实际物理子步均有完整几何记录，无禁止接触；实测最小禁触余量12.813 mm。该首次 run6 在 handoff 后的旧循环以 `student_risk_prediction_unknown` 退出；随后修复已满足目标状态判断顺序，并从同一 t=238 快照续测，确认不执行 Student 旧动作，而是明确以 `task_goal_phase_unresolved:grasp` fail-closed。
+
+随后从完整 Episode 自动运行：原生 t=0 Student 的5步隔离风险前缀预测禁触余量从99.0 mm、66.0 mm降至36.5 mm，在实际预计穿入10 mm硬余量前、触发距离50 mm处于t=10自动接管。引擎完成3条RRT路线、按风险边界和窄通道自主重规划两次；路线最低禁触余量12.054/11.283/12.471 mm。258控制步到达同一预抓取目标。258/258实际控制步的6,450/6,450物理子步、全机器人 Geometry/Contact 检查完整，无禁止接触；实测最小禁触余量11.861 mm。逐步Observation–Action、任务阶段、决策、双视频和t=1..258快照已保存。结果为局部恢复成功，完整任务成功/完整安全成功/标准1000步 Horizon 成功均为 false；抓取、搬运、放置及第二物体恢复目标没有可靠的当前阶段目标/控制器输入，故按设计在 `grasp` 阶段失败退出，没有拼接历史示范动作。未扩展 Horizon。当前还不能产生完整安全成功示范候选。
+
+19项单元/组件测试通过，包含状态机、预算/失败关闭、RRT、隔离物理子步覆盖、携物刚体变换、轨迹写入和 Snapshot roundtrip。另恢复已有稳定 Pot 2 抓持快照做只读 Bridge 集成检查：实时双指状态确认 `moka_pot_2` 持物；桥接端对 Ginger Beer、Place Box、Pot 1、Stove 与其它活动场景几何的携物间距查询全部 complete，禁止对象最小间隙204.2 mm，无物理推进。它验证了 L0T2 held-object 绑定，不代表 L0T0 回合。实现说明及复现命令见 [`research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md`](../research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md)。
+
+独立运行归档：t=10 接管 `/opt/data/private/gs_opd/rollouts/automatic_safety_recovery_l0t2_t10_20261023_run6/`；t=238 handoff fail-closed `/opt/data/private/gs_opd/rollouts/automatic_safety_recovery_l0t2_posthandoff_20261023_run8/`；完整 Episode `/opt/data/private/gs_opd/rollouts/automatic_safety_recovery_l0t2_episode_20261023_run9/`；稳定抓持几何检查 `/opt/data/private/gs_opd/rollouts/automatic_safety_recovery_carried_geometry_smoke_20261023_attempt2/`。Episode与t=10目录含逐步 Observation–Action、事件、视频及恢复 Snapshot。没有覆盖原1093步示范/历史数据，也没有启动 LoRA 训练。
+
+注意：早期 CLI 试启动曾错误使用被占用的用户 Bridge 端口38567，并在无任何 step action 前恢复了 t=10 Snapshot；该用户进程没有被停止或继续操作。修复为独立端口38569后完成上述有效运行。此前失败运行保留在各自目录，最终结果以 run6/run8/run9 为准。
+
+---
+
 
 ## L0T2 Round 1：t=323 接续重规划与150步 OSC 前缀（2026-10-23；t=473，等待复核）
 

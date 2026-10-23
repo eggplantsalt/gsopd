@@ -108,6 +108,12 @@ class TrajectoryWriter:
             "action": np.asarray(action, dtype=np.float32).copy(),
             "reward": float(bridge_data["reward"]),
             "done": bool(bridge_data["done"]),
+            "timestep": int(bridge_data.get("timestep", step_index + 1)),
+            "task_success": (
+                None
+                if bridge_data.get("task_success") is None
+                else bool(bridge_data["task_success"])
+            ),
         }
         if "snapshot_state" in bridge_data:
             step["physical_state_json"] = json.dumps(
@@ -253,6 +259,16 @@ class TrajectoryWriter:
             ),
             "step_dones": np.asarray(
                 [item["done"] for item in self.steps], dtype=np.bool_
+            ),
+            "step_timesteps": np.asarray(
+                [item["timestep"] for item in self.steps], dtype=np.int64
+            ),
+            "step_task_success": np.asarray(
+                [
+                    -1 if item["task_success"] is None else int(item["task_success"])
+                    for item in self.steps
+                ],
+                dtype=np.int8,
             ),
         }
         if any("physical_state_json" in item for item in self.steps):

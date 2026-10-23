@@ -1,0 +1,63 @@
+{
+  "benchmark": "obstacle_avoidance",
+  "level": 0,
+  "task_id": 2,
+  "init_state": 0,
+  "environment_seed": 0,
+  "expected_bddl_sha256": "901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c",
+  "expected_model_geometry_sha256": "1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752",
+  "goal_object_semantic_id": "moka_pot_2",
+  "historical_goal_seed_timestep": 118,
+  "phase": "pregrasp",
+  "post_pregrasp_handoff_phase": "grasp",
+  "held_phase": "transport",
+  "unresolved_goal_phases": ["grasp", "transport", "placement", "second_object_recovery"],
+  "open_gripper_action": -1.0,
+  "goal_position_tolerance_m": 0.012,
+  "goal_orientation_tolerance_rad": 0.08,
+  "recovery": {
+    "segment_control_steps": 8,
+    "risk_trigger_distance_m": 0.05,
+    "hard_minimum_clearance_m": 0.01,
+    "maximum_replans": 8,
+    "planning_time_budget_s": 360.0,
+    "execution_step_budget": 1000,
+    "total_wall_budget_s": 3600.0,
+    "maximum_joint_path_deviation_rad": 0.18,
+    "maximum_eef_tracking_error_m": 0.025,
+    "maximum_eef_orientation_error_rad": 0.08,
+    "stagnation_window_steps": 12,
+    "minimum_progress_m": 0.002,
+    "horizon_steps": 1000,
+    "allow_horizon_extension": false
+  },
+  "rrt_connect": {
+    "step_rad": 0.22,
+    "connect_max_steps": 20,
+    "goal_bias": 0.1,
+    "max_iterations": 2000,
+    "max_config_checks": 25000,
+    "max_candidate_routes": 3,
+    "search_time_budget_s": 360.0,
+    "shortcut_attempts": 250,
+    "edge_max_joint_delta_rad": 0.02,
+    "edge_max_eef_translation_m": 0.005,
+    "edge_max_eef_rotation_rad": 0.02,
+    "edge_max_geom_center_step_m": 0.004,
+    "edge_max_geom_midpoint_curvature_m": 0.0005,
+    "minimum_clearance_m": 0.01,
+    "seed": 20261023
+  },
+  "artifacts": {
+    "archived_student_trace": "/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_base_pi05_rollout_400_20261022_attempt2/rollout_trace.npz",
+    "historical_grasp_template": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/source_grasp_template.json",
+    "t10_runtime_snapshot": "/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/evidence/raw_pi05_t10_runtime_snapshot.pkl",
+    "t10_verification": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/t10_replay_snapshot_verification.json"
+  },
+  "provenance": {
+    "task_constraints": "active native L0T2 BDDL CheckRobotContact and CheckContact predicates",
+    "target_pose": "historical successful grasp record transformed by the current live target Body pose",
+    "teacher_generated_goal": false,
+    "held_object_detection": "live registered-object grasp-state checks for every BDDL object"
+  }
+}

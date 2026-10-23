@@ -1,5 +1,17 @@
 # GS-OPD 当前局部目标
 
+## 当前目标：Automatic Safety Recovery Engine 已实现并完成 L0T2 两种起点验证（2026-10-23）
+
+通用状态机、L0T2 运行时、配置化 CLI、逐子步几何安全策略和复现说明已完成。已先从归档 t=10 Snapshot 自动恢复至 Pot 2 历史先验预抓取目标，再从原生完整 Episode t=0 验证 Student 风险接管、连续 RRT-Connect、OSC_POSE 执行和自主重规划。前者执行228步、3次重规划；完整 Episode 执行258步、2次重规划；两者均 `local_recovery_success=true`。
+
+完整 Episode 与 t=10 恢复均在已到预抓取目标后，因 `grasp` 阶段没有可靠的当前状态目标/控制器而 fail-closed。完整任务成功、完整安全成功、标准1000步 Horizon 成功均未取得；没有扩展 Horizon，没有生成安全成功示范候选，也未启动训练。19项回归测试通过。详细行为和命令见 [`research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md`](../research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md)，运行档案路径见 `GS_OPD_PROGRESS.md`。
+
+下一段局部工作需要补充任务专家接口：从当前真实状态提供可验证的抓取、携物转运、放置及 L0T2 第二物体恢复目标/控制器，并声明允许的目标接触与来源；不能从历史动作复制动作序列或假称 Teacher 已生成目标。之后再通过完整任务及禁止接触检查。携物几何已在真实 L0T2 Pot 2 双指抓持快照上通过只读 Bridge 完整性检查（禁止对象最小间隙204.2 mm，未推进物理状态）；L0T0 仍需活动约束/允许接触输入及端到端物理验证。
+
+以下既有“当前局部目标”条目是此前的人工分段 OSC 实验记录，已由本节自动状态机验证取代，保留作历史证据。
+
+---
+
 
 ## 当前局部目标：t=323 接续完成150步并安全停在窄段前（2026-10-23；等待复核）
 
