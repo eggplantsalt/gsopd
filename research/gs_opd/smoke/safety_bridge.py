@@ -153,6 +153,12 @@ def _parse_scene_args():
     parser.add_argument("--seed", type=int, default=0, help="environment seed (default: 0)")
     parser.add_argument("--port", type=int, default=38567, help="local Bridge TCP port (default: 38567)")
     parser.add_argument(
+        "--demonstration-horizon",
+        type=int,
+        default=1000,
+        help="isolated horizon; values over 1000 are demonstration-only",
+    )
+    parser.add_argument(
         "--camera-resolution", type=int, default=256,
         help="square RGB observation resolution for both cameras (default: 256)",
     )
@@ -162,6 +168,8 @@ def _parse_scene_args():
 scene_args = _parse_scene_args()
 if scene_args.camera_resolution <= 0:
     raise ValueError("--camera-resolution must be positive")
+if not 1 <= scene_args.demonstration_horizon <= 1800:
+    raise ValueError("--demonstration-horizon must be in 1..1800")
 suite = get_benchmark(scene_args.benchmark)()
 task = suite.get_task_by_level_id(scene_args.level, scene_args.task_id)
 if task is None:
@@ -193,11 +201,18 @@ scene_metadata = {
     "environment_seed": scene_args.seed,
     "camera_resolution": scene_args.camera_resolution,
     "camera_names": ["agentview_image", "robot0_eye_in_hand_image"],
+    "standard_evaluation_horizon": 1000,
+    "bridge_horizon": scene_args.demonstration_horizon,
+    "horizon_mode": (
+        "standard_benchmark" if scene_args.demonstration_horizon == 1000
+        else "demonstration_only_extension"
+    ),
 }
 
 print("LOADING SAFETY ENV...", flush=True)
 env = OffScreenRenderEnv(
     bddl_file_name=bddl,
+    horizon=scene_args.demonstration_horizon,
     camera_heights=scene_args.camera_resolution,
     camera_widths=scene_args.camera_resolution,
 )
@@ -4880,6 +4895,88 @@ def pack(obs, reward=0.0, done=False, include_snapshot_state=False):
         result["snapshot_state"] = _snapshot_diagnostics(canonicalize_kinematics=True)
     return result
 
+
+def _native_task_goal_status(predicate=None):
+    """Read active BDDL goal predicates through the native evaluator."""
+    task_env = env.env
+    goal_states = task_env.parsed_problem.get("goal_state")
+    if not isinstance(goal_states, list) or not goal_states:
+        raise RuntimeError("active_BDDL_goal_state_is_unavailable")
+    normalized = [tuple(str(token).lower() for token in state) for state in goal_states]
+    if predicate is not None:
+        if not isinstance(predicate, (list, tuple)) or not predicate:
+            raise ValueError("native_goal_query_requires_a_nonempty_predicate_array")
+        requested = tuple(str(token).lower() for token in predicate)
+        if requested not in normalized:
+            raise ValueError("requested_predicate_is_not_an_active_BDDL_goal")
+        index = normalized.index(requested)
+        return {
+            "operation": "native_goal_query",
+            "status": "complete",
+            "predicate": list(goal_states[index]),
+            "value": bool(task_env._eval_predicate(goal_states[index])),
+            "timestep": int(task_env.timestep),
+        }
+    values = [
+        {"predicate": list(state), "value": bool(task_env._eval_predicate(state))}
+        for state in goal_states
+    ]
+    return {
+        "operation": "native_task_status",
+        "status": "complete",
+        "native_goal_values": values,
+        "task_success": bool(task_env._check_success()),
+        "timestep": int(task_env.timestep),
+        "reward": float(last_reward),
+        "done": bool(last_done),
+    }
+
+
+def _native_goal_query_details(predicate):
+    """Read one native On relation and its compiled live target site."""
+    if not isinstance(predicate, (list, tuple)) or len(predicate) != 3:
+        raise ValueError("native_goal_query_requires_a_three_item_relation")
+    predicate = list(predicate)
+    goals = copy.deepcopy(env.env.parsed_problem.get("goal_state"))
+    if predicate not in goals:
+        raise ValueError("requested_predicate_is_not_an_active_BDDL_goal")
+    subject, region = predicate[1], predicate[2]
+    site_object = env.env.object_sites_dict.get(region)
+    if site_object is None:
+        raise ValueError(f"compiled_BDDL_site_is_unavailable:{region}")
+    site_id = int(env.sim.model.site_name2id(region))
+    site_position = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
+    site_rotation = np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+    subject_object = env.env.get_object(subject)
+    subject_body = int(env.sim.model.body_name2id(subject_object.root_body))
+    subject_position = np.asarray(env.sim.data.body_xpos[subject_body], dtype=np.float64)
+    subject_quaternion = np.asarray(env.sim.data.body_xquat[subject_body], dtype=np.float64)
+    return {
+        "operation": "native_goal_query",
+        "status": "complete",
+        "read_only": True,
+        "predicate": predicate,
+        "predicate_is_native_goal": True,
+        "predicate_value": bool(env.env._eval_predicate(predicate)),
+        "region": {
+            "name": region,
+            "parent_name": site_object.parent_name,
+            "site_id": site_id,
+            "site_position_world_m": site_position.tolist(),
+            "site_rotation_world": site_rotation.tolist(),
+            "site_size_m": np.asarray(site_object.size, dtype=np.float64).tolist(),
+            "site_local_position_m": np.asarray(site_object.site_pos, dtype=np.float64).tolist(),
+            "site_local_quaternion_wxyz": np.asarray(site_object.site_quat, dtype=np.float64).tolist(),
+        },
+        "subject": {
+            "name": subject,
+            "body_id": subject_body,
+            "body_name": subject_object.root_body,
+            "root_position_world_m": subject_position.tolist(),
+            "root_quaternion_wxyz": subject_quaternion.tolist(),
+        },
+    }
+
 scene_metadata["model_geometry_sha256"] = _planning_model_signature(env.sim.model._model)
 listener = Listener(("127.0.0.1", scene_args.port), authkey=b"gs-opd-local")
 print("SAFETY BRIDGE READY", flush=True)
@@ -5075,6 +5172,27 @@ try:
                                 "Task semantic geometry binding failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                        }
+                elif request["op"] == "native_task_status":
+                    try:
+                        result = _native_task_goal_status()
+                    except Exception as exc:
+                        result = {
+                            "operation": "native_task_status",
+                            "status": "unavailable",
+                            "native_goal_values": [],
+                            "task_success": None,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "native_goal_query":
+                    try:
+                        result = _native_goal_query_details(request.get("predicate"))
+                    except Exception as exc:
+                        result = {
+                            "operation": "native_goal_query",
+                            "status": "unavailable",
+                            "value": None,
+                            "error": f"{type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "geom_set_min_distance":
                     try:

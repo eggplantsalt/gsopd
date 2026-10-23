@@ -114,7 +114,18 @@ class TrajectoryWriter:
                 if bridge_data.get("task_success") is None
                 else bool(bridge_data["task_success"])
             ),
+            "task_phase": (
+                str(record.get("task_phase")) if isinstance(record, dict) else "unknown"
+            ),
         }
+        native_status = bridge_data.get("native_task_status")
+        if native_status is not None:
+            step["native_task_status_json"] = json.dumps(
+                native_status,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         if "snapshot_state" in bridge_data:
             step["physical_state_json"] = json.dumps(
                 bridge_data["snapshot_state"],
@@ -270,7 +281,15 @@ class TrajectoryWriter:
                 ],
                 dtype=np.int8,
             ),
+            "step_task_phase": np.asarray(
+                [item.get("task_phase", "unknown") for item in self.steps], dtype=np.str_
+            ),
         }
+        if any("native_task_status_json" in item for item in self.steps):
+            arrays["post_native_task_status_json"] = np.asarray(
+                [item.get("native_task_status_json", "{}") for item in self.steps],
+                dtype=np.str_,
+            )
         if any("physical_state_json" in item for item in self.steps):
             arrays["post_physical_state_json"] = np.asarray(
                 [item.get("physical_state_json", "{}") for item in self.steps],

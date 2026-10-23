@@ -1,6 +1,18 @@
 # GS-OPD 总体路线
 
-## Automatic Safety Recovery 路线状态（2026-10-23）
+## Automatic task execution follow-up（2026-10-23）
+
+1. **通用恢复核心：保留。** Student风险预测接管、7D RRT-Connect、OSC_POSE滚动重规划、真实全Geom与25物理子步安全检查均未修改其已验证实现。
+2. **任务阶段控制接口：已接入，尚未端到端通过。** 新增阶段状态机与L0T2任务配置，使用实时物体/EEF状态和原生BDDL谓词驱动抓取、搬运、放置、释放、撤离、稳定及最终核验。归档 grasp transform/approach profile 和两 Pot 放置先验来源均显式记录为历史专家先验，不声称为 VLM Teacher 生成。`Turnon` 的可信控制器仍未提供；原生谓词若不成立则安全失败。
+3. **L0T2安全预抓取：当前确定阻塞。** 旧t=238预抓取候选的全机器人几何审计发现Pot2非指部机器人间隙0.419 mm，不满足10 mm；运行在动作前拒绝。目标改为实时重定向历史抓取模板中的object-frame approach pose后，从验证t=10 Snapshot完成118个真实安全控制步、2,950个完整物理子步和3次实时规划/重规划，但最后窄通道入口仍请求下一次重规划，超过三次阶段规划预算；停止时距预抓取232.6 mm。未进入 grasp/transport/placement。
+4. **依赖实验：未启动。** 因归档 Snapshot 接续没有完成预抓取，不启动原生t=0完整任务实验；完整任务、安全成功、标准1000步成功和扩展演示成功均未取得。没有安全示范候选，没有LoRA训练。
+5. **下一优先级：** 对照失败事件审计路线触发点、OSC参考跟踪偏差和目标余量；在保留Student提前接管和10 mm硬门槛前提下，确定一种可以在阶段内有限三次尝试完成窄通道穿越的规划/触发策略。验证后从新鲜安全状态续接抓取阶段，再依次验证第二Pot和原生`On`/`Turnon`；L0T0携物绕障仍待独立端到端适配。
+
+完整归档/复现文档：[`research/gs_opd/AUTOMATIC_TASK_RECOVERY.md`](../research/gs_opd/AUTOMATIC_TASK_RECOVERY.md)；运行数据、测试和分阶段失败记录见 [`GS_OPD_PROGRESS.md`](GS_OPD_PROGRESS.md)。
+
+---
+
+## Previous Automatic Safety Recovery checkpoint（2026-10-23；stage-controller follow-up supersedes task-stage status below）
 
 1. **通用安全恢复机制：已实现。** 状态机、7D 当前状态 RRT-Connect、隔离控制前缀 Snapshot 预演、原生 OSC_POSE 分段执行、全 Geom / 25子步监测、偏差/停滞/窄通道自主重规划、预算和 fail-closed 状态已集成。10 mm 禁止接触硬余量不可降低。完整当前状态和可复现 CLI 见 [`research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md`](../research/gs_opd/AUTOMATIC_SAFETY_RECOVERY.md)。
 2. **L0T2 预抓取自动避障：已验证到局部目标。** t=10 Snapshot运行228控制步/3次重规划；Episode从 t=0运行258控制步/2次重规划。均自动到达按 Pot 2 实时位姿重算的历史成功抓取预抓取先验，Episode 的结果为 `local_recovery_success=true`。完整任务、完整安全和标准1000步 Horizon均未成功。

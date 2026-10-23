@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from research.gs_opd.data.trajectory_writer import TrajectoryWriter
 from research.gs_opd.repair.automatic_recovery import (
@@ -45,6 +47,8 @@ from research.gs_opd.repair.trajectory_tracking import (
     quaternion_conjugate,
     quaternion_multiply,
 )
+from research.gs_opd.repair.grasp_retargeting import GraspRetargetingTemplate
+from research.gs_opd.repair.task_phase_controller import PhaseEvidence, TaskPhaseController
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -226,9 +230,38 @@ class BridgeProcess:
         self.connection = None
         self._bridge_log = None
 
-    def start(self, *, benchmark: str, level: int, task_id: int, init_state: int = 0, seed: int = 0):
+    def start(
+        self,
+        *,
+        benchmark: str,
+        level: int,
+        task_id: int,
+        init_state: int = 0,
+        seed: int = 0,
+        demonstration_horizon: int = 1000,
+    ):
         if not self.python.is_file():
             raise FileNotFoundError(f"Safety Bridge Python environment is missing: {self.python}")
+        if isinstance(demonstration_horizon, bool) or not 1 <= int(demonstration_horizon) <= 1800:
+            raise ValueError("demonstration_horizon_must_be_in_1_to_1800")
+        ownership = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{self.port}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if ownership.returncode == 0 and ownership.stdout.strip():
+            raise RuntimeError(
+                f"Bridge_port_is_already_owned:{self.port}:{ownership.stdout.strip()}"
+            )
+        if ownership.returncode != 0:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", self.port))
+            except OSError as exc:
+                raise RuntimeError(f"Bridge_port_is_unavailable:{self.port}:{exc}") from exc
+            finally:
+                probe.close()
         env = os.environ.copy()
         env["MUJOCO_GL"] = "egl"
         env["PYOPENGL_PLATFORM"] = "egl"
@@ -248,6 +281,7 @@ class BridgeProcess:
             "--level", str(level), "--task-id", str(task_id),
             "--init-state", str(init_state), "--seed", str(seed),
             "--port", str(self.port),
+            "--demonstration-horizon", str(int(demonstration_horizon)),
         ]
         self.process = subprocess.Popen(
             command,
@@ -402,6 +436,17 @@ class AutomaticRecoveryBridgeBackend:
             self.grasp_template["source_first_finger_contact_step_1based"]
         ):
             raise ValueError("historical_pregrasp_state_must_precede_first_finger_contact")
+        self.task_grasp_template = GraspRetargetingTemplate.from_dict(self.grasp_template)
+        self.task_controller: TaskPhaseController | None = None
+        self.task_expert_active = False
+        self.task_phase_anchor: tuple[np.ndarray, np.ndarray] | None = None
+        self.last_task_phase: str | None = None
+        self.phase_plan_attempts: dict[str, int] = {}
+        self.current_native_task_status: dict[str, Any] | None = None
+        self.current_native_goal_values: dict[tuple[str, ...], bool] = {}
+        self.current_region_parent: str | None = None
+        self.confirmed_placed_objects: set[str] = set()
+        self.task_support_geom_ids: tuple[int, ...] = ()
         self.latest_data: dict[str, Any] | None = None
         self.safety_policy: dict[str, Any] | None = None
         self.context_static: dict[str, Any] | None = None
@@ -606,6 +651,35 @@ class AutomaticRecoveryBridgeBackend:
             "forbidden_object_pairs": forbidden_object_pairs,
             "carried_object": None,
         }
+        task_execution = self.config_data.get("task_execution", {})
+        if task_execution.get("enabled") is True:
+            if task_execution.get("goal_source_is_vlm_teacher") is not False:
+                raise ValueError("task_expert_prior_must_not_be_mislabeled_as_VLM_Teacher_output")
+            if task_execution.get("fixture_activation_controller") is not None:
+                raise ValueError("configured_fixture_activation_controller_has_no_verified_runtime_adapter")
+            self.task_controller = TaskPhaseController(task_execution)
+            configured_objects = {
+                str(item["object_id"]) for item in task_execution.get("objects", [])
+            }
+            if not configured_objects or not configured_objects.issubset(object_names):
+                raise ValueError("task_phase_object_ids_must_bind_to_active_BDDL_objects")
+            support_names = task_execution.get("support_contact_geom_names", [])
+            if not isinstance(support_names, list) or not support_names:
+                raise ValueError("task_phase_program_requires_explicit_support_contact_geometry")
+            geometry_by_name: dict[str, list[int]] = {}
+            for item in inventory["geometries"]:
+                if item.get("collision_enabled") is True:
+                    geometry_by_name.setdefault(str(item["geom_name"]), []).append(
+                        int(item["geom_id"])
+                    )
+            resolved_support = []
+            for geom_name in support_names:
+                matches = geometry_by_name.get(str(geom_name), [])
+                if len(matches) != 1:
+                    raise ValueError(f"configured_support_geometry_is_not_unique:{geom_name}")
+                resolved_support.append(matches[0])
+            self.task_support_geom_ids = tuple(resolved_support)
+            self.safety_policy["allowed_contact_pairs"] = []
         template_object = self.config_data["goal_object_semantic_id"]
         if template_object not in object_names or template_object not in self.bindings:
             raise ValueError("historical_pregrasp_target_is_not_a_declared_BDDL_object")
@@ -722,6 +796,433 @@ class AutomaticRecoveryBridgeBackend:
         quaternion = _matrix_quat_wxyz(object_rotation @ relative_rotation)
         return position, quaternion
 
+    @staticmethod
+    def _predicate_key(predicate: Any) -> tuple[str, ...]:
+        if not isinstance(predicate, (list, tuple)) or not predicate:
+            raise ValueError("native_task_predicate_must_be_a_nonempty_array")
+        return tuple(str(value).lower() for value in predicate)
+
+    @staticmethod
+    def _pose_matrix(position: Any, quaternion_wxyz: Any) -> np.ndarray:
+        result = np.eye(4, dtype=np.float64)
+        result[:3, :3] = _quat_matrix_wxyz(quaternion_wxyz)
+        result[:3, 3] = np.asarray(position, dtype=np.float64)
+        if result.shape != (4, 4) or not np.isfinite(result).all():
+            raise ValueError("task_phase_pose_is_invalid")
+        return result
+
+    @staticmethod
+    def _matrix_pose(matrix: Any) -> tuple[np.ndarray, np.ndarray]:
+        value = np.asarray(matrix, dtype=np.float64)
+        if value.shape != (4, 4) or not np.isfinite(value).all():
+            raise ValueError("task_phase_transform_is_invalid")
+        return value[:3, 3].copy(), _matrix_quat_wxyz(value[:3, :3])
+
+    def _live_object_state(self, data: dict[str, Any], object_name: str) -> dict[str, Any]:
+        binding = self.bindings.get(object_name)
+        if not isinstance(binding, dict):
+            raise ValueError(f"task_phase_object_binding_is_missing:{object_name}")
+        key = f"{binding['mapping_name']}:{object_name}"
+        state = data.get("snapshot_state", {}).get("object_states", {}).get(key)
+        if not isinstance(state, dict):
+            raise ValueError(f"live_task_object_state_is_missing:{key}")
+        return state
+
+    def _live_eef_pose(self, data: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        robots = data.get("snapshot_state", {}).get("robot_states", [])
+        if len(robots) != 1:
+            raise ValueError("task_phase_requires_exactly_one_live_robot_state")
+        robot = robots[0]
+        position = np.asarray(robot.get("eef_pos"), dtype=np.float64)
+        quaternion = np.asarray(robot.get("eef_quat"), dtype=np.float64)
+        if position.shape != (3,) or quaternion.shape != (4,):
+            raise ValueError("task_phase_live_EEF_pose_is_malformed")
+        return position, quaternion / np.linalg.norm(quaternion)
+
+    def _native_region_query(self, object_spec: dict[str, Any]) -> dict[str, Any]:
+        predicate = object_spec.get("predicate")
+        query = self.bridge.request({"op": "native_goal_query", "predicate": predicate})
+        if query.get("status") != "complete" or query.get("predicate_is_native_goal") is not True:
+            raise ValueError(
+                f"native_task_target_region_is_unknown:{query.get('error') or query.get('status')}"
+            )
+        region = query.get("region")
+        if not isinstance(region, dict) or not region.get("parent_name"):
+            raise ValueError("native_task_target_region_frame_is_incomplete")
+        self.current_region_parent = str(region["parent_name"])
+        return query
+
+    def _placement_object_pose(
+        self, data: dict[str, Any], object_spec: dict[str, Any]
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        query = self._native_region_query(object_spec)
+        region = query["region"]
+        target = object_spec.get("target_pose_in_region")
+        if not isinstance(target, dict):
+            raise ValueError("task_goal_has_no_explicit_target_pose_in_native_region_frame")
+        region_matrix = np.eye(4, dtype=np.float64)
+        region_matrix[:3, :3] = np.asarray(region.get("site_rotation_world"), dtype=np.float64)
+        region_matrix[:3, 3] = np.asarray(region.get("site_position_world_m"), dtype=np.float64)
+        target_matrix = self._pose_matrix(
+            target.get("position_m"), target.get("quaternion_wxyz")
+        )
+        position, quaternion = self._matrix_pose(region_matrix @ target_matrix)
+        return position, quaternion, query
+
+    def _placement_eef_pose(
+        self, data: dict[str, Any], object_spec: dict[str, Any]
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        target_position, target_quaternion, query = self._placement_object_pose(data, object_spec)
+        object_state = self._live_object_state(data, str(object_spec["object_id"]))
+        eef_position, eef_quaternion = self._live_eef_pose(data)
+        object_world = self._pose_matrix(object_state["root_pos"], object_state["root_quat"])
+        eef_world = self._pose_matrix(eef_position, eef_quaternion)
+        object_to_eef = np.linalg.inv(object_world) @ eef_world
+        target_world = self._pose_matrix(target_position, target_quaternion) @ object_to_eef
+        position, quaternion = self._matrix_pose(target_world)
+        return position, quaternion, query
+
+    def _task_stage_target(
+        self, data: dict[str, Any], phase: str
+    ) -> dict[str, Any]:
+        if self.task_controller is None:
+            raise RuntimeError("task_phase_controller_is_not_enabled")
+        object_spec = self.task_controller.current_object
+        object_name = str(object_spec["object_id"])
+        eef_position, eef_quaternion = self._live_eef_pose(data)
+        gripper_open = float(self.config_data.get("open_gripper_action", -1.0))
+        close_command = float(self.config_data["task_execution"].get("close_gripper_action", 1.0))
+        mode = "osc_closed_loop"
+        source = str(object_spec["goal_source"])
+        allowed_contacts: tuple[str, ...] = ()
+        stride = float(self.config_data["task_execution"].get("default_stride_m", 0.012))
+
+        if phase == "pregrasp":
+            # Use the archived verified grasp's object-frame approach vector
+            # and distance. The earlier t=118 pose was reached within 9 mm in
+            # the archived continuation, where a non-finger robot geom had
+            # only 0.419 mm clearance. Treat it as history/IK seed, not a safe
+            # pregrasp target. Retarget the verified approach from the current
+            # live object pose.
+            object_state = self._live_object_state(data, object_name)
+            retargeted = self.task_grasp_template.retarget(
+                object_state["root_pos"], object_state["root_quat"]
+            )
+            position = retargeted.pregrasp_position_world_m
+            quaternion = retargeted.eef_quaternion_world_wxyz
+            source = (
+                "archived_verified_object_frame_grasp_and_approach_distance_"
+                "retargeted_from_live_object_pose"
+            )
+            mode = "rrt_connect"
+        elif phase in {"second_object_recovery", "approach"}:
+            object_state = self._live_object_state(data, object_name)
+            retargeted = self.task_grasp_template.retarget(
+                object_state["root_pos"], object_state["root_quat"]
+            )
+            if phase == "second_object_recovery":
+                position = retargeted.pregrasp_position_world_m
+                quaternion = retargeted.eef_quaternion_world_wxyz
+                mode = "rrt_connect"
+            else:
+                position = retargeted.eef_position_world_m
+                quaternion = retargeted.eef_quaternion_world_wxyz
+                allowed_contacts = (object_name,)
+                stride = float(self.config_data["task_execution"].get("approach_stride_m", 0.010))
+            source = "historical_object_frame_grasp_transform_retargeted_from_live_object_pose"
+        elif phase in {"close_gripper", "stable_grasp", "settle", "verify_task"}:
+            position, quaternion = eef_position, eef_quaternion
+            if phase in {"close_gripper", "stable_grasp"}:
+                allowed_contacts = (object_name,)
+        elif phase == "lift":
+            if self.task_phase_anchor is None:
+                raise ValueError("lift_phase_has_no_live_EEF_anchor")
+            position = self.task_phase_anchor[0] + np.asarray(
+                [0.0, 0.0, float(self.config_data["task_execution"].get("lift_height_m", 0.045))]
+            )
+            quaternion = self.task_phase_anchor[1]
+            stride = float(self.config_data["task_execution"].get("lift_stride_m", 0.025))
+        elif phase == "transport":
+            position, quaternion, _query = self._placement_eef_pose(data, object_spec)
+            position = position + np.asarray(
+                [0.0, 0.0, float(self.config_data["task_execution"].get("transport_clearance_m", 0.14))]
+            )
+            mode = "rrt_connect"
+        elif phase in {"precise_placement", "release"}:
+            position, quaternion, _query = self._placement_eef_pose(data, object_spec)
+            if phase == "precise_placement":
+                stride = float(self.config_data["task_execution"].get("descent_stride_m", 0.010))
+        elif phase == "withdrawal":
+            if self.task_phase_anchor is None:
+                raise ValueError("withdrawal_phase_has_no_live_EEF_anchor")
+            position = self.task_phase_anchor[0] + np.asarray(
+                [0.0, 0.0, float(self.config_data["task_execution"].get("withdrawal_height_m", 0.10))]
+            )
+            quaternion = self.task_phase_anchor[1]
+            mode = "rrt_connect"
+            allowed_contacts = (object_name,)
+        else:
+            raise ValueError(f"task_phase_target_is_undefined:{phase}")
+
+        if phase in {"close_gripper", "stable_grasp", "lift", "transport", "precise_placement"}:
+            gripper_command = close_command
+        elif phase in {"release", "withdrawal", "settle", "verify_task"}:
+            gripper_command = gripper_open
+        else:
+            gripper_command = float(self.task_grasp_template.open_command)
+        if not np.isfinite(position).all() or not np.isfinite(quaternion).all():
+            raise ValueError("task_phase_target_pose_is_not_finite")
+        return {
+            "object_spec": object_spec,
+            "object_id": object_name,
+            "phase": phase,
+            "position": np.asarray(position, dtype=np.float64),
+            "quaternion": np.asarray(quaternion, dtype=np.float64),
+            "gripper_command": float(np.clip(gripper_command, -1.0, 1.0)),
+            "mode": mode,
+            "source": source,
+            "allowed_contacts": allowed_contacts,
+            "stride_m": stride,
+        }
+
+    def _pose_error(self, data: dict[str, Any], target: dict[str, Any]) -> tuple[float, float]:
+        position, quaternion = self._live_eef_pose(data)
+        position_error = float(np.linalg.norm(position - target["position"]))
+        current = Rotation.from_quat(quaternion[[1, 2, 3, 0]])
+        desired = Rotation.from_quat(target["quaternion"][[1, 2, 3, 0]])
+        rotation_error = float((desired * current.inv()).magnitude())
+        return position_error, rotation_error
+
+    def _refresh_task_contact_policy(
+        self, phase: str, object_name: str, held_object: str | None
+    ) -> None:
+        finger_contact_phases = {
+            "approach", "close_gripper", "stable_grasp", "withdrawal"
+        }
+        target = self.bindings[object_name]
+        self.safety_policy["allowed_contact_pairs"] = [
+            {
+                "robot_geom_id": int(robot_geom),
+                "scene_geom_id": int(scene_geom),
+                "minimum_clearance_m": -0.002,
+            }
+            for robot_geom in self.context_static["gripper_geometry_ids"]
+            for scene_geom in target["geom_ids"]
+        ] if phase in finger_contact_phases else []
+        self._refresh_carried_geometry_policy(held_object)
+        if held_object is None:
+            return
+        carried = self.safety_policy.get("carried_object")
+        if not isinstance(carried, dict):
+            raise ValueError("live_held_object_has_no_carried_geometry_policy")
+        pairs = []
+        if phase in {"precise_placement", "release"}:
+            parent = self.current_region_parent
+            fixture = self.bindings.get(parent) if parent else None
+            if not isinstance(fixture, dict) or not fixture.get("geom_ids"):
+                raise ValueError("native_placement_support_has_no_verified_collision_geometry")
+            support_ids = [
+                geom_id for geom_id in self.task_support_geom_ids
+                if geom_id in set(fixture["geom_ids"])
+            ]
+            if not support_ids:
+                raise ValueError("configured_support_geometry_does_not_belong_to_native_target_fixture")
+            pairs = [
+                {
+                    "carried_geom_id": int(carried_geom),
+                    "scene_geom_id": int(scene_geom),
+                    "minimum_clearance_m": -0.002,
+                }
+                for carried_geom in self.bindings[held_object]["geom_ids"]
+                for scene_geom in support_ids
+            ]
+        carried["allowed_contact_pairs"] = pairs
+
+    def _task_phase_context(
+        self,
+        held: str | None,
+        grasp_verified: bool,
+        grasp_records: dict[str, Any],
+        latest: dict[str, Any],
+    ) -> TaskContext:
+        if self.task_controller is None:
+            raise RuntimeError("task_phase_controller_is_not_enabled")
+        status = self.bridge.request({"op": "native_task_status"})
+        if status.get("status") != "complete" or status.get("task_success") is None:
+            raise ValueError(f"native_task_goal_status_is_unknown:{status.get('error')}")
+        native_values = {
+            self._predicate_key(item.get("predicate")): bool(item.get("value"))
+            for item in status.get("native_goal_values", [])
+            if isinstance(item, dict) and isinstance(item.get("value"), bool)
+        }
+        task_config = self.config_data["task_execution"]
+        for item in task_config["objects"]:
+            predicate_key = self._predicate_key(item["predicate"])
+            if predicate_key not in native_values:
+                raise ValueError(f"configured_task_goal_is_not_reported_by_native_BDDL:{predicate_key}")
+        expected_all = {
+            self._predicate_key(item["predicate"]) for item in task_config["objects"]
+        }
+        if task_config.get("fixture_predicate"):
+            expected_all.add(self._predicate_key(task_config["fixture_predicate"]))
+        if not expected_all.issubset(native_values):
+            raise ValueError("configured_task_goal_set_differs_from_native_BDDL_goal_set")
+        self.current_native_task_status = status
+        self.current_native_goal_values = native_values
+
+        if held is not None and not self.task_expert_active:
+            self.task_controller.adopt_held_object(held)
+        elif held is not None and held != self.task_controller.current_object["object_id"]:
+            raise ValueError(f"held_object_does_not_match_active_task_phase:{held}")
+        for item in task_config["objects"]:
+            predicate_key = self._predicate_key(item["predicate"])
+            object_name = str(item["object_id"])
+            if native_values[predicate_key]:
+                self.confirmed_placed_objects.add(object_name)
+            elif object_name in self.confirmed_placed_objects:
+                raise ValueError(f"previously_placed_native_task_predicate_was_lost:{predicate_key}")
+
+        phase = self.task_controller.phase
+        target = self._task_stage_target(latest, phase)
+        position_error, rotation_error = self._pose_error(latest, target)
+        tolerances = task_config.get("phase_pose_tolerances", {}).get(phase, {})
+        goal_reached = bool(
+            position_error <= float(tolerances.get("position_m", self.config_data.get("goal_position_tolerance_m", 0.012)))
+            and rotation_error <= float(tolerances.get("orientation_rad", self.config_data.get("goal_orientation_tolerance_rad", 0.08)))
+        )
+        object_state = self._live_object_state(latest, str(target["object_id"]))
+        object_qvel = np.asarray(object_state.get("joint_qvel", []), dtype=np.float64)
+        eef_position, _eef_quaternion = self._live_eef_pose(latest)
+        object_predicate = self._predicate_key(target["object_spec"]["predicate"])
+        all_goals_satisfied = all(bool(native_values[key]) for key in expected_all)
+        satisfied_object_ids = tuple(
+            str(item["object_id"])
+            for item in task_config["objects"]
+            if bool(native_values[self._predicate_key(item["predicate"])])
+        )
+        fixture_key = (
+            self._predicate_key(task_config["fixture_predicate"])
+            if task_config.get("fixture_predicate") else None
+        )
+        evidence = PhaseEvidence(
+            timestep=int(latest.get("timestep", -1)),
+            eef_goal_reached=goal_reached,
+            held_object=held,
+            grasp_confirmed=bool(
+                grasp_records.get(str(target["object_id"]), {}).get("grasp_confirmed") is True
+            ),
+            object_position_world_m=tuple(float(x) for x in object_state["root_pos"]),
+            object_quaternion_wxyz=tuple(float(x) for x in object_state["root_quat"]),
+            object_qvel=tuple(float(x) for x in object_qvel),
+            eef_position_world_m=tuple(float(x) for x in eef_position),
+            task_goal_satisfied=bool(native_values[object_predicate]),
+            all_task_goals_satisfied=all_goals_satisfied,
+            satisfied_object_ids=satisfied_object_ids,
+            fixture_predicate_satisfied=(
+                bool(native_values[fixture_key]) if fixture_key is not None else None
+            ),
+            trusted_fixture_activation_available=False,
+            task_success=bool(status["task_success"]),
+        )
+        previous_phase = self.task_controller.phase
+        recorded_previous_phase = self.last_task_phase
+        transition = self.task_controller.update(evidence)
+        phase = self.task_controller.phase
+        if phase != self.last_task_phase:
+            self.task_phase_anchor = (eef_position.copy(), _eef_quaternion.copy())
+            self.last_task_phase = phase
+            self.artifacts.event({
+                "event": "task_phase_transition",
+                "timestep": evidence.timestep,
+                "from_phase": previous_phase if transition is not None else recorded_previous_phase,
+                "to_phase": phase,
+                "object_id": target["object_id"],
+                "transition_evidence": transition,
+                "predicate": list(object_predicate),
+                "predicate_value": evidence.task_goal_satisfied,
+                "task_success": evidence.task_success,
+                "target_source": target["source"],
+            })
+        elif self.last_task_phase is None:
+            self.task_phase_anchor = (eef_position.copy(), _eef_quaternion.copy())
+            self.last_task_phase = phase
+            self.artifacts.event({
+                "event": "task_phase_entered",
+                "timestep": evidence.timestep,
+                "phase": phase,
+                "object_id": target["object_id"],
+                "target_source": target["source"],
+            })
+
+        phase = self.task_controller.phase
+        target = self._task_stage_target(latest, phase)
+        self._refresh_task_contact_policy(phase, target["object_id"], held)
+        if phase == "verify_task" and status["task_success"] is not True:
+            raise ValueError("all_task_stage_predicates_true_but_native_task_success_is_false")
+        source_artifacts = tuple(
+            str(value)
+            for value in (
+                target["object_spec"].get("goal_source_artifact"),
+                self.grasp_template_path,
+                self.archived_trace_path,
+            )
+            if value
+        )
+        goal = GoalSpec(
+            goal_id=f"{target['object_id']}:{phase}",
+            phase=phase,
+            source=target["source"],
+            source_artifacts=source_artifacts,
+            position_world_m=tuple(float(x) for x in target["position"]),
+            quaternion_wxyz=tuple(float(x) for x in target["quaternion"]),
+            allowed_target_contacts=target["allowed_contacts"],
+        )
+        expert_active = self.task_expert_active
+        task_expert_only_snapshot = self.mode == "runtime-snapshot"
+        return TaskContext(
+            task_id=self.context_static["task_id"],
+            instruction=self.context_static["instruction"],
+            forbidden_contact_objects=tuple(self.context_static["forbidden_names"]),
+            allowed_target_contact_objects=tuple(self.context_static["allowed_target_contact_names"]),
+            held_object=held,
+            phase=phase,
+            target_source=target["source"],
+            safety_policy_source=self.safety_policy["source"],
+            goals=(goal,),
+            semantic_bindings_verified=True,
+            safety_constraints_verified=True,
+            grasp_state_verified=grasp_verified,
+            expert_handoff_available=True,
+            # Direct runtime-Snapshot continuation has no Student policy
+            # instance. If the saved pregrasp pose is even slightly outside
+            # tolerance, route it through the configured RRT phase. The t=10
+            # replay mode still consumes its archived Student actions before
+            # takeover; full episodes load the unchanged live Student.
+            handoff_policy=(
+                "expert" if expert_active or task_expert_only_snapshot else "student"
+            ),
+            post_recovery_policy="expert",
+            metadata={
+                "task_phase_source": task_config["provenance"],
+                "task_goal_source": target["source"],
+                "goal_source_is_vlm_teacher": False,
+                "task_phase": phase,
+                "task_object": target["object_id"],
+                "phase_execution_mode": target["mode"],
+                "requires_rrt_recovery": target["mode"] == "rrt_connect",
+                "phase_goal_position_error_m": position_error,
+                "phase_goal_orientation_error_rad": rotation_error,
+                "native_task_status": status,
+                "held_object_state_evidence": grasp_records,
+                "allowed_phase_contacts": list(target["allowed_contacts"]),
+                "initial_history_safety_verified": self.initial_history_safety_verified,
+                "initial_history_safety_scope": (
+                    "full_episode_from_timestep_zero" if self.mode == "episode"
+                    else "partial_archived_state_after_unverified_history"
+                ),
+            },
+        )
+
     def current_context(self) -> TaskContext:
         if self.context_static is None:
             data = self.bridge.request({"op": "observe", "include_snapshot_state": True})
@@ -743,6 +1244,8 @@ class AutomaticRecoveryBridgeBackend:
                 "safety_geometry_policy": self.safety_policy,
             })
             self.latest_data = latest
+        if self.task_controller is not None:
+            return self._task_phase_context(held, grasp_verified, grasp_records, latest)
         position, quaternion = self._goal_pose(latest)
         goal = GoalSpec(
             goal_id=f"{self.context_static['goal_object']}:historical_success_pregrasp",
@@ -874,6 +1377,7 @@ class AutomaticRecoveryBridgeBackend:
             "task_success": data.get("task_success"),
             "instruction": data.get("instruction"),
             "scene_metadata": data.get("scene_metadata"),
+            "native_task_status": data.get("native_task_status"),
         }
         if "reference_qpos" in data:
             raw["reference_qpos"] = data["reference_qpos"]
@@ -904,6 +1408,12 @@ class AutomaticRecoveryBridgeBackend:
             "include_snapshot_state": True,
             "safety_geometry_policy": self.safety_policy,
         })
+        if self.task_controller is not None:
+            cached = self.current_native_task_status
+            if not isinstance(cached, dict) or cached.get("timestep") != data.get("timestep"):
+                cached = self.bridge.request({"op": "native_task_status"})
+            data["native_task_status"] = cached
+            self.current_native_task_status = cached
         self.latest_data = data
         if not self.context_static:
             self._load_context_inputs(data)
@@ -1025,6 +1535,7 @@ class AutomaticRecoveryBridgeBackend:
             "action_source": source,
             "task_phase": context.phase,
             "risk_prediction_horizon_control_steps": len(self.current_forecast),
+            "native_task_status": current.get("native_task_status"),
         }
         predicted_actions = (
             self.current_forecast.copy()
@@ -1044,6 +1555,9 @@ class AutomaticRecoveryBridgeBackend:
             "action_index": int(current.get("timestep", 0)),
             "safety_geometry_policy": self.safety_policy,
         })
+        if self.task_controller is not None:
+            result["native_task_status"] = self.bridge.request({"op": "native_task_status"})
+            self.current_native_task_status = result["native_task_status"]
         self.latest_data = result
         if source == "safety_recovery_osc_pose":
             self.plan_cursor += 1
@@ -1073,6 +1587,14 @@ class AutomaticRecoveryBridgeBackend:
         return context.goal_for_phase(context.phase)
 
     def plan_rrt_connect(self, observation: Observation, goal: GoalSpec, context: TaskContext, config: RecoveryConfig) -> JointSpacePlan:
+        if self.task_controller is not None:
+            phase_limit = int(
+                self.config_data["task_execution"].get("maximum_plan_attempts_per_phase", 3)
+            )
+            attempts = self.phase_plan_attempts.get(context.phase, 0)
+            if attempts >= phase_limit:
+                raise RuntimeError(f"task_phase_planning_attempt_budget_exhausted:{context.phase}")
+            self.phase_plan_attempts[context.phase] = attempts + 1
         integration_state = np.asarray(
             observation.raw["snapshot_state"]["mujoco_integration_state"], dtype=np.float64
         )
@@ -1104,6 +1626,8 @@ class AutomaticRecoveryBridgeBackend:
         self.artifacts.event({
             "event": "planner_result_details",
             "plan_index": self.plan_counter,
+            "task_phase": context.phase,
+            "phase_plan_attempt": self.phase_plan_attempts.get(context.phase),
             "planner_result": result,
         })
         return JointSpacePlan(
@@ -1280,7 +1804,56 @@ class AutomaticRecoveryBridgeBackend:
         )
 
     def task_expert_action(self, observation: Observation, context: TaskContext) -> np.ndarray | None:
-        return None
+        if self.task_controller is None:
+            return None
+        target = self._task_stage_target(observation.raw, context.phase)
+        if target["mode"] == "rrt_connect":
+            return None
+        robot_position, robot_quaternion = self._live_eef_pose(observation.raw)
+        delta = target["position"] - robot_position
+        distance = float(np.linalg.norm(delta))
+        if distance > target["stride_m"]:
+            delta *= target["stride_m"] / distance
+        desired_rotation = Rotation.from_quat(target["quaternion"][[1, 2, 3, 0]])
+        current_rotation = Rotation.from_quat(robot_quaternion[[1, 2, 3, 0]])
+        rotation_delta = (desired_rotation * current_rotation.inv()).as_rotvec()
+        position_scale = float(self.config_data["task_execution"].get("position_action_scale_m", 0.05))
+        rotation_scale = float(self.config_data["task_execution"].get("rotation_action_scale_rad", 0.5))
+        if position_scale <= 0 or rotation_scale <= 0:
+            raise ValueError("native_OSC_POSE_action_scales_must_be_positive")
+        action = np.zeros(7, dtype=np.float32)
+        action[:3] = np.clip(delta / position_scale, -1.0, 1.0)
+        action[3:6] = np.clip(rotation_delta / rotation_scale, -1.0, 1.0)
+        action[6] = target["gripper_command"]
+        if not np.isfinite(action).all():
+            raise ValueError("task_expert_action_is_not_finite_7D")
+        self._current_action_source = "task_expert_osc_pose"
+        self.current_forecast = action[None, :].copy()
+        return action
+
+    def handoff_to_task_expert(self, observation: Observation, context: TaskContext) -> None:
+        if self.task_controller is None:
+            raise RuntimeError("task_expert_handoff_requested_without_a_task_phase_program")
+        if not self.task_expert_active:
+            if self.task_controller.phase == "pregrasp":
+                self.task_controller.handoff_after_pregrasp()
+            self.task_expert_active = True
+            self.student_chunk = np.empty((0, 7), dtype=np.float32)
+            self.student_chunk_cursor = 0
+            self.current_forecast = np.empty((0, 7), dtype=np.float32)
+            self.artifacts.event({
+                "event": "task_expert_handoff",
+                "timestep": observation.timestep,
+                "phase": self.task_controller.phase,
+                "source": self.config_data["task_execution"]["provenance"],
+                "policy_action_space": "native_7D_OSC_POSE_plus_gripper",
+            })
+        else:
+            self.artifacts.event({
+                "event": "task_expert_resumed_after_automatic_replan",
+                "timestep": observation.timestep,
+                "phase": self.task_controller.phase,
+            })
 
     def handoff_to_student(self, observation: Observation, context: TaskContext) -> None:
         self.student_handoff_completed = True
@@ -1353,18 +1926,24 @@ class AutomaticRecoveryBridgeBackend:
         return {"status": "initial_episode_state_verified", "snapshot_state": response["snapshot_state"]}
 
     def initialize_trajectory(self):
+        task_execution = self.config_data.get("task_execution", {})
+        task_provenance = task_execution.get("provenance") or self.config_data.get(
+            "provenance", {}
+        ).get("target_pose", "configured_verified_task_goal_sources")
         self.trajectory = TrajectoryWriter(
             self.output_dir / "observation_action_trace.npz",
             {
                 "schema": "gs_opd_automatic_safety_recovery_observation_action.v1",
-                "benchmark": "obstacle_avoidance",
-                "level": 0,
-                "task_id": 2,
+                "benchmark": self.config_data["benchmark"],
+                "level": int(self.config_data["level"]),
+                "task_id": int(self.config_data["task_id"]),
                 "mode": self.mode,
                 "source_student_trace": str(self.archived_trace_path),
                 "source_student_trace_sha256": self.archive_sha256,
-                "goal_provenance": "historical_successful_grasp_record",
-                "goal_is_VLM_Teacher_output": False,
+                "goal_provenance": task_provenance,
+                "goal_is_VLM_Teacher_output": bool(
+                    task_execution.get("goal_source_is_vlm_teacher", False)
+                ),
                 "model_checkpoint": str(self.student.checkpoint) if self.student else None,
                 "model_checkpoint_sha256": sha256_file(self.student.checkpoint / "model.safetensors") if self.student else None,
             },

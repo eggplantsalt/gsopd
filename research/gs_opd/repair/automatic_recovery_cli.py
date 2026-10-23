@@ -51,7 +51,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--python", type=Path, default=DEFAULT_ENV_PYTHON)
-    parser.add_argument("--bridge-port", type=int, default=38569)
+    parser.add_argument("--bridge-port", type=int, default=38731)
     parser.add_argument("--student-checkpoint", type=Path, default=DEFAULT_PI05_CHECKPOINT)
     parser.add_argument("--student-device", default="cuda:0")
     return parser.parse_args()
@@ -60,6 +60,8 @@ def _arguments() -> argparse.Namespace:
 def main() -> int:
     args = _arguments()
     config_data, recovery_config = load_runtime_config(args.config)
+    task_expert_enabled = config_data.get("task_execution", {}).get("enabled") is True
+    needs_student = args.mode == "episode" or not task_expert_enabled
     if args.output_dir is None:
         timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M%S")
         output_dir = args.output_root / f"automatic_safety_recovery_l0t2_{args.mode}_{timestamp}"
@@ -74,8 +76,20 @@ def main() -> int:
                 "config_sha256": sha256_file(args.config),
                 "recovery_config": asdict(recovery_config),
                 "student_checkpoint": str(args.student_checkpoint),
-                "student_checkpoint_sha256": sha256_file(args.student_checkpoint / "model.safetensors"),
+                "student_checkpoint_sha256": (
+                    sha256_file(args.student_checkpoint / "model.safetensors")
+                    if needs_student else None
+                ),
                 "student_device": args.student_device,
+                "bridge_port": int(args.bridge_port),
+                "bridge_process_scope": "dedicated_child_checked_unoccupied_before_start",
+                "standard_evaluation_horizon": recovery_config.standard_horizon_steps,
+                "bridge_horizon": recovery_config.horizon_steps,
+                "horizon_mode": (
+                    "standard_benchmark"
+                    if recovery_config.horizon_steps == recovery_config.standard_horizon_steps
+                    else "demonstration_only_extension"
+                ),
                 "created_local": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                 "source_artifacts": config_data["artifacts"],
             },
@@ -91,10 +105,20 @@ def main() -> int:
     backend = None
     started = time.monotonic()
     try:
-        print("Loading the unchanged Pi0.5 Student checkpoint...", flush=True)
-        from research.gs_opd.repair.automatic_recovery_runtime import Pi05StudentPolicy
+        student = None
+        if needs_student:
+            print("Loading the unchanged Pi0.5 Student checkpoint...", flush=True)
+            from research.gs_opd.repair.automatic_recovery_runtime import Pi05StudentPolicy
 
-        student = Pi05StudentPolicy(args.student_checkpoint, device=args.student_device)
+            student = Pi05StudentPolicy(args.student_checkpoint, device=args.student_device)
+        elif args.mode == "t10-snapshot":
+            print(
+                "Verified t=10 continuation will replay only the archived Student action prefix, "
+                "then use the configured task expert after risk takeover.",
+                flush=True,
+            )
+        else:
+            print("Snapshot continuation uses the configured task expert; Student is not loaded.", flush=True)
         print("Starting the native LIBERO-Safety Bridge...", flush=True)
         bridge.start(
             benchmark=config_data["benchmark"],
@@ -102,6 +126,7 @@ def main() -> int:
             task_id=int(config_data["task_id"]),
             init_state=int(config_data["init_state"]),
             seed=int(config_data["environment_seed"]),
+            demonstration_horizon=recovery_config.horizon_steps,
         )
         backend = AutomaticRecoveryBridgeBackend(
             bridge,

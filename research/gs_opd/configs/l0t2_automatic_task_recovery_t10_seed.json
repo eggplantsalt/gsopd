@@ -1,0 +1,181 @@
+{
+  "artifacts": {
+    "archived_student_trace": "/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_base_pi05_rollout_400_20261022_attempt2/rollout_trace.npz",
+    "historical_grasp_template": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/source_grasp_template.json",
+    "t10_runtime_snapshot": "/opt/data/private/gs_opd/rollouts/l0t2_round1_safety_recovery_20261023_attempt1/evidence/raw_pi05_t10_runtime_snapshot.pkl",
+    "t10_verification": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/t10_replay_snapshot_verification.json",
+    "t10_start_provenance": "verified_raw_Pi0.5_episode_timestep_10_snapshot; archived_Student_actions_continue_until_predictive_risk_takeover"
+  },
+  "benchmark": "obstacle_avoidance",
+  "environment_seed": 0,
+  "expected_bddl_sha256": "901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c",
+  "expected_model_geometry_sha256": "1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752",
+  "goal_object_semantic_id": "moka_pot_2",
+  "goal_orientation_tolerance_rad": 0.08,
+  "goal_position_tolerance_m": 0.012,
+  "held_phase": "transport",
+  "historical_goal_seed_timestep": 118,
+  "init_state": 0,
+  "level": 0,
+  "open_gripper_action": -1.0,
+  "phase": "pregrasp",
+  "post_pregrasp_handoff_phase": "grasp",
+  "provenance": {
+    "held_object_detection": "live registered-object grasp-state checks for every BDDL object",
+    "target_pose": "historical successful grasp record transformed by the current live target Body pose",
+    "task_constraints": "active native L0T2 BDDL CheckRobotContact and CheckContact predicates",
+    "teacher_generated_goal": false
+  },
+  "recovery": {
+    "allow_horizon_extension": true,
+    "execution_step_budget": 1800,
+    "hard_minimum_clearance_m": 0.01,
+    "horizon_steps": 1800,
+    "maximum_eef_orientation_error_rad": 0.08,
+    "maximum_eef_tracking_error_m": 0.025,
+    "maximum_joint_path_deviation_rad": 0.18,
+    "maximum_replans": 12,
+    "minimum_progress_m": 0.002,
+    "planning_time_budget_s": 360.0,
+    "risk_trigger_distance_m": 0.05,
+    "segment_control_steps": 8,
+    "stagnation_window_steps": 12,
+    "standard_horizon_steps": 1000,
+    "total_wall_budget_s": 14400.0
+  },
+  "rrt_connect": {
+    "connect_max_steps": 20,
+    "edge_max_eef_rotation_rad": 0.02,
+    "edge_max_eef_translation_m": 0.005,
+    "edge_max_geom_center_step_m": 0.004,
+    "edge_max_geom_midpoint_curvature_m": 0.0005,
+    "edge_max_joint_delta_rad": 0.02,
+    "goal_bias": 0.1,
+    "max_candidate_routes": 3,
+    "max_config_checks": 25000,
+    "max_iterations": 2000,
+    "minimum_clearance_m": 0.01,
+    "search_time_budget_s": 360.0,
+    "seed": 20261023,
+    "shortcut_attempts": 250,
+    "step_rad": 0.22
+  },
+  "task_execution": {
+    "approach_stride_m": 0.01,
+    "close_gripper_action": 1.0,
+    "default_stride_m": 0.012,
+    "descent_stride_m": 0.01,
+    "enabled": true,
+    "fixture_activation_controller": null,
+    "fixture_predicate": [
+      "turnon",
+      "flat_stove_1"
+    ],
+    "goal_object_order_source": "verified_archived_episode_phase_order_pot2_then_pot1",
+    "goal_source_is_vlm_teacher": false,
+    "grasp_template_source": "/opt/data/private/gs_opd/rollouts/l0t2_round1_jointspace_rrt_connect_20261023_attempt1/source/source_grasp_template.json",
+    "lift_height_m": 0.045,
+    "lift_stride_m": 0.025,
+    "lift_validation_height_m": 0.03,
+    "maximum_plan_attempts_per_phase": 3,
+    "objects": [
+      {
+        "goal_source": "archived_candidate_07_native_On_success_and_geometry_derived_region_target",
+        "goal_source_artifact": "/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot2_near_goal_osc_recovery_20261022_attempt1/evidence/near_goal_recovery_report.json",
+        "object_id": "moka_pot_2",
+        "predicate": [
+          "on",
+          "moka_pot_2",
+          "flat_stove_1_cook_region"
+        ],
+        "target_pose_in_region": {
+          "position_m": [
+            0.008,
+            -0.008,
+            0.09261
+          ],
+          "quaternion_wxyz": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "goal_source": "archived_final_placement_success_pose_expressed_in_native_region_frame",
+        "goal_source_artifact": "/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_final_placement_demo_20261022_attempt3/evidence/execution_preflight.json",
+        "object_id": "moka_pot_1",
+        "predicate": [
+          "on",
+          "moka_pot_1",
+          "flat_stove_1_cook_region"
+        ],
+        "target_pose_in_region": {
+          "position_m": [
+            -0.065,
+            -0.065,
+            0.09161
+          ],
+          "quaternion_wxyz": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      }
+    ],
+    "phase_control_step_limits": {
+      "approach": 120,
+      "close_gripper": 30,
+      "lift": 80,
+      "precise_placement": 180,
+      "pregrasp": 1,
+      "release": 30,
+      "second_object_recovery": 400,
+      "settle": 40,
+      "stable_grasp": 20,
+      "transport": 450,
+      "withdrawal": 220
+    },
+    "phase_pose_tolerances": {
+      "approach": {
+        "orientation_rad": 0.06,
+        "position_m": 0.008
+      },
+      "precise_placement": {
+        "orientation_rad": 0.05,
+        "position_m": 0.005
+      },
+      "transport": {
+        "orientation_rad": 0.08,
+        "position_m": 0.012
+      },
+      "withdrawal": {
+        "orientation_rad": 0.08,
+        "position_m": 0.012
+      }
+    },
+    "position_action_scale_m": 0.05,
+    "provenance": "human_curated_L0T2_expert_prior_from_native_BDDL_and_archived_successful_OSC_demonstrations",
+    "rotation_action_scale_rad": 0.5,
+    "settle_angular_speed_rad_s": 0.5,
+    "settle_linear_speed_m_s": 0.05,
+    "settle_position_span_m": 0.001,
+    "stable_grasp_control_steps": 3,
+    "support_contact_geom_names": [
+      "flat_stove_1_collision_burner"
+    ],
+    "support_contact_geometry_source": "/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T2_mokapot2_near_goal_osc_recovery_20261022_attempt1/evidence/near_goal_recovery_report.json",
+    "transport_clearance_m": 0.14,
+    "withdrawal_height_m": 0.1
+  },
+  "task_id": 2,
+  "unresolved_goal_phases": [
+    "grasp",
+    "transport",
+    "placement",
+    "second_object_recovery"
+  ]
+}

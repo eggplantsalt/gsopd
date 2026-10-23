@@ -1,12 +1,20 @@
 # Automatic Safety Recovery Engine
 
+**Current task-phase execution status:** the stage controller and L0T2 task
+configuration have since been added. The archived t=238 state is rejected by
+the full robot-geometry gate, and the verified t=10 continuation currently
+stops at the bounded pregrasp replanning limit. Use
+[`AUTOMATIC_TASK_RECOVERY.md`](AUTOMATIC_TASK_RECOVERY.md) for current configs,
+commands, results, and blockers. The remainder of this file records the
+earlier core-engine validation before task phases were implemented.
+
 This engine runs the Student, risk monitor, recovery planner, native OSC_POSE
 controller, and task handoff as one bounded state machine. Its reusable logic is
 in `repair/automatic_recovery.py`; the L0T2 LIBERO adapter is in
 `repair/automatic_recovery_runtime.py`, and the Safety Bridge owns MuJoCo
 geometry, snapshots, isolated prefix checks, and physical execution.
 
-## Run
+## Historical Run (before task-phase integration)
 
 Use a fresh output directory for every run. The archived t=10 run resumes from
 the verified t=10 runtime snapshot; the episode mode starts the unchanged
@@ -77,7 +85,7 @@ returned complete carried-object geometry for every classified scene group
 with 204.2 mm minimum clearance to its forbidden objects. It has not yet been
 validated on L0T0.
 
-## L0T2 task inputs and current limitation
+## Historical L0T2 task inputs and limitation (superseded)
 
 L0T2 constraints come from its active native BDDL predicates and verified
 compiled geometry. Ginger Beer and Place Box keep a 10 mm minimum clearance.
@@ -97,7 +105,7 @@ standard horizon is 1000 and extension is disabled. A task-specific config
 must identify every phase goal and allowed target contact; unresolved stages
 remain fail-closed.
 
-## Verification results (2026-10-23)
+## Previous core-engine verification results (2026-10-23; superseded by the current follow-up)
 
 - Archived t=10 Snapshot run: 228 recovery controls reached the historical Pot
   2 pregrasp goal at episode t=238 after three replans. Local recovery passed.

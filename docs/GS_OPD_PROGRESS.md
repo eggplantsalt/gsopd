@@ -1,6 +1,18 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## Automatic Safety Recovery Engine（2026-10-23；t=10 与完整 Episode 验证完成）
+## Automatic task-phase recovery follow-up（2026-10-23；阶段控制已接入，L0T2 阻塞于预抓取规划预算）
+
+新增通用实时阶段控制器 `research/gs_opd/repair/task_phase_controller.py`，并接入 Automatic Safety Recovery Engine。阶段接口包含预抓取、接近、闭爪、稳定双指抓持、抬升、持物转运、精确放置、释放、撤离、稳定、第二物体恢复和原生任务谓词核验。复核归档中 Pot 2 的 t=118–141 成功抓取、425步 Pot 2 放置修正、135步 Pot 1 Grasp Retargeting 和239步最终放置；抽取并复用的只有 `grasp_retargeting.py` 历史物体坐标变换/接近方向/距离与阶段先验。它们会在当前实时物体位姿上重新计算，动作由当前 EEF/物理状态通过原生 7D OSC_POSE 生成；没有拼接历史动作。L0T2 两个原生 `On` 目标、区域位姿、接触几何和阶段顺序来自已存档 BDDL 与人工整理的成功示范先验，不是 VLM Teacher 生成。`Turnon` 若未满足且没有可信激活控制器会 fail-closed。
+
+先试用旧归档中标作 Pot 2 预抓取的 t=238 Snapshot。全机器人几何检查发现非指部 robot geom 到 Pot 2 只有 0.419 mm，小于配置的 10 mm 余量；引擎在执行动作前拒绝，0 个真实动作。复核后发现该 Snapshot 对应的旧目标其实是 t=118 近接姿态，不是可通过当前完整几何门槛的预抓取点。已将预抓取目标改为历史已验证抓取模板中的物体坐标接近方向和 60.648 mm 接近距离，并按实时 Pot 位姿变换；没有放宽任何安全距离。
+
+再从经核验的原始 t=10 Snapshot 启动独立 Bridge。t=10 的归档 Student 动作前缀经隔离 Snapshot 风险预测后触发自动接管，预测最小余量17.586 mm；没有在主环境执行这段前缀。此后 RRT-Connect 以实时关节状态规划，OSC_POSE 经隔离候选控制前缀验证后在主分支执行。累计118个真实控制转换，2,950/2,950个物理子步检查完整，没有发生不安全转换；实际禁触对象最小余量36.534 mm（episode t=90）。动作、前后 Observation/物理状态、原生谓词、任务阶段、接触监控、RGB 视频和119个主 Snapshot均保存在 `automatic_task_execution_l0t2_t10_seed_20261023_attempt2/`。三次自动规划在跟踪偏差、50 mm风险边界和窄通道入口后均从真实状态重新规划。第三次重规划请求触发每阶段三次规划预算上限；引擎以 `task_phase_planning_attempt_budget_exhausted:pregrasp` 确定失败。失败时 EEF 距预抓取目标232.6 mm，episode t=128，禁触对象余量49.761 mm。没有达到局部恢复成功，未进入抓取/搬运/放置。
+
+结果分类：局部恢复成功=false，完整任务成功=false，完整安全成功=false，标准1000步 Horizon成功=false，扩展 Horizon示范成功=false。t=238预抓取候选和t=10自动恢复都没有完成；因此按用户要求没有启动依赖其成功的原生t=0完整任务实验，也没有生成安全示范候选或训练。已有1093步示范及LeRobot数据未改。
+
+验证：抓取 retargeting、阶段状态机、恢复状态机/预算、逐物理子步覆盖、7D RRT、携物几何、Panda 夹爪、Safety Bridge Snapshot/controller、Observation–Action Writer 定向测试共41项通过；相关模块 `compileall` 通过。用法、输入来源、失败判据和本轮CLI见 [`research/gs_opd/AUTOMATIC_TASK_RECOVERY.md`](../research/gs_opd/AUTOMATIC_TASK_RECOVERY.md)。独立运行归档：t=238几何拒绝 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_runtime_snapshot_20261023_attempt1/`；t=10旧目标被 RRT 端点检查拒绝 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt1/`；修正预抓取目标后的执行前缀 `/opt/data/private/gs_opd/rollouts/automatic_task_execution_l0t2_t10_seed_20261023_attempt2/`。所有 Bridge 使用独立端口并在进程结束时关闭。
+
+## Previous checkpoint: Automatic Safety Recovery handoff boundary（2026-10-23；historical result, superseded by the follow-up above）
 
 已在 `research/gs_opd/repair/` 实现可复用恢复状态机、7D RRT-Connect 规划适配器、L0T2 Safety Bridge/Student 运行时与 CLI。引擎从真实状态预测 Student 风险，隔离 Snapshot 预演候选控制前缀；风险触发后用实时 7D qpos 求解、规划及 OSC_POSE 分段执行，逐物理子步检查全机器人几何、接触、EEF/关节跟踪和任务进展，并在停滞、窄通道及偏离时自动重规划。时间、规划、段长、重规划和执行预算均由配置控制。Ginger Beer / Place Box 的10 mm硬余量不能配置降低。主分支只执行通过隔离预演的真实控制，不直接改 qpos 或物体位置。
 

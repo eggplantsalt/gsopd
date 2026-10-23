@@ -86,6 +86,7 @@ class TaskContext:
     grasp_state_verified: bool
     expert_handoff_available: bool = False
     handoff_policy: str = "student"
+    post_recovery_policy: str | None = None
     unresolved_goal_phases: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -102,6 +103,10 @@ class TaskContext:
             raise ValueError("handoff_policy must be student or expert")
         if self.handoff_policy == "expert" and not self.expert_handoff_available:
             raise ValueError("expert handoff was selected but no task expert is declared")
+        if self.post_recovery_policy not in {None, "student", "expert"}:
+            raise ValueError("post_recovery_policy must be student, expert, or unset")
+        if self.post_recovery_policy == "expert" and not self.expert_handoff_available:
+            raise ValueError("expert post-recovery policy was selected without a task expert")
         if any(not phase for phase in self.unresolved_goal_phases):
             raise ValueError("unresolved goal phase names must be explicit")
         if self.phase in self.unresolved_goal_phases:
@@ -141,6 +146,7 @@ class RecoveryConfig:
     stagnation_window_steps: int = 12
     minimum_progress_m: float = 0.002
     horizon_steps: int = 1000
+    standard_horizon_steps: int = 1000
     allow_horizon_extension: bool = False
 
     def validate(self) -> None:
@@ -150,6 +156,7 @@ class RecoveryConfig:
             "execution_step_budget",
             "stagnation_window_steps",
             "horizon_steps",
+            "standard_horizon_steps",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -298,6 +305,8 @@ class RecoveryBackend(Protocol):
     ) -> np.ndarray | None: ...
 
     def handoff_to_student(self, observation: Observation, context: TaskContext) -> None: ...
+
+    def handoff_to_task_expert(self, observation: Observation, context: TaskContext) -> None: ...
 
     def is_recovery_goal_reached(
         self, observation: Observation, goal: GoalSpec
@@ -457,6 +466,7 @@ class AutomaticSafetyRecoveryEngine:
     def _record_transition(self, action: np.ndarray, observation: Observation, source: str) -> None:
         self.steps = max(self.steps + 1, int(observation.timestep))
         self._physical_transitions += 1
+        self._extended_horizon = self.steps > self.config.standard_horizon_steps
         reason = self._safety_check(observation, self.config)
         if reason:
             self._fail(reason, action_source=source, observation=observation.raw)
@@ -503,6 +513,14 @@ class AutomaticSafetyRecoveryEngine:
                 raise RuntimeError(failure)
             if observation.task_success is True:
                 self.state = RecoveryState.COMPLETE
+                return observation
+            if policy == "expert" and context.metadata.get("requires_rrt_recovery") is True:
+                self._event(
+                    "task_phase_rrt_route_requested",
+                    phase=context.phase,
+                    goal=asdict(context.goal_for_phase(context.phase)),
+                    source=context.metadata.get("task_goal_source"),
+                )
                 return observation
             if policy == "student":
                 raw_action = self.backend.student_action(observation)
@@ -808,18 +826,31 @@ class AutomaticSafetyRecoveryEngine:
                     observation = self._run_policy_until_risk(context, context.handoff_policy)
                     if self.state is RecoveryState.COMPLETE:
                         break
+                    context = self.backend.current_context()
+                    context.validate()
                     observation = self._execute_recovery(observation, context)
                 if self.state is RecoveryState.FAILED:
                     break
                 if self._local_recovery_success:
                     self.state = RecoveryState.HANDOFF
                     self._event("local_recovery_succeeded", goal_phase=self._phase)
-                    if context.handoff_policy == "student":
+                    next_policy = context.post_recovery_policy or context.handoff_policy
+                    if next_policy == "student":
                         handoff_context = self.backend.current_context()
                         handoff_context.validate()
                         self.backend.handoff_to_student(observation, handoff_context)
+                    elif next_policy == "expert":
+                        handoff_context = self.backend.current_context()
+                        handoff_context.validate()
+                        handoff = getattr(self.backend, "handoff_to_task_expert", None)
+                        if handoff is None:
+                            self._fail("task_expert_handoff_is_not_implemented")
+                            break
+                        handoff(observation, handoff_context)
+                    context = self.backend.current_context()
+                    context.validate()
                     self.state = RecoveryState.VERIFY
-                    self._event("task_success_check_started", handoff_policy=context.handoff_policy)
+                    self._event("task_success_check_started", handoff_policy=next_policy)
                     if observation.task_success is True:
                         self.state = RecoveryState.COMPLETE
                         break
@@ -830,7 +861,7 @@ class AutomaticSafetyRecoveryEngine:
                         break
                 if self.config.horizon_steps <= self.steps and not self.config.allow_horizon_extension:
                     self._fail("standard_1000_step_horizon_exhausted")
-                elif self.steps >= self.config.horizon_steps and self.config.allow_horizon_extension:
+                elif self.steps > self.config.standard_horizon_steps and self.config.allow_horizon_extension:
                     self._extended_horizon = True
             if self.state is RecoveryState.COMPLETE:
                 self._event("complete_task_success", task_success=True)
@@ -861,8 +892,10 @@ class AutomaticSafetyRecoveryEngine:
             local_recovery_success=self._ever_local_recovery_success,
             complete_task_success=final_task_success,
             complete_safety_success=bool(final_task_success and final_safe),
-            standard_horizon_success=bool(final_task_success and self.steps <= self.config.horizon_steps),
-            extended_horizon=self._extended_horizon or self.steps > self.config.horizon_steps,
+            standard_horizon_success=bool(
+                final_task_success and self.steps <= self.config.standard_horizon_steps
+            ),
+            extended_horizon=self._extended_horizon or self.steps > self.config.standard_horizon_steps,
             steps_executed=self._physical_transitions,
             initial_episode_timestep=self._initial_timestep,
             final_episode_timestep=self.steps,
