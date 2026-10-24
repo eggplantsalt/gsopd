@@ -1,16 +1,34 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：Episode 9 t=249 Snapshot恢复门失败并停止（2026-10-24）
+## 最新进度：t=236 Approach handoff死循环已修复；有界抓取重接入仍无可行解（2026-10-24）
 
-按Round 0 Task-Success-First主线，只读核验并尝试恢复已归档Episode 9的Pot 2稳定双指抓持末态t=249 Snapshot。归档Snapshot完整包含MuJoCo integration state、机器人OSC控制器状态/缓冲、夹爪当前动作、task bookkeeping、任务对象属性、观测缓存和RNG；317个integration-state值与Episode 9轨迹t=249末态逐项一致，最大绝对差0。Snapshot SHA-256 `3e142c23aa2e0cad30569b350b6a4a4e83e2152ec34891f0ecd580d30c3d81c0`，记录模型几何指纹`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`。新隔离Bridge接受相同场景/任务与BDDL身份，但原生Snapshot恢复拒绝：`Runtime Snapshot model geometry differs from the active Bridge`。当前Bridge几何指纹未随错误返回，原因尚不能细分。未修改校验、未直接写物理状态；恢复失败后不发Observation/动作，物理动作和MuJoCo子步均为0，Bridge已关闭。另核实Bridge Runtime Snapshot没有保存Bridge外部Python `TaskPhaseController`、phase anchor、阶段/重规划计数；事件只记录t=249进入`lift`，没有完整后端控制器检查点。
+**死循环根因已由调用判据不一致确认。** 归档运行配置同时设全局恢复到达阈值12 mm/0.08 rad与Approach阶段阈值8 mm/0.06 rad。t=236时EEF位置误差11.2673916 mm，恢复引擎的`is_recovery_goal_reached()`按全局阈值返回已到达；`TaskPhaseController.update()`按Approach阶段阈值保持Approach。隔离下一动作又因`gripper0_hand_collision`到Pot 2仅9.207675 mm被Safety Bridge拒绝，物理timestep不变。调用链于是重复“unsafe预测→接管→恢复目标被全局阈值判成功→task expert handoff→同一动作再被拒绝”，总计94次、没有物理进展。没有通过放宽阶段或安全精度修复。
 
-静态检查发现robosuite gripper `contact_geoms`也覆盖Palm/hand collision。为满足“只许可实际手指—目标物接触”，已将`automatic_recovery_runtime.py`的目标接触白名单限定到`finger1/2`的collision mesh与pad四个Geom，并要求四者全部可解析，否则fail-closed。该收窄及t=249持物期间许可修复均未物理复验；没有为验证此代码另开环境动作。
+**判据统一及有限停滞保护已实现。** `TaskPhaseController.is_pose_goal_reached()`成为共用阶段判据；恢复引擎和阶段更新都查询当前阶段的阈值，Approach仍为8 mm/0.06 rad。`RecoveryConfig.maximum_same_state_handoffs`默认3；同一物理timestep、同一阶段且无物理/阶段进展的handoff达到上限时以`same_state_handoff_without_physical_progress_limit_exceeded`fail-closed。新增针对11.267 mm仍处于Approach、阶段边界内转换及重复handoff上限的回归测试。定向套件25项通过：
 
-归档前缀安全记录重新核对通过：已验证t=0→10回放有10动作、250/250子步且机器人—Ginger Beer/Place Box接触事件为0；Episode 9 t=10→249有239动作、5,975/5,975子步完整，离线扫描无禁触、自碰撞、未许可环境接触或未知项。Ginger Beer与Place Box最小余量10.190708/47.479514 mm；组合证据为249动作、6,225子步。Episode 9 t=249 fail-closed记录的目标指接触穿透为0.528 mm，本在2 mm许可上限内；当时仅因目标夹爪许可集合被清空而停止。当前程序的持物许可修复没有真实物理复验，因为Snapshot恢复兼容门失败。
+```bash
+/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m unittest research.gs_opd.repair.test_task_phase_controller research.gs_opd.repair.test_automatic_recovery_runtime research.gs_opd.repair.test_automatic_recovery
+```
 
-历史碰撞布局差异：原成功链21–56 Ginger Beer接触后，t=20→56瓶子位移61.333 mm/转角0.8113 rad，至t=118相对t=20位移351.670 mm；Pot 2 t=118→141另移动10.602 mm/转角0.2752 rad。因此旧抓取关节解不能直接拷贝。Episode 9从无该历史碰撞的安全t=10 Snapshot重新搜索并真实抓稳；该Episode t=10→249 Ginger Beer位移2.635 μm，Pot 2随新抓持位移3.071 mm/转角0.09617 rad，Pot 1和Place Box不变。
+**t=236有界抓取与抬升筛选没有得到安全候选。** 以归档t=236真实Snapshot复原，模型几何SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`、Snapshot SHA `355c59e82470702a2e7953d2fb00c45dc3e8c4cb2da1a2f48a2a7acae50d7a28`、Integration State SHA `a299ea309f78435c868306716bfa403834d20f3599473793b25612e93207c0f8`均核对通过。原scratch搜索24组实质不同的腕/接近/7D冗余候选，151.27 s，0/24全链离线可行：12组在预抓取全几何/自碰撞处失败，12组在关节限位内未找到MuJoCo IK。所有候选失败于预抓取，未调用RRT（0构型检查）；严格许可仍只有指Geom 76/77/79/80，非指、Ginger Beer、Place Box均不豁免，10 mm和合法指接触2 mm门槛未变。
 
-本轮恢复失败后按用户要求停止，没有启动新Episode、抬升、搬运、放置、LoRA或候选搜索；新增候选、筛查、RRT及物理动作成本均为0。此次目标下原生任务成功、完整安全成功、标准1000步成功和1800步扩展示范成功均为false，不生成Round 0种子。只读探针代码为`research/gs_opd/repair/audit_episode9_t249_snapshot_restore.py`；完整机器结果、日志和快照末态审计在`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_restore_audit_20261024/`。历史1093步示范、Episode 8/9以及全部LeRobot数据未修改。
+**按要求追加独立CuRobo生成器评估，仍未得到可执行候选。** 在独立Python 3.11环境安装官方CuRobo源码（commit `78fd485fa82d9b9a063fb4985e371814587e666a`），复用已有CUDA PyTorch 2.11.0+cu130、Warp 1.18.0和RTX 4090。官方Franka GPU IK smoke成功；针对t=236的24个对齐接近方向/腕部滚转目标运行96个阶段IK，52个返回CuRobo IK解；其联合`MotionPlanner.plan_grasp`选择候选4后，在“当前→预抓取”阶段失败，接近/抓取/抬升均未规划成功。CuRobo不含LIBERO精确场景网格，只作为提议器，所有提议随后经当前精确MuJoCo、10 mm全Geom/自碰撞及四指许可规则复筛：0/24可行。结果分类为15组MuJoCo预抓取IK未达到3 mm/0.035 rad门槛，7组预抓取几何/自碰撞（包括Place Box或Pot 1侵入，最差−48.861 mm），2组最终接近路径触犯Pot 2 10 mm/接触语义。RRT路线0，物理分支0；未执行动作。两轮搜索耗时151.27 s + 75.29 s（226.56 s），CuRobo联合优化本身12.29 s；无RRT构型检查。既有与新增两轮合计48组有界目标搜索，不能据此宣称抓取终点全局不存在，但当前有证据的安全重接入构型/路径集合为空，分类为“有界候选未通过MuJoCo验证”，非物理抓取失败或后续任务重接入失败。
+
+可复现入口：`research/gs_opd/repair/search_t236_pot2_grasp_reentries.py`（24组scratch搜索）和`research/gs_opd/repair/run_t236_curobo_grasp_reentries.py`（恢复同一t=236 Snapshot、CuRobo多目标IK/联合接近抓取抬升建议、精确MuJoCo复筛及候选RRT）。CuRobo专用入口`research/gs_opd/repair/curobo_t236_plan_grasps.py`运行于`/workspace/gsopd_curobo_eval/.venv`。完整报告在`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_grasp_search_20261024/t236_pot2_grasp_search.json`和`episode1_t236_curobo_search_20261024b/t236_curobo_exact_mujoco_report.json`。复跑时为 scratch 搜索指定新的`--output-dir`以保留现有归档；CuRobo入口默认写到`episode1_t236_curobo_search_20261024c/`。当前停在Pot 2 Approach目标接入；任务成功/全过程安全成功均false，没有Round 0安全种子，不训练LoRA。历史1093步示范、Episode 8/9和全部LeRobot数据不变。
+
+## 历史进度：t=249恢复顺序已核清；上一轮授权Episode在Approach停滞后停止（2026-10-24）
+
+**Snapshot兼容性失败根因已定位。** 之前的t=249探针漏掉正式入口在Bridge启动后执行的原生`reset`。零物理动作重放记录：Bridge startup模型SHA为`75c8db457aa094e5efc43050a4f07192a9e8dca1379e84a67f4854800466d574`，reset后与归档SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`完全一致。两阶段编译签名唯一不同字段是`body_pos`（32×3）；Python 3.10.21、MuJoCo 3.3.2、robosuite 1.4.0、LIBERO 0.1.0、NumPy 1.26.4及BDDL SHA一致。按正式顺序恢复t=249 Snapshot成功，317维MuJoCo integration state逐元素精确一致。详细字段指纹在`episode9_t249_reset_order_audit_20261024b/restore_probe.json`。
+
+按唯一获批预算，从原始Student t=10 Snapshot启动一条新物理Episode，task expert无LoRA，复用`tsfs_01_axis2_rot+30`，没有重筛24组候选。TaskPhaseController在同一Episode自然转入`pregrasp`（t=10）和`approach`（t=213）。在线RRT-Connect共接受2条规划，6,332构型检查、120.18秒；最小路径余量25.031 mm和13.339 mm。
+
+实机到全局t=236、`approach`阶段，共提交226动作、5,650子步，全部25/25子步接触/间隙记录完整。执行前缀没有机器人接触、自碰撞、未许可环境接触或未知项；Ginger Beer、Place Box、Pot 2最近机器人几何的最小余量分别为12.122、48.828、11.815 mm。实际安全许可的Panda几何ID精确为76/77/79/80（finger1/2 collision与pad）；hand/palm ID74仍受10 mm约束。几何清单与安全预测里实际使用的ID相符，证据见`episode1/whitelist_audit/whitelist_audit.json`。
+
+`t=236 approach`下隔离预测检测到下一动作会令`gripper0_hand_collision`与`moka_pot_2_g12`净距降至9.208 mm（<10 mm），预测动作未提交。EEF距恢复目标11.267 mm，已在12 mm位置容差内，但阶段仍停在`approach`；同一7D动作与“unsafe前缀→local recovery success→expert handoff”循环重复94次且没有物理动作，按明确停滞条件fail-closed。Pot 2未稳定抓持、未抬升、未放置；Pot 1阶段未开始。原生状态Pot1 On=false、Pot2 On=false、Stove Turnon=true，reward=0、done=false。
+
+本轮增量成本：24候选重筛0；2条在线RRT规划、6,332检查/120.18秒；226个真实动作、5,650个物理子步。被复用的历史候选搜索成本为24组候选、一次选中路线预检4,448检查/101.818秒。安全前缀、t=236可恢复Snapshot、原始事件日志、两路227帧视频及部分OA NPZ保存在`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1/`。部分NPZ动作/状态/监测数据来自原始日志，相机数据由MP4解码且为有损；SIGINT在TrajectoryWriter finalize前发生，标准`observation_action_trace.npz`未生成。
+
+结论：原生任务成功=false、完整安全成功=false、标准1000步成功=false、1800步扩展示范成功=false；不建立Round 0种子、不训练LoRA。配置生成入口`research/gs_opd/repair/prepare_tsfs01_episode_config.py`，执行入口`research/gs_opd/repair/automatic_recovery_cli.py`。这次授权的Episode已用完；历史1093步任务成功示范、Episode 8/9及所有LeRobot数据均保留。
 
 ## 历史进度：Task-Success-First Safety Reconstruction（2026-10-23；两次真实尝试后停止）
 

@@ -19,8 +19,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import pickle
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from research.gs_opd.repair.automatic_recovery_runtime import BridgeProcess
 
@@ -31,6 +34,10 @@ DEFAULT_ARCHIVE = Path(
     "task_success_first_safety_reconstruction_l0t2_20261023_attempt1"
 )
 DEFAULT_PYTHON = Path("/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python")
+
+
+class _PythonObjectState:
+    """Compatibility placeholder for helper states pickled by the Bridge."""
 
 
 def _json_default(value: Any) -> Any:
@@ -60,7 +67,7 @@ def main() -> int:
     payload = snapshot_path.read_bytes()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     report: dict[str, Any] = {
-        "schema": "gs_opd_episode9_t249_restore_probe.v1",
+        "schema": "gs_opd_episode9_t249_reset_order_audit.v1",
         "read_only": True,
         "snapshot_path": str(snapshot_path),
         "snapshot_sha256": hashlib.sha256(payload).hexdigest(),
@@ -70,6 +77,7 @@ def main() -> int:
         "demonstration_horizon": 1800,
         "physical_action_steps": 0,
         "physical_substeps": 0,
+        "native_reset_operations": 0,
         "post_restore_observation_requested": False,
     }
     bridge = BridgeProcess(
@@ -84,6 +92,74 @@ def main() -> int:
             seed=int(config["environment_seed"]),
             demonstration_horizon=1800,
         )
+        pre_observation = bridge.request(
+            {"op": "observe", "include_snapshot_state": True}
+        )
+        pre_fingerprint = bridge.request(
+            {"op": "compiled_model_fingerprint_details"}
+        )
+        report["bridge_startup"] = {
+            "timestep": pre_observation.get("timestep"),
+            "model_geometry_sha256": pre_observation.get("scene_metadata", {}).get(
+                "model_geometry_sha256"
+            ),
+            "fingerprint_details": pre_fingerprint,
+        }
+
+        reset_response = bridge.request({"op": "reset"})
+        report["native_reset_operations"] = 1
+        post_observation = bridge.request(
+            {"op": "observe", "include_snapshot_state": True}
+        )
+        post_fingerprint = bridge.request(
+            {"op": "compiled_model_fingerprint_details"}
+        )
+        report["after_formal_native_reset"] = {
+            "timestep": reset_response.get("timestep"),
+            "model_geometry_sha256": reset_response.get("scene_metadata", {}).get(
+                "model_geometry_sha256"
+            ),
+            "fingerprint_details": post_fingerprint,
+            "observed_timestep": post_observation.get("timestep"),
+        }
+        before_fields = pre_fingerprint.get("component_digests", {})
+        after_fields = post_fingerprint.get("component_digests", {})
+        report["startup_vs_reset_component_changes"] = {
+            name: {
+                "before": before_fields.get(name),
+                "after": after_fields.get(name),
+            }
+            for name in sorted(set(before_fields) | set(after_fields))
+            if before_fields.get(name) != after_fields.get(name)
+        }
+        after_hash = report["after_formal_native_reset"]["model_geometry_sha256"]
+        report["archive_fingerprint_match_after_reset"] = (
+            after_hash == report["expected_model_geometry_sha256"]
+        )
+        report["reset_timestep_zero_verified"] = (
+            reset_response.get("timestep") == 0
+            and post_observation.get("timestep") == 0
+        )
+        if not report["reset_timestep_zero_verified"]:
+            report["restore_status"] = "not_attempted_reset_timestep_invalid"
+            report["restore_error"] = "native_reset_did_not_leave_timestep_zero"
+            report["scene_and_model_validation"] = "failed"
+            report["restore_state"] = None
+            _write_report(args.output_dir, report)
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=_json_default))
+            return 2
+        if not report["archive_fingerprint_match_after_reset"]:
+            report["restore_status"] = "not_attempted_post_reset_fingerprint_mismatch"
+            report["restore_error"] = (
+                "post-reset compiled geometry fingerprint differs from archived "
+                "Episode 9 model; strict restore was not attempted"
+            )
+            report["scene_and_model_validation"] = "failed_at_model_geometry_signature"
+            report["restore_state"] = None
+            _write_report(args.output_dir, report)
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=_json_default))
+            return 2
+
         try:
             response = bridge.request(
                 {"op": "restore_runtime_snapshot", "payload": payload}
@@ -91,24 +167,10 @@ def main() -> int:
         except RuntimeError as exc:
             report["restore_status"] = "restore_failed"
             report["restore_error"] = str(exc)
-            report["scene_and_model_validation"] = (
-                "failed_at_model_geometry_signature"
-                if "model geometry differs" in str(exc)
-                else "failed"
-            )
+            report["scene_and_model_validation"] = "failed"
             report["restore_state"] = None
-            report["post_restore_observation_requested"] = False
-            (args.output_dir / "restore_probe.json").write_text(
-                json.dumps(
-                    report,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                    default=_json_default,
-                )
-                + "\n"
-            )
-            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            _write_report(args.output_dir, report)
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=_json_default))
             return 2
         report["restore_status"] = response.get("status")
         report["restore_error"] = response.get("error")
@@ -121,28 +183,51 @@ def main() -> int:
         if response.get("status") != "restored":
             report["restore_state"] = None
             report["post_restore_observation_requested"] = False
-            (args.output_dir / "restore_probe.json").write_text(
-                json.dumps(
-                    report,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                    default=_json_default,
-                )
-                + "\n"
-            )
+            _write_report(args.output_dir, report)
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             return 2
 
         report["restore_state"] = response.get("snapshot_state")
         report["post_restore_observation_requested"] = True
+        archived_envelope = pickle.loads(payload)
+        archived_mujoco_state = np.asarray(
+            archived_envelope["snapshot"]["mujoco_state"], dtype=np.float64
+        )
+        restored_mujoco_state = np.asarray(
+            response["snapshot_state"]["mujoco_integration_state"],
+            dtype=np.float64,
+        )
+        report["archived_integration_state_shape"] = list(
+            archived_mujoco_state.shape
+        )
+        report["restored_integration_state_shape"] = list(
+            restored_mujoco_state.shape
+        )
+        report["archived_integration_state_exactly_restored"] = bool(
+            archived_mujoco_state.shape == restored_mujoco_state.shape
+            and np.array_equal(archived_mujoco_state, restored_mujoco_state)
+        )
+        report["archived_reward_done"] = {
+            "reward": archived_envelope["snapshot"]["bridge_reward"],
+            "done": archived_envelope["snapshot"]["bridge_done"],
+            "task_bookkeeping": archived_envelope["snapshot"][
+                "task_bookkeeping"
+            ],
+        }
+        report["restored_reward_done"] = {
+            "reward": response.get("reward"),
+            "done": response.get("done"),
+            "timestep": response["snapshot_state"]["mujoco_integration_state"][0],
+        }
         observation = bridge.request(
             {"op": "observe", "include_snapshot_state": True}
         )
         native = bridge.request({"op": "native_task_status"})
+        contacts = bridge.request({"op": "inspect_contacts"})
         exported = bridge.request({"op": "export_runtime_snapshot"})
         report["observed_timestep"] = observation.get("timestep")
         report["native_task_status"] = native
+        report["restored_contacts"] = contacts
         report["reexport_status"] = exported.get("status")
         report["reexport_sha256"] = exported.get("payload_sha256")
         report["snapshot_payload_byte_identical_after_restore"] = (
@@ -151,20 +236,24 @@ def main() -> int:
         report["restore_state_matches_observation_timestep"] = (
             observation.get("timestep") == 249
         )
-        (args.output_dir / "restore_probe.json").write_text(
-            json.dumps(
-                report,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-                default=_json_default,
-            )
-            + "\n"
-        )
+        _write_report(args.output_dir, report)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=_json_default))
-        return 0 if report["snapshot_payload_byte_identical_after_restore"] else 3
+        return 0 if report["archived_integration_state_exactly_restored"] else 3
     finally:
         bridge.close()
+
+
+def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
+    (output_dir / "restore_probe.json").write_text(
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        )
+        + "\n"
+    )
 
 
 if __name__ == "__main__":

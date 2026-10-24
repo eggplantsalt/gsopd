@@ -1,22 +1,34 @@
 # GS-OPD 总体路线
 
-## 最新总体状态：Episode 9恢复门不兼容，Round 0安全重构停止（2026-10-24）
+## 最新总体状态：t=236 handoff死循环已修复；48组候选均未通过精确MuJoCo检查（2026-10-24）
 
-### Round 0执行状态
+Round 0目标仍是先产生一条完整安全成功L0T2示范；目前没有安全重接入构型、物理抓取或成功种子。t=236的重复handoff来自恢复全局12 mm/0.08 rad与Approach 8 mm/0.06 rad判据分裂：EEF误差11.267 mm时恢复层回报成功，阶段层仍判未到；9.208 mm的hand–Pot 2预测余量使同一动作连续被安全拒绝，循环94次。两层现已统一按当前阶段的判据，且同状态无进展handoff默认至多3次后fail-closed；25项相关回归测试通过。
 
-Task-Success-First路线已在同一合法Episode 9中得到Pot 2真实稳定双指抓持状态t=249；但用户要求先严格恢复该Snapshot，再验证接触许可修复和继续抬升。归档场景及BDDL身份可匹配，当前原生Bridge恢复接口却因模型几何签名不匹配而拒绝Snapshot。恢复响应未提供活动模型签名，故差异根因未确认。Bridge Snapshot也不包含外部Python `TaskPhaseController`、phase anchor和重规划状态；t=249事件只证明阶段名为`lift`，不构成完整控制器检查点。没有绕开原生模型校验，也没有执行物理动作或进入新Episode。
+在恢复校验通过的同一t=236 Snapshot上，MuJoCo scratch筛查24组腕姿/方向/冗余IK候选，0/24完整可行（12组预抓取几何/自碰撞、12组无关节限位内IK）；CuRobo Franka GPU多目标IK另生成24组候选，96个阶段目标中52个CuRobo IK成功，但联合`plan_grasp`在预抓取规划失败。全部候选回到当前MuJoCo模型与指Geom 76/77/79/80白名单复筛后仍0/24可行：15组预抓取IK失败、7组预抓取Geom/自碰撞、2组Approach触犯Pot 2的10 mm/接触语义。RRT候选0、物理分支0、执行动作0。CuRobo只提供提议，不认证安全。
 
-只读源码检查另发现robosuite Panda `contact_geoms`包含Palm/hand collision。任务接触许可现已收窄到明确命名的finger1/2 collision mesh及pad四个Geom，缺失时fail-closed；这项最小代码收窄和原持物许可修复均未物理验证。
+因此本轮结论是有界筛查未找到安全抓持/抬升终点或可达路径，不能扩大成全局不可达证明；也未测试物理闭爪、30 mm真实抬升或后续Pot 2放置/Pot 1重接入。当前保留已采集的t=236前缀及Snapshot，不新增Episode、不训练LoRA。复现入口是`research/gs_opd/repair/search_t236_pot2_grasp_reentries.py`和`research/gs_opd/repair/run_t236_curobo_grasp_reentries.py`，报告位于Round 0归档的`episode1_t236_grasp_search_20261024/`与`episode1_t236_curobo_search_20261024b/`。
 
-t=0→249历史可用前缀有249动作、6,225个完整子步，监测无禁触、自碰撞或遗漏；Ginger Beer/Place Box最小余量10.190708/47.479514 mm。恢复失败意味着t=249之后的抓持控制器阶段内部态与许可策略没有完成恢复后验证，不能把归档中的安全抓持提升为可续跑的安全成功轨迹。原生任务、完整安全、标准1000步及1800步扩展成功均为false；Round 0候选和LoRA均未产生。
+后续路线只在产生新的、有来源的抓取/接近假设后继续有限离线搜索；任何真实OSC_POSE Snapshot分支都必须先通过精确全机器人预抓取、Approach、闭爪稳定持有、≥30 mm抬升和safe-exit几何筛选，且仍使用每次RRT最多3候选、50/60 mm风险滞回、进展型预算与停滞退出。不得降低10 mm约束或扩大finger whitelist。历史1093步任务成功示范、Episode 8/9和所有LeRobot数据保持原样。
 
-旧示范动作21–56确实使Ginger Beer从t=20到t=56移动61.333 mm；到t=118相对t=20累计移动351.670 mm。Pot 2在旧t=118→141抓持阶段移动10.602 mm。Episode 9基于无碰撞的t=10安全布局重新规划并独立物理抓持，所以当时持物抓取构型适用于Episode 9当前状态，但不等同于旧成功轨迹关节姿态可直接复用。
+## 上一轮总体状态：Round 0首条种子未取得；一次授权Episode在Approach处停机（2026-10-24）
 
-### 路线停靠点
+### 结果
 
-当前阻塞归类为**归档Runtime Snapshot与当前编译模型不兼容**，而非安全抓取终点不存在、RRT路径不可达或物理抓取失败。严格恢复探针与审计在`research/gs_opd/repair/audit_episode9_t249_snapshot_restore.py`及归档`episode9_t249_restore_audit_20261024/`。恢复响应明确失败后已按要求关闭Bridge，零动作、零子步；本轮不追加Episode或候选搜索。需先解决并可证明运行时模型指纹兼容，后续才有资格评估对原Episode 9的安全状态续接；不得通过放宽10 mm禁触约束、跳过Snapshot模型检查或直接改qpos解决。
+t=249直接restore失败是探针遗漏正式入口的原生`reset`顺序；reset后模型SHA与归档完全一致，编译字段变化只涉及`body_pos`，运行依赖和BDDL指纹相同。t=249 Runtime Snapshot在正式顺序下原生恢复成功、317维integration state精确一致。由于外部`TaskPhaseController`不在Bridge Snapshot中，本轮按要求没有拼接t=249后端状态，而从原始Student t=10 Snapshot启动新Episode。
 
-1093步历史任务成功示范及所有现有LeRobot数据保持原样。Task-Success-First候选搜索历史成本仍为24个离线候选、216次复用筛查、1个离线可行候选；本轮增量搜索成本为0。
+复用`tsfs_01_axis2_rot+30`且未重筛24候选。TaskPhaseController自然推进到Pot 2 Approach。t=236之前的226动作、5,650/5,650个子步安全记录通过：执行中的Ginger Beer最小余量12.122 mm、Place Box 48.828 mm；Panda接触许可精确限于四个finger collision/pad Geom，Palm/hand持续受约束。
+
+Approach下一动作的隔离预测检测到Palm/hand—Pot 2净距9.208 mm，低于10 mm要求；动作被拒绝。EEF距恢复目标11.267 mm，已在12 mm位置容差内，但阶段仍为`approach`；同一7D动作触发94次相同自动接管/handoff循环，没有物理推进。按停滞 fail-closed 规则停止。停机阶段是Pot 2 Approach，非规划不可达、非物理抓取失败：RRT到达预抓取并通过；失败是Approach末端动作将仍受约束的hand几何带入Pot 2 10 mm边界，现有phase handoff在相同timestep循环。
+
+### 验收和资源边界
+
+当前新Episode任务成功=false、完整物理安全成功=false（已执行前缀通过但未完成任务）、标准1000步成功=false、1800步扩展示范成功=false。没有30 mm抬升或任何放置，因此不生成Round 0种子。两路视频、226步动作/子步事件、t=236 Runtime Snapshot和从MP4恢复的部分OA数据保存在`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1/`。TrajectoryWriter未finalize；失败记录不用于训练。没有重跑候选、插值扩增或LoRA。
+
+本次增量搜索为0个新抓取候选、2条在线RRT（6,332构型检查、120.18秒）、226个物理动作。历史24组候选、选中预检路线4,448检查/101.818秒作为先验保留，不计作本轮重搜。 t=10安全前缀、原始1093步任务成功示范和全部LeRobot数据保留。
+
+### 下一停靠点
+
+授权的一次完整Episode已用完，本轮不继续物理执行。下一步先对失败动作做局部静态诊断：令真实`approach`目标/阶段切换在hand/Palm及全机械臂Geoms仍保持≥10 mm时可行，同时只对四个真实手指Geom允许目标物接触；修复同timestep无动作handoff循环的早退保护。不得改10 mm硬边界、不得把hand加入白名单、不得重开24候选搜索。任何新完整物理Episode需要新的明确预算。
 
 ## 历史总体路线状态：Task-Success-First 安全重构未达示范验收（2026-10-23）
 

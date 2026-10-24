@@ -2603,6 +2603,61 @@ def _planning_model_signature(model):
     return digest.hexdigest()
 
 
+def _planning_model_signature_details(model):
+    """Expose component digests for zero-action model compatibility audits."""
+    import importlib.metadata
+    import platform
+
+    fields = (
+        "body_parentid", "body_pos", "body_quat", "body_mocapid", "qpos0",
+        "jnt_type", "jnt_bodyid", "jnt_pos", "jnt_axis", "jnt_qposadr",
+        "geom_bodyid", "geom_type", "geom_dataid", "geom_pos", "geom_quat",
+        "geom_size", "geom_rbound", "geom_contype", "geom_conaffinity",
+        "geom_margin", "pair_geom1", "pair_geom2", "pair_margin",
+        "mesh_vertadr", "mesh_vertnum", "mesh_vert", "mesh_face",
+        "site_bodyid", "site_pos", "site_quat", "site_size", "site_type",
+    )
+    components = {}
+    for name in fields:
+        values = np.ascontiguousarray(getattr(model, name))
+        components[name] = {
+            "dtype": str(values.dtype),
+            "shape": list(values.shape),
+            "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+        }
+    components["names"] = {
+        "dtype": "bytes",
+        "shape": [len(model.names)],
+        "sha256": hashlib.sha256(bytes(model.names)).hexdigest(),
+    }
+    gravity = np.asarray(model.opt.gravity, dtype=np.float64)
+    components["opt.gravity"] = {
+        "dtype": str(gravity.dtype),
+        "shape": list(gravity.shape),
+        "sha256": hashlib.sha256(gravity.tobytes()).hexdigest(),
+        "value": gravity.tolist(),
+    }
+    distributions = {}
+    for distribution in ("mujoco", "robosuite", "libero", "numpy", "gym"):
+        try:
+            distributions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            distributions[distribution] = None
+    return {
+        "model_geometry_sha256": _planning_model_signature(model),
+        "component_digests": components,
+        "runtime": {
+            "python": platform.python_version(),
+            "mujoco_api": getattr(mujoco, "__version__", None),
+            "numpy_api": np.__version__,
+            "distributions": distributions,
+            "bridge_source": str(Path(__file__).resolve()),
+            "bddl_path": scene_metadata.get("bddl_path"),
+            "bddl_sha256": scene_metadata.get("bddl_sha256"),
+        },
+    }
+
+
 def _planning_cache_signature(data):
     import hashlib
 
@@ -5205,6 +5260,19 @@ try:
                                 f"{type(exc).__name__}: {exc}"
                             ),
                         }
+                elif request["op"] == "compiled_model_fingerprint_details":
+                    try:
+                        result = _planning_model_signature_details(
+                            env.sim.model._model
+                        )
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "error": (
+                                "Compiled model fingerprint detail query failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
                 elif request["op"] == "task_semantic_geometry_bindings":
                     try:
                         result = _task_semantic_geometry_bindings()
@@ -5226,6 +5294,15 @@ try:
                             "status": "unavailable",
                             "native_goal_values": [],
                             "task_success": None,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "inspect_contacts":
+                    try:
+                        result = _collect_contacts()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "contacts": [],
                             "error": f"{type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "native_goal_query":
@@ -5339,19 +5416,32 @@ try:
                             request.get("safety_geometry_policy")
                         )
                         finger_groups, _closure = _tracking_gripper_sides(env.robots[0])
-                        gripper_component_bodies = set()
-                        for finger_geom_id in finger_groups["left"] | finger_groups["right"]:
-                            body_id = int(env.sim.model._model.geom_bodyid[int(finger_geom_id)])
-                            while body_id > 0:
-                                body_name = str(env.sim.model.body_id2name(body_id) or "").lower()
-                                if "gripper" not in body_name and "finger" not in body_name:
-                                    break
-                                gripper_component_bodies.add(body_id)
-                                body_id = int(env.sim.model._model.body_parentid[body_id])
-                        gripper_component_geoms = sorted(
-                            geom_id for geom_id in policy["robot_geom_ids"]
-                            if int(env.sim.model._model.geom_bodyid[int(geom_id)]) in gripper_component_bodies
+                        finger_geom_ids = sorted(
+                            finger_groups["left"] | finger_groups["right"]
                         )
+                        required_finger_suffixes = {
+                            "finger1_collision",
+                            "finger1_pad_collision",
+                            "finger2_collision",
+                            "finger2_pad_collision",
+                        }
+                        finger_geom_names = {
+                            str(env.sim.model.geom_id2name(int(geom_id)))
+                            for geom_id in finger_geom_ids
+                        }
+                        matched_finger_suffixes = {
+                            suffix
+                            for name in finger_geom_names
+                            for suffix in required_finger_suffixes
+                            if name.endswith(suffix)
+                        }
+                        if (
+                            len(finger_geom_ids) != 4
+                            or matched_finger_suffixes != required_finger_suffixes
+                        ):
+                            raise ValueError(
+                                "candidate_screen_requires_exact_four_Panda_finger_mesh_pad_geoms"
+                            )
                         result = screen_grasp_candidates(
                             env,
                             request.get("candidates"),
@@ -5360,7 +5450,7 @@ try:
                             target_root_body_id=request.get("target_root_body_id"),
                             left_finger_geom_ids=sorted(finger_groups["left"]),
                             right_finger_geom_ids=sorted(finger_groups["right"]),
-                            gripper_geom_ids=gripper_component_geoms,
+                            gripper_geom_ids=finger_geom_ids,
                             closed_gripper_qpos=request.get("closed_gripper_qpos"),
                             predicted_stable_object_pose_world=request.get("predicted_stable_object_pose_world"),
                             start_state_sha256=current_state_hash,

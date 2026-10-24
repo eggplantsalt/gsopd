@@ -81,6 +81,22 @@ def _exact_pair_distance(mujoco, model, data, geom_a, geom_b):
     return value if np.isfinite(value) and np.isfinite(segment).all() else None
 
 
+def validate_finger_only_contact_geoms(
+    left_finger_geom_ids: list[int],
+    right_finger_geom_ids: list[int],
+    allowed_gripper_geom_ids: list[int],
+) -> set[int]:
+    """Require the contact exception to equal the two physical finger sides."""
+    left = {int(value) for value in left_finger_geom_ids}
+    right = {int(value) for value in right_finger_geom_ids}
+    allowed = {int(value) for value in allowed_gripper_geom_ids}
+    if not left or not right or left & right:
+        raise ValueError("both_disjoint_verified_gripper_finger_sides_are_required")
+    if allowed != left | right:
+        raise ValueError("grasp_contact_exception_must_contain_only_the_verified_finger_geoms")
+    return allowed
+
+
 def carried_object_world_transform(eef_world_transform, eef_to_object_transform):
     """Compose the measured grasp transform at a candidate EEF pose."""
     eef = np.asarray(eef_world_transform, dtype=np.float64)
@@ -554,12 +570,12 @@ def screen_grasp_candidates(
         "left": set(int(item) for item in left_finger_geom_ids),
         "right": set(int(item) for item in right_finger_geom_ids),
     }
-    gripper_geoms = set(int(item) for item in gripper_geom_ids)
-    if not finger_sides["left"] or not finger_sides["right"]:
-        raise ValueError("both_verified_gripper_finger_geom_sides_are_required")
-    if not (finger_sides["left"] | finger_sides["right"]).issubset(gripper_geoms):
-        raise ValueError("verified_gripper_geometry_does_not_cover_both_finger_sides")
-    finger_ids = finger_sides["left"] | finger_sides["right"]
+    finger_ids = validate_finger_only_contact_geoms(
+        left_finger_geom_ids,
+        right_finger_geom_ids,
+        gripper_geom_ids,
+    )
+    gripper_geoms = set(finger_ids)
     object_geoms = np.asarray(sorted(target_geoms), dtype=np.int64)
     object_body_transform = np.eye(4, dtype=np.float64)
     object_body_transform[:3, :3] = np.asarray(live.xmat[root_body_id]).reshape(3, 3)
@@ -571,6 +587,7 @@ def screen_grasp_candidates(
         raise ValueError("predicted_stable_target_pose_has_an_invalid_homogeneous_row")
     lower_all = lower + 1e-7
     upper_all = upper - 1e-7
+    open_gripper = np.asarray(live.qpos[gripper_qadr], dtype=np.float64).copy()
 
     def set_arm(q):
         scratch.qpos[qadr] = np.asarray(q, dtype=np.float64)
@@ -763,6 +780,27 @@ def screen_grasp_candidates(
                 entry["reason"] = "closed_gripper_grasp_ik_not_found_within_joint_limits"
                 results.append(entry)
                 continue
+            # Check the entire final approach using the live open-gripper
+            # posture. Only the two verified finger sides may enter the
+            # target's contact envelope; Palm/hand remains in the full 10 mm
+            # geometry check performed by evaluate().
+            set_gripper(open_gripper)
+            approach_checks = []
+            approach_failure = None
+            for alpha in np.linspace(0.1, 1.0, 10):
+                q = pre_ik[1] + float(alpha) * (grasp_ik[1] - pre_ik[1])
+                check = evaluate(q, allow_target_gripper=True)
+                approach_checks.append(check)
+                if check["status"] != "pass":
+                    approach_failure = "approach_full_geom_or_contact_semantics_failed"
+                    break
+            if approach_failure:
+                entry.update({
+                    "reason": approach_failure,
+                    "approach_path_checks": approach_checks,
+                })
+                results.append(entry)
+                continue
             # The archived object moved during the successful bilateral close.
             # Reuse that object-seat pose only as a scratch hypothesis while all
             # obstacles remain at their verified t10 positions.
@@ -809,7 +847,10 @@ def screen_grasp_candidates(
                         if value is not None:
                             pairs.append(value)
                 side_distances[side] = min(pairs, default=None)
-            if grasp_check["status"] != "pass" or any(value is None or value > 0.002 for value in side_distances.values()):
+            if grasp_check["status"] != "pass" or any(
+                value is None or value > 0.002 or value < -0.002
+                for value in side_distances.values()
+            ):
                 entry.update({"reason": "grasp_contact_semantics_or_geometry_failed", "grasp_check": grasp_check, "finger_target_distance_m": side_distances})
                 results.append(entry)
                 continue
@@ -856,6 +897,7 @@ def screen_grasp_candidates(
                 "finger_target_distance_m": side_distances,
                 "pregrasp_check": pre_check,
                 "grasp_check": grasp_check,
+                "approach_path_checks": approach_checks,
                 "predicted_stable_target_pose_clearance_m": target_layout_clearances,
                 "predicted_stable_object_pose_source": "historical_t141_close_result_as_unverified_scratch_prior",
                 "held_path_checks": held_checks,

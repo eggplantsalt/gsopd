@@ -42,6 +42,8 @@ class PhaseEvidence:
     trusted_fixture_activation_available: bool
     task_success: bool | None
     count_phase_control: bool = True
+    eef_position_error_m: float | None = None
+    eef_orientation_error_rad: float | None = None
 
 
 class TaskPhaseController:
@@ -67,7 +69,13 @@ class TaskPhaseController:
         "verify_task",
     }
 
-    def __init__(self, config: Mapping[str, Any]):
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        default_goal_position_tolerance_m: float = 0.012,
+        default_goal_orientation_tolerance_rad: float = 0.08,
+    ):
         objects = config.get("objects")
         if not isinstance(objects, list) or not objects:
             raise ValueError("task_phase_program_requires_ordered_object_goals")
@@ -80,6 +88,15 @@ class TaskPhaseController:
         if any(not item.get("predicate") or not item.get("goal_source") for item in self.objects):
             raise ValueError("each_task_object_requires_a_goal_predicate_and_provenance")
         self.config = dict(config)
+        self.default_goal_position_tolerance_m = float(default_goal_position_tolerance_m)
+        self.default_goal_orientation_tolerance_rad = float(default_goal_orientation_tolerance_rad)
+        if (
+            not np.isfinite(self.default_goal_position_tolerance_m)
+            or self.default_goal_position_tolerance_m <= 0.0
+            or not np.isfinite(self.default_goal_orientation_tolerance_rad)
+            or self.default_goal_orientation_tolerance_rad <= 0.0
+        ):
+            raise ValueError("default_pose_goal_tolerances_must_be_finite_and_positive")
         self.grasp_pose_candidates = [
             dict(item)
             for item in self.config.get(
@@ -127,6 +144,35 @@ class TaskPhaseController:
     @property
     def complete(self) -> bool:
         return self.phase == "verify_task"
+
+    def pose_goal_tolerances(self, phase: str) -> tuple[float, float]:
+        """Return the one authoritative position/orientation threshold pair."""
+        configured = self.config.get("phase_pose_tolerances", {}).get(phase, {})
+        position = float(configured.get("position_m", self.default_goal_position_tolerance_m))
+        orientation = float(
+            configured.get("orientation_rad", self.default_goal_orientation_tolerance_rad)
+        )
+        if (
+            not np.isfinite(position)
+            or position <= 0.0
+            or not np.isfinite(orientation)
+            or orientation <= 0.0
+        ):
+            raise ValueError(f"phase_pose_goal_tolerances_invalid:{phase}")
+        return position, orientation
+
+    def is_pose_goal_reached(
+        self,
+        phase: str,
+        position_error_m: float,
+        orientation_error_rad: float,
+    ) -> bool:
+        """Apply the same phase threshold to recovery and phase progression."""
+        position_tolerance, orientation_tolerance = self.pose_goal_tolerances(phase)
+        return bool(
+            float(position_error_m) <= position_tolerance
+            and float(orientation_error_rad) <= orientation_tolerance
+        )
 
     def handoff_after_pregrasp(self) -> None:
         """Start the configured phase program after recovery reaches pregrasp."""
@@ -193,7 +239,18 @@ class TaskPhaseController:
 
         if not self._expert_handoff:
             return None
-        if self.phase == "approach" and evidence.eef_goal_reached:
+        eef_goal_reached = evidence.eef_goal_reached
+        if (
+            evidence.eef_position_error_m is not None
+            and evidence.eef_orientation_error_rad is not None
+        ):
+            eef_goal_reached = self.is_pose_goal_reached(
+                self.phase,
+                evidence.eef_position_error_m,
+                evidence.eef_orientation_error_rad,
+            )
+
+        if self.phase == "approach" and eef_goal_reached:
             self._transition("close_gripper")
         elif self.phase in {"close_gripper", "stable_grasp"}:
             self.phase = "stable_grasp"
@@ -220,10 +277,10 @@ class TaskPhaseController:
                 and current[2] - self._lift_start[2] >= distance
             ):
                 self._transition("transport")
-        elif self.phase in {"transport", "second_object_recovery"} and evidence.eef_goal_reached:
+        elif self.phase in {"transport", "second_object_recovery"} and eef_goal_reached:
             next_phase = "precise_placement" if self.phase == "transport" else "approach"
             self._transition(next_phase)
-        elif self.phase == "precise_placement" and evidence.eef_goal_reached:
+        elif self.phase == "precise_placement" and eef_goal_reached:
             if evidence.held_object != target or not evidence.grasp_confirmed:
                 raise RuntimeError("held_object_lost_before_precise_placement")
             self._transition("release")
@@ -232,7 +289,7 @@ class TaskPhaseController:
                 self._settle_samples.clear()
                 self._settle_last_timestep = -1
                 self._transition("withdrawal")
-        elif self.phase == "withdrawal" and evidence.eef_goal_reached:
+        elif self.phase == "withdrawal" and eef_goal_reached:
             self._transition("settle")
         elif self.phase == "settle":
             qvel = np.asarray(evidence.object_qvel, dtype=np.float64)

@@ -678,7 +678,15 @@ class AutomaticRecoveryBridgeBackend:
                 raise ValueError("task_expert_prior_must_not_be_mislabeled_as_VLM_Teacher_output")
             if task_execution.get("fixture_activation_controller") is not None:
                 raise ValueError("configured_fixture_activation_controller_has_no_verified_runtime_adapter")
-            self.task_controller = TaskPhaseController(task_execution)
+            self.task_controller = TaskPhaseController(
+                task_execution,
+                default_goal_position_tolerance_m=float(
+                    self.config_data.get("goal_position_tolerance_m", 0.012)
+                ),
+                default_goal_orientation_tolerance_rad=float(
+                    self.config_data.get("goal_orientation_tolerance_rad", 0.08)
+                ),
+            )
             if (
                 self.mode == "runtime-snapshot"
                 and task_execution.get("initial_phase", "pregrasp") != "pregrasp"
@@ -1212,10 +1220,8 @@ class AutomaticRecoveryBridgeBackend:
         phase = self.task_controller.phase
         target = self._task_stage_target(latest, phase)
         position_error, rotation_error = self._pose_error(latest, target)
-        tolerances = task_config.get("phase_pose_tolerances", {}).get(phase, {})
-        goal_reached = bool(
-            position_error <= float(tolerances.get("position_m", self.config_data.get("goal_position_tolerance_m", 0.012)))
-            and rotation_error <= float(tolerances.get("orientation_rad", self.config_data.get("goal_orientation_tolerance_rad", 0.08)))
+        goal_reached = self.task_controller.is_pose_goal_reached(
+            phase, position_error, rotation_error
         )
         object_state = self._live_object_state(latest, str(target["object_id"]))
         object_qvel = np.asarray(object_state.get("joint_qvel", []), dtype=np.float64)
@@ -1251,6 +1257,8 @@ class AutomaticRecoveryBridgeBackend:
             trusted_fixture_activation_available=False,
             task_success=bool(status["task_success"]),
             count_phase_control=bool(self.task_expert_active),
+            eef_position_error_m=position_error,
+            eef_orientation_error_rad=rotation_error,
         )
         previous_phase = self.task_controller.phase
         recorded_previous_phase = self.last_task_phase
@@ -2068,6 +2076,10 @@ class AutomaticRecoveryBridgeBackend:
         b = np.asarray(goal.quaternion_wxyz, dtype=np.float64)
         b /= np.linalg.norm(b)
         rotation_error = 2.0 * math.acos(float(np.clip(abs(np.dot(a, b)), 0.0, 1.0)))
+        if self.task_controller is not None:
+            return self.task_controller.is_pose_goal_reached(
+                goal.phase, position_error, rotation_error
+            )
         return bool(
             position_error <= float(self.config_data.get("goal_position_tolerance_m", 0.012))
             and rotation_error <= float(self.config_data.get("goal_orientation_tolerance_rad", 0.08))

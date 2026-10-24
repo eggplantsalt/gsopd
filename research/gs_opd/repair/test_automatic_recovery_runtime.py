@@ -8,10 +8,15 @@
 from __future__ import annotations
 
 import unittest
+import numpy as np
 
+from research.gs_opd.repair.automatic_recovery import GoalSpec, Observation
 from research.gs_opd.repair.automatic_recovery_runtime import (
+    AutomaticRecoveryBridgeBackend,
     risk_branch_coverage_is_complete,
 )
+from research.gs_opd.repair.task_phase_controller import TaskPhaseController
+from research.gs_opd.repair.mujoco_jointspace_planning import validate_finger_only_contact_geoms
 
 
 def _monitor(*, unsafe=False, missing_substeps=False):
@@ -51,6 +56,52 @@ class AutomaticRecoveryRuntimeCoverageTests(unittest.TestCase):
         self.assertFalse(
             risk_branch_coverage_is_complete(_monitor(missing_substeps=True), 1)
         )
+
+    def test_recovery_goal_check_uses_approach_phase_tolerance(self):
+        controller = TaskPhaseController({
+            "objects": [{
+                "object_id": "pot_2",
+                "predicate": ["on", "pot_2", "support_region"],
+                "goal_source": "verified_prior",
+            }],
+            "phase_pose_tolerances": {
+                "approach": {"position_m": 0.008, "orientation_rad": 0.06}
+            },
+        })
+        backend = object.__new__(AutomaticRecoveryBridgeBackend)
+        backend.task_controller = controller
+        backend.config_data = {
+            "goal_position_tolerance_m": 0.012,
+            "goal_orientation_tolerance_rad": 0.08,
+        }
+        goal = GoalSpec(
+            goal_id="pot2-approach",
+            phase="approach",
+            source="test",
+            source_artifacts=(),
+            position_world_m=(0.0, 0.0, 0.0),
+            quaternion_wxyz=(1.0, 0.0, 0.0, 0.0),
+        )
+        observation = Observation(
+            timestep=236,
+            qpos=np.zeros(7),
+            eef_position_world_m=np.array([0.0112673916, 0.0, 0.0]),
+            eef_quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            minimum_forbidden_clearance_m=0.02,
+            clearance_complete=True,
+            contacts_complete=True,
+        )
+        self.assertFalse(backend.is_recovery_goal_reached(observation, goal))
+        observation.eef_position_world_m[:] = [0.0079, 0.0, 0.0]
+        self.assertTrue(backend.is_recovery_goal_reached(observation, goal))
+
+    def test_candidate_contact_exception_rejects_palm_or_hand_geometry(self):
+        allowed = validate_finger_only_contact_geoms([76, 77], [79, 80], [76, 77, 79, 80])
+        self.assertEqual(allowed, {76, 77, 79, 80})
+        with self.assertRaisesRegex(ValueError, "only_the_verified_finger_geoms"):
+            validate_finger_only_contact_geoms(
+                [76, 77], [79, 80], [74, 76, 77, 79, 80]
+            )
 
 
 if __name__ == "__main__":

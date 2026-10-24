@@ -146,6 +146,7 @@ class RecoveryConfig:
     maximum_eef_tracking_error_m: float = 0.025
     maximum_eef_orientation_error_rad: float = 0.08
     stagnation_window_steps: int = 12
+    maximum_same_state_handoffs: int = 3
     minimum_progress_m: float = 0.002
     horizon_steps: int = 1000
     standard_horizon_steps: int = 1000
@@ -158,6 +159,7 @@ class RecoveryConfig:
             "maximum_replans_per_phase",
             "execution_step_budget",
             "stagnation_window_steps",
+            "maximum_same_state_handoffs",
             "horizon_steps",
             "standard_horizon_steps",
         ):
@@ -450,6 +452,7 @@ class AutomaticSafetyRecoveryEngine:
         self._active_goal_position: np.ndarray | None = None
         self._initial_timestep = 0
         self._initial_history_safety_verified = False
+        self._same_state_handoff_count = 0
 
     def _event(self, kind: str, **details: Any) -> None:
         event = {
@@ -1051,6 +1054,9 @@ class AutomaticSafetyRecoveryEngine:
             while self.state not in (RecoveryState.COMPLETE, RecoveryState.FAILED):
                 if self.state is RecoveryState.FAILED:
                     break
+                cycle_start_timestep = int(observation.timestep)
+                cycle_start_phase = context.phase
+                cycle_start_transitions = self._physical_transitions
                 if not self._local_recovery_success:
                     observation = self._run_policy_until_risk(context, context.handoff_policy)
                     if self.state is RecoveryState.COMPLETE:
@@ -1088,6 +1094,31 @@ class AutomaticSafetyRecoveryEngine:
                     if observation.done and observation.task_success is not True:
                         self._fail("episode_terminated_without_task_success")
                         break
+                    same_state_handoff = (
+                        self._physical_transitions == cycle_start_transitions
+                        and int(observation.timestep) == cycle_start_timestep
+                        and context.phase == cycle_start_phase
+                    )
+                    if same_state_handoff:
+                        self._same_state_handoff_count += 1
+                        self._event(
+                            "same_state_handoff_without_physical_progress",
+                            consecutive_count=self._same_state_handoff_count,
+                            maximum_count=self.config.maximum_same_state_handoffs,
+                            timestep=int(observation.timestep),
+                            phase=context.phase,
+                        )
+                        if self._same_state_handoff_count >= self.config.maximum_same_state_handoffs:
+                            self._fail(
+                                "same_state_handoff_without_physical_progress_limit_exceeded",
+                                consecutive_count=self._same_state_handoff_count,
+                                maximum_count=self.config.maximum_same_state_handoffs,
+                                timestep=int(observation.timestep),
+                                phase=context.phase,
+                            )
+                            break
+                    else:
+                        self._same_state_handoff_count = 0
                 if self.config.horizon_steps <= self.steps and not self.config.allow_horizon_extension:
                     self._fail("standard_1000_step_horizon_exhausted")
                 elif self.steps > self.config.standard_horizon_steps and self.config.allow_horizon_extension:

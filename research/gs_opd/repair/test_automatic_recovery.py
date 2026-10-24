@@ -265,6 +265,36 @@ class UnsafeTaskExpertBackend(SafeTaskExpertBackend):
         }
 
 
+class SameStateHandoffBackend(FakeBackend):
+    """Model a phase handoff that repeats without moving the simulator."""
+
+    def __init__(self):
+        super().__init__()
+        self.context = replace(
+            self.context,
+            handoff_policy="expert",
+            post_recovery_policy="expert",
+            expert_handoff_available=True,
+        )
+
+    def current_context(self):
+        return self.context
+
+    def handoff_to_task_expert(self, observation, context):
+        self.handed_off = True
+        if self.context.phase == "pregrasp":
+            goal = replace(self.context.goals[0], phase="approach")
+            self.context = replace(
+                self.context,
+                phase="approach",
+                goals=(goal,),
+                metadata={"requires_rrt_recovery": True},
+            )
+
+    def is_recovery_goal_reached(self, observation, goal):
+        return True
+
+
 class ExpertRiskHandlingTests(unittest.TestCase):
     def test_verified_expert_action_can_continue_inside_risk_band(self):
         backend = SafeTaskExpertBackend()
@@ -385,6 +415,25 @@ class AutomaticRecoveryTests(unittest.TestCase):
         self.assertFalse(result.complete_task_success)
         self.assertIn("task_goal_phase_unresolved:grasp", result.reason)
         self.assertTrue(backend.handed_off)
+
+    def test_repeated_same_state_handoffs_fail_closed_after_bounded_count(self):
+        backend = SameStateHandoffBackend()
+        engine = AutomaticSafetyRecoveryEngine(
+            backend,
+            RecoveryConfig(maximum_same_state_handoffs=2),
+        )
+        result = engine.run()
+
+        self.assertEqual(result.state, RecoveryState.FAILED)
+        self.assertIn("same_state_handoff_without_physical_progress_limit_exceeded", result.reason)
+        self.assertEqual(result.steps_executed, 0)
+        self.assertEqual(backend.executed_actions, [])
+        same_state_events = [
+            event for event in engine._events
+            if event["event"] == "same_state_handoff_without_physical_progress"
+        ]
+        self.assertEqual(len(same_state_events), 2)
+        self.assertEqual(same_state_events[-1]["phase"], "approach")
 
     def test_already_satisfied_goal_hands_off_without_replaying_policy_actions(self):
         backend = MissingPostGraspGoalBackend(start_at_goal=True)

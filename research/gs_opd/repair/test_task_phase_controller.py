@@ -46,6 +46,8 @@ def _evidence(
     fixture_predicate_satisfied=True,
     task_success=False,
     count_phase_control=True,
+    eef_position_error_m=None,
+    eef_orientation_error_rad=None,
 ):
     return PhaseEvidence(
         timestep=timestep,
@@ -63,6 +65,8 @@ def _evidence(
         trusted_fixture_activation_available=False,
         task_success=task_success,
         count_phase_control=count_phase_control,
+        eef_position_error_m=eef_position_error_m,
+        eef_orientation_error_rad=eef_orientation_error_rad,
     )
 
 
@@ -99,6 +103,44 @@ class TaskPhaseControllerTests(unittest.TestCase):
             evidence = _evidence(timestep=timestep, count_phase_control=False)
             self.assertIsNone(controller.update(evidence))
         self.assertEqual(controller.phase, "pregrasp")
+
+    def test_approach_phase_uses_the_same_strict_pose_tolerance(self):
+        config = _config(("object_a",))
+        config["phase_pose_tolerances"] = {
+            "approach": {"position_m": 0.008, "orientation_rad": 0.06}
+        }
+        controller = TaskPhaseController(
+            config,
+            default_goal_position_tolerance_m=0.012,
+            default_goal_orientation_tolerance_rad=0.08,
+        )
+        controller.handoff_after_pregrasp()
+
+        controller.update(_evidence(
+            236,
+            eef_goal_reached=True,
+            eef_position_error_m=0.0112673916,
+            eef_orientation_error_rad=0.04,
+        ))
+        self.assertEqual(controller.phase, "approach")
+
+        controller.update(_evidence(
+            237,
+            eef_goal_reached=False,
+            eef_position_error_m=0.0079,
+            eef_orientation_error_rad=0.059,
+        ))
+        self.assertEqual(controller.phase, "close_gripper")
+
+    def test_approach_orientation_threshold_is_not_replaced_by_global_tolerance(self):
+        config = _config(("object_a",))
+        config["phase_pose_tolerances"] = {
+            "approach": {"position_m": 0.008, "orientation_rad": 0.06}
+        }
+        controller = TaskPhaseController(config)
+        controller.handoff_after_pregrasp()
+        self.assertFalse(controller.is_pose_goal_reached("approach", 0.007, 0.061))
+        self.assertTrue(controller.is_pose_goal_reached("approach", 0.007, 0.059))
 
     def test_grasp_requires_stable_bilateral_contact_and_verified_lift(self):
         controller = TaskPhaseController(_config())
