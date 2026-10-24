@@ -463,6 +463,25 @@ class AutomaticSafetyRecoveryEngine:
         self._initial_timestep = 0
         self._initial_history_safety_verified = False
         self._same_state_handoff_count = 0
+        self._task_milestone: dict[str, Any] | None = None
+
+    def _check_task_milestone(self, observation: Observation, action_source: str) -> bool:
+        """Honor an optional backend-local stop milestone after a safe transition."""
+        callback = getattr(self.backend, "task_milestone_reached", None)
+        if not callable(callback):
+            return False
+        milestone = callback(observation)
+        if not isinstance(milestone, dict) or not milestone:
+            return False
+        self._task_milestone = milestone
+        self.state = RecoveryState.COMPLETE
+        self._event(
+            "task_milestone_reached",
+            milestone=milestone,
+            action_source=action_source,
+            timestep=int(observation.timestep),
+        )
+        return True
 
     def _event(self, kind: str, **details: Any) -> None:
         event = {
@@ -671,6 +690,8 @@ class AutomaticSafetyRecoveryEngine:
             self._record_transition(action, next_observation, policy)
             if self.state is RecoveryState.FAILED:
                 raise RuntimeError(self._failure_reason)
+            if self._check_task_milestone(next_observation, policy):
+                return next_observation
 
     def _execute_recovery(self, observation: Observation, context: TaskContext) -> Observation:
         self.state = RecoveryState.RESOLVE
@@ -838,6 +859,9 @@ class AutomaticSafetyRecoveryEngine:
                     actual = self.backend.execute_action(action, context)
                     self._record_transition(action, actual, "safety_recovery_osc_pose")
                     if self.state is RecoveryState.FAILED:
+                        break
+                    if self._check_task_milestone(actual, "safety_recovery_osc_pose"):
+                        observation = actual
                         break
                     risk_transition = risk_boundary.update(
                         actual.minimum_forbidden_clearance_m
@@ -1155,7 +1179,11 @@ class AutomaticSafetyRecoveryEngine:
                 final_safe = False
         except Exception:
             final_safe = False
-        status = "task_success" if final_task_success else "failed"
+        status = (
+            "task_success" if final_task_success
+            else "task_milestone" if self._task_milestone is not None
+            else "failed"
+        )
         result = RecoveryResult(
             status=status,
             state=self.state,
@@ -1172,7 +1200,10 @@ class AutomaticSafetyRecoveryEngine:
             replans=self.replans,
             reason=self._failure_reason,
             phase=self._phase,
-            artifacts={"events": len(self._events)},
+            artifacts={
+                "events": len(self._events),
+                **({"task_milestone": self._task_milestone} if self._task_milestone else {}),
+            },
         )
         if self.artifacts is not None:
             self.artifacts.manifest({

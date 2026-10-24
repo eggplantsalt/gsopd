@@ -1,6 +1,22 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：从t=359安全续接Pot 2 transport；本轮30步预算已用尽（2026-10-24）
+## 当前局部目标：从t=463真实持物状态重建Pot 2放置路线；本轮按跟踪偏差fail-closed停止（2026-10-24）
+
+本轮严格审计并复用t=359剩余257点路线的索引30。恢复状态、模型、策略、夹爪及Pot 2双指抓持核验通过；路线实际执行39步后在t=398超过0.18 rad关节路径跟踪限值，EEF误差仍在既定范围。对精确t=398 Snapshot严格恢复后只做一次既有RRT-Connect（193路点、199.249秒、4,590构型检查），保存了完整路线，再真实执行65步到t=463。
+
+连续新增动作合计104/450，2,600/2,600子步均通过Native Safety与Operational Safety，无禁触/自碰撞/未许可接触、无Operational关节越限，Pot 2双指持有持续。Strict-10mm统计未通过，因Pot 2机器人非手指间隙约4.36 mm；当前2 mm目标物Operational门槛和Ginger Beer/Place Box禁触约束均未违反。t=463关节路线误差0.182045 rad越过冻结0.18 rad，而EEF误差为4.238 mm/0.034841 rad；唯一规划预算已用，故按maximum_replanning_attempts_exhausted停止。
+
+t=463仍为transport，Pot 2 On=false，Pot 1 On=false，Stove Turnon=true，reward=0、done=false。没有Pot 2放置/释放、Pot 1阶段、完整任务成功或Round 0种子；不启动LoRA。完整合并审计为 /opt/data/private/gs_opd/rollouts/l0t2_round0_t398_pot2_single_replan_20261024_214225/posthoc_review.json，重规划路线及状态/策略指纹在同目录的replanned_route_t398.npz与JSON sidecar。OA、双相机、每步25子步、安全事件与Snapshot保留在t359和t398两个连续归档中。
+
+本轮规划调用已用尽，当前任务暂停在t=463真实Snapshot；后续需有新预算，先针对7D RRT路点和OSC_POSE冗余关节跟踪偏差作有界诊断，再从严格恢复的t=463状态重规划。不放宽0.18 rad、安全余量、禁触规则，不重放旧动作，不把局部前缀拼成完整种子。
+
+只读审计入口：
+
+/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t359_pot2_placement --audit-only
+/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t398_pot2_single_replan --audit-only --source-run /opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308
+
+
+## 前一局部目标：从t=359安全续接Pot 2 transport；本轮30步预算已用尽（2026-10-24）
 
 上一阶段“RRT有可行路线但超时零动作”已通过规划结果复用解决：从严格恢复的t=329状态校验Integration State、模型/策略指纹和路线端点后，直接加载归档257点完整路线，没有再次运行360秒RRT。缓存路线的首次可行候选在iteration 10；该时刻墙钟时间未记录。持物预演夹爪命令已改为neutral `0.0`，并记录来源。
 

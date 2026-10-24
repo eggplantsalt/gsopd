@@ -2221,12 +2221,21 @@ def _snapshot_diagnostics(canonicalize_kinematics=False):
                 else:
                     joint_qpos = sim.data.qpos[address]
                 joints.extend(np.asarray(joint_qpos).reshape(-1).tolist())
+            joint_velocities = []
+            for joint in getattr(obj, "joints", ()):
+                address = sim.model.get_joint_qvel_addr(joint)
+                if isinstance(address, tuple):
+                    joint_qvel = sim.data.qvel[address[0] : address[1]]
+                else:
+                    joint_qvel = sim.data.qvel[address]
+                joint_velocities.extend(np.asarray(joint_qvel).reshape(-1).tolist())
             object_states[f"{mapping_name}:{object_name}"] = {
                 "body_id": int(body_id),
                 "body_name": str(root_body),
                 "root_pos": np.asarray(diagnostic_body_xpos[body_id]).tolist(),
                 "root_quat": np.asarray(diagnostic_body_xquat[body_id]).tolist(),
                 "joint_qpos": joints,
+                "joint_qvel": joint_velocities,
             }
 
     return {

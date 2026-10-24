@@ -1,6 +1,36 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：复用t=329归档RRT路线并真实执行30步安全transport前缀（2026-10-24）
+## 最新进度：t=359旧路线安全续接、一次重规划真实执行至t=463后按跟踪阈值停止（2026-10-24）
+
+### 路线、Snapshot与控制器审计
+
+只读审计 t=359 Snapshot、剩余路线bundle、RRT记录、恢复审计和动作日志后，确认t=359恢复指纹/积分状态与已归档值一致，Pot 2双指持有和finger-only接触有效，控制器依据当前真实状态建立为transport。缓存的原始路线为257点，续接索引30；当前transport目标与旧路线终点仅差0.07070 mm/0.000321 rad（阶段容差12 mm/0.08 rad）。隔离首段覆盖路径索引31–38，共8动作/200子步，双指接触全覆盖，最大关节路径误差0.122801 rad、EEF误差6.932 mm/0.036118 rad，主Snapshot回滚一致。其后39步的关节误差由t=360的0.122801 rad增至t=398的0.181877 rad，最后5步持续上升；EEF位置误差峰值7.706 mm且t=398为7.314 mm，仍在阈值内。t=398动作的安全检查通过，但路线跟踪超限，旧路线不能继续硬跑。
+
+从 t=398 Snapshot进行严格恢复后，模型几何SHA 1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752、Integration State SHA 06c41375a949fa39e849bae45efbc0122ddf05372994bff25f515adc6e08957d、Snapshot SHA f98813b78f024b0c86ccfb022c58964a3c46a6e7d184b08847943d3658ce80a5、内部Runtime Snapshot hash及安全策略SHA均匹配；Pot 2实时双指抓持与当前指尖接触白名单检查通过。没有从旧控制器事件伪造阶段状态，也没有重放前30个历史动作。
+
+### 唯一一次规划与真实后缀
+
+旧路线在t=398的量化误差证明需要新的路径，因此只调用一次已有RRT-Connect。结果offline_feasible：选中候选0、193个7D qpos与EEF参考点、66次迭代、4,590次构型检查、199.249 s；最小禁触净距17.731 mm。完整路线、起始积分状态SHA、模型与安全策略来源及指纹已导出到 replanned_route_t398.npz 和metadata/policy sidecar；不得将离线可行当作OSC可执行认证。
+
+隔离预演通过后执行t=399→463的65个真实OSC_POSE动作；连同前段t=360→398共104步、2,600/2,600子步，均有连续同一原生Episode timestep和每步Snapshot/OA/事件/双相机视频。全段Pot 2双指持有未丢失，未见禁触、未知、自碰撞或未许可接触，Operational关节限位违规0。两段分别通过 Native Safety与Operational Safety；Strict-10mm不通过，机器人非手指—Pot 2最小间隙约4.36 mm（高于2 mm Operational边界、低于10 mm统计门槛），Ginger Beer/Place Box禁触边界仍满足。t=463时Pot 2仍被持有，阶段为transport，尚未On Stove。
+
+新路线执行终止的精确链路是：OSC_POSE继续跟踪EEF，但7D关节路径误差增长；关节路径误差从t=399的0.004534 rad持续增长，t=462达到0.179761 rad，t=463动作后为0.1820452 rad，超过冻结0.18 rad；EEF位置误差最大5.848 mm，t=463为4.238 mm，姿态误差0.034841 rad。恢复引擎记录preview_tracking_deviation并在本轮唯一RRT额度已用后以maximum_replanning_attempts_exhausted fail-closed。数据证明7D参考跟踪偏差，不足以直接证明其底层原因；“EEF跟踪和冗余关节参考不兼容”是待进一步验证的诊断，不应降低关节偏差门槛。动作预算消耗104/450，停止原因是有限重规划预算耗尽，而不是450动作耗尽。
+
+### 当前验收、归档与复现
+
+t=463原生谓词：Pot 1 On=false、On(moka_pot_2, flat_stove_1_cook_region)=false、Stove Turnon=true、reward=0、done=false、task_success=false。Pot 2放置/释放未完成；Pot 1阶段未开始。因此Pot 2局部放置后缀、完整任务、标准1000步成功、demo-only 1800步成功、完整安全成功和Round 0种子均未取得。保留Native/Operational后缀通过的局部证据，但没有把缺少当前规则前缀证据的数据拼成种子。本轮不训练LoRA。
+
+ t=359→398归档：/opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308/；t=398→463与可复用重规划路线：/opt/data/private/gs_opd/rollouts/l0t2_round0_t398_pot2_single_replan_20261024_214225/。后者的posthoc_review.json合并记载连续104步结果，replanned_route_t398.npz保存完整193点路线；两个目录保留OA、25子步接触/间隙、Snapshot、事件及agentview/wrist视频。停止后未继续物理动作，也未再调用规划器。
+
+只读/严格恢复审计复现入口：
+
+/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t359_pot2_placement --audit-only
+/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t398_pot2_single_replan --audit-only --source-run /opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308
+
+后续若获新执行预算，应从严格校验的t=463 Snapshot与当前持物状态初始化，先解决真实7D路线跟踪/OSC交接问题，再在冻结安全边界下规划到Pot 2放置并验证原生On谓词；不能重放这次路线或修改0.18 rad限制来掩盖偏差。当前轮规划调用已用尽；不能默认继续第二次规划。本地相关Python模块py_compile已通过；本轮没有运行额外自动化测试。历史1093步示范、所有原始Episode和LeRobot数据均未修改。
+
+
+## 前一阶段：复用t=329归档RRT路线并真实执行30步安全transport前缀（2026-10-24）
 
 ### 规划结果审计与复用
 
