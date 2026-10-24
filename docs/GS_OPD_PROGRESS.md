@@ -1,6 +1,18 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：Task-Success-First Safety Reconstruction（2026-10-23；两次真实尝试后停止）
+## 最新进度：Episode 9 t=249 Snapshot恢复门失败并停止（2026-10-24）
+
+按Round 0 Task-Success-First主线，只读核验并尝试恢复已归档Episode 9的Pot 2稳定双指抓持末态t=249 Snapshot。归档Snapshot完整包含MuJoCo integration state、机器人OSC控制器状态/缓冲、夹爪当前动作、task bookkeeping、任务对象属性、观测缓存和RNG；317个integration-state值与Episode 9轨迹t=249末态逐项一致，最大绝对差0。Snapshot SHA-256 `3e142c23aa2e0cad30569b350b6a4a4e83e2152ec34891f0ecd580d30c3d81c0`，记录模型几何指纹`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`。新隔离Bridge接受相同场景/任务与BDDL身份，但原生Snapshot恢复拒绝：`Runtime Snapshot model geometry differs from the active Bridge`。当前Bridge几何指纹未随错误返回，原因尚不能细分。未修改校验、未直接写物理状态；恢复失败后不发Observation/动作，物理动作和MuJoCo子步均为0，Bridge已关闭。另核实Bridge Runtime Snapshot没有保存Bridge外部Python `TaskPhaseController`、phase anchor、阶段/重规划计数；事件只记录t=249进入`lift`，没有完整后端控制器检查点。
+
+静态检查发现robosuite gripper `contact_geoms`也覆盖Palm/hand collision。为满足“只许可实际手指—目标物接触”，已将`automatic_recovery_runtime.py`的目标接触白名单限定到`finger1/2`的collision mesh与pad四个Geom，并要求四者全部可解析，否则fail-closed。该收窄及t=249持物期间许可修复均未物理复验；没有为验证此代码另开环境动作。
+
+归档前缀安全记录重新核对通过：已验证t=0→10回放有10动作、250/250子步且机器人—Ginger Beer/Place Box接触事件为0；Episode 9 t=10→249有239动作、5,975/5,975子步完整，离线扫描无禁触、自碰撞、未许可环境接触或未知项。Ginger Beer与Place Box最小余量10.190708/47.479514 mm；组合证据为249动作、6,225子步。Episode 9 t=249 fail-closed记录的目标指接触穿透为0.528 mm，本在2 mm许可上限内；当时仅因目标夹爪许可集合被清空而停止。当前程序的持物许可修复没有真实物理复验，因为Snapshot恢复兼容门失败。
+
+历史碰撞布局差异：原成功链21–56 Ginger Beer接触后，t=20→56瓶子位移61.333 mm/转角0.8113 rad，至t=118相对t=20位移351.670 mm；Pot 2 t=118→141另移动10.602 mm/转角0.2752 rad。因此旧抓取关节解不能直接拷贝。Episode 9从无该历史碰撞的安全t=10 Snapshot重新搜索并真实抓稳；该Episode t=10→249 Ginger Beer位移2.635 μm，Pot 2随新抓持位移3.071 mm/转角0.09617 rad，Pot 1和Place Box不变。
+
+本轮恢复失败后按用户要求停止，没有启动新Episode、抬升、搬运、放置、LoRA或候选搜索；新增候选、筛查、RRT及物理动作成本均为0。此次目标下原生任务成功、完整安全成功、标准1000步成功和1800步扩展示范成功均为false，不生成Round 0种子。只读探针代码为`research/gs_opd/repair/audit_episode9_t249_snapshot_restore.py`；完整机器结果、日志和快照末态审计在`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_restore_audit_20261024/`。历史1093步示范、Episode 8/9以及全部LeRobot数据未修改。
+
+## 历史进度：Task-Success-First Safety Reconstruction（2026-10-23；两次真实尝试后停止）
 
 Round 0 主线现为“先取得真实任务成功但可含违规的历史任务先验，再从安全状态寻找可安全重接入的任务成功抓持/抬升状态”。1093步历史示范保持原样：294步 π₀.₅、425步 Pot 2 放置、135步 Pot 1 抓取迁移、239步最终放置；t=1053 首次获得原生完整任务成功（reward=1、done=true），但历史动作21–56 与 Ginger Beer 有接触，峰值接触力12.096849 N，不能作为安全轨迹。
 

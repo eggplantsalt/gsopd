@@ -1,6 +1,28 @@
 # GS-OPD 当前局部目标
 
-## 当前结果与局部目标：从已验证 Pot 2 稳定抓持状态完成安全抬升重接入（2026-10-23）
+## 当前状态：Episode 9 t=249 Snapshot严格恢复失败，已停止（2026-10-24）
+
+只读检查确认t=249 Runtime Snapshot中保留了MuJoCo积分状态、OSC控制器与机器人缓冲、夹爪当前动作、task bookkeeping、对象属性、观测缓存及RNG；317个integration-state值与Episode 9轨迹t=249末态逐项相同（最大差0）。归档模型几何指纹为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`。隔离Bridge的任务/场景元数据校验通过，但原生恢复接口因`Runtime Snapshot model geometry differs from the active Bridge`拒绝恢复。当前活动模型指纹没有由Bridge错误响应返回，故不臆测差异根因，也不绕过检查。
+
+归档的Bridge Runtime Snapshot没有包含Bridge外部Python `TaskPhaseController`、`task_phase_anchor`、阶段计数和重规划游标；恢复事件只记录t=249进入`lift`，不足以证明这些后端内部字段已逐项还原。只读检查还发现robosuite的gripper `contact_geoms`包含Palm/hand collision，因此已把任务接触白名单收窄为四个明确命名的finger collision mesh/pad Geom，并在Geom集合不完整时fail-closed。此代码修复未做物理验证。
+
+t=0→10前缀有250/250子步覆盖且无机器人—Ginger Beer/Place Box接触；Episode 9 t=10→249有239动作、5,975/5,975子步完整，Ginger Beer/Place Box最小余量10.190708/47.479514 mm。恢复失败后没有发Observation或动作请求，0个物理动作、0个子步，Bridge已关闭。Episode 9 t=249原生任务仍未成功；Pot 2虽已稳定双指抓持，但没有开始真实抬升。fail-closed记录的目标指接触穿透为0.528 mm，本在2 mm许可上限内；当时停机原因是目标夹爪许可集合被清空。
+
+历史碰撞造成的布局变化已核对：旧成功链动作21–56中Ginger Beer位移61.333 mm并旋转0.8113 rad，t=20→118累计位移351.670 mm；旧Pot 2 t=118→141另移动10.602 mm。Episode 9从干净、经验证的t=10状态重新规划与抓取，当前t=10→249 Ginger Beer仅移动2.635 μm，Pot 2新抓持移动3.071 mm，Pot 1与Place Box保持原位。旧抓取关节构型不直接适用；Episode 9的双指抓持是当前布局下真实验证的。
+
+| 验收项 | 当前结果 |
+|---|---|
+| t=249严格Snapshot恢复 | **失败：模型几何指纹不兼容** |
+| 接触许可修复的物理复验 | 未执行 |
+| Pot 2真实抬升≥30 mm | 未执行 |
+| 本轨迹原生任务成功 / 全程安全成功 | false / false |
+| 标准1000步成功 / 1800步扩展示范成功 | false / false |
+| 新候选搜索、RRT、物理动作 | 0、0、0 |
+| Round 0种子 / LoRA | 未建立 / 未启动 |
+
+证据和恢复错误详见`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_restore_audit_20261024/`。只读复现入口为`research/gs_opd/repair/audit_episode9_t249_snapshot_restore.py`，恢复失败即退出且不执行动作。当前局部目标停在Snapshot兼容门；历史1093步任务成功示范、Episode 8/9及全部LeRobot数据保持原样。
+
+## 历史结果：从已验证 Pot 2 稳定抓持状态完成安全抬升重接入（2026-10-23）
 
 ### 本轮已完成
 

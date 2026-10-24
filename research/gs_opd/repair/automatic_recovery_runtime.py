@@ -530,11 +530,27 @@ class AutomaticRecoveryBridgeBackend:
         gripper_inventory = self.bridge.request({"op": "gripper_geometry_inventory"})
         if gripper_inventory.get("status") != "complete" or len(gripper_inventory.get("grippers", [])) != 1:
             raise ValueError("complete_single_Panda_gripper_geometry_inventory_is_unavailable")
-        gripper_geom_ids = sorted(
-            item["geom_id"] for item in gripper_inventory["grippers"][0]["geometries"]
+        # Robosuite's gripper.contact_geoms also includes the palm/hand collision
+        # geometry. A task grasp exception is only valid for the four physical
+        # finger collision meshes/pads, never for the palm or the rest of Panda.
+        finger_geom_suffixes = (
+            "finger1_collision",
+            "finger1_pad_collision",
+            "finger2_collision",
+            "finger2_pad_collision",
         )
-        if not gripper_geom_ids:
-            raise ValueError("Panda_gripper_contact_geometry_is_empty")
+        gripper_geom_ids = sorted(
+            int(item["geom_id"])
+            for item in gripper_inventory["grippers"][0]["geometries"]
+            if any(
+                str(item.get("geom_name", "")).endswith(suffix)
+                for suffix in finger_geom_suffixes
+            )
+        )
+        if len(gripper_geom_ids) != len(finger_geom_suffixes):
+            raise ValueError(
+                "complete_Panda_finger_collision_geometry_is_unavailable_or_ambiguous"
+            )
 
         forbidden_names = sorted(forbidden_robot)
         unbound_goal_targets = sorted(goal_targets - set(self.bindings))
@@ -1090,10 +1106,10 @@ class AutomaticRecoveryBridgeBackend:
             "approach", "close_gripper", "stable_grasp", "withdrawal"
         }
         target = self.bindings[object_name]
-        # Keep exact Panda gripper-to-active-object pairs whitelisted for as
-        # long as the live grasp monitor says the task object is held. The
-        # target object remains a 10 mm checked object for every other robot
-        # geometry; this only preserves the contact needed to carry it.
+        # Keep only the four verified Panda finger-to-active-object pairs
+        # whitelisted while the live grasp monitor says the task object is
+        # held. The palm, other robot Geoms, and all non-target objects retain
+        # their normal hard-clearance checks.
         grasp_contact_active = phase in finger_contact_phases or held_object == object_name
         self.safety_policy["allowed_contact_pairs"] = [
             {
