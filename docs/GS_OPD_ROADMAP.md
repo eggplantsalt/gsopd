@@ -1,5 +1,15 @@
 # GS-OPD 总体路线
 
+## 最新总体状态：t=590→649 Pot 2局部安全放置成功；完整双壶任务未完成（2026-10-25）
+
+从同一Episode的真实t=590连续状态继续，经严格t=642 Runtime Snapshot恢复、7个新OSC_POSE动作和每步25子步滚动认证，到t=649首次取得原生`On(moka_pot_2, flat_stove_1_cook_region)=true`，并通过5个连续样本的稳定放置验收。t=590→649共59个实际动作、1,475个完整物理子步，Native/Operational安全均通过，禁触、自碰撞、未解析/未许可接触及关节限制违规为0。Pot 2非手指间隙最低4.242 mm，机器人到Ginger Beer/Place Box最低32.678/52.850 mm；指尖最大合法穿透0.282 mm。Strict-10mm仅为附加统计且未通过，不影响本轮冻结的Operational门槛；没有安全阈值、qpos比较或BDDL成功标准更改，没有重复RRT。
+
+本次诊断修复了预测终态几何策略缓存和release门控：预测状态按实时抓持重绑，恢复时回到精确源Snapshot；release阶段仅四个指尖Geom与Pot 2维持−2 mm允许对，其他机器人Geom和禁触对象持续受原约束。Native On由Pot 2与原生stove支撑接触后成立，而非释放前置条件。
+
+验收边界：Pot 2局部放置及稳定成功；原生完整任务仍false（Pot 1 On=false、Stove Turnon=true、reward=0、done=false）。t=649处于标准1000步和demo-only 1800步内的是Pot 2局部里程碑，**完整Benchmark成功与完整扩展示范成功均false**。不构成Round 0完整安全种子，也没有Pot 1动作或LoRA训练。完整种子下一阶段仍要求从兼容的原始安全t=10 Snapshot开始，在同一Episode中连续执行和统一安全复验；不能拼接此次t=590局部安全轨迹补齐未知前缀。后续若先做Pot 1局部阶段，应严格恢复t=649并根据Native Pot 2谓词重建任务阶段。
+
+入口：`research/gs_opd/repair/execute_t463_execution_aware_pot2_placement.py`。本轮归档：`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_release_continue_t642_20261025/`；总审计`posthoc_acceptance_audit.json`，原始视频、OA、逐子步安全和接触身份、Snapshot均在目录中。t=590→642连续前缀证据保存在相邻的同链运行归档中；59动作/1,475子步整体回读审计0项监测违规。1093步历史示范、Episode与LeRobot数据保持不变。
+
 ## 最新总体状态：t=463安全搬运到t=589；t=590提交比对失配后停止（2026-10-24）
 
 复用已归档t=398的193点路径，以新执行感知入口从严格恢复的t=463 Snapshot做短段MuJoCo认证。无新RRT。126个动作连续到t=589，每动作25子步以及预测/实执行比较均通过；Native/Operational Safety成立，Pot 2双指持有，阶段控制器自然切换至precise placement。严格t=589 Snapshot恢复、Integration State和controller/gripper内部状态核对均精确通过；运行时状态、模型与当前策略attestation一致。

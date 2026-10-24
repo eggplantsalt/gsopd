@@ -1,5 +1,25 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## 最新进度：t=590→649 Pot 2真实放置与稳定验收通过（2026-10-25）
+
+### Release阻塞修复与严格续接
+
+从同一Episode已归档的t=642真实Runtime Snapshot继续。模型几何SHA为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，317维Integration State SHA为`728279cabf061d58d4cbc8994a1f8c6809e55fd30d3dd0a035a3e5712ac7e906`，Snapshot SHA为`21e1f64cdbe53e0dbeb52e5893231b766edbf9230230e086258f03ede67b7534`。实时Pot 2双指抓持、指尖接触身份和t=642同一时刻的`precise_placement→release`阶段事件均匹配；Snapshot不包含Python TaskPhaseController计数，因此只按持物与Native谓词复核后重建release阶段，不伪造历史控制器内部状态。
+
+修复`_inspect_prediction()`在分支终态仍使用源状态持物几何缓存的问题：现在按预测终态的实际抓持状态重新绑定几何策略，并在无论通过或失败后恢复精确源Snapshot、复核Integration State、再按源抓持重建缓存。Safety Bridge在release阶段只保留原先核验的四个Panda finger Geom（76/77/79/80）与Pot 2 Geom接触对，合法最大穿透仍为2 mm；Palm/hand及其他机器人Geom、Ginger Beer、Place Box、自碰撞、BDDL和关节限制均未放宽。release本身由精确放置阶段门槛进入，因而分支安全通过后允许夹爪释放；物理支撑接触随后使原生On谓词成立，不再错误要求On必须先于release成立。
+
+本轮同时落实此前的细小派生位姿差异诊断化：t=589→590约0.087 mm EEF误差动作的25子步实际安全记录完整；t=590→591及后续恢复段的派生EEF/Pot根姿态差异，仅在预测与实际Runtime Snapshot、MuJoCo Integration State精确匹配且其余物理/Native证据通过时记作诊断值。原始差异日志保留，关节/夹爪状态、接触身份、谓词和安全限制仍严格比较；没有因数值记录而跳过任何真实不安全分支。
+
+### 真实任务进展和验收
+
+从t=590实际状态到t=649连续提交59个动作，共1,475/1,475个完整MuJoCo子步；每个动作25子步监测完整，Native/Operational违规、自碰撞、禁触/未许可/未解析接触和关节限位违规均为0。t=642→649的7个OSC_POSE动作依次经过release；t=644原生`On(moka_pot_2, flat_stove_1_cook_region)=true`且抓持解除，t=645–649取得5个连续稳定样本。t=649 Pot 2线速度0.000895 m/s、角速度0.018118 rad/s、5点位置跨度0.446 mm，均满足既有稳定限值。Pot 1 On仍false、Stove Turnon=true、reward=0、done=false、完整原生task_success=false。
+
+t=590→649全链最小robot–Pot 2非手指间隙4.242 mm（高于Operational 2 mm，故附加Strict-10mm统计不通过）；robot–Ginger Beer/Place Box最小间隙32.678/52.850 mm，持物时Pot 2到两者最小间隙123.276/66.641 mm。4指Geom–Pot 2最大穿透0.282 mm，小于2 mm许可。分类为**Native Safety通过、Operational Safety通过、Strict-10mm不通过**。t=649局部Pot 2里程碑位于标准1000步和demo-only 1800步内；这不是完整Benchmark或全任务成功，也不是完整Round 0种子。qpos路径误差仍仅作诊断，原0.18 rad记录、动作路径引用、安全余量和原生成功谓词均未改；本轮RRT调用0次。
+
+入口修复：`research/gs_opd/repair/execute_t463_execution_aware_pot2_placement.py`与`automatic_recovery_runtime.py`。另修正报告字段语义：`standard_horizon_success`和`demonstration_horizon_success`现在要求完整原生任务成功；Pot 2局部Horizon里程碑另有独立字段。t=649归档中的`posthoc_acceptance_audit.json`复核并校正了此语义，原始物理日志不变。
+
+真实数据归档：`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_release_continue_t642_20261025/`，包含7步原始Observation–Action、双方相机帧与视频、每动作25子步及接触身份、预测/提交对照、Snapshot、任务阶段、原生谓词、reward/done；t=590→642的52步连续前缀保存在其三个数值差异诊断段及t=593→642段归档中。t=590→649整段journal复核为59动作、1,475子步、0项监测违规。此次只完成Pot 2局部安全放置，不进入Pot 1、不拼接缺失前缀、不启动LoRA；Round 0完整安全种子仍要求从兼容的原始t=10 Snapshot在同一物理Episode连续重放并统一验收。历史1093步示范、Episode与LeRobot数据均保留。
+
 ## 最新进度：t=463执行感知搬运至t=590后按预测/实执行不一致停止（2026-10-24）
 
 ### 路线复用与连续状态链

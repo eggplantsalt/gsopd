@@ -1133,7 +1133,7 @@ class AutomaticRecoveryBridgeBackend:
         self, phase: str, object_name: str, held_object: str | None
     ) -> None:
         finger_contact_phases = {
-            "approach", "close_gripper", "stable_grasp", "withdrawal"
+            "approach", "close_gripper", "stable_grasp", "release", "withdrawal"
         }
         target = self.bindings[object_name]
         # Keep only the four verified Panda finger-to-active-object pairs

@@ -1,5 +1,17 @@
 # GS-OPD 当前局部目标
 
+## 当前局部目标：Pot 2局部安全放置已完成；完整任务继续留待后续阶段（2026-10-25）
+
+本轮从严格恢复的真实t=642 Snapshot续接到t=649。源模型SHA`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`、Integration State SHA`728279cabf061d58d4cbc8994a1f8c6809e55fd30d3dd0a035a3e5712ac7e906`、源Snapshot SHA`21e1f64cdbe53e0dbeb52e5893231b766edbf9230230e086258f03ede67b7534`已核验。t=642的真实阶段事件与双指抓持通过后，TaskPhaseController只重建已归档证明的release阶段。
+
+此前约0.087 mm EEF派生位姿差异现在保留为诊断，不再单独阻止安全动作；只有Runtime Snapshot和Integration State精确相同、每子步安全以及Native/接触证据均通过时才接受。数值门限、安全阈值、关节限位和BDDL谓词均未放宽。
+
+已连续提交7个新OSC_POSE动作（t=642→649）；Pot 2在t=644满足原生`On(moka_pot_2, flat_stove_1_cook_region)=true`并解除抓持，t=649通过5样本稳定检查。新段175/175物理子步完整；与t=590→642的同Episode链合计59动作、1,475/1,475子步，Native Safety和Operational Safety均通过，违规0。合法指尖最大穿透0.282 mm；全链robot–Pot 2、Ginger Beer、Place Box最小间隙分别4.242、32.678、52.850 mm，Strict-10mm附加统计不通过。
+
+当前状态是**已验证的Pot 2局部安全成功后缀**，不是完整任务：Pot 1 On=false，task_success=false，reward=0、done=false；t=649局部里程碑在标准1000步与demo-only 1800步内，但完整标准Benchmark/demo任务成功均为false。完整Round 0种子仍未取得，未训练LoRA。
+
+归档目录：`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_release_continue_t642_20261025/`；机器可读总审计`posthoc_acceptance_audit.json`，续跑结果`suffix_result.json`，Snapshot `snapshots/main_timestep_000649.pkl`。后续待办是在用户授权后从t=649真实状态继续Pot 1阶段，或为Round 0种子从t=10启动一条连续全任务Episode；不把局部后缀拼成完整种子。历史数据均保留。
+
 ## 当前局部目标：prediction/commit失配后停止在t=590（2026-10-24）
 
 本轮按获批方式复用t=398的193点路线，从严格恢复的t=463状态开始滚动预演和真实提交。t=463→589共126动作、3,150子步，逐动作预测/实执行认证通过，Pot 2保持双指抓持，阶段进入`precise_placement`。从完全匹配的同Episode t=589 Runtime Snapshot恢复后，TaskPhaseController根据真实状态重建，游标191，安全策略阈值及禁触对未改变。

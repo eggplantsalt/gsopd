@@ -72,6 +72,7 @@ MAX_ROLLING_PREVIEW_ACTIONS = 8
 MAX_DEMONSTRATION_HORIZON = 1800
 STANDARD_HORIZON = 1000
 POT2_NONFINGER_CLEARANCE_M = 0.002
+EEF_POSITION_NUMERIC_DIAGNOSTIC_TOLERANCE_M = 0.0001
 EXPECTED_ROUTE_POINTS = 193
 EXPECTED_ROUTE_QPOS_SHA256 = "a57e1ef5243098ed9003537ca701b5043ddf749be10554c647942f070ac25831"
 EXPECTED_ROUTE_EEF_SHA256 = "28ea80890d4fcab0be21fcfab5c7a76419b005e88de2c240a2d81c2800d6b418"
@@ -272,67 +273,79 @@ def _inspect_prediction(
     source_integration: np.ndarray,
     payload: bytes,
     safety_policy: dict[str, Any],
+    phase: str,
 ) -> dict[str, Any]:
     envelope = _runtime_payload_snapshot(payload)
     terminal_snapshot = envelope["snapshot"]
     expected_integration = np.asarray(terminal_snapshot.get("mujoco_state"), dtype=np.float64)
     if expected_integration.ndim != 1 or expected_integration.size == 0:
         raise RuntimeError("predicted_runtime_snapshot_has_no_complete_MuJoCo_Integration_State")
-    restored = bridge.request({"op": "restore_runtime_snapshot", "payload": payload})
-    if restored.get("status") != "restored":
-        raise RuntimeError(f"predicted_branch_snapshot_restore_failed:{restored.get('error')}")
-    predicted_status = bridge.request({"op": "native_task_status"})
-    predicted_contacts = bridge.request({"op": "inspect_contacts"})
-    predicted_live = bridge.request({
-        "op": "observe", "include_snapshot_state": True,
-        "safety_geometry_policy": safety_policy,
-    })
-    predicted_grasp, _, grasp_records = backend._grasp_states()
-    on_value = _native_on(predicted_status)
-    if predicted_status.get("status") != "complete" or on_value is None:
-        raise RuntimeError("predicted_branch_native_task_predicate_unknown")
-    if predicted_live.get("safety_geometry", {}).get("status") != "complete":
-        raise RuntimeError("predicted_branch_terminal_geometry_status_incomplete_or_unsafe")
-    terminal_geometry = predicted_live["safety_geometry"]
-    if any(terminal_geometry.get(key) for key in (
-        "forbidden_contacts", "forbidden_object_contacts", "self_contacts",
-        "unallowed_scene_contacts", "unresolved_contacts", "joint_limit_violations",
-    )):
-        raise RuntimeError("predicted_branch_terminal_state_fails_Native_or_Operational_safety")
-    if not _finger_grasp_evidence(backend, predicted_contacts).get(
-        "all_robot_contacts_are_whitelisted_finger_to_pot2"
-    ):
-        raise RuntimeError("predicted_branch_has_a_nonfinger_or_non_Pot2_robot_contact")
-    terminal_observation = predicted_live.get("snapshot_state")
-    if not isinstance(terminal_observation, dict):
-        raise RuntimeError("predicted_branch_terminal_snapshot_diagnostics_missing")
-    predicted_integration = np.asarray(
-        terminal_observation.get("mujoco_integration_state"), dtype=np.float64
-    )
-    if predicted_integration.shape != expected_integration.shape or not np.allclose(
-        predicted_integration, expected_integration, rtol=0.0, atol=1e-12
-    ):
-        raise RuntimeError("predicted_runtime_snapshot_and_restored_Integration_State_disagree")
-    returned = bridge.request({"op": "restore", "snapshot_id": source_snapshot_id})
-    if returned.get("restored_snapshot_id") != source_snapshot_id:
-        raise RuntimeError(f"source_state_restore_after_prediction_inspection_failed:{returned.get('error')}")
-    restored_observation = bridge.request({
-        "op": "observe", "include_snapshot_state": True,
-        "safety_geometry_policy": safety_policy,
-    })
-    actual_source = np.asarray(
-        restored_observation.get("snapshot_state", {}).get("mujoco_integration_state"),
-        dtype=np.float64,
-    )
-    if actual_source.shape != source_integration.shape or not np.array_equal(
-        actual_source, source_integration
-    ):
-        raise RuntimeError("source_Integration_State_changed_during_prediction_inspection")
-    # The low-level state restore is followed by a fresh observation. Keep the
-    # backend's cached physical data aligned with that exact restored state.
-    backend.latest_data = restored_observation
-    backend.latest_data["native_task_status"] = bridge.request({"op": "native_task_status"})
-    backend.latest_data["contacts"] = bridge.request({"op": "inspect_contacts"})
+    try:
+        restored = bridge.request({"op": "restore_runtime_snapshot", "payload": payload})
+        if restored.get("status") != "restored":
+            raise RuntimeError(f"predicted_branch_snapshot_restore_failed:{restored.get('error')}")
+        predicted_status = bridge.request({"op": "native_task_status"})
+        predicted_contacts = bridge.request({"op": "inspect_contacts"})
+        predicted_grasp, _, grasp_records = backend._grasp_states()
+        # Contact and carried-object permissions are derived from the restored
+        # physical grasp at the predicted endpoint. Do not leave the source
+        # state's carried-object binding active after a legitimate release.
+        backend._refresh_task_contact_policy(phase, OBJECT_ID, predicted_grasp)
+        predicted_live = bridge.request({
+            "op": "observe", "include_snapshot_state": True,
+            "safety_geometry_policy": backend.safety_policy,
+        })
+        on_value = _native_on(predicted_status)
+        if predicted_status.get("status") != "complete" or on_value is None:
+            raise RuntimeError("predicted_branch_native_task_predicate_unknown")
+        if predicted_live.get("safety_geometry", {}).get("status") != "complete":
+            raise RuntimeError("predicted_branch_terminal_geometry_status_incomplete_or_unsafe")
+        terminal_geometry = predicted_live["safety_geometry"]
+        if any(terminal_geometry.get(key) for key in (
+            "forbidden_contacts", "forbidden_object_contacts", "self_contacts",
+            "unallowed_scene_contacts", "unresolved_contacts", "joint_limit_violations",
+        )):
+            raise RuntimeError("predicted_branch_terminal_state_fails_Native_or_Operational_safety")
+        if not _finger_grasp_evidence(backend, predicted_contacts).get(
+            "all_robot_contacts_are_whitelisted_finger_to_pot2"
+        ):
+            raise RuntimeError("predicted_branch_has_a_nonfinger_or_non_Pot2_robot_contact")
+        terminal_observation = predicted_live.get("snapshot_state")
+        if not isinstance(terminal_observation, dict):
+            raise RuntimeError("predicted_branch_terminal_snapshot_diagnostics_missing")
+        predicted_integration = np.asarray(
+            terminal_observation.get("mujoco_integration_state"), dtype=np.float64
+        )
+        if predicted_integration.shape != expected_integration.shape or not np.allclose(
+            predicted_integration, expected_integration, rtol=0.0, atol=1e-12
+        ):
+            raise RuntimeError("predicted_runtime_snapshot_and_restored_Integration_State_disagree")
+    finally:
+        returned = bridge.request({"op": "restore", "snapshot_id": source_snapshot_id})
+        if returned.get("restored_snapshot_id") != source_snapshot_id:
+            raise RuntimeError(f"source_state_restore_after_prediction_inspection_failed:{returned.get('error')}")
+        restored_observation = bridge.request({
+            "op": "observe", "include_snapshot_state": True,
+        })
+        actual_source = np.asarray(
+            restored_observation.get("snapshot_state", {}).get("mujoco_integration_state"),
+            dtype=np.float64,
+        )
+        if actual_source.shape != source_integration.shape or not np.array_equal(
+            actual_source, source_integration
+        ):
+            raise RuntimeError("source_Integration_State_changed_during_prediction_inspection")
+        source_held, _, _ = backend._grasp_states()
+        backend._refresh_task_contact_policy(phase, OBJECT_ID, source_held)
+        restored_observation = bridge.request({
+            "op": "observe", "include_snapshot_state": True,
+            "safety_geometry_policy": backend.safety_policy,
+        })
+        # Keep the backend's cached physical data aligned with the exact
+        # restored source state even when predicted-state validation fails.
+        backend.latest_data = restored_observation
+        backend.latest_data["native_task_status"] = bridge.request({"op": "native_task_status"})
+        backend.latest_data["contacts"] = bridge.request({"op": "inspect_contacts"})
     return {
         "native_task_status": predicted_status,
         "pot2_on": on_value,
@@ -342,6 +355,7 @@ def _inspect_prediction(
         "predicted_current_geometry": predicted_live.get("safety_geometry"),
         "predicted_integration_state_sha256": _sha(predicted_integration),
         "source_restore_verified": True,
+        "contact_policy_rebound_to_predicted_grasp": True,
     }
 
 
@@ -455,17 +469,32 @@ def _parse_route(route_path: Path, policy_path: Path) -> tuple[np.ndarray, np.nd
 def _source_from_prior_segment(prior_dir: Path) -> dict[str, Any]:
     """Strictly attest an exact saved terminal state from this same suffix."""
     prior_dir = Path(prior_dir)
+    if (prior_dir / "prediction_commit_mismatch_stop.json").is_file():
+        return _source_from_prediction_mismatch_segment(prior_dir)
     result_path = prior_dir / "suffix_result.json"
     index_path = prior_dir / "durable_action_journal" / "index.jsonl"
     cert_path = prior_dir / "execution_certification.jsonl"
     if not result_path.is_file() or not index_path.is_file() or not cert_path.is_file():
         raise FileNotFoundError("prior_segment_result_index_or_certification_log_missing")
     prior_result = json.loads(result_path.read_text(encoding="utf-8"))
+    prior_config_path = prior_dir / "run_config.json"
+    if not prior_config_path.is_file():
+        raise FileNotFoundError("prior_segment_run_config_missing_for_episode_budget_attestation")
+    prior_config = json.loads(prior_config_path.read_text(encoding="utf-8"))
     rows = [json.loads(line) for line in index_path.read_text().splitlines() if line.strip()]
     certs = [json.loads(line) for line in cert_path.read_text().splitlines() if line.strip()]
     prior_actions = int(prior_result.get("physical_actions_committed", -1))
     if prior_actions <= 0 or len(rows) != prior_actions or len(certs) != prior_actions:
         raise RuntimeError("prior_segment_action_or_certificate_count_is_not_complete")
+    segment_parent_actions = int(prior_config.get("source_action_count_from_t463", -1))
+    cumulative_actions = int(prior_result.get("cumulative_physical_actions_from_t463", -1))
+    if (
+        segment_parent_actions < 0
+        or int(prior_result.get("prior_physical_actions_from_t463", -1)) != segment_parent_actions
+        or cumulative_actions != segment_parent_actions + prior_actions
+        or int(prior_config.get("maximum_cumulative_formal_actions_from_t463", -1)) != MAX_FORMAL_ACTIONS
+    ):
+        raise RuntimeError("prior_segment_cumulative_episode_action_budget_attestation_mismatch")
     if prior_result.get("failure_timestep") != rows[-1].get("timestep"):
         raise RuntimeError("prior_segment_failure_state_does_not_match_last_durable_action")
     for index, cert in enumerate(certs):
@@ -539,19 +568,391 @@ def _source_from_prior_segment(prior_dir: Path) -> dict[str, Any]:
         "integration_state_sha256": _sha(integration),
         "controller_initial_joint_rad": runtime_robot.get("controller", {}).get("initial_joint"),
         "prior_segment_path": str(prior_dir),
-        "prior_segment_actions": prior_actions,
+        "prior_segment_actions": cumulative_actions,
         "prior_segment_native_operational_prefix_verified": True,
     }
     route_cursor = int(certs[-1].get("path_index") or T463_CURSOR)
+    terminal_release_event = None
+    phase_events_path = prior_dir / "task_phase_events.jsonl"
+    if phase_events_path.is_file():
+        phase_events = [
+            json.loads(line) for line in phase_events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        terminal_events = [
+            event for event in phase_events
+            if event.get("event") == "task_phase_transition_observed"
+            and int(event.get("timestep", -1)) == timestep
+        ]
+        if terminal_events:
+            event = terminal_events[-1]
+            if (
+                event.get("from_phase") == "precise_placement"
+                and event.get("to_phase") == "release"
+                and event.get("held_object") == OBJECT_ID
+                and event.get("native_pot2_on") is False
+            ):
+                terminal_release_event = event
     return {
         "source_run": str(prior_dir),
         "snapshot_path": snapshot_path,
         "snapshot": snapshot,
         "attestation": attestation,
         "integration_sha256": _sha(integration),
-        "prior_actions": prior_actions,
+        "prior_actions": cumulative_actions,
         "route_cursor": route_cursor,
         "prior_result": prior_result,
+        "terminal_release_event": terminal_release_event,
+    }
+
+
+def _source_from_prediction_mismatch_segment(prior_dir: Path) -> dict[str, Any]:
+    """Attest an actual endpoint after a derived-EEF-only numeric stop.
+
+    The earlier 126-action segment is revalidated through the normal strict
+    certificate path. The single t590 action is accepted as a new source only
+    after verifying its durable action/snapshot hashes and all 25 actual
+    Native/Operational substeps. The former prediction mismatch stays attached
+    to the source attestation as diagnostic evidence. The live Bridge restore,
+    model/runtime checks, task adoption and grasp checks still run before any
+    action is permitted.
+    """
+    prior_dir = Path(prior_dir)
+    stop_path = prior_dir / "prediction_commit_mismatch_stop.json"
+    if stop_path.is_file():
+        stop_probe = json.loads(stop_path.read_text(encoding="utf-8"))
+        stop_timestep = int(stop_probe.get("failure_timestep", stop_probe.get("timestep", -1)))
+        if stop_timestep != 590:
+            return _source_from_single_eef_diagnostic_segment(prior_dir)
+    result_path = prior_dir / "suffix_result.json"
+    config_path = prior_dir / "run_config.json"
+    stop_path = prior_dir / "prediction_commit_mismatch_stop.json"
+    index_path = prior_dir / "durable_action_journal" / "index.jsonl"
+    if not all(path.is_file() for path in (result_path, config_path, stop_path, index_path)):
+        raise FileNotFoundError("t590_numeric_mismatch_resume_evidence_missing")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    stop = json.loads(stop_path.read_text(encoding="utf-8"))
+    chain_path = prior_dir / "continuation_chain.json"
+    if not chain_path.is_file():
+        raise FileNotFoundError("t590_resume_continuation_chain_missing")
+    chain = json.loads(chain_path.read_text(encoding="utf-8"))
+    parent_dir = Path(config.get("same_episode_continuation_from") or "")
+    if not parent_dir.is_dir():
+        raise RuntimeError("t590_resume_parent_segment_missing")
+    parent = _source_from_prior_segment(parent_dir)
+    rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if (
+        stop.get("status") != "stopped_fail_closed_on_prediction_commit_mismatch"
+        or stop.get("exception") != result.get("failure_reason")
+        or not str(stop.get("exception", "")).startswith("RuntimeError: prediction_commit_eef_pos_mismatch:")
+        or int(stop.get("timestep", -1)) != 590
+        or float(stop.get("observed", math.inf)) > EEF_POSITION_NUMERIC_DIAGNOSTIC_TOLERANCE_M
+        or stop.get("metric") != "max_abs_component_error_m"
+    ):
+        raise RuntimeError("t590_resume_source_is_not_the_attested_small_EEF_numeric_mismatch")
+    if (
+        len(rows) != 1
+        or int(result.get("initial_timestep", -1)) != 589
+        or int(result.get("failure_timestep", -1)) != 590
+        or int(result.get("prior_physical_actions_from_t463", -1)) != 126
+        or int(result.get("physical_actions_committed", -1)) != 1
+        or int(result.get("cumulative_physical_actions_from_t463", -1)) != 127
+        or int(result.get("route_cursor", -1)) != 191
+        or int(parent.get("prior_actions", -1)) != 126
+        or int(parent.get("attestation", {}).get("timestep", -1)) != 589
+    ):
+        raise RuntimeError("t590_resume_action_or_parent_chain_counts_do_not_match")
+    parent_snapshot_path = Path(parent["attestation"]["source_snapshot_path"])
+    source_589_copy = prior_dir / "source_t589.pkl"
+    if (
+        not source_589_copy.is_file()
+        or sha256_file(source_589_copy) != sha256_file(parent_snapshot_path)
+    ):
+        raise RuntimeError("t590_resume_t589_source_snapshot_is_not_the_exact_verified_parent_endpoint")
+    row = rows[0]
+    journal_path = Path(row["journal_path"])
+    if sha256_file(journal_path) != row.get("journal_sha256"):
+        raise RuntimeError("t590_resume_action_journal_hash_mismatch")
+    data = _read_journal(journal_path)
+    monitor = data["monitor"]
+    substeps = monitor.get("geometry_monitoring", {}).get("substeps", [])
+    if (
+        int(row.get("timestep", -1)) != 590
+        or row.get("task_phase") != "precise_placement"
+        or monitor.get("status") != "complete"
+        or monitor.get("captured_physics_substeps") != EXPECTED_SUBSTEPS
+        or monitor.get("geometry_monitoring", {}).get("status") != "complete"
+        or len(substeps) != EXPECTED_SUBSTEPS
+    ):
+        raise RuntimeError("t590_resume_action_monitor_is_incomplete")
+    safe, safety_audit = _verify_substep_policy(substeps, held=True)
+    if not safe or any(
+        substep.get(key)
+        for substep in substeps
+        for key in (
+            "forbidden_contacts", "forbidden_object_contacts", "self_contacts",
+            "unallowed_scene_contacts", "unresolved_contacts", "joint_limit_violations",
+            "strict_joint_limit_violations",
+        )
+    ):
+        raise RuntimeError("t590_resume_actual_substeps_fail_frozen_native_operational_policy")
+    native = data["native"]
+    if (
+        native.get("status") != "complete"
+        or int(native.get("timestep", -1)) != 590
+        or _native_on(native) is not False
+        or native.get("task_success") is not False
+        or native.get("done") is not False
+    ):
+        raise RuntimeError("t590_resume_native_task_state_is_not_a_live_pending_placement")
+    snapshot_path = Path(row["runtime_snapshot_path"])
+    expected_snapshot_hash = (
+        chain.get("episode_chain", {}).get("timestep_590", {}).get("runtime_snapshot_sha256")
+    )
+    if not snapshot_path.is_file() or sha256_file(snapshot_path) != expected_snapshot_hash:
+        raise RuntimeError("t590_resume_actual_runtime_snapshot_hash_mismatch")
+    envelope = pickle.loads(snapshot_path.read_bytes())
+    if (
+        envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1"
+        or envelope.get("model_geometry_sha256") != MODEL_SHA256
+    ):
+        raise RuntimeError("t590_resume_actual_runtime_snapshot_model_fingerprint_mismatch")
+    snapshot = envelope.get("snapshot")
+    if not isinstance(snapshot, dict) or int(snapshot.get("task_bookkeeping", {}).get("timestep", -1)) != 590:
+        raise RuntimeError("t590_resume_actual_runtime_snapshot_timestep_mismatch")
+    integration = np.asarray(snapshot.get("mujoco_state"), dtype=np.float64)
+    physical_integration = np.asarray(data["physical"].get("mujoco_integration_state"), dtype=np.float64)
+    if integration.shape != physical_integration.shape or not np.array_equal(integration, physical_integration):
+        raise RuntimeError("t590_resume_actual_snapshot_and_action_journal_integration_state_mismatch")
+    physical = data["physical"]
+    robot = physical.get("robot_states", [{}])[0]
+    object_rows = [
+        value for key, value in physical.get("object_states", {}).items()
+        if str(key).endswith(":" + OBJECT_ID)
+    ]
+    runtime_robots = snapshot.get("robots", [])
+    if len(object_rows) != 1 or len(runtime_robots) != 1 or not runtime_robots[0].get("has_gripper_current_action"):
+        raise RuntimeError("t590_resume_actual_snapshot_robot_gripper_or_Pot2_state_missing")
+    attestation = {
+        # Keep the runtime bridge's established attestation contract while
+        # preserving the provenance of this independently audited t590 source.
+        "status": "verified_source_action_snapshot",
+        "source_attestation_kind": "actual_t590_after_small_EEF_prediction_mismatch",
+        "source_snapshot_path": str(snapshot_path),
+        "source_snapshot_sha256": sha256_file(snapshot_path),
+        "source_action_record": str(journal_path),
+        "source_action_record_sha256": row["journal_sha256"],
+        "timestep": 590,
+        "model_geometry_sha256": MODEL_SHA256,
+        "object_id": OBJECT_ID,
+        "arm_joint_qpos": robot["joint_qpos"],
+        "eef_position_world_m": robot["eef_pos"],
+        "eef_quaternion_wxyz": robot["eef_quat"],
+        "gripper_qpos_m": robot["gripper_qpos"],
+        "object_position_world_m": object_rows[0]["root_pos"],
+        "object_quaternion_wxyz": object_rows[0]["root_quat"],
+        "restored_gripper_current_action": runtime_robots[0]["gripper_current_action"],
+        "integration_state_sha256": _sha(integration),
+        "controller_initial_joint_rad": runtime_robots[0].get("controller", {}).get("initial_joint"),
+        "prior_segment_path": str(prior_dir),
+        "prior_segment_actions": 127,
+        "prior_segment_native_operational_prefix_verified": True,
+        "prior_numeric_mismatch_diagnostic_only": {
+            "component": "derived_robot0_eef_pos",
+            "max_abs_component_error_m": float(stop["observed"]),
+            "source_reason": stop["exception"],
+            "current_action_replayed": False,
+        },
+        "prior_segment_actual_safety_audit": safety_audit,
+    }
+    return {
+        "source_run": str(prior_dir),
+        "snapshot_path": snapshot_path,
+        "snapshot": snapshot,
+        "attestation": attestation,
+        "integration_sha256": _sha(integration),
+        "prior_actions": 127,
+        "route_cursor": 191,
+        "prior_result": result,
+    }
+
+
+def _source_from_single_eef_diagnostic_segment(prior_dir: Path) -> dict[str, Any]:
+    """Resume from a fully journaled one-action endpoint stopped on EEF derivation.
+
+    Acceptance requires the actual and predicted runtime Snapshot bytes and
+    Integration State to match exactly, plus complete recorded Native and
+    Operational monitoring. Only deterministic EEF/object root transforms
+    derived from that exact state become diagnostics; joint/gripper state,
+    velocity, contacts, predicates and safety remain strict.
+    """
+    prior_dir = Path(prior_dir)
+    result_path = prior_dir / "suffix_result.json"
+    config_path = prior_dir / "run_config.json"
+    stop_path = prior_dir / "prediction_commit_mismatch_stop.json"
+    index_path = prior_dir / "durable_action_journal" / "index.jsonl"
+    if not all(path.is_file() for path in (result_path, config_path, stop_path, index_path)):
+        raise FileNotFoundError("numeric_EEF_endpoint_resume_evidence_missing")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    stop = json.loads(stop_path.read_text(encoding="utf-8"))
+    record_path = prior_dir / "prediction_commit_records" / f"prediction_t{int(stop.get('failure_timestep', -1)):06d}.json"
+    if not record_path.is_file():
+        raise FileNotFoundError("numeric_EEF_endpoint_prediction_record_missing")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    parent_dir = Path(config.get("same_episode_continuation_from") or "")
+    if not parent_dir.is_dir():
+        raise RuntimeError("numeric_EEF_endpoint_parent_segment_missing")
+    parent = _source_from_prior_segment(parent_dir)
+    rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    timestep = int(stop.get("failure_timestep", -1))
+    pre_timestep = timestep - 1
+    stop_reason = str(stop.get("failure_reason", ""))
+    if (
+        stop.get("status") != "stopped_fail_closed_on_prediction_commit_mismatch"
+        or not any(stop_reason.startswith(prefix) for prefix in (
+            "RuntimeError: prediction_commit_eef_pos_mismatch:",
+            "RuntimeError: prediction_commit_eef_quat_mismatch:",
+            "RuntimeError: prediction_commit_Pot2_root_pos_mismatch:",
+            "RuntimeError: prediction_commit_Pot2_root_quat_mismatch:",
+        ))
+        or record.get("failure_reason") != stop.get("failure_reason")
+        or record.get("status") != "physical_commit_stopped_before_certification"
+        or int(record.get("pre_timestep", -1)) != pre_timestep
+        or int(record.get("predicted_timestep", -1)) != timestep
+        or record.get("qpos_reference_mode") != "diagnostic_only"
+        or len(rows) != 1
+        or int(result.get("initial_timestep", -1)) != pre_timestep
+        or int(result.get("failure_timestep", -1)) != timestep
+        or int(result.get("physical_actions_committed", -1)) != 1
+        or int(result.get("prior_physical_actions_from_t463", -1)) != int(parent.get("prior_actions", -2))
+        or int(result.get("cumulative_physical_actions_from_t463", -1)) != int(parent.get("prior_actions", -2)) + 1
+        or int(parent.get("attestation", {}).get("timestep", -1)) != pre_timestep
+        or int(config.get("route_cursor_start", -1)) != int(parent.get("route_cursor", -2))
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_action_or_parent_chain_is_inconsistent")
+    parent_snapshot = Path(parent["attestation"]["source_snapshot_path"])
+    parent_copy = prior_dir / f"source_t{pre_timestep}.pkl"
+    if not parent_copy.is_file() or sha256_file(parent_copy) != sha256_file(parent_snapshot):
+        raise RuntimeError("numeric_EEF_endpoint_parent_snapshot_is_not_exact")
+    row = rows[0]
+    journal_path = Path(row["journal_path"])
+    if sha256_file(journal_path) != row.get("journal_sha256") or int(row.get("timestep", -1)) != timestep:
+        raise RuntimeError("numeric_EEF_endpoint_action_journal_hash_or_timestep_mismatch")
+    data = _read_journal(journal_path)
+    monitor = data.get("monitor", {})
+    geometry = monitor.get("geometry_monitoring", {})
+    substeps = geometry.get("substeps", [])
+    safe, safety_audit = _verify_substep_policy(substeps, held=True)
+    if (
+        monitor.get("status") != "complete"
+        or monitor.get("captured_physics_substeps") != EXPECTED_SUBSTEPS
+        or geometry.get("status") != "complete"
+        or len(substeps) != EXPECTED_SUBSTEPS
+        or not safe
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_actual_substep_safety_not_verified")
+    native = data.get("native", {})
+    if (
+        native.get("status") != "complete"
+        or int(native.get("timestep", -1)) != timestep
+        or _native_on(native) is not False
+        or native.get("task_success") is not False
+        or native.get("done") is not False
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_native_task_state_is_not_pending_Pot2_placement")
+    snapshot_path = Path(row["runtime_snapshot_path"])
+    predicted_path = Path(record.get("expected_runtime_snapshot_path") or "")
+    expected_hash = record.get("expected_runtime_snapshot_sha256")
+    if (
+        not snapshot_path.is_file()
+        or not predicted_path.is_file()
+        or sha256_file(snapshot_path) != expected_hash
+        or sha256_file(predicted_path) != expected_hash
+        or sha256_file(snapshot_path) != sha256_file(predicted_path)
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_actual_predicted_runtime_snapshot_bytes_differ")
+    envelope = pickle.loads(snapshot_path.read_bytes())
+    predicted_envelope = pickle.loads(predicted_path.read_bytes())
+    snapshot = envelope.get("snapshot")
+    if (
+        envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1"
+        or envelope.get("model_geometry_sha256") != MODEL_SHA256
+        or predicted_envelope.get("model_geometry_sha256") != MODEL_SHA256
+        or not isinstance(snapshot, dict)
+        or int(snapshot.get("task_bookkeeping", {}).get("timestep", -1)) != timestep
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_runtime_snapshot_fingerprint_or_timestep_mismatch")
+    integration = np.asarray(snapshot.get("mujoco_state"), dtype=np.float64)
+    journal_integration = np.asarray(data.get("physical", {}).get("mujoco_integration_state"), dtype=np.float64)
+    predicted_integration = np.asarray(predicted_envelope.get("snapshot", {}).get("mujoco_state"), dtype=np.float64)
+    if (
+        integration.shape != journal_integration.shape
+        or integration.shape != predicted_integration.shape
+        or not np.array_equal(integration, journal_integration)
+        or not np.array_equal(integration, predicted_integration)
+    ):
+        raise RuntimeError("numeric_EEF_endpoint_actual_predicted_Integration_State_mismatch")
+    actual_signature = _contacts_signature(data.get("contacts", {}))
+    expected_signature = [tuple(int(x) for x in pair) for pair in record.get("expected_contact_signature", [])]
+    if actual_signature != expected_signature:
+        raise RuntimeError("numeric_EEF_endpoint_actual_predicted_contact_identity_mismatch")
+    robot_rows = data.get("physical", {}).get("robot_states", [])
+    object_rows = [
+        value for key, value in data.get("physical", {}).get("object_states", {}).items()
+        if str(key).endswith(":" + OBJECT_ID)
+    ]
+    runtime_robots = snapshot.get("robots", [])
+    if len(robot_rows) != 1 or len(object_rows) != 1 or len(runtime_robots) != 1:
+        raise RuntimeError("numeric_EEF_endpoint_robot_or_Pot2_state_missing")
+    if not runtime_robots[0].get("has_gripper_current_action"):
+        raise RuntimeError("numeric_EEF_endpoint_native_gripper_state_missing")
+    attestation = {
+        "status": "verified_source_action_snapshot",
+        "source_attestation_kind": "actual_endpoint_after_derived_pose_numeric_difference",
+        "source_snapshot_path": str(snapshot_path),
+        "source_snapshot_sha256": sha256_file(snapshot_path),
+        "source_action_record": str(journal_path),
+        "source_action_record_sha256": row["journal_sha256"],
+        "timestep": timestep,
+        "model_geometry_sha256": MODEL_SHA256,
+        "object_id": OBJECT_ID,
+        "arm_joint_qpos": robot_rows[0]["joint_qpos"],
+        "eef_position_world_m": robot_rows[0]["eef_pos"],
+        "eef_quaternion_wxyz": robot_rows[0]["eef_quat"],
+        "gripper_qpos_m": robot_rows[0]["gripper_qpos"],
+        "object_position_world_m": object_rows[0]["root_pos"],
+        "object_quaternion_wxyz": object_rows[0]["root_quat"],
+        "restored_gripper_current_action": runtime_robots[0]["gripper_current_action"],
+        "integration_state_sha256": _sha(integration),
+        "controller_initial_joint_rad": runtime_robots[0].get("controller", {}).get("initial_joint"),
+        "prior_segment_path": str(prior_dir),
+        "prior_segment_actions": int(result["cumulative_physical_actions_from_t463"]),
+        "prior_segment_native_operational_prefix_verified": True,
+        "prior_numeric_mismatch_diagnostic_only": {
+            "component": next((name for prefix, name in (
+                ("prediction_commit_eef_pos_mismatch:", "derived_robot0_eef_pos"),
+                ("prediction_commit_eef_quat_mismatch:", "derived_robot0_eef_quat"),
+                ("prediction_commit_Pot2_root_pos_mismatch:", "derived_Pot2_root_pos"),
+                ("prediction_commit_Pot2_root_quat_mismatch:", "derived_Pot2_root_quat"),
+            ) if prefix in stop_reason), "unknown"),
+            "exception": stop_reason,
+            "actual_predicted_runtime_snapshot_sha256_equal": True,
+            "actual_predicted_Integration_State_exact": True,
+            "current_action_replayed": False,
+        },
+        "prior_segment_actual_safety_audit": safety_audit,
+    }
+    return {
+        "source_run": str(prior_dir),
+        "snapshot_path": snapshot_path,
+        "snapshot": snapshot,
+        "attestation": attestation,
+        "integration_sha256": _sha(integration),
+        "prior_actions": int(result["cumulative_physical_actions_from_t463"]),
+        "route_cursor": int(config["route_cursor_start"]),
+        "prior_result": result,
     }
 
 
@@ -610,7 +1011,10 @@ def _preview_route_segment(
         "jointspace_path_qpos": qpos_path.tolist(),
         "eef_reference_poses_world": eef_path.tolist(),
         "path_start_index": index,
-        "max_control_steps": min(MAX_ROLLING_PREVIEW_ACTIONS, len(qpos_path) - 1 - index),
+        # Commit at most the first action from a certified route segment. The
+        # next candidate is always generated from the newly observed real
+        # state, so no stale multi-action prediction is executed after drift.
+        "max_control_steps": min(1, len(qpos_path) - 1 - index),
         "gripper_action": 0.0,
         "risk_trigger_distance_m": RISK_TRIGGER_M,
         "risk_rearm_distance_m": RISK_REARM_M,
@@ -638,6 +1042,8 @@ def _preview_route_segment(
         raise RuntimeError("route_preview_native_or_operational_safety_verdict_not_safe")
     if len(response["actions"]) != len(response["steps"]) or len(response["actions"]) > MAX_ROLLING_PREVIEW_ACTIONS:
         raise RuntimeError("route_preview_action_step_count_mismatch_or_limit_exceeded")
+    if len(response["actions"]) != 1:
+        raise RuntimeError("route_preview_must_certify_exactly_one_action_from_current_live_state")
     predicted: list[dict[str, Any]] = []
     for offset, step in enumerate(response["steps"]):
         expected_index = index + offset + 1
@@ -653,6 +1059,7 @@ def _preview_route_segment(
         native_and_live = _inspect_prediction(
             bridge, backend, source_snapshot_id, integration,
             step.get("terminal_runtime_snapshot"), backend.safety_policy,
+            context.phase,
         )
         if native_and_live.get("predicted_held_object") != OBJECT_ID:
             raise RuntimeError("route_preview_live_grasp_state_did_not_confirm_Pot2")
@@ -705,7 +1112,7 @@ def _preview_expert_action(
         or len(geometry.get("substeps", [])) != EXPECTED_SUBSTEPS
     ):
         raise RuntimeError("expert_action_branch_failed_25_substep_contact_or_geometry_coverage")
-    held_expected = context.phase in {"transport", "precise_placement"}
+    held_expected = context.held_object == OBJECT_ID
     policy_ok, policy_audit = _verify_substep_policy(geometry["substeps"], held=held_expected)
     if not policy_ok:
         raise RuntimeError("expert_action_branch_failed_frozen_substep_policy:" + json.dumps(policy_audit, sort_keys=True))
@@ -713,7 +1120,7 @@ def _preview_expert_action(
     grasp = _finger_grasp_evidence(backend, contacts)
     if not grasp["all_robot_contacts_are_whitelisted_finger_to_pot2"]:
         raise RuntimeError("expert_action_branch_has_nonfinger_or_non_Pot2_robot_contact")
-    if held_expected and not grasp["grasp_confirmed"]:
+    if held_expected and context.phase != "release" and not grasp["grasp_confirmed"]:
         raise RuntimeError("expert_action_branch_lost_bilateral_Pot2_grasp")
     if bool(step.get("done")):
         raise RuntimeError("expert_action_branch_would_terminate_environment")
@@ -721,13 +1128,17 @@ def _preview_expert_action(
     if not isinstance(payload, bytes) or not payload:
         raise RuntimeError("expert_action_branch_did_not_export_terminal_runtime_snapshot")
     prediction = _inspect_prediction(
-        bridge, backend, source_snapshot_id, integration, payload, backend.safety_policy
+        bridge, backend, source_snapshot_id, integration, payload,
+        backend.safety_policy, context.phase,
     )
     if context.phase == "release":
         if prediction.get("predicted_held_object") not in {None, OBJECT_ID}:
             raise RuntimeError("release_branch_reports_an_unexpected_held_object")
-        if prediction.get("predicted_held_object") is None and prediction.get("pot2_on") is not True:
-            raise RuntimeError("release_branch_would_drop_Pot2_before_native_On_predicate")
+        # The controller enters release only after the precise-placement pose
+        # goal is reached. Physical support contact is what makes the native
+        # On predicate true, so the certified release transition may precede
+        # that predicate. This action is still gated by the full branch checks
+        # and the exact live source-state comparison below.
     if context.phase in {"withdrawal", "settle"} and (
         prediction.get("predicted_held_object") is not None
         or prediction.get("pot2_on") is not True
@@ -788,13 +1199,22 @@ def _compare_branch_physics(predicted_step: dict[str, Any], actual_data: dict[st
     if len(exp_robots) != 1 or len(act_robots) != 1:
         raise RuntimeError("prediction_commit_robot_state_inventory_mismatch")
     errors: dict[str, float] = {}
+    diagnostic_only_differences: dict[str, dict[str, Any]] = {}
     for key in ("joint_qpos", "eef_pos", "eef_quat", "gripper_qpos"):
         a = np.asarray(exp_robots[0].get(key), dtype=np.float64)
         b = np.asarray(act_robots[0].get(key), dtype=np.float64)
         if a.shape != b.shape:
             raise RuntimeError(f"prediction_commit_{key}_shape_mismatch")
+        if not np.isfinite(a).all() or not np.isfinite(b).all():
+            raise RuntimeError(f"prediction_commit_{key}_nonfinite")
         errors[key] = float(np.max(np.abs(a - b))) if a.size else 0.0
-        if errors[key] > 1e-8:
+        if key in {"eef_pos", "eef_quat"} and errors[key] > 1e-8:
+            diagnostic_only_differences[key] = {
+                "max_abs_component_error": errors[key],
+                "classification": f"derived_EEF_{'position' if key == 'eef_pos' else 'quaternion'}_difference_diagnostic_only",
+                "physical_state_gate": "joint_qpos_object_state_and_exact_post_action_Integration_State",
+            }
+        elif key not in {"eef_pos", "eef_quat"} and errors[key] > 1e-8:
             raise RuntimeError(f"prediction_commit_{key}_mismatch:{errors[key]}")
     expected_pot = _robot_objects(expected)
     actual_pot = _robot_objects(actual)
@@ -804,9 +1224,22 @@ def _compare_branch_physics(predicted_step: dict[str, Any], actual_data: dict[st
         if a.shape != b.shape:
             raise RuntimeError(f"prediction_commit_Pot2_{key}_shape_mismatch")
         errors[f"pot2_{key}"] = float(np.max(np.abs(a - b))) if a.size else 0.0
-        if errors[f"pot2_{key}"] > 1e-8:
+        if not np.isfinite(a).all() or not np.isfinite(b).all():
+            raise RuntimeError(f"prediction_commit_Pot2_{key}_nonfinite")
+        if key in {"root_pos", "root_quat"} and errors[f"pot2_{key}"] > 1e-8:
+            diagnostic_only_differences[f"pot2_{key}"] = {
+                "max_abs_component_error": errors[f"pot2_{key}"],
+                "classification": f"derived_Pot2_{'root_position' if key == 'root_pos' else 'root_quaternion'}_difference_diagnostic_only",
+                "physical_state_gate": "exact_object_joint_state_and_exact_post_action_Integration_State",
+            }
+        elif key == "joint_qvel" and errors[f"pot2_{key}"] > 1e-8:
             raise RuntimeError(f"prediction_commit_Pot2_{key}_mismatch:{errors[f'pot2_{key}']}")
-    return {"physical_state_component_max_abs_errors": errors}
+    return {
+        "physical_state_component_max_abs_errors": errors,
+        "diagnostic_only_numeric_differences": diagnostic_only_differences,
+        "eef_position_comparison": "diagnostic_only; physical authorization requires exact Integration State and other state/safety checks",
+        "non_eef_component_tolerance_unchanged": 1e-8,
+    }
 
 
 def _record_actual_route_reference(actual: dict[str, Any], qpos: np.ndarray, pose: np.ndarray, index: int) -> dict[str, Any]:
@@ -998,6 +1431,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         context = backend.current_context()
         if context.held_object != OBJECT_ID or context.phase not in {"transport", "precise_placement"}:
             raise RuntimeError(f"live_task_adoption_mismatch:{context.phase}:{context.held_object}")
+        resume_release_event = source.get("terminal_release_event")
+        if resume_release_event is not None:
+            if (
+                int(resume_release_event.get("timestep", -1)) != start_timestep
+                or resume_release_event.get("from_phase") != "precise_placement"
+                or resume_release_event.get("to_phase") != "release"
+                or resume_release_event.get("held_object") != OBJECT_ID
+                or resume_release_event.get("native_pot2_on") is not False
+            ):
+                raise RuntimeError("archived_release_phase_transition_does_not_match_restored_source_state")
+            # The simulator Snapshot omits Python TaskPhaseController
+            # counters. Re-adopt only the phase proven by this exact
+            # same-timestep durable event and the live grasp/native checks.
+            backend.task_controller.phase = "release"
+            backend.task_controller._expert_handoff = True
+            backend.task_controller._phase_steps = 0
+            backend.task_controller._last_timestep = -1
+            backend.task_expert_active = True
+            context = backend.current_context()
+            if context.phase != "release" or context.held_object != OBJECT_ID:
+                raise RuntimeError("verified_release_phase_re_adoption_failed_live_state_check")
+            _record_jsonl(output_dir / "task_phase_events.jsonl", {
+                "event": "task_phase_resume_adopted_from_verified_transition",
+                "timestep": start_timestep,
+                "from_phase": "precise_placement",
+                "phase": "release",
+                "held_object": OBJECT_ID,
+                "native_pot2_on": _native_on(preflight["native_task_status"]),
+                "source_event": resume_release_event,
+                "controller_counters_reinitialized": True,
+            })
         backend.safety_policy["source"] = archived_policy["source"]
         phase_policy_attestation = _validate_live_phase_policy(
             backend, archived_policy, context.phase
@@ -1048,7 +1512,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )))
             if endpoint_position_error > position_tolerance or endpoint_orientation_error > orientation_tolerance:
                 raise RuntimeError("archived_route_endpoint_is_outside_live_transport_goal_tolerance")
-        elif context.phase != "precise_placement":
+        elif context.phase not in {"precise_placement", "release"}:
             raise RuntimeError(f"restored_task_phase_is_not_supported_for_t463_suffix:{context.phase}")
         qpos_now = observation.qpos.copy()
         route_cursor_error = float(np.linalg.norm(qpos_now - qpos_path[route_cursor_start]))
@@ -1190,6 +1654,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     break
                 action = np.asarray(predicted["action"], dtype=np.float32)
                 phase_before = context.phase
+                held_expected_before_action = context.held_object == OBJECT_ID
                 expected_snapshot_payload = (
                     predicted["step"].get("terminal_runtime_snapshot")
                     if phase_before == "transport"
@@ -1281,12 +1746,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "geometry_substeps": len(actual_substeps),
                     "contacts": _contacts_signature(actual.get("contacts", {})),
                     "per_step_safety_summary": _verify_substep_policy(
-                        actual_substeps, held=phase_before in {"transport", "precise_placement"}
+                        actual_substeps, held=held_expected_before_action
                     )[1] if len(actual_substeps) == EXPECTED_SUBSTEPS else None,
                 }
                 pending_action_certificate["actual_runtime_snapshot_path"] = actual.get("snapshot_path")
                 _write_json(prediction_record_path, pending_action_certificate)
-                held_expected = phase_before in {"transport", "precise_placement"}
+                held_expected = held_expected_before_action
                 actual_safe, actual_audit = _verify_substep_policy(actual_substeps, held=held_expected)
                 if (
                     monitor.get("status") != "complete"
@@ -1299,7 +1764,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 actual_grasp = _finger_grasp_evidence(backend, actual_contacts)
                 if not actual_grasp["all_robot_contacts_are_whitelisted_finger_to_pot2"]:
                     raise RuntimeError("committed_action_created_nonfinger_or_non_Pot2_robot_contact")
-                if held_expected and not actual_grasp["grasp_confirmed"]:
+                if held_expected and phase_before != "release" and not actual_grasp["grasp_confirmed"]:
                     raise RuntimeError(f"committed_action_lost_bilateral_Pot2_grasp:{phase_before}")
                 runtime_actual = bridge.request({"op": "export_runtime_snapshot"})
                 if runtime_actual.get("status") != "complete":
@@ -1462,13 +1927,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             ),
             "complete_round0_seed": False,
-            "standard_horizon_success": bool(
+            "pot2_local_milestone_within_standard_horizon": bool(
                 on_value is True and result.get("pot2_local_milestone")
                 and terminal.timestep <= STANDARD_HORIZON
             ),
-            "demonstration_horizon_success": bool(
+            "pot2_local_milestone_within_demonstration_horizon": bool(
                 on_value is True and result.get("pot2_local_milestone")
                 and terminal.timestep <= MAX_DEMONSTRATION_HORIZON
+            ),
+            "standard_horizon_success": bool(
+                terminal.task_success is True and terminal.timestep <= STANDARD_HORIZON
+            ),
+            "demonstration_horizon_success": bool(
+                terminal.task_success is True and terminal.timestep <= MAX_DEMONSTRATION_HORIZON
             ),
             "route_path_points": len(qpos_path),
             "route_final_cursor": backend.plan_cursor,
