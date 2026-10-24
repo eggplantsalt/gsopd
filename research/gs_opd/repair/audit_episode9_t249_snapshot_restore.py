@@ -64,6 +64,7 @@ def _summarize_episode9_history(episode_dir: Path) -> dict[str, Any]:
         incomplete_substeps = 0
         unsafe_substeps = 0
         limit_violations = 0
+        substeps_with_joint_limit_fields = 0
         forbidden_contact_events = 0
         unresolved_events = 0
         latest_monitor = monitors[index]
@@ -74,6 +75,10 @@ def _summarize_episode9_history(episode_dir: Path) -> dict[str, Any]:
             for substep in substeps:
                 incomplete_substeps += int(substep.get("status") not in ("complete", "unsafe"))
                 unsafe_substeps += int(substep.get("status") == "unsafe")
+                substeps_with_joint_limit_fields += int(
+                    "joint_limit_violations" in substep
+                    or "strict_joint_limit_violations" in substep
+                )
                 limit_violations += len(substep.get("joint_limit_violations", []))
                 forbidden_contact_events += len(substep.get("forbidden_contacts", []))
                 unresolved_events += len(substep.get("unresolved_contacts", []))
@@ -83,6 +88,23 @@ def _summarize_episode9_history(episode_dir: Path) -> dict[str, Any]:
         # but not raw per-substep contact identities. Actual contact identities
         # were saved once at the post-control observation in post_contacts_json.
         latest_has_contact_identities = any("contacts" in item for item in latest_substeps)
+        gripper_qpos = np.asarray(trace["post_robot0_gripper_qpos"], dtype=np.float64)
+        joint_endpoint_excursions = {}
+        for column, name, lower, upper in (
+            (0, "gripper0_finger_joint1", 0.0, 0.04),
+            (1, "gripper0_finger_joint2", -0.04, 0.0),
+        ):
+            values = gripper_qpos[:, column]
+            outside = np.maximum(np.maximum(lower - values, values - upper), 0.0)
+            joint_endpoint_excursions[name] = {
+                "unit": "m",
+                "model_range_from_verified_MuJoCo_inventory": [lower, upper],
+                "recorded_post_control_qpos_min": float(values.min()),
+                "recorded_post_control_qpos_max": float(values.max()),
+                "post_control_samples_outside_model_range": int(np.count_nonzero(outside > 0.0)),
+                "maximum_post_control_range_excursion_m": float(outside.max()),
+                "per_substep_qpos_was_recorded": False,
+            }
         return {
             "status": "complete",
             "trace_path": str(trace_path),
@@ -99,7 +121,16 @@ def _summarize_episode9_history(episode_dir: Path) -> dict[str, Any]:
             "total_geometry_substeps": total_substeps,
             "incomplete_geometry_substeps": incomplete_substeps,
             "unsafe_geometry_substeps": unsafe_substeps,
-            "joint_limit_violation_events": limit_violations,
+            "joint_limit_evidence_status": (
+                "recorded"
+                if substeps_with_joint_limit_fields == total_substeps
+                else "not_recorded_per_substep;historical_zero_event_count_is_not_a_pass"
+            ),
+            "substeps_with_joint_limit_fields": substeps_with_joint_limit_fields,
+            "joint_limit_violation_events": (
+                limit_violations if substeps_with_joint_limit_fields else None
+            ),
+            "post_control_gripper_joint_limit_excursions": joint_endpoint_excursions,
             "forbidden_contact_events": forbidden_contact_events,
             "unresolved_contact_events": unresolved_events,
             "timestep_249_post_control_gripper_qpos": trace["post_robot0_gripper_qpos"][index].tolist(),

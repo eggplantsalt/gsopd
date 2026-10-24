@@ -418,6 +418,7 @@ class AutomaticRecoveryBridgeBackend:
         grasp_template_path: Path,
         runtime_snapshot_path: Path,
         t10_verification_path: Path,
+        runtime_snapshot_attestation: dict[str, Any] | None = None,
     ):
         self.bridge = bridge
         self.config_data = config_data
@@ -430,6 +431,20 @@ class AutomaticRecoveryBridgeBackend:
         self.grasp_template_path = Path(grasp_template_path)
         self.runtime_snapshot_path = Path(runtime_snapshot_path)
         self.t10_verification_path = Path(t10_verification_path)
+        self.runtime_snapshot_attestation = runtime_snapshot_attestation
+        if self.mode == "task-runtime-snapshot":
+            if not isinstance(runtime_snapshot_attestation, dict):
+                raise ValueError("task_runtime_snapshot_requires_a_source_attestation")
+            if runtime_snapshot_attestation.get("status") != "verified_source_action_snapshot":
+                raise ValueError("task_runtime_snapshot_source_attestation_is_not_verified")
+            if runtime_snapshot_attestation.get("source_snapshot_sha256") != sha256_file(
+                self.runtime_snapshot_path
+            ):
+                raise ValueError("task_runtime_snapshot_source_sha256_mismatch")
+            if runtime_snapshot_attestation.get("model_geometry_sha256") != self.config_data.get(
+                "expected_model_geometry_sha256"
+            ):
+                raise ValueError("task_runtime_snapshot_model_attestation_mismatch")
         self.archive = np.load(self.archived_trace_path, allow_pickle=False)
         self.archived_actions = np.asarray(self.archive["executed_actions"], dtype=np.float32)
         self.archive_sha256 = sha256_file(self.archived_trace_path)
@@ -770,6 +785,10 @@ class AutomaticRecoveryBridgeBackend:
             if not obstacle_scope_verified:
                 raise ValueError("archived_t10_history_has_no_complete_obstacle_safety_evidence")
             self.initial_history_safety_verified = True
+        elif self.mode == "task-runtime-snapshot":
+            # This is a state-level suffix continuation, not a claim that the
+            # older prefix is fully audited under the current contact schema.
+            self.initial_history_safety_verified = False
         else:
             self.initial_history_safety_verified = True
         return self.context_static
@@ -1317,7 +1336,9 @@ class AutomaticRecoveryBridgeBackend:
             allowed_target_contacts=target["allowed_contacts"],
         )
         expert_active = self.task_expert_active
-        task_expert_only_snapshot = self.mode == "runtime-snapshot"
+        task_expert_only_snapshot = self.mode in {
+            "runtime-snapshot", "task-runtime-snapshot"
+        }
         return TaskContext(
             task_id=self.context_static["task_id"],
             instruction=self.context_static["instruction"],
@@ -1927,6 +1948,20 @@ class AutomaticRecoveryBridgeBackend:
         snapshot_id = snapshot.get("snapshot_id")
         if not snapshot_id:
             return PrefixPreview(np.empty((0, 7)), [], False, False, False, "active_physical_state_Snapshot_failed")
+        # A verified carried-object state must preserve the current grasp.
+        # PandaGripper uses zero as a hold command; sending the configured
+        # open command during an isolated transport preview could release the
+        # object in the branch and then commit that unsafe action sequence.
+        preview_gripper_action = (
+            0.0
+            if context.held_object is not None
+            else float(self.config_data.get("open_gripper_action", -1.0))
+        )
+        preview_gripper_action_source = (
+            "neutral_hold_verified_held_object"
+            if context.held_object is not None
+            else "configured_open_command_unheld"
+        )
         request = {
             "op": "osc_prefix_probe",
             "snapshot_id": snapshot_id,
@@ -1937,7 +1972,7 @@ class AutomaticRecoveryBridgeBackend:
             "eef_reference_poses_world": self._plan_poses.tolist(),
             "path_start_index": self.plan_cursor,
             "max_control_steps": config.segment_control_steps,
-            "gripper_action": float(self.config_data.get("open_gripper_action", -1.0)),
+            "gripper_action": preview_gripper_action,
             "risk_trigger_distance_m": config.risk_trigger_distance_m,
             "risk_rearm_distance_m": config.risk_rearm_distance_m,
             "risk_crossing_armed": bool(risk_boundary_armed),
@@ -1990,6 +2025,8 @@ class AutomaticRecoveryBridgeBackend:
                 "plan_index": self.plan_counter,
                 "snapshot_id": snapshot_id,
                 "stop_reason": stop_reason,
+                "preview_gripper_action": preview_gripper_action,
+                "preview_gripper_action_source": preview_gripper_action_source,
                 "contact_monitoring": result.get("contact_monitoring"),
                 "branch_snapshot_paths": snapshot_paths,
                 "main_state_restored_verified": main_restored,
@@ -2114,12 +2151,71 @@ class AutomaticRecoveryBridgeBackend:
             raise RuntimeError("native_episode_reset_model_geometry_fingerprint_mismatch")
         if int(reset.get("timestep", -1)) != 0:
             raise RuntimeError("native_episode_reset_did_not_return_timestep_zero")
-        if self.mode in {"t10-snapshot", "runtime-snapshot"}:
+        if self.mode in {"t10-snapshot", "runtime-snapshot", "task-runtime-snapshot"}:
             payload = self.runtime_snapshot_path.read_bytes()
-            response = self.bridge.request({"op": "restore_runtime_snapshot", "payload": payload})
-            if response.get("status") != "restored":
-                raise RuntimeError(f"runtime_snapshot_restore_failed:{response.get('error')}")
-            label = "start_t10_archived_snapshot" if self.mode == "t10-snapshot" else "start_runtime_snapshot"
+            restore = self.bridge.request({"op": "restore_runtime_snapshot", "payload": payload})
+            if restore.get("status") != "restored":
+                raise RuntimeError(f"runtime_snapshot_restore_failed:{restore.get('error')}")
+            response = restore
+            if self.mode == "task-runtime-snapshot":
+                attestation = self.runtime_snapshot_attestation or {}
+                response = self.bridge.request({
+                    "op": "observe", "include_snapshot_state": True
+                })
+                state = response.get("snapshot_state")
+                if not isinstance(state, dict):
+                    raise RuntimeError("task_runtime_snapshot_restore_has_no_state")
+                expected_timestep = int(attestation.get("timestep", -1))
+                if int(response.get("timestep", -1)) != expected_timestep:
+                    raise RuntimeError("task_runtime_snapshot_restored_timestep_mismatch")
+                if response.get("scene_metadata", {}).get("model_geometry_sha256") != attestation.get(
+                    "model_geometry_sha256"
+                ):
+                    raise RuntimeError("task_runtime_snapshot_restored_model_fingerprint_mismatch")
+                robots = state.get("robot_states", [])
+                if len(robots) != 1:
+                    raise RuntimeError("task_runtime_snapshot_restored_robot_inventory_mismatch")
+                robot = robots[0]
+                expected_fields = (
+                    ("joint_qpos", "arm_joint_qpos"),
+                    ("eef_pos", "eef_position_world_m"),
+                    ("eef_quat", "eef_quaternion_wxyz"),
+                    ("gripper_qpos", "gripper_qpos_m"),
+                )
+                for state_key, attestation_key in expected_fields:
+                    actual = np.asarray(robot.get(state_key), dtype=np.float64)
+                    expected = np.asarray(attestation.get(attestation_key), dtype=np.float64)
+                    if actual.shape != expected.shape or not np.allclose(
+                        actual, expected, rtol=0.0, atol=1e-12
+                    ):
+                        raise RuntimeError(
+                            f"task_runtime_snapshot_restored_{state_key}_mismatch"
+                        )
+                object_rows = [
+                    row for key, row in state.get("object_states", {}).items()
+                    if str(key).endswith(":" + str(attestation.get("object_id")))
+                ]
+                if len(object_rows) != 1:
+                    raise RuntimeError("task_runtime_snapshot_restored_target_object_binding_mismatch")
+                for state_key, attestation_key in (
+                    ("root_pos", "object_position_world_m"),
+                    ("root_quat", "object_quaternion_wxyz"),
+                ):
+                    actual = np.asarray(object_rows[0].get(state_key), dtype=np.float64)
+                    expected = np.asarray(attestation.get(attestation_key), dtype=np.float64)
+                    if actual.shape != expected.shape or not np.allclose(
+                        actual, expected, rtol=0.0, atol=1e-12
+                    ):
+                        raise RuntimeError(
+                            f"task_runtime_snapshot_restored_target_{state_key}_mismatch"
+                        )
+                self.initial_history_safety_verified = False
+                response["runtime_snapshot_restore_status"] = restore.get("status")
+            label = (
+                "start_t10_archived_snapshot" if self.mode == "t10-snapshot"
+                else "start_task_runtime_snapshot" if self.mode == "task-runtime-snapshot"
+                else "start_runtime_snapshot"
+            )
             self._save_runtime_snapshot(payload, f"snapshots/{label}.pkl")
             return response
         response = self.bridge.request({"op": "observe", "include_snapshot_state": True})
@@ -2167,6 +2263,8 @@ class AutomaticRecoveryBridgeBackend:
     def prepare_task_success_first_candidates(self) -> dict[str, Any] | None:
         """Find a safe task-success endpoint before attempting its approach route."""
         search = self.config_data.get("candidate_search", {})
+        if self.mode == "task-runtime-snapshot" and search.get("enabled") is True:
+            raise RuntimeError("task_runtime_snapshot_continuation_must_not_run_grasp_candidate_search")
         if not isinstance(search, dict) or search.get("enabled") is not True:
             return None
         if self.task_controller is None or self.latest_data is None or self.safety_policy is None:

@@ -17,9 +17,15 @@ from pathlib import Path
 import sys
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
+from research.gs_opd.smoke.joint_limit_policy import (
+    DEFAULT_JOINT_LIMIT_TOLERANCE_POLICY,
+    evaluate_joint_limit,
+    joint_type_name,
+    normalize_joint_limit_tolerance_policy,
+)
 
 
-JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD = 1e-8
+JOINT_LIMIT_TOLERANCE_POLICY = DEFAULT_JOINT_LIMIT_TOLERANCE_POLICY
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
@@ -2269,6 +2275,7 @@ def _collect_contacts():
                 "body1": {"id": body1_id, "name": body1_name},
                 "body2": {"id": body2_id, "name": body2_name},
                 "position": np.asarray(contact.pos, dtype=np.float64).tolist(),
+                "signed_contact_distance_m": float(contact.dist),
             }
             try:
                 contact_frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
@@ -2338,6 +2345,58 @@ def _robot_body_ids():
                     break
                 current_id = parent_id
     return robot_body_ids
+
+
+def _robot_joint_limit_inventory(raw_tolerance_policy=None):
+    """Return limited robot joints with qpos units and raw live measurements."""
+    model = env.sim.model._model
+    robot_bodies = _robot_body_ids()
+    tolerance_policy = normalize_joint_limit_tolerance_policy(
+        raw_tolerance_policy or JOINT_LIMIT_TOLERANCE_POLICY
+    )
+    joints = []
+    for joint_id in range(int(model.njnt)):
+        joint_type = int(model.jnt_type[joint_id])
+        if (
+            int(model.jnt_bodyid[joint_id]) not in robot_bodies
+            or not bool(model.jnt_limited[joint_id])
+            or joint_type not in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            )
+        ):
+            continue
+        name = str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id))
+        kind = joint_type_name(
+            joint_type,
+            int(mujoco.mjtJoint.mjJNT_HINGE),
+            int(mujoco.mjtJoint.mjJNT_SLIDE),
+        )
+        qpos = float(env.sim.data.qpos[int(model.jnt_qposadr[joint_id])])
+        lower, upper = (float(value) for value in model.jnt_range[joint_id])
+        joints.append({
+            "joint_id": joint_id,
+            "joint_name": name,
+            "mujoco_jnt_type": joint_type,
+            "joint_type": kind,
+            "unit": "rad" if kind == "hinge" else "m",
+            "limited": True,
+            **evaluate_joint_limit(
+                joint_name=name,
+                joint_type=kind,
+                qpos=qpos,
+                lower=lower,
+                upper=upper,
+                policy=tolerance_policy,
+            ),
+        })
+    return {
+        "operation": "robot_joint_limit_inventory",
+        "status": "complete" if joints else "unavailable",
+        "joint_limit_tolerance_policy": tolerance_policy,
+        "joints": joints,
+        "physical_state_unchanged": True,
+    }
 
 
 def _build_geometry_inventory(
@@ -3651,6 +3710,9 @@ def _normalize_safety_geometry_policy(raw_policy):
         or float(margin) < 0.0
     ):
         raise ValueError("minimum_clearance_m_must_be_non_negative")
+    joint_limit_tolerance_policy = normalize_joint_limit_tolerance_policy(
+        raw_policy.get("joint_limit_tolerance_policy", JOINT_LIMIT_TOLERANCE_POLICY)
+    )
     robot_bodies = _robot_body_ids()
     if not robot_bodies:
         raise ValueError("complete_robot_body_inventory_unavailable")
@@ -3974,6 +4036,7 @@ def _normalize_safety_geometry_policy(raw_policy):
         "allowed_carried_support_contact_geom_ids": set(support_geom_ids),
         "forbidden_object_pairs": normalized_forbidden_pairs,
         "carried_object": carried_object,
+        "joint_limit_tolerance_policy": joint_limit_tolerance_policy,
         "source": raw_policy.get("source"),
     }
 
@@ -4065,7 +4128,9 @@ def _substep_safety_geometry(monitor, contact_result):
         "unresolved_contacts": [],
         "forbidden_object_contacts": [],
         "unallowed_scene_contacts": [],
+        "contact_identities": [],
         "joint_limit_violations": [],
+        "strict_joint_limit_violations": [],
     }
     try:
         if contact_result.get("status") not in ("contact", "no_contact"):
@@ -4184,6 +4249,16 @@ def _substep_safety_geometry(monitor, contact_result):
             geom_b = int(contact["geom2"]["id"])
             body_a = int(contact["body1"]["id"])
             body_b = int(contact["body2"]["id"])
+            item["contact_identities"].append({
+                "contact_index": int(contact.get("contact_index", len(item["contact_identities"]))),
+                "geom1": contact["geom1"],
+                "geom2": contact["geom2"],
+                "body1": contact["body1"],
+                "body2": contact["body2"],
+                "position_world_m": contact.get("position"),
+                "normal_geom1_to_geom2_world": contact.get("normal_geom1_to_geom2"),
+                "signed_contact_distance_m": contact.get("signed_contact_distance_m"),
+            })
             pair_key = tuple(sorted((geom_a, geom_b)))
             if body_a in policy["robot_body_ids"] and body_b in policy["robot_body_ids"]:
                 item["self_contacts"].append(contact)
@@ -4227,20 +4302,32 @@ def _substep_safety_geometry(monitor, contact_result):
             qpos_address = int(model.jnt_qposadr[joint_id])
             value = float(sim.data.qpos[qpos_address])
             lower, upper = (float(v) for v in model.jnt_range[joint_id])
-            if (
-                value < lower - JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD
-                or value > upper + JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD
-            ):
+            joint_name = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_JOINT, int(joint_id)
+            )
+            joint_kind = joint_type_name(
+                int(model.jnt_type[joint_id]),
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            )
+            measurement = evaluate_joint_limit(
+                joint_name=str(joint_name),
+                joint_type=joint_kind,
+                qpos=value,
+                lower=lower,
+                upper=upper,
+                policy=policy["joint_limit_tolerance_policy"],
+            )
+            if not measurement["strict_criterion_pass"]:
+                item["strict_joint_limit_violations"].append({
+                    "joint_id": int(joint_id),
+                    **measurement,
+                })
+            if not measurement["operational_pass"]:
                 item["status"] = "unsafe"
                 item["joint_limit_violations"].append({
                     "joint_id": int(joint_id),
-                    "joint_name": mujoco.mj_id2name(
-                        model, mujoco.mjtObj.mjOBJ_JOINT, int(joint_id)
-                    ),
-                    "qpos": value,
-                    "lower": lower,
-                    "upper": upper,
-                    "numerical_tolerance_rad": JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD,
+                    **measurement,
                 })
         if item["minimum_clearance_m"] is None and policy["forbidden_objects"]:
             item["status"] = "incomplete"
@@ -5313,6 +5400,19 @@ try:
                                 "Compiled model fingerprint detail query failed: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                        }
+                elif request["op"] == "robot_joint_limit_inventory":
+                    try:
+                        result = _robot_joint_limit_inventory(
+                            request.get("joint_limit_tolerance_policy")
+                        )
+                    except Exception as exc:
+                        result = {
+                            "operation": "robot_joint_limit_inventory",
+                            "status": "unavailable",
+                            "joints": [],
+                            "physical_state_unchanged": True,
+                            "error": f"{type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "task_semantic_geometry_bindings":
                     try:

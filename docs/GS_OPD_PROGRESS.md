@@ -1,5 +1,67 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## 最新进度：复用t=329归档RRT路线并真实执行30步安全transport前缀（2026-10-24）
+
+### 规划结果审计与复用
+
+审计归档 `l0t2_round0_t329_native_task_suffix_20261024_194230/recovery_events.jsonl` 确认 `offline_feasible` 结果保存了完整257点、7D qpos路径和257点EEF参考姿态；路径SHA分别为 `afc53f8684f68f0a4c3ab6493c46dc5e4c11814b2767c35fd764b90dae51440` 与 `46a87d84f8f68f0a4c3ab6493c46dc5e4c11814fe91ea36f679578b93c811842`。起始Integration State SHA为 `a24835bf1b93399a78d2802e71f551984289b5f19a59b2e09f9de6b1fb270ed1`，模型几何SHA为 `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`；安全策略来源与SHA也归档。两条候选里首条可行路线记录在iteration 10，但首次可行的墙钟时刻没有记录；原搜索继续到117次迭代、7,979次构型检查和360.055 s，不能据此声称首条路线本身花了360 s。
+
+新的执行从同一t=329状态严格恢复后复用该完整路径，没有重复360 s搜索。当前恢复Integration State、模型指纹、策略指纹、路径起终点均核验通过；完整路线沿用归档的全几何可行性记录，本轮没有另跑整条scratch几何验证。路径剩余部分与t=359状态、路径索引30保存在续接bundle中；该续接Snapshot/bundle尚未做恢复预验证。
+
+### 规划—控制交接与真实前缀
+
+修复 `AutomaticRecoveryBridgeBackend.preview_prefix`：持有物体期间预演发neutral夹爪 `0.0`，不再发开爪 `−1`；无持物时仍按配置发开爪动作。预演产物现在记录命令和来源，并在t=329 runner中对持物状态和gripper维度作fail-closed校验。
+
+第一次启动仅因把30步预算误设成绝对timestep 30而在t=329拒绝执行，物理动作数为0（归档`/opt/data/private/gs_opd/rollouts/l0t2_round0_t329_native_task_suffix_20261024_205423/`）；随后纠正为绝对终点t=359。第二次执行先做4段隔离OSC前缀预演（32动作、800物理子步），所有25子步监测及状态回滚通过，预演与实执行的EEF/关节末态偏差均为0。然后在原授权上限内提交30个真实OSC动作（t=329→359，750/750子步），gripper命令全为0；Pot 2全程750子步保持左右双指接触。全程未发现禁触/未解析/自碰撞接触，Operational关节限位违规为0。关节路径最大偏差0.122807 rad（门槛0.18），EEF最大位置/姿态误差7.326 mm/0.036344 rad（门槛25 mm/0.08 rad）。EEF移动74.187 mm，Pot 2移动75.474 mm，其中竖直上升32.529 mm，证实真实transport进展与抓持维持。
+
+本段最小净距：机器人非手指Geom–Pot 2为4.370 mm（高于Operational 2 mm）；机器人–Ginger Beer为18.776 mm、机器人–Place Box为42.177 mm。携带Pot 2到Ginger Beer/Place Box分别121.452/74.124 mm。验收单独记录 **Native Safety通过、Operational Safety通过、Strict-10mm不通过**；未降低安全标准或扩展接触白名单。
+
+### 停止、验收与复现
+
+任务仍在 `transport`：Pot 1 On=false、Pot 2 On=false、Stove Turnon=true、reward=0、done=false。停止原因是本轮授权的30个真实动作用尽（`execution_step_budget_exhausted`），不是规划、控制、接触或抓持失败；没有完成放置或原生任务成功，未建立Round 0种子。首次零动作配置错误和第二次有效执行分开留档；没有追加物理动作。
+
+归档 `/opt/data/private/gs_opd/rollouts/l0t2_round0_t329_native_task_suffix_20261024_205500/`：完整Observation–Action 30步、每步25子步journal、30个主状态Snapshot、32个隔离预演Snapshot、agentview/wrist各31帧视频、完整复用路径与剩余路径bundle。审计为 `route_reuse_prefix_audit.json`；t=359 Snapshot SHA `ce7c004543a0fc19217c46c65ccfd82a561bb90999dfce0f75cd405dbb82ab47`，Integration State SHA `8d74c65c32250f4542bec0efab17a536e92b2b3ab9ba5b463604108683981874`。剩余路径续接包 `route_resume_bundle_timestep_000359.npz` SHA `5cd9e04134592982b871f219637601610c4fb514a63a6320b3b87b535e5338f8`，恢复尚待严格核验。
+
+复现本次归档路线复用入口：`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.run_t329_native_task_suffix --route-archive /opt/data/private/gs_opd/rollouts/l0t2_round0_t329_native_task_suffix_20261024_194230`。后续若续跑，先按恢复顺序核验t=359 Snapshot、Integration State、模型与策略指纹，再从路径索引30开始；本轮30动作预算已耗尽，需新的执行授权。t=329局部后缀不与其他Snapshot拼接成完整Episode；标准1000步成功、扩展1800步成功、原生完整成功与Round 0种子均未取得。历史1093步示范和全部LeRobot数据保留，不启动LoRA。
+
+
+## 上一阶段：严格恢复 t=329 通过；Pot 2 搬运在 RRT 预算边缘 fail-closed（2026-10-24）
+
+### 恢复与阶段接入
+
+从 Episode 9 t=249→329 已验证局部抬升分支的真实 t=329 Runtime Snapshot 启动独立 Bridge。正式原生 reset 后模型几何 SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`、源 Snapshot SHA `34f213c63d87be1a26cd69a3e4d442f9df9f2dcf4d406230a32ecea1dcd00673`、Episode timestep 329 均匹配。恢复后的7个手臂关节、EEF位置/姿态、夹爪slide qpos和Pot 2 root位姿与源动作记录逐值对上；当前实时抓持确认 Pot 2，9条接触均只在四个许可指Geom（76/77/79/80）与Pot 2间。没有复制旧 TaskPhaseController 内态；新控制器依据当前抓持和原生谓词自然初始化到 `transport`。Pot 1/2 On=false、Stove Turnon=true、reward=0、done=false、任务成功=false。冻结Operational Safety预检和接触完整性检查通过。
+
+### 路径搜索结果与停止原因
+
+调用既有单次RRT-Connect规划（每次最多3条路线候选；没有重写规划器）。求解器记录 `offline_feasible`、117次迭代、7,979个构型检查、2条不同route候选，选中route 0。离线最小禁触间隙17.5466 mm；所选路径的携带Pot 2至Ginger Beer/Place Box最小间隙分别17.5466/17.5807 mm；机器人非手指与Pot 2最小间隙4.3703 mm，高于该对象当前2 mm门槛。此路径仍只是当前Snapshot下的离线候选，未经过OSC物理执行。
+
+Recovery Engine配置的单次规划时间上限为360 s。RRT调用返回耗时360.055 s，外层规划用时361.403 s，超上限约1.4 s；引擎记录 `planning_time_budget_exhausted` 并在transport阶段fail-closed。没有提交任何OSC动作，Episode仍为t=329；这次没有物理碰撞、禁触、抓持丢失或关节违规事件，也没有 Pot 2 放置或Pot 1阶段。按本轮一次连续后缀授权停止，没有再次启动相同规划。
+
+### 验收与归档
+
+源t=249→329抬升分支的独立结果仍为 Native Safety pass、Operational Safety pass、Strict-10mm fail（源分支Pot 2非手指最小净距4.316 mm）。本次恢复后的当前状态Operational preflight通过；由于后缀执行动作数为0，后缀级Native Safety、Operational Safety与Strict-10mm均为**未评估**，原运行器将空轨迹编码为false；后验审计已在`posthoc_review.json`明确该差异，当前入口已改为0动作时写入null/`not_run_zero_physical_actions`。不能把旧结果字段false误读为发生了物理违规。原生完整任务成功、标准1000步成功、扩展1800步成功、Round 0种子均为false/未取得；`t=329`不是任务成功里程碑。
+
+独立归档：`/opt/data/private/gs_opd/rollouts/l0t2_round0_t329_native_task_suffix_20261024_194230/`。包含严格恢复Snapshot、restore attestation、模型与物体/机器人状态、接触许可、planner route与筛选指标、事件、配置、摘要及双相机各1帧初始视频；OA trace数组为0步，动作journal为空。逐帧episode采集没有开始。复现入口：`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.run_t329_native_task_suffix`。历史1093步成功示范、Episode 8/9、t=249→329结果与所有LeRobot数据均保留。
+
+下一步需在另行明确的执行预算下处理“RRT找到离线可行路径但360 s限时超约1.4 s”的规划预算/交接失败；任何后续物理执行仍须从兼容Snapshot经Bridge、当前状态重规划并使用OSC闭环验证。完整安全种子还要求从原始安全t=10状态连续重放并统一复验此前缀，不能拼接此t=329后缀，也不启动LoRA。
+
+
+## 最新进度：t=249真实抬升与接触自由退出通过；限位单位和历史证据已勘误（2026-10-24）
+
+本轮先修正 Safety Bridge 的限位单位诊断：MuJoCo hinge qpos 用 rad、slide qpos 用 m。编译模型确认 `gripper0_finger_joint2` 为 slide，范围 `[-0.04, 0] m`；t=236 Snapshot 初值 `−0.04000417971758497 m`，越过下限 `4.179718 μm`。旧日志把它标成 rad 属单位错误。原严格判据保留为 hinge/slide 各自 `1e-8` 对应单位；独立 Operational 容差只覆盖两个 Panda finger slide，设为 `8 μm`。该值由 Episode 9 的239个post-control记录校准：finger_joint1最大范围外偏差 `7.374166 μm`（122个末态在范围外），finger_joint2最大偏差 `4.203744 μm`（21个末态在范围外）。这些历史数据没有逐子步 qpos，故8 μm是按历史控制端点标定的Operational软限位容差，不替代原始严格判据，也不修改MJCF范围、qpos或BDDL接触规则。
+
+历史安全报告的关节计数为0不能证明该前缀未越限：Episode 9的5,975个旧子步记录没有 `joint_limit_violations` / `strict_joint_limit_violations` 字段，也没有逐子步joint qpos；旧审计通过缺省空数组将缺失记成0。更新后的只读审计将这段历史标为“未记录”，并从239个动作末端qpos单独报告越界次数与幅度。t=236首个物理子步实测越限是可验证事件；此前所谓与安全前缀报告的矛盾，来自单位误标及旧监测字段缺失。
+
+从 Episode 9 t=249 Runtime Snapshot正式reset后恢复：模型几何指纹匹配，317维Integration State逐元素一致，timestep=249，当前双指抓持通过；source与re-export Snapshot字节哈希不同（既有只读审计也观察到此现象），但物理Integration State精确匹配，因此按已验证的严格状态判据继续。四个许可Geom仍仅76/77/79/80。零动作Operational预检发现 Pot 2 与桌面 `table_collision` 支撑重叠 `19.064 μm`，且活动BDDL没有将桌面列为禁止对象；局部分支只对白名单table支撑对启用最多2 mm支撑穿透许可。Ginger Beer与Place Box仍保持10 mm，Pot 2非手指机器人余量2 mm，目标指尖穿透仍最多2 mm。Palm/hand、其他机器人Geom、自碰撞与BDDL禁触规则保持约束。
+
+唯一隔离物理分支从该t=249快照执行80动作、2,000个物理子步。OSC_POSE从真实EEF姿态逐步闭环竖直抬升；夹爪发 `0` 增量保持内部动作 `[-1,+1]`，全程抓持确认通过。t=311时Pot 2真实上升 `30.443 mm`；该步完整25子步中Pot 2–桌面接触为0，之后19个控制动作共475子步持续无该支撑接触。终态t=329上升 `39.129 mm`；额外40 mm目标未达，但用户要求的30 mm抬升及接触自由安全退出已通过。全过程80×25记录齐全，保存82,490条逐子步接触Geom/Body身份；最大指尖穿透 `0.5273 mm`，机器人非手指非法接触、自碰撞、Operational限位违规均为0。
+
+验收结果独立记录：**Native Safety pass；Operational Safety pass；Strict-10mm fail**。分支最小间隙：Pot 2非手指机器人 `4.316 mm`（低于Strict-10mm但高于Operational 2 mm）、Ginger Beer `10.193 mm`、Place Box `47.592 mm`；Pot 2携带物到Ginger Beer/Place Box的最小余量分别 `149.254/96.387 mm`。原生任务仍未成功（Pot 1与Pot 2 On均false，reward=0、done=false）。这只是t=249起的局部抬升/退出成功，不是完整任务Episode，也不是Round 0种子；历史Episode 9 t=11→249前缀的逐子步接触身份仍不完整，因此不能把该分支前缀升级成全程finger-only安全轨迹。
+
+物理归档：`/opt/data/private/gs_opd/rollouts/l0t2_round0_t249_operational_lift_20261024_branch1/`，后验审计为 `posthoc_lift_exit_audit.json`；含双相机Observation–Action、完整逐子步接触身份、2,000子步安全结果、快照、视频、奖励/终止与原生谓词。无额外抓取搜索、无完整Episode、无LoRA。单位/边界回归测试8项通过，相关模块`py_compile`通过。
+
+复现入口：`python -m research.gs_opd.repair.run_episode9_t249_lift_branch --maximum-actions 80`；限位审计/回归入口：`research/gs_opd/smoke/joint_limit_policy.py`、`research/gs_opd/smoke/test_joint_limit_policy.py`。历史1093步示范、原始前缀归档与所有LeRobot数据保留。
+
 ## 最新进度：t=236首个物理子步仍触发夹爪限位，按规则停止（2026-10-24）
 
 本轮停止批量抓取搜索，先修复了 `run_t236_physical_grasp_branches.py` 的两个基础控制问题：最多2支、每支100个动作；t=236本来已处于Approach，不再先退到旧60.65 mm pregrasp点，而改为根据当前EEF与实时Pot 2姿态插值到抓取目标。脚本为每步保存25子步监测、双相机、夹爪与关节状态、grasp/native predicate及Runtime Snapshot。`py_compile`通过，未运行单元测试。
@@ -8,7 +70,9 @@
 
 robosuite 1.4 `PandaGripper.format_action()`源码以 `current_action += [-1,+1] * 0.01 * sign(action)` 更新执行器命令，因此 `+1`闭合、`−1`张开、`0`保持。回看本轮物理数据后确认，该函数在25子步的单个监测动作内被调用25次：t=236恢复初值 `[+1,−1]` 经动作 `[0,0,0,0,0,0,+1]` 后变为 `[+0.75,−0.75]`。这纠正了本轮早先把“每个policy动作只更新1%”的描述；低层单次调用仍是1%，但一个外层受监测动作累计了25次。动作方向确实离开张开饱和端，未继续发送张开命令；neutral `0` 的保持语义有源码保证，但由于首个物理动作失败，本轮没有提交后续neutral物理动作。
 
-初始 `gripper0_finger_joint2` qpos = −0.04000417971758497 rad，模型range下限 = −0.04 rad，初值已越限4.1797×10⁻⁶ rad。首个 `+1` 动作的物理子步0–6均越限：子步0 qpos −0.04000415306424795 rad（越限4.1531×10⁻⁶），子步6 qpos −0.04000046520674484 rad（越限4.6521×10⁻⁷）。限位监控仍使用 `1e-8 rad`，没有放宽range、epsilon或规则。动作末qpos已回到 `[0.03942231803383946, −0.039542471757833396]`，夹爪内部动作 `[0.75,−0.75]`；但前7个子步越限使此动作整体unsafe。该动作几何最小净距：Pot 2非手指10.4561 mm、Ginger Beer11.7887 mm、Place Box48.5270 mm；未发生禁触接触、自碰撞或手掌接触。立即停止，没有运行第二分支，也没有进入接近/闭爪阶段。最远真实里程碑仍是安全恢复的Pot 2 Approach，没有稳定抓持、30 mm抬升或safe exit。
+单位勘误：本段旧日志把 `gripper0_finger_joint2` 的qpos与range误标为rad；该MuJoCo joint是slide，单位为m。初始qpos −0.04000417971758497 m、下限−0.04 m，越限4.1797 μm；首个`+1`动作子步0–6均越限，子步0越限4.1531 μm、子步6越限0.4652 μm。原`1e-8`严格比较值应读作米。物理观察值不变。
+
+初始 `gripper0_finger_joint2` qpos = −0.04000417971758497 m，模型range下限 = −0.04 m，初值已越限4.1797×10⁻⁶ m。首个 `+1` 动作的物理子步0–6均越限：子步0 qpos −0.04000415306424795 m（越限4.1531×10⁻⁶），子步6 qpos −0.04000046520674484 m（越限4.6521×10⁻⁷）。原限位监控数值阈值`1e-8`对应米单位，没有放宽range、epsilon或规则。动作末qpos已回到范围内 `[0.03942231803383946, −0.039542471757833396]`，夹爪内部动作 `[0.75,−0.75]`；但前7个子步越限使此动作整体unsafe。该动作几何最小净距：Pot 2非手指10.4561 mm、Ginger Beer11.7887 mm、Place Box48.5270 mm；未发生禁触接触、自碰撞或手掌接触。立即停止，没有运行第二分支，也没有进入接近/闭爪阶段。最远真实里程碑仍是安全恢复的Pot 2 Approach，没有稳定抓持、30 mm抬升或safe exit。
 
 物理归档：`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_gripper_limit_fix_branches_20261024/physical_branch_report.json`；分支内 `substep_safety.jsonl` 的 `physics_substep_index_zero_based=0` 保存精确越界字段，`first_substep_controller_state_reconstruction.json`区分了来源公式重建值和实测动作末值，`steps.json`、`observation_action_trace.npz`、两路视频与Runtime Snapshot保留了原始一动作证据。运行入口：`research/gs_opd/repair/run_t236_physical_grasp_branches.py`。从 t=236 继续闭环Approach的代码已写入，但本轮未物理验证。
 
@@ -16,7 +80,7 @@ robosuite 1.4 `PandaGripper.format_action()`源码以 `current_action += [-1,+1]
 
 复用既有严格恢复审计入口并按正式native reset顺序重新读取：模型几何指纹匹配，317维Integration State逐元素精确恢复到 t=249，执行物理动作0、物理子步0。当前实时 `grasp_state` 为pass：夹爪闭合谓词true、内部状态`[-1,+1]`、qpos `[0.00763703,−0.00738810]`；左右指对Pot 2有三处接触，Geom对为77↔116、79↔117、80↔115；机器人当前只接触白名单Geom 76/77/79/80与Pot 2，Palm/hand及其他机器人Geom没有当前接触。原生谓词仍是Pot1 On=false、Pot2 On=false、Stove Turnon=true，task_success=false。
 
-Episode 9历史前缀记录239个控制动作/5,975个几何子步，25/25采样记录完整，归档监测中joint-limit、forbidden contact、unresolved contact计数均为0。可取的t=249动作级后观察保存了三处finger/Pot 2接触身份；但原始contact identity未按每个物理子步保存，因此旧记录不能完整证明239步前缀逐子步满足当前finger-only规则，也不能升级成安全种子。只读审计文件：`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_finger_only_audit_20261024/restore_probe.json`。
+Episode 9历史前缀记录239个控制动作/5,975个几何子步，旧采样覆盖为25/25；但逐子步没有保存关节qpos或joint-limit字段。此前把缺省空字段计作0事件不能证明无越限。动作末态记录显示finger_joint1有122/239、finger_joint2有21/239次超出各自slide range，最大分别7.374和4.204 μm。可取的t=249动作级后观察保存了三处finger/Pot 2接触身份；但原始contact identity未按每个物理子步保存，因此旧记录不能完整证明239步前缀逐子步满足当前finger-only规则，也不能升级成安全种子。只读审计文件：`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_finger_only_audit_20261024/restore_probe.json`。
 
 无完整Episode、无Round 0种子、无额外抓取搜索、无LoRA训练；1093步历史示范和所有LeRobot数据保留。由于 t=236 起点在严格限位规则下首子步失败，下一步必须先定位一个模型关节range内有效且指纹兼容的Snapshot，不可直接更改qpos。
 
@@ -3103,12 +3167,12 @@ t=966 Runtime Snapshot 随后由原有 `restore_runtime_snapshot` 接口成功�
 
 按用户授权将净距设为对象级策略：Pot 2与非手指机器人Geom首档2 mm、可在明确阻塞时降至0 mm但不允许穿透；Ginger Beer/Place Box初始各10 mm，只有实际记录到正间隙低于当前门槛才依次调至5 mm、2 mm；合法finger–Pot2接触最多2 mm穿透。物理分支策略的白名单仅为Geom 76/77/79/80；Palm/hand、其余机器人Geom、非目标场景、BDDL、自碰撞约束均保持受检。同步移除了Bridge、RecoveryConfig、JointSpaceRRT与候选筛选器把10 mm当成全局最低可配置值的校验；分组净距仍由各对象显式阈值执行。Approach已有12 mm/0.08 rad阶段完成容差，本轮局部闭环没有通过放宽该容差改变抓取目标。
 
-新增全机器人受限hinge/slide关节的25子步检查。首次动作报告Panda `gripper0_finger_joint2` 为−0.04000418628070624 rad、range下限−0.04 rad，越界4.1863×10⁻⁶ rad；其余机械臂关节均在限位内。8个分支都在已完全张开的夹爪上重复发送`gripper=-1`，因同一首动作Joint-limit告警而各只执行1步，合计8步。该原因与Pot2间隙、障碍物阈值无关；它是实际监测告警，故每支立即停止。关节range与1e-8 rad数值比较epsilon均保持不变；入口改为先向闭合方向累计1%控制更新，后续Approach以neutral命令保持，不再继续驱动开限位。该修正未物理复验。后续入口已加入关节监测失败时停止整个候选批次的保护，避免对共享基础失败继续开分支；同时尊重用户传入的每支动作上限。
+新增全机器人受限hinge/slide关节的25子步检查。该条旧日志曾报告Panda `gripper0_finger_joint2` 为−0.04000418628070624 rad、range下限−0.04 rad，越界4.1863×10⁻⁶ rad；单位勘误后确认该关节是slide，以上qpos、range和越界量应使用m。8个分支都在已完全张开的夹爪上重复发送`gripper=-1`，因同一首动作Joint-limit告警而各只执行1步，合计8步。该原因与Pot2间隙、障碍物阈值无关；它是实际监测告警，故每支立即停止。关节range与原生严格判据均保持不变，1e-8按关节单位解释；入口改为先向闭合方向更新，后续Approach以neutral命令保持，不再继续驱动开限位。后续入口已加入关节监测失败时停止整个候选批次的保护，避免对共享基础失败继续开分支；同时尊重用户传入的每支动作上限。
 
 ### 真实执行证据与边界
 
 原生reset模型SHA为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`；t=236 Runtime Snapshot恢复后的Integration State SHA为`a299ea309f78435c868306716bfa403834d20f3599473793b25612e93207c0f8`，与归档精确匹配。每个已提交控制动作均有25/25 MuJoCo子步、双相机RGB、逐步Observation/Action、全机器人Geom及关节限位记录、grasp状态、原生任务状态、reward/done和动作末态Runtime Snapshot。
 
-8个动作有限前缀所测Pot2非手指几何最小正间隙为10.570898 mm，Ginger Beer为11.733975 mm，Place Box为48.536454 mm；第一分支对应10.693784/11.821668/48.575158 mm。没有观察到自碰撞、Ginger Beer/Place Box接触或Palm–Pot2接触；接触监测的唯一unsafe项是上面的4.186×10⁻⁶ rad gripper joint-limit excursion。全程Pot2抓持状态false，Pot2只发生至t=237附近的局部EEF接近；native reward=0、done=false。因monitor未通过，这段不能认证为完整安全或Strict-10mm Safe，虽然已测对象间隙超过10 mm。
+8个动作有限前缀所测Pot2非手指几何最小正间隙为10.570898 mm，Ginger Beer为11.733975 mm，Place Box为48.536454 mm；第一分支对应10.693784/11.821668/48.575158 mm。没有观察到自碰撞、Ginger Beer/Place Box接触或Palm–Pot2接触；接触监测的唯一unsafe项是上面的4.186×10⁻⁶ m gripper joint-limit excursion。全程Pot2抓持状态false，Pot2只发生至t=237附近的局部EEF接近；native reward=0、done=false。因monitor未通过，这段不能认证为完整安全或Strict-10mm Safe，虽然已测对象间隙超过10 mm。
 
 本轮8个物理分支预算已全部用完；条件授权的两次完整Episode未触发，不曾启动。没有稳定双指抓持、≥30 mm真实抬升、safe exit、Pot2/ Pot1放置或原生任务成功，因此没有Round 0种子候选、不做插值扩增或LoRA训练。完整归档包括每支双相机视频、NPZ、JSON事件/子步数据和逐动作可恢复Snapshot：`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_relaxed_clearance_physical_branches_20261024/`。复现脚本为`research/gs_opd/repair/run_t236_physical_grasp_branches.py`；其执行上限是8支×80动作。当前预算下停止，不把离线或短前缀结果冒充真实安全抓取。
