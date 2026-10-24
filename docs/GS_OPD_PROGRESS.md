@@ -1,6 +1,30 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：t=359旧路线安全续接、一次重规划真实执行至t=463后按跟踪阈值停止（2026-10-24）
+## 最新进度：t=463 RRT→OSC偏差归因与隔离执行感知预演（2026-10-24）
+
+### 两段实际轨迹的7D跟踪诊断
+
+只读联合 Episode 9 t=329→359 归档30步与 t=359→398 归档39步，按原始257点 RRT qpos/EEF参考和每步 MuJoCo 实测 qpos/EEF重算；并读取 t=398→463 新RRT路径193点及65步实际状态。合计104条状态均有reference index和最近qpos路径index，完整逐步数值在本轮诊断归档 `route_tracking_analysis.json`。旧路径 t=330→398 共69点：最近qpos索引比进度索引落后1–6点（中位4），平均cursor qpos误差0.117058 rad，最近构型误差0.095249 rad，最近点仅解释0.021810 rad（18.6%）；新路径 t=399→463 共65点，滞后0–4点（中位4），均值0.098824→0.084370 rad，差0.014455 rad（14.6%）。因此有约4点进度滞后，但不是主误差来源。
+
+t=398：cursor索引69、最近qpos索引65；qpos误差0.181877→0.173479 rad，减少仅0.008398 rad（4.6%）。实际EEF相对cursor参考误差7.314 mm/0.033593 rad；最近qpos索引的EEF误差3.177 mm/0.010241 rad，但7D关节误差仍0.173479 rad。t=463：cursor索引65、最近索引61；qpos误差0.182045→0.175973 rad，减少仅0.006072 rad（3.3%）。EEF相对cursor仅4.238 mm/0.034841 rad，最近qpos点EEF差2.080 mm/0.010135 rad。两个末态都显示近似相同EEF姿态下存在明显冗余关节构型差异。
+
+源码调用链揭示首要接口原因：Bridge `osc_prefix_probe`用 `path_poses[path_index]` 构造 `world_pose_tracking_action`，qpos路径只用于FK一致性检查和动作后的误差统计，未作为OSC关节目标；Recovery Engine随后仍以`actual.qpos - expected.reference_qpos`套用冻结0.18 rad门槛。robosuite OSC_POSE另在任务空间力矩外叠加nullspace torque，目标是恢复controller的 `initial_joint`；BaseController构造时把它设为控制器初始化时的joint position，t=463 Runtime Snapshot保存值为 `[0,-0.1610,0,-2.4446,0,2.2268,0.7854]`，控制工具按 `kp*(initial_joint-joint_pos)-kv*joint_vel` 生成回归力矩。Recovery每执行一条OSC动作就`plan_cursor += 1`，不按实测qpos重新关联最近路径索引。故主因是“7D RRT qpos参考只被事后审查，OSC实际仅跟踪6D末端位姿”；nullspace回归解释了偏离方向，cursor固定步进造成数点次级滞后。这是强机制证据，尚非控制器消融后的因果证明。源码见 `safety_bridge.py:4993–5018`、`automatic_recovery.py:881–924`、robosuite `osc.py:347–352`、`base_controller.py:89–93`、`control_utils.py:8–40`、Recovery runtime `automatic_recovery_runtime.py:1722–1727`。
+
+### t=463独立Snapshot预演
+
+正式Episode没有接收任何新动作，也未再次调用RRT。新入口 `research/gs_opd/repair/diagnose_t463_osc_path_reference.py` 严格reset后恢复归档t=463 Snapshot：模型SHA `1a0c…f752`、Integration State SHA `37607e…08b0e`、normalized runtime/controller/gripper hash `2bc730…13b8`均匹配；Pot 2左右finger contact和源策略SHA通过。原0.18 rad阈值原值传入，`qpos_reference_mode=diagnostic_only`只允许该独立probe继续记录路径关节误差；EEF位置25 mm/姿态0.08 rad限值、50/60 mm风险滞回、Native/Operational完整几何与关节限制均保持，夹爪用neutral 0.0。
+
+分支执行8个OSC动作/200个MuJoCo物理子步，动作后t=464→471；双指抓持每步重验通过，Pot 2相对t=463位移逐步增长，t=471总位移15.914 mm。EEF误差为3.290–3.660 mm、姿态误差0.03695–0.04333 rad；诊断qpos误差从0.184203增至0.192083 rad，八步均超过原门槛。25/25逐子步Native/Operational检查完整，未见禁触、自碰撞、未解析/未许可接触或Operational关节越限。8步最低几何余量：机器人非手指–Pot 2 4.363 mm（当前2 mm Operational门槛通过、Strict-10mm不通过）；机器人–Ginger Beer 103.811 mm、机器人–Place Box 169.469 mm；携带Pot 2到Ginger Beer/Place Box分别39.356/52.176 mm。reward=0、done=false、Native任务成功=false，阶段仍transport。
+
+8步EEF总进展10.987 mm（逐动作1.299–1.528 mm），超过保守8步停滞判断2 mm；risk clearance从约115.2 mm保持在103.7 mm以上，没有触发50/60 mm滞回边界。
+
+随后从保存的t=464…471分支Snapshot做零动作只读恢复审计，Pot 2抓持和几何状态仍逐个通过；Bridge最终将Integration State和Runtime controller/gripper状态精确恢复到原t=463哈希。Native Safety通过、Operational Safety通过、Strict-10mm不通过；这是8步隔离branch证据，不是提交的Episode动作、安全成功后缀或Round 0种子。
+
+执行感知的OSC方案值得继续用作**短段滚动安全预演**：这8步证明EEF参考不精确实现7D qpos路径时，真实MuJoCo分支仍能安全前进并维持抓持；它不构成对整条运输路线的可执行证明。当前不必立即迁移joint-space控制器用于安全探索，但原生0.18 rad正式拒绝逻辑没有改变；若下一正式操作仍要求RRT 7D qpos跟踪，需采用成熟关节空间控制器，或先获授权将执行方式明确改成短段OSC+MuJoCo分支认证，不能只绕过正式门槛。本轮没有后续真实Episode动作或规划。
+
+本轮归档 `/opt/data/private/gs_opd/rollouts/l0t2_round0_t463_osc_tracking_diagnostic_20261024_223003/`：`route_tracking_analysis.json`、恢复/策略指纹、8步OA与逐子步接触/间隙记录、双相机压缩帧与视频、8个分支Runtime Snapshot、`branch_state_pose_audit.json`和最终精确恢复证据。复现入口（将另建隔离Bridge，最多8个分支动作）为：`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.diagnose_t463_osc_path_reference --bridge-port 38764`。历史1093步示范、Episode 8/9和LeRobot数据均未改；未训练LoRA。
+
+## 前一阶段：t=359旧路线安全续接、一次重规划真实执行至t=463后按跟踪阈值停止（2026-10-24）
 
 ### 路线、Snapshot与控制器审计
 

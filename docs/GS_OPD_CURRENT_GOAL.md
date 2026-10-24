@@ -1,19 +1,25 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：从t=463真实持物状态重建Pot 2放置路线；本轮按跟踪偏差fail-closed停止（2026-10-24）
+## 当前局部目标：从t=463 Snapshot已完成偏差归因和8步隔离预演；暂停所有正式动作（2026-10-24）
 
-本轮严格审计并复用t=359剩余257点路线的索引30。恢复状态、模型、策略、夹爪及Pot 2双指抓持核验通过；路线实际执行39步后在t=398超过0.18 rad关节路径跟踪限值，EEF误差仍在既定范围。对精确t=398 Snapshot严格恢复后只做一次既有RRT-Connect（193路点、199.249秒、4,590构型检查），保存了完整路线，再真实执行65步到t=463。
+针对t=329→398与t=398→463两次qpos阈值停止，分别从两个连续物理归档恢复每步实测qpos、EEF、参考qpos和路径索引。最近路线点的关节误差只能解释14.6–18.6%平均误差；终点t=398/t=463只解释4.6%/3.3%。最近参考构型的EEF更接近当前末端，但仍有0.173479/0.175973 rad qpos误差。源码进一步确认Bridge按7D RRT点取EEF pose给OSC构造动作，qpos仅作动作后误差检查；OSC的nullspace项回归构造时`initial_joint`，cursor每动作固定加1、不关联实测构型。根因优先级为：7D关节路径与6D任务空间OSC执行接口不匹配；nullspace posture项使冗余关节解偏离；固定cursor带来约4点次级滞后。源码与状态数值相符，尚非控制器消融因果证明。
 
-连续新增动作合计104/450，2,600/2,600子步均通过Native Safety与Operational Safety，无禁触/自碰撞/未许可接触、无Operational关节越限，Pot 2双指持有持续。Strict-10mm统计未通过，因Pot 2机器人非手指间隙约4.36 mm；当前2 mm目标物Operational门槛和Ginger Beer/Place Box禁触约束均未违反。t=463关节路线误差0.182045 rad越过冻结0.18 rad，而EEF误差为4.238 mm/0.034841 rad；唯一规划预算已用，故按maximum_replanning_attempts_exhausted停止。
+已从严格恢复的t=463 Snapshot运行独立最多8动作预演，实际执行8动作、200个子步后安全达到t=471；双指持有，Pot 2位移15.914 mm，EEF跟踪在3.29–3.66 mm。qpos偏差增长0.184203→0.192083 rad，故仍会违反冻结0.18正式门槛。全Native/Operational子步安全通过：非手指–Pot 2最低4.363 mm，Ginger Beer/Place Box及携物余量均大于10 mm；严格10mm只针对Pot 2统计失败。保存的每个branch Snapshot又经过零动作读审，最后精确恢复至t=463源Integration State与runtime内部哈希。
 
-t=463仍为transport，Pot 2 On=false，Pot 1 On=false，Stove Turnon=true，reward=0、done=false。没有Pot 2放置/释放、Pot 1阶段、完整任务成功或Round 0种子；不启动LoRA。完整合并审计为 /opt/data/private/gs_opd/rollouts/l0t2_round0_t398_pot2_single_replan_20261024_214225/posthoc_review.json，重规划路线及状态/策略指纹在同目录的replanned_route_t398.npz与JSON sidecar。OA、双相机、每步25子步、安全事件与Snapshot保留在t359和t398两个连续归档中。
+**当前结论**：执行感知的OSC短段预演值得用于下一阶段的隔离安全认证；8步结果不足以宣称长路线或完整搬运安全。无需现在立即改控制框架，但如果沿用严格7D RRT关节跟踪语义，则下一次正式执行必须采用成熟关节空间控制器；若使用OSC，需要先单独授权并维持“短段闭环 + 完整物理分支验收”，不能改写0.18正式逻辑。本轮没有正式Episode动作、RRT调用、Pot 2放置或Round 0种子。
 
-本轮规划调用已用尽，当前任务暂停在t=463真实Snapshot；后续需有新预算，先针对7D RRT路点和OSC_POSE冗余关节跟踪偏差作有界诊断，再从严格恢复的t=463状态重规划。不放宽0.18 rad、安全余量、禁触规则，不重放旧动作，不把局部前缀拼成完整种子。
+详细结果与复现命令见 `GS_OPD_PROGRESS.md` 最新节及归档 `/opt/data/private/gs_opd/rollouts/l0t2_round0_t463_osc_tracking_diagnostic_20261024_223003/`。独立预演入口为 `/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.diagnose_t463_osc_path_reference --bridge-port 38764`。下一工作须先取得新动作/规划预算并从同一t=463归档状态启动；不重跑已完成的偏差分析、不重做抓取搜索，不放宽安全约束，不将后缀拼为完整Episode。
 
-只读审计入口：
+只读恢复入口：
 
-/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t359_pot2_placement --audit-only
-/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t398_pot2_single_replan --audit-only --source-run /opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308
+`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t398_pot2_single_replan --audit-only --source-run /opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308`
+
+偏差分析与隔离预演入口：
+
+`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.diagnose_t463_osc_path_reference --bridge-port 38764`
+
+
+## 前一局部目标：从t=463真实持物状态重建Pot 2放置路线；按跟踪偏差fail-closed停止（2026-10-24）
 
 
 ## 前一局部目标：从t=359安全续接Pot 2 transport；本轮30步预算已用尽（2026-10-24）

@@ -4875,6 +4875,9 @@ def _osc_prefix_probe(request):
     max_joint_error = request.get("maximum_joint_path_deviation_rad")
     max_eef_error = request.get("maximum_eef_tracking_error_m")
     max_orientation_error = request.get("maximum_eef_orientation_error_rad")
+    qpos_reference_mode = request.get("qpos_reference_mode", "enforced")
+    if qpos_reference_mode not in {"enforced", "diagnostic_only"}:
+        raise ValueError("qpos_reference_mode_must_be_enforced_or_diagnostic_only")
     if (
         path_qpos.ndim != 2
         or path_qpos.shape[1:] != (7,)
@@ -4926,7 +4929,10 @@ def _osc_prefix_probe(request):
     qpos_addresses = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
     if len(qpos_addresses) != 7:
         raise ValueError("active_robot_arm_qpos_is_not_7d")
-    if np.linalg.norm(np.asarray(sim.data.qpos[qpos_addresses]) - path_qpos[start_index]) > float(max_joint_error):
+    cursor_qpos_error = float(np.linalg.norm(
+        np.asarray(sim.data.qpos[qpos_addresses]) - path_qpos[start_index]
+    ))
+    if qpos_reference_mode == "enforced" and cursor_qpos_error > float(max_joint_error):
         raise ValueError("path_cursor_does_not_match_current_real_qpos_within_limit")
     if getattr(robot.controller, "name", type(robot.controller).__name__) != "OSC_POSE":
         raise ValueError("active_robot_controller_is_not_native_OSC_POSE")
@@ -4963,6 +4969,9 @@ def _osc_prefix_probe(request):
         "path_start_index": start_index,
         "requested_steps": min(max_steps, len(path_qpos) - 1 - start_index),
         "executed_steps": 0,
+        "qpos_reference_mode": qpos_reference_mode,
+        "qpos_cursor_reference_error_rad": cursor_qpos_error,
+        "maximum_joint_path_deviation_rad": float(max_joint_error),
         "actions": [],
         "steps": [],
         "main_state_restored_verified": False,
@@ -5029,6 +5038,8 @@ def _osc_prefix_probe(request):
                 "actual_eef_position_world_m": eef_position.tolist(),
                 "actual_eef_quaternion_wxyz": eef_quaternion.tolist(),
                 "joint_path_deviation_rad": q_error,
+                "joint_path_deviation_exceeds_frozen_reference_limit": q_error > float(max_joint_error),
+                "qpos_reference_mode": qpos_reference_mode,
                 "eef_tracking_error_m": eef_error,
                 "eef_orientation_error_rad": eef_rotation_error,
                 "reward": float(reward),
@@ -5051,7 +5062,11 @@ def _osc_prefix_probe(request):
                 break
             if geom_status != "complete":
                 break
-            if q_error > float(max_joint_error) or eef_error > float(max_eef_error) or eef_rotation_error > float(max_orientation_error):
+            if (
+                (qpos_reference_mode == "enforced" and q_error > float(max_joint_error))
+                or eef_error > float(max_eef_error)
+                or eef_rotation_error > float(max_orientation_error)
+            ):
                 result["stop_reason"] = "planned_joint_or_eef_reference_deviation"
                 break
             if current_margin is not None:

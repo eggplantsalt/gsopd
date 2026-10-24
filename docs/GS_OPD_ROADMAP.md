@@ -1,6 +1,16 @@
 # GS-OPD 总体路线
 
-## 最新总体状态：单次重规划执行至t=463后关节路线偏差触发安全停止（2026-10-24）
+## 最新总体状态：t=463偏差已归因；隔离OSC安全预演通过8步但不构成路线认证（2026-10-24）
+
+7D RRT→OSC_POSE重复偏差已由104个历史实际状态定量分析：路径最近qpos点通常比`plan_cursor`落后4点，但最近点仅减少平均误差14.6–18.6%；t=398/t=463分别只解释末端0.0084/0.0061 rad。真实EEF仍贴近参考，而同末端附近的冗余关节qpos相差约0.174–0.176 rad。源码确认Bridge只把RRT点的EEF pose转成OSC动作、qpos只用于事后误差；robosuite nullspace项回归到controller构造时的`initial_joint`，Recovery cursor只按动作数递增。主要机制是7D关节目标与6D任务空间执行接口不一致，nullspace姿态回归促成冗余解差异，cursor滞后为次因。
+
+隔离t=463 Snapshot严格恢复后，在独立Bridge以诊断模式运行8个OSC_POSE动作、200子步，Pot 2仍双指持有并移动15.914 mm；全子步Native/Operational安全、EEF跟踪、关节、禁触对象间隙和状态恢复均通过。qpos偏差从0.184203增加到0.192083 rad，正式0.18阈值仍冻结；这证明短段执行感知的MuJoCo分支安全预演值得作为下一步选项，但不证明余下全路线可执行。Native Safety和Operational Safety通过，Strict-10mm仍失败（Pot 2非手指间隙4.363 mm）。没有后续正式Episode动作、放置或任务成功。
+
+下一阶段控制决策是有条件的：若7D RRT路径仍要求qpos参考限值，则需要成熟关节空间控制器；若沿用OSC，则必须在获得新明确预算后采用有限短段闭环与全状态MuJoCo隔离认证，不能把qpos阈值diag-only扩展到正式执行，也不能降低任何碰撞/关节/BDDL边界。当前继续暂停物理动作与RRT调用，先基于本轮结果评估执行模式。L0T2完整种子、Pot 2放置、Pot 1阶段及LoRA仍未开始。
+
+诊断与复现入口：`research/gs_opd/repair/diagnose_t463_osc_path_reference.py`；归档位于`/opt/data/private/gs_opd/rollouts/l0t2_round0_t463_osc_tracking_diagnostic_20261024_223003/`。历史t=329→463物理轨迹与规划记录保留原归档，不修改1093步历史示范或LeRobot数据。
+
+## 前一总体状态：单次重规划执行至t=463后关节路线偏差触发安全停止（2026-10-24）
 
 执行线已从t=359缓存路径续接到t=398；在准确Snapshot恢复和单次既有RRT-Connect后，又安全真实执行至t=463。合计104动作、2,600物理子步，Native/Operational Safety通过、双指抓持与finger-only接触规则保持、关节限位违规0；Strict-10mm统计因机器人非手指—Pot 2约4.36 mm而未通过，Ginger Beer/Place Box禁触边界仍满足。
 
