@@ -1,6 +1,32 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：t=463 RRT→OSC偏差归因与隔离执行感知预演（2026-10-24）
+## 最新进度：t=463执行感知搬运至t=590后按预测/实执行不一致停止（2026-10-24）
+
+### 路线复用与连续状态链
+
+从严格恢复的t=463 Runtime Snapshot出发，复用t=398归档的193点RRT路线及EEF参考，未调用RRT。新正式入口将7D qpos参考误差保持为`diagnostic_only`指标，冻结原0.18 rad数值；实际动作许可来自最多8动作滚动预演中的完整MuJoCo 25子步分支认证。t=463恢复的模型几何SHA为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，Integration State SHA为`37607e2e7d0d22932d9e5254881a50374b679fe265118fbe05ee6202db008b0e`；路线游标65、双指持Pot 2成立。OSC_POSE连续执行126动作到t=589，所有动作逐一预演/提交状态比较通过，3,150/3,150个MuJoCo子步完整，阶段自然由transport进入`precise_placement`。
+
+t=463→589这一段Native Safety与Operational Safety均通过，Operational关节限位违规0；Pot 2非手指机器人间隙最低4.363 mm（超过2 mm操作门槛，因此附加Strict-10mm统计失败），机器人到Ginger Beer最低36.866 mm，携物到Ginger Beer/Place Box最低39.356/20.673 mm。原OA与双相机视频保留在`/opt/data/private/gs_opd/rollouts/l0t2_round0_t463_execution_aware_pot2_placement_20261024_230355/`。
+
+正式runner曾在t=589阶段转换后因EEF tracking accessor软件错误、尚未提交新物理动作而中止；修正读取字段后，从同一归档的t=589 Runtime Snapshot做严格恢复并续接，快照字节SHA `b4134617f8642e46df5e683a660fc0a1ac6c82a12fe971724ef362d50c1ce3b8`与源/续接副本匹配，317维Integration State SHA `905aaee4600fe20d084c5d1df2047309f6e60c21f528d5ae31c6033a9dac95f7`与归一化控制器/夹爪Runtime SHA `96363c79245c2b34fc32013aa1f43fbf588947ed558d9e19f0bc416ae0d44eed`均核验。新TaskPhaseController由t=589真实状态接管为`precise_placement`，cursor191；Pot 2双指抓持与9个实时手指接触记录有效。基础安全阈值及禁触对未变；放置阶段只启用原策略中预配置的阶段性支撑接触，策略attestation确认冻结阈值和禁触对仍相同。
+
+### t=590停止证据与验收
+
+仅提交了1个t=589→590的precise-placement动作。该动作的完整25子步接触/几何/关节监测实际通过：禁触机器人接触、禁触物体接触、自碰撞、未许可场景接触、未解析接触、Operational/Strict关节限位越界均为0；Pot 2双指抓持保留，合法手指–Pot 2最大穿透0.069247 mm（2 mm允许值不变）。本动作非手指–Pot 2最小间隙4.377791 mm；机器人到Ginger Beer/Place Box最低78.733/139.272 mm，携Pot 2到两者最低123.605/117.205 mm。Native Safety及Operational Safety的单动作实测监测通过，Strict-10mm仍失败。
+
+执行许可比较随后在机器人EEF position的预测/实执行精确状态比对处fail-closed：`prediction_commit_eef_pos_mismatch:8.663630374972087e-05`，即最大绝对坐标分量差`8.663630374972087e-05 m`，超过冻结的`1e-8 m`比较限值。未放宽比较精度；t=590实际监测通过不替代预测/提交一致性验收。安全runner立即停止，没有后续动作，也没有第二次RRT。实际动作使Pot 2移动1.343 mm，但`On(moka_pot_2, flat_stove_1_cook_region)=false`；Pot 1 On=false、炉具Turnon=true、reward=0、done=false、task_success=false。任务仍处于precise placement，未完成放置或稳定释放。
+
+t=590路径关节游标191的qpos L2偏差为0.244654 rad，逐关节绝对偏差为`[0.160544, 0.008355, 0.170086, 0.006278, 0.068589, 0.015663, 0.009628] rad`。此执行模式下该值继续只是诊断指标，原始0.18 rad保持不变且不授权动作。
+
+Cumulative物理动作127/450，323个动作预算未使用；标准1000步成功、demo-only 1800步成功、Pot 2原生放置、完整任务成功、verified safe suffix和Round 0种子均为false；没有进入Pot 1，也没有LoRA训练。归档`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_resume_t589_20261024_231708/`保留同一timestep链的两段OA、双相机视频、t=589/t=590 Snapshot、动作journal、接触身份、25子步记录、谓词与奖励。机器可读报告是`continuation_chain.json`和`prediction_commit_mismatch_stop.json`，人读报告`t463_to_t590_stop_report.md`。
+
+原运行器在prediction/commit比对成功后才写预测终态Snapshot，因此触发本次比对异常时，t=590预演Snapshot与预测EEF向量未持久化；实际状态和本步完整监测均在journal中。入口现已做局部持久化修复：每个已认证预测Snapshot和动作记录将在真实提交前写盘，提交后补记实测状态与认证结果；这只是数据持久性修正，未改变控制、安全阈值或本次实测结果，本轮没有因此重新运行物理分支。语法编译检查通过，未启动新动作或测试套件。
+
+**停止类别：prediction/execution state mismatch。** 此次授权在失配点停止；后续必须先只读定位预演与实执行状态偏差来源，并重新取得物理续跑授权。禁止从t=590直接继续、放宽比较限值、重复RRT、训练或拼接成完整种子。历史1093步示范、既有Episode和LeRobot数据全部保留。
+
+---
+
+## 前一阶段进度：t=463 RRT→OSC偏差归因与隔离执行感知预演（2026-10-24）
 
 ### 两段实际轨迹的7D跟踪诊断
 

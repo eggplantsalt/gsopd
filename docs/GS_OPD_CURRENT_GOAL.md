@@ -1,22 +1,14 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：从t=463 Snapshot已完成偏差归因和8步隔离预演；暂停所有正式动作（2026-10-24）
+## 当前局部目标：prediction/commit失配后停止在t=590（2026-10-24）
 
-针对t=329→398与t=398→463两次qpos阈值停止，分别从两个连续物理归档恢复每步实测qpos、EEF、参考qpos和路径索引。最近路线点的关节误差只能解释14.6–18.6%平均误差；终点t=398/t=463只解释4.6%/3.3%。最近参考构型的EEF更接近当前末端，但仍有0.173479/0.175973 rad qpos误差。源码进一步确认Bridge按7D RRT点取EEF pose给OSC构造动作，qpos仅作动作后误差检查；OSC的nullspace项回归构造时`initial_joint`，cursor每动作固定加1、不关联实测构型。根因优先级为：7D关节路径与6D任务空间OSC执行接口不匹配；nullspace posture项使冗余关节解偏离；固定cursor带来约4点次级滞后。源码与状态数值相符，尚非控制器消融因果证明。
+本轮按获批方式复用t=398的193点路线，从严格恢复的t=463状态开始滚动预演和真实提交。t=463→589共126动作、3,150子步，逐动作预测/实执行认证通过，Pot 2保持双指抓持，阶段进入`precise_placement`。从完全匹配的同Episode t=589 Runtime Snapshot恢复后，TaskPhaseController根据真实状态重建，游标191，安全策略阈值及禁触对未改变。
 
-已从严格恢复的t=463 Snapshot运行独立最多8动作预演，实际执行8动作、200个子步后安全达到t=471；双指持有，Pot 2位移15.914 mm，EEF跟踪在3.29–3.66 mm。qpos偏差增长0.184203→0.192083 rad，故仍会违反冻结0.18正式门槛。全Native/Operational子步安全通过：非手指–Pot 2最低4.363 mm，Ginger Beer/Place Box及携物余量均大于10 mm；严格10mm只针对Pot 2统计失败。保存的每个branch Snapshot又经过零动作读审，最后精确恢复至t=463源Integration State与runtime内部哈希。
+t=590提交的第1个precise-placement动作本身完成25/25子步监测：Native/Operational动作安全检查通过，0禁触/自碰撞/未许可接触/关节违规，finger-only抓持仍稳定，Pot 2非手指间隙4.378 mm；Strict-10mm附加项失败。随后严格状态比对报`prediction_commit_eef_pos_mismatch:8.663630374972087e-05`（EEF位置最大绝对分量差，比较限值仍为1e-8 m），立即停止。此动作改变后的Pot 2仍未满足原生On谓词，reward=0、done=false。
 
-**当前结论**：执行感知的OSC短段预演值得用于下一阶段的隔离安全认证；8步结果不足以宣称长路线或完整搬运安全。无需现在立即改控制框架，但如果沿用严格7D RRT关节跟踪语义，则下一次正式执行必须采用成熟关节空间控制器；若使用OSC，需要先单独授权并维持“短段闭环 + 完整物理分支验收”，不能改写0.18正式逻辑。本轮没有正式Episode动作、RRT调用、Pot 2放置或Round 0种子。
+最终预算127/450，未运行RRT；任务成功、Pot 2局部放置、标准1000步、demo-only 1800步、verified safe suffix、Round 0种子均未取得。该链条不进入Pot 1，不训练LoRA。停止是执行预测与真实状态的一致性失败，并非观测到碰撞或关节限位违规。归档路径为`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_resume_t589_20261024_231708/`；完整人读/机器报告见`t463_to_t590_stop_report.md`、`continuation_chain.json`和`prediction_commit_mismatch_stop.json`。
 
-详细结果与复现命令见 `GS_OPD_PROGRESS.md` 最新节及归档 `/opt/data/private/gs_opd/rollouts/l0t2_round0_t463_osc_tracking_diagnostic_20261024_223003/`。独立预演入口为 `/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.diagnose_t463_osc_path_reference --bridge-port 38764`。下一工作须先取得新动作/规划预算并从同一t=463归档状态启动；不重跑已完成的偏差分析、不重做抓取搜索，不放宽安全约束，不将后缀拼为完整Episode。
-
-只读恢复入口：
-
-`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.resume_t398_pot2_single_replan --audit-only --source-run /opt/data/private/gs_opd/rollouts/l0t2_round0_t359_pot2_placement_20261024_213308`
-
-偏差分析与隔离预演入口：
-
-`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python -m research.gs_opd.repair.diagnose_t463_osc_path_reference --bridge-port 38764`
+正式入口`research/gs_opd/repair/execute_t463_execution_aware_pot2_placement.py`已补上预测终态Snapshot在动作提交前持久化，避免下一次有授权的运行再次丢失预测侧证据；原0.18 rad qpos参考值、Native/Operational判据和比较容差均未修改。本次停止后不从t=590继续；下一项是只读诊断该EEF状态失配，之后再讨论续跑预算与起点。历史数据保持不变。
 
 
 ## 前一局部目标：从t=463真实持物状态重建Pot 2放置路线；按跟踪偏差fail-closed停止（2026-10-24）

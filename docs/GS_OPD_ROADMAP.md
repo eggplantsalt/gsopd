@@ -1,6 +1,18 @@
 # GS-OPD 总体路线
 
-## 最新总体状态：t=463偏差已归因；隔离OSC安全预演通过8步但不构成路线认证（2026-10-24）
+## 最新总体状态：t=463安全搬运到t=589；t=590提交比对失配后停止（2026-10-24）
+
+复用已归档t=398的193点路径，以新执行感知入口从严格恢复的t=463 Snapshot做短段MuJoCo认证。无新RRT。126个动作连续到t=589，每动作25子步以及预测/实执行比较均通过；Native/Operational Safety成立，Pot 2双指持有，阶段控制器自然切换至precise placement。严格t=589 Snapshot恢复、Integration State和controller/gripper内部状态核对均精确通过；运行时状态、模型与当前策略attestation一致。
+
+t=590只执行1个precise-placement动作。其25个物理子步Native/Operational监测通过：无禁触、无自碰撞、无关节限制违规，finger-only抓持仍成立。随后物理状态与分支预测在EEF位置的最大绝对分量上差`8.663630374972087e-05 m`，超过未变的`1e-8 m`严格提交比较限值。系统按fail-closed停止，没有后续动作或RRT。差异不是已检测安全违规，但阻止把t=463→590认定为已验证执行安全后缀。
+
+t=590原生Pot 2 On仍false、reward=0、done=false；Pot 2已经移动1.343 mm但未放置。累计动作127/450，标准1000步及扩展1800步成功均false；Strict-10mm继续只做附加统计并失败，其他几何和安全阈值不变。Round 0种子与训练均未开始。归档含两段OA、双相机视频、真实Snapshot、实际journal、子步监测、阶段与谓词，并记录原runner未能在提交前持久化预测Snapshot这一证据缺口。执行入口现已在提交前保存预测数据供后续诊断；本次执行未因此重启。
+
+**当前下一步：** 只读定位t=590分支与实执行的EEF状态差异；在解释偏差前不继续物理动作、不放宽1e-8比较、不运行RRT。后续任何续跑都从严格验证的真实Snapshot、按新的授权和剩余动作额度进行。即使后缀完成，也不得补接缺失的安全前缀当作完整Round 0种子；完整安全种子仍要求从已验证原始安全t=10开始同一Episode连续执行及统一安全验收。
+
+完整结果与复现材料：`/opt/data/private/gs_opd/rollouts/l0t2_execution_aware_pot2_resume_t589_20261024_231708/t463_to_t590_stop_report.md`、`continuation_chain.json`。正式入口：`research/gs_opd/repair/execute_t463_execution_aware_pot2_placement.py`。历史示范、LeRobot数据、Episode归档保持不变。
+
+## 前一总体状态：t=463偏差已归因；隔离OSC安全预演通过8步但不构成路线认证（2026-10-24）
 
 7D RRT→OSC_POSE重复偏差已由104个历史实际状态定量分析：路径最近qpos点通常比`plan_cursor`落后4点，但最近点仅减少平均误差14.6–18.6%；t=398/t=463分别只解释末端0.0084/0.0061 rad。真实EEF仍贴近参考，而同末端附近的冗余关节qpos相差约0.174–0.176 rad。源码确认Bridge只把RRT点的EEF pose转成OSC动作、qpos只用于事后误差；robosuite nullspace项回归到controller构造时的`initial_joint`，Recovery cursor只按动作数递增。主要机制是7D关节目标与6D任务空间执行接口不一致，nullspace姿态回归促成冗余解差异，cursor滞后为次因。
 
