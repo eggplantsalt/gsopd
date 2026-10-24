@@ -3685,6 +3685,16 @@ def _normalize_safety_geometry_policy(raw_policy):
     forbidden_groups = parse_groups(raw_policy.get("forbidden_objects"), "forbidden_objects", 0.010)
     target_groups = parse_groups(raw_policy.get("allowed_target_objects", []), "allowed_target_objects", 0.010)
     other_groups = parse_groups(raw_policy.get("other_scene_objects", []), "other_scene_objects", 0.0)
+    support_geom_ids = raw_policy.get("allowed_carried_support_contact_geom_ids", [])
+    if (
+        not isinstance(support_geom_ids, list)
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in support_geom_ids)
+        or len(set(support_geom_ids)) != len(support_geom_ids)
+        or not set(support_geom_ids).issubset(
+            set().union(*(item["geom_ids"] for item in other_groups)) if other_groups else set()
+        )
+    ):
+        raise ValueError("allowed_carried_support_contact_geoms_must_be_verified_other_scene_geometries")
     if not forbidden_groups:
         raise ValueError("at_least_one_forbidden_contact_object_is_required_for_takeover")
     allowed_body_ids = set().union(*(item["body_ids"] for item in target_groups)) if target_groups else set()
@@ -3827,6 +3837,29 @@ def _normalize_safety_geometry_policy(raw_policy):
             key = tuple(sorted((carried_geom, scene_geom)))
             carried_pair_ids.add(key)
             carried_pair_minimum[key] = float(required)
+        allowed_support_pairs = carried_raw.get("allowed_support_contact_pairs", [])
+        if not isinstance(allowed_support_pairs, list):
+            raise ValueError("carried_object_allowed_support_contact_pairs_must_be_an_array")
+        for pair_index, pair in enumerate(allowed_support_pairs):
+            if not isinstance(pair, dict):
+                raise ValueError(f"carried_object_allowed_support_contact_pairs[{pair_index}]_must_be_an_object")
+            carried_geom = pair.get("carried_geom_id")
+            scene_geom = pair.get("scene_geom_id")
+            required = pair.get("minimum_clearance_m", -0.002)
+            if (
+                isinstance(carried_geom, bool) or not isinstance(carried_geom, int)
+                or carried_geom not in carried_group["geom_ids"]
+                or isinstance(scene_geom, bool) or not isinstance(scene_geom, int)
+                or scene_geom not in support_geom_ids
+                or isinstance(required, bool) or not isinstance(required, (int, float))
+                or not np.isfinite(float(required)) or float(required) < -0.002
+            ):
+                raise ValueError(f"carried_object_allowed_support_contact_pairs[{pair_index}]_is_invalid")
+            key = tuple(sorted((carried_geom, scene_geom)))
+            if key in carried_pair_ids:
+                raise ValueError("carried_object_support_contact_pair_duplicates_an_existing_pair")
+            carried_pair_ids.add(key)
+            carried_pair_minimum[key] = float(required)
         finger_groups, _ = _tracking_gripper_sides(env.robots[0])
         expected_gripper_geoms = set().union(*finger_groups.values())
         carried_object = {
@@ -3872,6 +3905,7 @@ def _normalize_safety_geometry_policy(raw_policy):
         "classified_scene_body_ids": classified_scene_body_ids,
         "forbidden_scene_body_ids": set().union(*(item["body_ids"] for item in forbidden_groups)) if forbidden_groups else set(),
         "other_scene_body_ids": set().union(*(item["body_ids"] for item in other_groups)) if other_groups else set(),
+        "allowed_carried_support_contact_geom_ids": set(support_geom_ids),
         "forbidden_object_pairs": normalized_forbidden_pairs,
         "carried_object": carried_object,
         "source": raw_policy.get("source"),
@@ -5285,6 +5319,65 @@ try:
                             "status": "unavailable",
                             "failure_reason": f"{type(exc).__name__}: {exc}",
                             "live_state_unchanged": None,
+                        }
+                elif request["op"] == "screen_grasp_candidates":
+                    try:
+                        import hashlib
+                        from research.gs_opd.repair.mujoco_jointspace_planning import screen_grasp_candidates
+
+                        expected_instruction = request.get("expected_instruction")
+                        if expected_instruction != task.language:
+                            raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+                        actual_model = _planning_model_signature(env.sim.model._model)
+                        if request.get("model_geometry_sha256") != actual_model:
+                            raise ValueError("compiled_model_geometry_signature_changed")
+                        current_state = _mujoco_integration_state(env.sim)
+                        current_state_hash = hashlib.sha256(current_state.tobytes()).hexdigest()
+                        if request.get("start_state_sha256") != current_state_hash:
+                            raise ValueError("active_state_changed_before_candidate_screen")
+                        policy = _normalize_safety_geometry_policy(
+                            request.get("safety_geometry_policy")
+                        )
+                        finger_groups, _closure = _tracking_gripper_sides(env.robots[0])
+                        gripper_component_bodies = set()
+                        for finger_geom_id in finger_groups["left"] | finger_groups["right"]:
+                            body_id = int(env.sim.model._model.geom_bodyid[int(finger_geom_id)])
+                            while body_id > 0:
+                                body_name = str(env.sim.model.body_id2name(body_id) or "").lower()
+                                if "gripper" not in body_name and "finger" not in body_name:
+                                    break
+                                gripper_component_bodies.add(body_id)
+                                body_id = int(env.sim.model._model.body_parentid[body_id])
+                        gripper_component_geoms = sorted(
+                            geom_id for geom_id in policy["robot_geom_ids"]
+                            if int(env.sim.model._model.geom_bodyid[int(geom_id)]) in gripper_component_bodies
+                        )
+                        result = screen_grasp_candidates(
+                            env,
+                            request.get("candidates"),
+                            policy,
+                            target_object_id=request.get("target_object_id"),
+                            target_root_body_id=request.get("target_root_body_id"),
+                            left_finger_geom_ids=sorted(finger_groups["left"]),
+                            right_finger_geom_ids=sorted(finger_groups["right"]),
+                            gripper_geom_ids=gripper_component_geoms,
+                            closed_gripper_qpos=request.get("closed_gripper_qpos"),
+                            predicted_stable_object_pose_world=request.get("predicted_stable_object_pose_world"),
+                            start_state_sha256=current_state_hash,
+                            expected_instruction=expected_instruction,
+                            actual_instruction=task.language,
+                            clearance_m=float(request.get("clearance_m", 0.010)),
+                        )
+                        result["model_geometry_sha256"] = actual_model
+                        result["safety_policy_source"] = request.get("safety_geometry_policy", {}).get("source")
+                    except Exception as exc:
+                        result = {
+                            "operation": "screen_grasp_candidates",
+                            "status": "unavailable",
+                            "screening_type": "offline_scratch_only_not_physical_execution",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": None,
+                            "candidates": [],
                         }
                 elif request["op"] == "osc_prefix_probe":
                     try:

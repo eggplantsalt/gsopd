@@ -1,6 +1,22 @@
 # GS-OPD 当前局部目标
 
-## 当前目标：解决 Pot 2 阶段抓取目标的全机器人安全端点阻塞（2026-10-23）
+## 当前结果与局部目标：从已验证 Pot 2 稳定抓持状态完成安全抬升重接入（2026-10-23）
+
+### 本轮已完成
+
+- 只读审计并保留历史1093步L0T2任务成功链；第一处禁触违规是动作21–56的Ginger Beer接触。t=10、t=719、t=854、t=1093精确Snapshot存在；t=141、t=156、t=1021、t=1053没有对应精确Snapshot。逐里程碑的关节/物体相对姿态/原生谓词与文件可用性见最新审计JSON。
+- 生成同一组24个实质不同的抓取与抬升候选；1组通过离线全机器人Geometry、关节、双指接触与抬升/退出筛选。RRT-Connect从原始Student t=10前缀的安全终态规划到预抓取，随后真实OSC接近，风险余量、滞回、全机器人Geometry与10 mm障碍物约束未放宽。
+- Episode 9在同一合法物理Episode内真实达到 Pot 2稳定双指抓持（t=239起稳定持有），截至t=249位姿总移动3.071 mm，Ginger Beer最小余量10.1907 mm、Place Box 47.4795 mm。完整239步有5,975/5,975个子步记录；无禁触或自碰撞。引擎在进入 `lift` 后、首次抬升动作之前 fail-closed。
+
+### 停止原因与验收
+
+两次Episode预算已经用完，本轮不启动第三次。Episode 8因Pot 2仍支撑在桌面时，`unmapped_scene_environment`把目标物—桌面接触误认作障碍违规而停在 `stable_grasp`。Episode 9确认了真实抓持，但离开 `stable_grasp` 时安全策略清空目标夹爪接触许可；因此同一真实指抓持接触被误判为Pot 2 10 mm间隙违规（−0.528 mm）。该接触属于任务必需的夹持，不是 Ginger Beer 或 Place Box 接触；在此前全部物理子步中，禁触余量和接触记录均通过。未完成30 mm真实抬升，Pot 2原生On仍为false，后续Pot 2放置、Pot 1抓放与全任务谓词均未重接入。
+
+已把现有策略修正为：只要实时抓持核验仍确认当前任务目标由夹爪持有，就维持当前任务目标的精确夹爪Geom接触许可，最大穿透保持2 mm；其它机器人Geom与障碍物禁触检查不变。该代码修复尚未物理复验。当前结果：真实安全抓持成立，安全抬升/任务成功/完整安全成功未得到验证；不建立Round 0安全成功示范候选，不修改历史示范或LeRobot数据，不训练LoRA。
+
+归档：`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/`；机器可读结果为 `evidence/task_success_first_result.json`。后续若继续，先从Episode 9 的精确t=249 Snapshot做严格兼容性与抓持状态恢复核验，再只推进真实抬升与退出；若无法把该恢复证明为同一连续物理Episode，则需另行授权新的Episode预算。可复现CLI及固定t=10入口见 [GS_OPD_PROGRESS.md](GS_OPD_PROGRESS.md)。
+
+## 历史状态：Pot 2 阶段抓取端点阻塞（已由上方Task-Success-First真实运行更新）
 
 ### 已完成
 

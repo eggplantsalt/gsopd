@@ -1,6 +1,20 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## Task Phase Controller 回归修复与 Pot 2 抓取验证（2026-10-23；首次阻塞在安全抓取位姿）
+## 最新进度：Task-Success-First Safety Reconstruction（2026-10-23；两次真实尝试后停止）
+
+Round 0 主线现为“先取得真实任务成功但可含违规的历史任务先验，再从安全状态寻找可安全重接入的任务成功抓持/抬升状态”。1093步历史示范保持原样：294步 π₀.₅、425步 Pot 2 放置、135步 Pot 1 抓取迁移、239步最终放置；t=1053 首次获得原生完整任务成功（reward=1、done=true），但历史动作21–56 与 Ginger Beer 有接触，峰值接触力12.096849 N，不能作为安全轨迹。
+
+只读审计位于 `/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/evidence/historical_reference_audit.json`（v2）。1093/1093个动作均有完整25子步接触/几何记录；违规动作仅21–56共36步。t=10→20所有物体位姿不变；Ginger Beer 在t=20→118移动351.670 mm，而 Pot 1、Pot 2、Place Box保持原位。Pot 2在历史闭爪到t=141稳定双指抓持期间移动10.602 mm，因此历史抓持变换重表达在安全 t=10 的 Pot 2 位姿上，未复制历史关节解。审计记录各里程碑的7D关节、EEF姿态、Pot 1/Pot 2物体坐标抓持变换、存档中可读取的谓词/动作状态与Snapshot可用性；无精确谓词记录的里程碑在JSON中显式为`null`。精确Snapshot可用点为t=10、t=719、t=854、t=1093；t=141、t=156、t=1021、t=1053没有对应精确归档Snapshot。t=141双指抓持、t=156 Pot 2上升31.217 mm；t=719 Pot 2 On为真；t=854 Pot 2 On/炉具 Turnon为真而 Pot 1 On为假；t=1053三项原生谓词全真；t=1093继续稳定。每个里程碑的数值和Snapshot路径均在审计JSON中。
+
+候选逻辑在同一个安全 t=10 Snapshot布局下生成24组实质不同的物体相对抓取/腕部/接近候选，并以scratch全机器人 Geom、关节限位、目标指接触、Pot 2抬升及退出几何筛选。重复实现校正阶段仍复用了这同一组24个候选（9轮隔离筛查、共216次候选计算；没有增加不同候选）。最终24组中1组离线可行：`tsfs_01_axis2_rot+30`。最多3条RRT路线候选中，本次预规划耗时101.818 s、4,448个构型检查，选中路线的Ginger Beer/Place Box路径余量分别25.031/59.786 mm；RRT-Connect与10 mm硬约束、50/60 mm风险滞回、进展型重规划预算及停滞退出门槛均保留。
+
+两次独立真实 t=10 Snapshot Episode尝试都完整采集双相机Observation–Action、动作/阶段/谓词事件、每步25物理子步接触与间隙、逐步可恢复Snapshot和双视频；Episode 8执行237步（t=10→247），Episode 9执行239步（t=10→249）。两条均由同一逻辑搜索候选 `tsfs_01_axis2_rot+30` 得到。Episode 8在Pot 2稳定抓持后，被错误判定的Pot 2–桌面支撑间隙−0.047 mm fail-closed；没有Ginger Beer/Place Box接触，最小禁触余量10.210 mm。Episode 9完成预抓取、接近、闭爪及连续稳定双指抓持，t=249进入 `lift` 阶段前被另一项策略错误 fail-closed：安全余量例外在离开 `stable_grasp` 时被清空，将仍在夹爪内的目标 Pot 2 指接触按10 mm障碍物余量处理（测得−0.528 mm）。Episode 9此前239/239动作、5,975/5,975子步监控完整，所有这些子步禁触/自碰撞记录均为空；全程最小Ginger Beer余量10.1907 mm、Place Box余量47.4795 mm。Pot 2真实双指抓持成立，Pot 2根位姿相对t=10仅移动3.071 mm，未执行任何抬升动作；所以未证明真实30 mm抬升，完整任务和完整安全成功均为false，没有Round 0安全示范候选。
+
+已对现有阶段策略做窄修正：当实时抓持状态仍确认当前任务目标在夹爪内时，保持精确夹爪—目标Geom接触许可，最大穿透仍为2 mm；机器人其他几何和 Ginger Beer / Place Box 的10 mm余量不变。该修正在本轮预算内未重新物理验证。当前不超出用户授权的两次物理尝试；失败分类为“RRT路径可到达、物理双指抓持成功，但`lift`阶段的接触策略门控错误使真实抬升未开始”，而非安全抓取终点不存在、路径不可达或后续任务不可重接入。
+
+搜索/执行归档根目录：`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/`；机器可读汇总 `evidence/task_success_first_result.json`（完成本节后写入）。Episode 8/9各自保存 `observation_action_trace.npz`、`agentview.mp4`、`wrist.mp4`、`recovery_events.jsonl`、`recovery_manifest.json`、`snapshots/` 和候选搜索结果。原历史1093步示范与既有LeRobot目录没有改动；未开始LoRA训练。CLI可复现入口为 `research/gs_opd/repair/automatic_recovery_cli.py --mode runtime-snapshot --config research/gs_opd/configs/l0t2_task_success_first_safety_reconstruction.json`；归档t=10 Snapshot和模型/BDDL指纹写在配置文件中。
+
+## 历史阶段记录：Task Phase Controller 回归修复与 Pot 2 抓取验证（2026-10-23；被上方新实验结果更新）
 
 ### 回归根因与修复
 

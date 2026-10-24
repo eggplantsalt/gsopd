@@ -149,6 +149,7 @@ def main() -> int:
         context = backend.current_context()
         context.validate()
         backend.initialize_trajectory()
+        backend.prepare_task_success_first_candidates()
         artifacts = RecoveryArtifactWriter(output_dir)
         engine = AutomaticSafetyRecoveryEngine(backend, recovery_config, artifacts=artifacts)
         result = engine.run()

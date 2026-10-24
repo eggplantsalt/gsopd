@@ -25,7 +25,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from multiprocessing.connection import Client
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,7 @@ from research.gs_opd.repair.grasp_retargeting import (
     lateral_direction_away_from_nearest_obstacle_object_frame,
 )
 from research.gs_opd.repair.task_phase_controller import PhaseEvidence, TaskPhaseController
+from research.gs_opd.repair.task_success_first import generate_grasp_candidates
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -450,6 +451,7 @@ class AutomaticRecoveryBridgeBackend:
         self.current_region_parent: str | None = None
         self.confirmed_placed_objects: set[str] = set()
         self.task_support_geom_ids: tuple[int, ...] = ()
+        self.task_carried_support_geom_ids: tuple[int, ...] = ()
         self.latest_data: dict[str, Any] | None = None
         self.safety_policy: dict[str, Any] | None = None
         self.context_static: dict[str, Any] | None = None
@@ -687,7 +689,20 @@ class AutomaticRecoveryBridgeBackend:
                     raise ValueError(f"configured_support_geometry_is_not_unique:{geom_name}")
                 resolved_support.append(matches[0])
             self.task_support_geom_ids = tuple(resolved_support)
+            carried_support_names = task_execution.get("carried_support_contact_geom_names", [])
+            if not isinstance(carried_support_names, list):
+                raise ValueError("carried_support_contact_geom_names_must_be_an_explicit_array")
+            resolved_carried_support = []
+            for geom_name in carried_support_names:
+                matches = geometry_by_name.get(str(geom_name), [])
+                if len(matches) != 1:
+                    raise ValueError(f"configured_carried_support_geometry_is_not_unique:{geom_name}")
+                resolved_carried_support.append(matches[0])
+            self.task_carried_support_geom_ids = tuple(resolved_carried_support)
             self.safety_policy["allowed_contact_pairs"] = []
+            self.safety_policy["allowed_carried_support_contact_geom_ids"] = list(
+                self.task_carried_support_geom_ids
+            )
         template_object = self.config_data["goal_object_semantic_id"]
         if template_object not in object_names or template_object not in self.bindings:
             raise ValueError("historical_pregrasp_target_is_not_a_declared_BDDL_object")
@@ -712,21 +727,22 @@ class AutomaticRecoveryBridgeBackend:
             "source_trace_sha256": self.archive_sha256,
         }
         if self.mode in {"t10-snapshot", "runtime-snapshot"}:
-            if self.mode == "t10-snapshot":
-                verification = json.loads(self.t10_verification_path.read_text(encoding="utf-8"))
-                if verification.get("status") != "verified" or verification.get("timestep") != 10:
-                    raise ValueError("archived_t10_replay_snapshot_verification_is_not_valid")
-                if verification.get("model_geometry_sha256") != metadata["model_geometry_sha256"]:
-                    raise ValueError("archived_t10_model_geometry_fingerprint_mismatch")
-                if verification.get("source_trace_sha256") != self.archive_sha256:
-                    raise ValueError("archived_t10_student_trace_fingerprint_mismatch")
-                obstacle_scope_verified = bool(
-                    verification.get("substep_contact_monitoring", {}).get("coverage_complete")
-                    and verification.get("substep_contact_monitoring", {}).get("robot_bottle_or_box_contact_events") == 0
-                )
-                if not obstacle_scope_verified:
-                    raise ValueError("archived_t10_history_has_no_complete_obstacle_safety_evidence")
-            self.initial_history_safety_verified = False
+            verification = json.loads(self.t10_verification_path.read_text(encoding="utf-8"))
+            if verification.get("status") != "verified" or verification.get("timestep") != 10:
+                raise ValueError("archived_t10_replay_snapshot_verification_is_not_valid")
+            if verification.get("model_geometry_sha256") != metadata["model_geometry_sha256"]:
+                raise ValueError("archived_t10_model_geometry_fingerprint_mismatch")
+            if verification.get("source_trace_sha256") != self.archive_sha256:
+                raise ValueError("archived_t10_student_trace_fingerprint_mismatch")
+            if verification.get("t10_snapshot_sha256") != sha256_file(self.runtime_snapshot_path):
+                raise ValueError("archived_t10_runtime_snapshot_sha256_mismatch")
+            obstacle_scope_verified = bool(
+                verification.get("substep_contact_monitoring", {}).get("coverage_complete")
+                and verification.get("substep_contact_monitoring", {}).get("robot_bottle_or_box_contact_events") == 0
+            )
+            if not obstacle_scope_verified:
+                raise ValueError("archived_t10_history_has_no_complete_obstacle_safety_evidence")
+            self.initial_history_safety_verified = True
         else:
             self.initial_history_safety_verified = True
         return self.context_static
@@ -907,46 +923,70 @@ class AutomaticRecoveryBridgeBackend:
 
         def retarget_current_grasp(object_state: dict[str, Any]):
             candidate = self.task_controller.current_grasp_pose_candidate
-            offset = np.asarray(
-                candidate.get("translation_offset_object_m", [0.0, 0.0, 0.0]),
-                dtype=np.float64,
-            )
-            if offset.shape != (3,) or not np.isfinite(offset).all():
-                raise ValueError("task_grasp_candidate_translation_offset_is_invalid")
-            offset_policy = candidate.get("translation_offset_policy")
-            if offset_policy is not None:
-                if offset_policy != "lateral_away_from_nearest_forbidden_geometry":
-                    raise ValueError(f"unsupported_task_grasp_offset_policy:{offset_policy}")
-                obstacle_positions = [
-                    self._live_object_state(data, str(name))["root_pos"]
-                    for name in self.context_static["forbidden_names"]
-                ]
-                direction = lateral_direction_away_from_nearest_obstacle_object_frame(
-                    object_state["root_pos"],
-                    object_state["root_quat"],
-                    obstacle_positions,
+            direction = np.asarray(
+                candidate.get(
+                    "approach_direction_object",
                     self.task_grasp_template.approach_direction_object,
-                )
-                offset = offset + direction * float(candidate["translation_offset_m"])
-            rotation_delta = np.asarray(
-                candidate.get("rotation_delta_object_rad", [0.0, 0.0, 0.0]),
+                ),
                 dtype=np.float64,
             )
-            if rotation_delta.shape != (3,) or not np.isfinite(rotation_delta).all():
-                raise ValueError("task_grasp_candidate_rotation_delta_is_invalid")
-            about_approach = candidate.get("rotation_delta_about_approach_rad")
-            if about_approach is not None:
-                rotation_delta = rotation_delta + (
-                    self.task_grasp_template.approach_direction_object
-                    * float(about_approach)
+            if direction.shape != (3,) or not np.isfinite(direction).all() or np.linalg.norm(direction) < 1e-8:
+                raise ValueError("task_grasp_candidate_approach_direction_is_invalid")
+            direction = direction / np.linalg.norm(direction)
+            candidate_transform = candidate.get("object_to_eef")
+            if candidate_transform is not None:
+                matrix = np.asarray(candidate_transform, dtype=np.float64)
+                if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+                    raise ValueError("task_grasp_candidate_object_to_eef_is_invalid")
+                candidate_template = replace(
+                    self.task_grasp_template,
+                    object_to_eef=matrix,
+                    approach_direction_object=direction,
                 )
-            retargeted = self.task_grasp_template.retarget(
-                object_state["root_pos"],
-                object_state["root_quat"],
-                translation_offset_object_m=offset,
-                rotation_delta_object_rad=rotation_delta,
+                retargeted = candidate_template.retarget(
+                    object_state["root_pos"], object_state["root_quat"]
+                )
+            else:
+                offset = np.asarray(
+                    candidate.get("translation_offset_object_m", [0.0, 0.0, 0.0]),
+                    dtype=np.float64,
+                )
+                if offset.shape != (3,) or not np.isfinite(offset).all():
+                    raise ValueError("task_grasp_candidate_translation_offset_is_invalid")
+                offset_policy = candidate.get("translation_offset_policy")
+                if offset_policy is not None:
+                    if offset_policy != "lateral_away_from_nearest_forbidden_geometry":
+                        raise ValueError(f"unsupported_task_grasp_offset_policy:{offset_policy}")
+                    obstacle_positions = [
+                        self._live_object_state(data, str(name))["root_pos"]
+                        for name in self.context_static["forbidden_names"]
+                    ]
+                    lateral = lateral_direction_away_from_nearest_obstacle_object_frame(
+                        object_state["root_pos"], object_state["root_quat"],
+                        obstacle_positions, direction,
+                    )
+                    offset = offset + lateral * float(candidate["translation_offset_m"])
+                rotation_delta = np.asarray(
+                    candidate.get("rotation_delta_object_rad", [0.0, 0.0, 0.0]),
+                    dtype=np.float64,
+                )
+                if rotation_delta.shape != (3,) or not np.isfinite(rotation_delta).all():
+                    raise ValueError("task_grasp_candidate_rotation_delta_is_invalid")
+                about_approach = candidate.get("rotation_delta_about_approach_rad")
+                if about_approach is not None:
+                    rotation_delta = rotation_delta + direction * float(about_approach)
+                retargeted = self.task_grasp_template.retarget(
+                    object_state["root_pos"], object_state["root_quat"],
+                    translation_offset_object_m=offset,
+                    rotation_delta_object_rad=rotation_delta,
+                )
+            object_rotation = self._pose_matrix(
+                object_state["root_pos"], object_state["root_quat"]
+            )[:3, :3]
+            pregrasp_position = retargeted.eef_position_world_m - (
+                object_rotation @ direction * retargeted.approach_distance_m
             )
-            return candidate, retargeted
+            return candidate, retargeted, pregrasp_position
 
         if phase == "pregrasp":
             # Use the archived verified grasp's object-frame approach vector
@@ -956,8 +996,8 @@ class AutomaticRecoveryBridgeBackend:
             # pregrasp target. Retarget the verified approach from the current
             # live object pose.
             object_state = self._live_object_state(data, object_name)
-            candidate, retargeted = retarget_current_grasp(object_state)
-            position = retargeted.pregrasp_position_world_m
+            candidate, retargeted, pregrasp_position = retarget_current_grasp(object_state)
+            position = pregrasp_position
             quaternion = retargeted.eef_quaternion_world_wxyz
             source = (
                 "archived_verified_object_frame_grasp_and_approach_distance_"
@@ -966,9 +1006,9 @@ class AutomaticRecoveryBridgeBackend:
             mode = "rrt_connect"
         elif phase in {"second_object_recovery", "approach"}:
             object_state = self._live_object_state(data, object_name)
-            candidate, retargeted = retarget_current_grasp(object_state)
+            candidate, retargeted, pregrasp_position = retarget_current_grasp(object_state)
             if phase == "second_object_recovery":
-                position = retargeted.pregrasp_position_world_m
+                position = pregrasp_position
                 quaternion = retargeted.eef_quaternion_world_wxyz
                 mode = "rrt_connect"
             else:
@@ -1050,6 +1090,11 @@ class AutomaticRecoveryBridgeBackend:
             "approach", "close_gripper", "stable_grasp", "withdrawal"
         }
         target = self.bindings[object_name]
+        # Keep exact Panda gripper-to-active-object pairs whitelisted for as
+        # long as the live grasp monitor says the task object is held. The
+        # target object remains a 10 mm checked object for every other robot
+        # geometry; this only preserves the contact needed to carry it.
+        grasp_contact_active = phase in finger_contact_phases or held_object == object_name
         self.safety_policy["allowed_contact_pairs"] = [
             {
                 "robot_geom_id": int(robot_geom),
@@ -1058,7 +1103,7 @@ class AutomaticRecoveryBridgeBackend:
             }
             for robot_geom in self.context_static["gripper_geometry_ids"]
             for scene_geom in target["geom_ids"]
-        ] if phase in finger_contact_phases else []
+        ] if grasp_contact_active else []
         self._refresh_carried_geometry_policy(held_object)
         if held_object is None:
             return
@@ -1087,6 +1132,22 @@ class AutomaticRecoveryBridgeBackend:
                 for scene_geom in support_ids
             ]
         carried["allowed_contact_pairs"] = pairs
+        support_pairs = []
+        if (
+            phase in {"stable_grasp", "lift"}
+            and held_object == object_name
+            and self.task_carried_support_geom_ids
+        ):
+            support_pairs = [
+                {
+                    "carried_geom_id": int(carried_geom),
+                    "scene_geom_id": int(scene_geom),
+                    "minimum_clearance_m": -0.002,
+                }
+                for carried_geom in self.bindings[held_object]["geom_ids"]
+                for scene_geom in self.task_carried_support_geom_ids
+            ]
+        carried["allowed_support_contact_pairs"] = support_pairs
 
     def _task_phase_context(
         self,
@@ -1269,6 +1330,8 @@ class AutomaticRecoveryBridgeBackend:
                 "initial_history_safety_verified": self.initial_history_safety_verified,
                 "initial_history_safety_scope": (
                     "full_episode_from_timestep_zero" if self.mode == "episode"
+                    else "verified_archived_student_actions_0_to_t10_exact_snapshot_plus_live_continuation"
+                    if self.initial_history_safety_verified
                     else "partial_archived_state_after_unverified_history"
                 ),
             },
@@ -1334,6 +1397,8 @@ class AutomaticRecoveryBridgeBackend:
                 "initial_history_safety_scope": (
                     "full_episode_from_timestep_zero"
                     if self.mode == "episode"
+                    else "verified_archived_student_actions_0_to_t10_exact_snapshot_plus_live_continuation"
+                    if self.initial_history_safety_verified
                     else "partial_archived_robot_bottle_box_contact_evidence_only"
                 ),
                 "task_context_source": "native_BDDL_constraints_and_live_registered_geometry",
@@ -1679,7 +1744,30 @@ class AutomaticRecoveryBridgeBackend:
         self.plan_attempt += 1
         rrt = dict(self.config_data.get("rrt_connect", {}))
         rrt["seed"] = int(rrt.get("seed", 20261023)) + self.plan_attempt - 1
-        result = self.bridge.request({
+        candidate = (
+            self.task_controller.current_grasp_pose_candidate
+            if self.task_controller is not None else {}
+        )
+        preplanned = getattr(self, "_task_success_first_preplanned_route", None)
+        if (
+            context.phase == "pregrasp"
+            and isinstance(preplanned, dict)
+            and preplanned.get("candidate_id") == candidate.get("candidate_id")
+            and preplanned.get("start_state_sha256") == start_hash
+        ):
+            result = preplanned["result"]
+            self._task_success_first_preplanned_route = None
+            result = dict(result)
+            result["source"] = "cached_task_success_first_preflight_from_same_verified_t10_snapshot"
+        else:
+            candidate_seed = candidate.get("preferred_ik_seed_qpos")
+            seeds = [self.historical_goal_qpos.tolist()]
+            if isinstance(candidate_seed, list) and len(candidate_seed) == 7:
+                seeds.insert(0, candidate_seed)
+            for seed in candidate.get("ik_seed_qpos", []):
+                if isinstance(seed, list) and len(seed) == 7:
+                    seeds.append(seed)
+            result = self.bridge.request({
             "op": "rrt_connect",
             "expected_instruction": context.instruction,
             "start_state_sha256": start_hash,
@@ -1689,7 +1777,8 @@ class AutomaticRecoveryBridgeBackend:
                 "quaternion_wxyz": list(goal.quaternion_wxyz),
             },
             "safety_geometry_policy": self.safety_policy,
-            "ik_seed_qpos": [self.historical_goal_qpos.tolist()],
+            "ik_seed_qpos": seeds,
+            "ik_selection_seed_qpos": candidate_seed,
             "planner_config": rrt,
         })
         if result.get("status") != "offline_feasible" or result.get("live_state_unchanged") is not True:
@@ -2043,6 +2132,190 @@ class AutomaticRecoveryBridgeBackend:
                 "safety_geometry_policy": self.safety_policy,
             })
         self._save_video_frame(self.latest_data)
+
+    def prepare_task_success_first_candidates(self) -> dict[str, Any] | None:
+        """Find a safe task-success endpoint before attempting its approach route."""
+        search = self.config_data.get("candidate_search", {})
+        if not isinstance(search, dict) or search.get("enabled") is not True:
+            return None
+        if self.task_controller is None or self.latest_data is None or self.safety_policy is None:
+            raise RuntimeError("task_success_first_search_requires_initialized_live_context")
+        if self.mode != "runtime-snapshot" or int(self.latest_data.get("timestep", -1)) != 10:
+            raise RuntimeError("task_success_first_search_requires_verified_t10_runtime_snapshot")
+        excluded = set(str(item) for item in search.get("excluded_candidate_ids", []))
+        limit = min(24, int(search.get("maximum_offline_candidates", 24)))
+        trace_states = self.archive["post_physical_state_json"]
+        clean_record = json.loads(str(trace_states[9]))
+        stable_record = json.loads(str(trace_states[140]))
+        approach_record = json.loads(str(trace_states[117]))
+        stable_qpos = np.asarray(stable_record["robot_states"][0]["joint_qpos"], dtype=np.float64)
+        approach_qpos = np.asarray(approach_record["robot_states"][0]["joint_qpos"], dtype=np.float64)
+        clean_object_rows = [
+            value for key, value in clean_record["object_states"].items()
+            if key.endswith(":" + self.config_data["goal_object_semantic_id"])
+        ]
+        if len(clean_object_rows) != 1:
+            raise ValueError("verified_t10_target_object_pose_is_not_unique_in_source_trace")
+        stable_object_rows = [
+            value for key, value in stable_record["object_states"].items()
+            if key.endswith(":" + self.config_data["goal_object_semantic_id"])
+        ]
+        if len(stable_object_rows) != 1:
+            raise ValueError("historical_stable_grasp_target_object_pose_is_not_unique")
+        clean_object_world = self._pose_matrix(
+            clean_object_rows[0]["root_pos"], clean_object_rows[0]["root_quat"]
+        )
+        stable_eef_transforms = []
+        for index in (138, 139, 140):
+            robot_state = json.loads(str(trace_states[index]))["robot_states"][0]
+            stable_eef_transforms.append(
+                self._pose_matrix(robot_state["eef_pos"], robot_state["eef_quat"])
+            )
+        eef_world = np.eye(4, dtype=np.float64)
+        eef_world[:3, 3] = np.median(
+            np.stack([item[:3, 3] for item in stable_eef_transforms]), axis=0
+        )
+        eef_world[:3, :3] = Rotation.from_matrix(
+            np.stack([item[:3, :3] for item in stable_eef_transforms])
+        ).mean().as_matrix()
+        adjusted_template = dict(self.grasp_template)
+        adjusted_transform = np.linalg.inv(clean_object_world) @ eef_world
+        adjusted_template["object_to_eef"] = adjusted_transform.tolist()
+        candidates = generate_grasp_candidates(
+            adjusted_template, stable_qpos, approach_qpos, limit=limit
+        )
+        snapshot = self.latest_data["snapshot_state"]
+        state_hash = hashlib.sha256(
+            np.asarray(snapshot["mujoco_integration_state"], dtype=np.float64).tobytes()
+        ).hexdigest()
+        object_name = str(self.config_data["goal_object_semantic_id"])
+        binding = self.bindings[object_name]
+        screen = self.bridge.request({
+            "op": "screen_grasp_candidates",
+            "expected_instruction": self.context_static["instruction"],
+            "model_geometry_sha256": self.context_static["model_geometry_sha256"],
+            "start_state_sha256": state_hash,
+            "safety_geometry_policy": self.safety_policy,
+            "target_object_id": object_name,
+            "target_root_body_id": int(binding["root_body_id"]),
+            "clearance_m": float(self.config.hard_minimum_clearance_m),
+            "closed_gripper_qpos": np.asarray(
+                stable_record["robot_states"][0]["gripper_qpos"], dtype=np.float64
+            ).tolist(),
+            "predicted_stable_object_pose_world": self._pose_matrix(
+                stable_object_rows[0]["root_pos"], stable_object_rows[0]["root_quat"]
+            ).tolist(),
+            "candidates": candidates,
+        })
+        if screen.get("status") != "complete" or screen.get("live_state_unchanged") is not True:
+            raise RuntimeError(f"offline_candidate_screen_incomplete:{screen.get('failure_reason') or screen.get('status')}")
+        screen_by_id = {item["candidate_id"]: item for item in screen.get("candidates", [])}
+        ranked = [item for item in screen.get("ranked_candidate_ids", []) if item not in excluded]
+        route_cfg = dict(self.config_data.get("rrt_connect", {}))
+        route_cfg.update(dict(search.get("preflight_rrt", {})))
+        route_cfg["minimum_clearance_m"] = float(self.config.hard_minimum_clearance_m)
+        route_cfg["max_candidate_routes"] = min(3, int(route_cfg.get("max_candidate_routes", 3)))
+        max_preflights = min(limit, int(search.get("maximum_route_preflights", limit)))
+        preflight_rows = []
+        selected = None
+        selected_route = None
+        object_state = self._live_object_state(self.latest_data, object_name)
+        object_matrix = self._pose_matrix(object_state["root_pos"], object_state["root_quat"])
+        for candidate_id in ranked[:max_preflights]:
+            candidate = next(item for item in candidates if item["candidate_id"] == candidate_id)
+            feasible = screen_by_id[candidate_id]
+            transform = np.asarray(candidate["object_to_eef"], dtype=np.float64)
+            approach = object_matrix[:3, :3] @ np.asarray(candidate["approach_direction_object"], dtype=np.float64)
+            eef_matrix = object_matrix @ transform
+            pregrasp_position = eef_matrix[:3, 3] - approach * float(candidate["approach_distance_m"])
+            pregrasp_quaternion = _matrix_quat_wxyz(eef_matrix[:3, :3])
+            route = self.bridge.request({
+                "op": "rrt_connect",
+                "expected_instruction": self.context_static["instruction"],
+                "start_state_sha256": state_hash,
+                "model_geometry_sha256": self.context_static["model_geometry_sha256"],
+                "goal_pose_world": {
+                    "position_world_m": pregrasp_position.tolist(),
+                    "quaternion_wxyz": pregrasp_quaternion.tolist(),
+                },
+                "safety_geometry_policy": self.safety_policy,
+                "ik_seed_qpos": [feasible["pregrasp_qpos"], *candidate.get("ik_seed_qpos", [])],
+                "ik_selection_seed_qpos": feasible["pregrasp_qpos"],
+                "planner_config": route_cfg,
+            })
+            summary = {
+                "candidate_id": candidate_id,
+                "status": route.get("status"),
+                "failure_reason": route.get("failure_reason"),
+                "planning_seconds": route.get("planning_seconds"),
+                "config_checks": route.get("config_checks"),
+                "minimum_forbidden_clearance_m": route.get("minimum_forbidden_clearance_m"),
+                "route_candidates": route.get("route_candidates"),
+                "live_state_unchanged": route.get("live_state_unchanged"),
+            }
+            preflight_rows.append(summary)
+            if route.get("status") == "offline_feasible" and route.get("live_state_unchanged") is True:
+                selected = dict(candidate)
+                selected["preferred_ik_seed_qpos"] = feasible["pregrasp_qpos"]
+                selected["pregrasp_qpos"] = feasible["pregrasp_qpos"]
+                selected["offline_screen_status"] = "offline_feasible_candidate_not_physical_execution"
+                selected["offline_minimum_clearance_m"] = feasible.get("minimum_observed_clearance_m")
+                selected_route = route
+                break
+        report = {
+            "schema": "gs_opd_task_success_first_candidate_search.v1",
+            "source_snapshot_timestep": 10,
+            "start_state_sha256": state_hash,
+            "candidate_limit": limit,
+            "candidate_count": len(candidates),
+            "historical_grasp_rebase": {
+                "source": "median_stable_EEF_pose_t139_to_t141_reexpressed_in_unchanged_verified_t10_Pot2_frame",
+                "t10_target_root_position_world_m": np.asarray(clean_object_rows[0]["root_pos"]).tolist(),
+                "historical_stable_target_root_position_world_m": np.asarray(stable_object_rows[0]["root_pos"]).tolist(),
+                "stable_EEF_world_position_m": eef_world[:3, 3].tolist(),
+                "original_historical_object_to_EEF": self.grasp_template["object_to_eef"],
+                "reexpressed_object_to_EEF": adjusted_transform.tolist(),
+                "historical_pot2_close_displacement_into_grasp_m": float(np.linalg.norm(
+                    np.asarray(self.grasp_template["source_stable_contact_evidence"][-1]["object_position_world_m"], dtype=np.float64)
+                    - np.asarray(clean_object_rows[0]["root_pos"], dtype=np.float64)
+                )),
+            },
+            "offline_screen": screen,
+            "excluded_candidate_ids": sorted(excluded),
+            "route_preflights": preflight_rows,
+            "route_preflight_budget": {
+                "maximum_candidate_routes_per_rrt": route_cfg["max_candidate_routes"],
+                "maximum_candidate_route_preflights": max_preflights,
+                "search_time_budget_s_per_candidate": route_cfg.get("search_time_budget_s"),
+            },
+            "selected_candidate_id": selected.get("candidate_id") if selected else None,
+            "selected_route_summary": preflight_rows[-1] if selected_route else None,
+            "physical_validation_started": False,
+        }
+        (self.output_dir / "task_success_first_candidate_search.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.artifacts.event({
+            "event": "task_success_first_candidate_search_complete",
+            "timestep": 10,
+            "offline_candidates": len(candidates),
+            "offline_feasible_candidates": screen.get("feasible_count"),
+            "route_preflights": len(preflight_rows),
+            "selected_candidate_id": selected.get("candidate_id") if selected else None,
+            "physical_validation_started": False,
+            "live_state_unchanged": True,
+        })
+        if selected is None or selected_route is None:
+            raise RuntimeError("no_offline_feasible_and_RRT_reachable_safe_grasp_reentry_from_t10")
+        self.config_data["task_execution"]["grasp_pose_candidates"] = [selected]
+        self.task_controller.grasp_pose_candidates = [selected]
+        self._task_success_first_preplanned_route = {
+            "candidate_id": selected["candidate_id"],
+            "start_state_sha256": state_hash,
+            "result": selected_route,
+        }
+        return report
 
     def finalize(self, result: dict[str, Any]):
         if hasattr(self, "trajectory"):
