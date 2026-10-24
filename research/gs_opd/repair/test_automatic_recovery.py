@@ -449,9 +449,12 @@ class AutomaticRecoveryTests(unittest.TestCase):
         self.assertTrue(backend.handed_off)
         self.assertIn("task_goal_phase_unresolved:grasp", result.reason)
 
-    def test_config_cannot_reduce_the_ten_millimetre_floor(self):
-        with self.assertRaisesRegex(ValueError, "cannot be below 10 mm"):
-            RecoveryConfig(hard_minimum_clearance_m=0.009).validate()
+    def test_config_accepts_explicit_sub_ten_millimetre_object_clearance(self):
+        RecoveryConfig(
+            hard_minimum_clearance_m=0.009,
+            target_object_clearance_m=0.002,
+            object_clearance_m={"moka_pot_2": 0.002},
+        ).validate()
 
 
 if __name__ == "__main__":

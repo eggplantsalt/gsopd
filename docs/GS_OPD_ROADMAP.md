@@ -1,6 +1,14 @@
 # GS-OPD 总体路线
 
-## 最新总体状态：t=236 handoff死循环已修复；48组候选均未通过精确MuJoCo检查（2026-10-24）
+## 最新总体状态：任务优先安全重构仍未取得物理抓持；t=236分支预算耗尽（2026-10-24）
+
+Round 0仍以一条完整、安全、原生任务成功的L0T2轨迹为第一道验收；当前没有种子。已把净距参数改为逐对象配置：Pot 2非手指机器人Geom首档2 mm、必要时0 mm且不允许穿透；Ginger Beer/Place Box默认10 mm，只在实测正间隙确认其为阻塞时逐个试5 mm再2 mm；指尖与Pot 2只允许四个核验Geom、穿透最多2 mm。Bridge、RecoveryConfig、RRT及离线候选筛选已支持这些分档，原生BDDL约束与模型关节range保持不变。
+
+严格t=236恢复通过，但本轮8个物理分支各执行首个动作后均因已张开的Panda夹爪被继续发送`open=-1`而报finger joint低于机械限位4.186×10⁻⁶ rad，未进入有效接近/抓持验证。每动作25子步、双相机、接触/间隙、Snapshot等证据已归档；Pot 2、Ginger Beer、Place Box的已测最小几何净距均超过10 mm。未观察到禁触物接触、自碰撞或Pot2手掌接触。Bridge仍保留1e-8 rad数值比较精度；分支入口改成从张开饱和位置向闭合方向更新1%后再以neutral命令保持，但尚未物理复验。8个物理分支预算已消耗，停止继续物理动作；尚未启动完整Episode、未获得真实安全抓持或抬升、未满足种子条件。
+
+归档：`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_relaxed_clearance_physical_branches_20261024/`。入口：`research/gs_opd/repair/run_t236_physical_grasp_branches.py`。下一停靠点是在新获批物理预算内验证夹爪饱和时的保持策略，再继续目标阶段；不能把本轮分支标为安全抓取成功或Strict-10mm Safe。历史1093步示范、Episode 8/9和全部LeRobot数据保留。
+
+## 前一阶段总体状态：handoff死循环已修复；48组候选均未通过精确MuJoCo检查（2026-10-24）
 
 Round 0目标仍是先产生一条完整安全成功L0T2示范；目前没有安全重接入构型、物理抓取或成功种子。t=236的重复handoff来自恢复全局12 mm/0.08 rad与Approach 8 mm/0.06 rad判据分裂：EEF误差11.267 mm时恢复层回报成功，阶段层仍判未到；9.208 mm的hand–Pot 2预测余量使同一动作连续被安全拒绝，循环94次。两层现已统一按当前阶段的判据，且同状态无进展handoff默认至多3次后fail-closed；25项相关回归测试通过。
 

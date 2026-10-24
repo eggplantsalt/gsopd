@@ -3076,3 +3076,19 @@ t=966 Runtime Snapshot 随后由原有 `restore_runtime_snapshot` 接口成功�
 离线 scratch 完整机器人几何预检按5 mm/0.025 rad采样159点，在首段 `clearance_lift` 的第8点停止。此前已检点没有 Ginger Beer/Place Box/Pot/Stove 接触；Ginger Beer、Place Box最小间隙分别196.177、225.294 mm。第8点有界 IK 位置残差3.646 mm（要求3 mm）、姿态残差0.003225 rad，关节未越限。该姿态 `robot0_joint5=0.003488 rad`；EEF Jacobian 最小奇异值从 t=291 的0.03802下降到 `7.74×10⁻⁶`，条件数约246,237。增加数值求解迭代预算后残差仍未改善，故这条保持姿态的抬升路线未通过可达性认证。此结果不证明预抓取目标全局不可达；它定位到当前进场姿态下的严重局部腕部病态。按本轮约束，没有执行物理接近或调整路线继续搜索。
 
 本轮 Bridge `env.step`=0；未运行 VLA、抓取、放置或训练。t=291状态已导出并再次确认 Integration State与全部快照组件逐项一致，Bridge已停止。独立归档：`/opt/data/private/gs_opd/rollouts/l0t2_round1_pregrasp_reentry_20261023_attempt1/`，详细说明见 `evidence/pregrasp_reentry_report.md`，首个IK阻塞和Jacobian证据见 `evidence/kinematic_singularity_diagnostic.json`。任务和安全成功均为 false；原1093步成功示范及LeRobot数据未改。本轮停止等待复核。
+
+## L0T2 Round 0：t=236放宽目标余量的物理抓取/抬升分支（2026-10-24；Joint-limit数值监测处fail-closed）
+
+### 阈值配置改为逐对象
+
+按用户授权将净距设为对象级策略：Pot 2与非手指机器人Geom首档2 mm、可在明确阻塞时降至0 mm但不允许穿透；Ginger Beer/Place Box初始各10 mm，只有实际记录到正间隙低于当前门槛才依次调至5 mm、2 mm；合法finger–Pot2接触最多2 mm穿透。物理分支策略的白名单仅为Geom 76/77/79/80；Palm/hand、其余机器人Geom、非目标场景、BDDL、自碰撞约束均保持受检。同步移除了Bridge、RecoveryConfig、JointSpaceRRT与候选筛选器把10 mm当成全局最低可配置值的校验；分组净距仍由各对象显式阈值执行。Approach已有12 mm/0.08 rad阶段完成容差，本轮局部闭环没有通过放宽该容差改变抓取目标。
+
+新增全机器人受限hinge/slide关节的25子步检查。首次动作报告Panda `gripper0_finger_joint2` 为−0.04000418628070624 rad、range下限−0.04 rad，越界4.1863×10⁻⁶ rad；其余机械臂关节均在限位内。8个分支都在已完全张开的夹爪上重复发送`gripper=-1`，因同一首动作Joint-limit告警而各只执行1步，合计8步。该原因与Pot2间隙、障碍物阈值无关；它是实际监测告警，故每支立即停止。关节range与1e-8 rad数值比较epsilon均保持不变；入口改为先向闭合方向累计1%控制更新，后续Approach以neutral命令保持，不再继续驱动开限位。该修正未物理复验。后续入口已加入关节监测失败时停止整个候选批次的保护，避免对共享基础失败继续开分支；同时尊重用户传入的每支动作上限。
+
+### 真实执行证据与边界
+
+原生reset模型SHA为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`；t=236 Runtime Snapshot恢复后的Integration State SHA为`a299ea309f78435c868306716bfa403834d20f3599473793b25612e93207c0f8`，与归档精确匹配。每个已提交控制动作均有25/25 MuJoCo子步、双相机RGB、逐步Observation/Action、全机器人Geom及关节限位记录、grasp状态、原生任务状态、reward/done和动作末态Runtime Snapshot。
+
+8个动作有限前缀所测Pot2非手指几何最小正间隙为10.570898 mm，Ginger Beer为11.733975 mm，Place Box为48.536454 mm；第一分支对应10.693784/11.821668/48.575158 mm。没有观察到自碰撞、Ginger Beer/Place Box接触或Palm–Pot2接触；接触监测的唯一unsafe项是上面的4.186×10⁻⁶ rad gripper joint-limit excursion。全程Pot2抓持状态false，Pot2只发生至t=237附近的局部EEF接近；native reward=0、done=false。因monitor未通过，这段不能认证为完整安全或Strict-10mm Safe，虽然已测对象间隙超过10 mm。
+
+本轮8个物理分支预算已全部用完；条件授权的两次完整Episode未触发，不曾启动。没有稳定双指抓持、≥30 mm真实抬升、safe exit、Pot2/ Pot1放置或原生任务成功，因此没有Round 0种子候选、不做插值扩增或LoRA训练。完整归档包括每支双相机视频、NPZ、JSON事件/子步数据和逐动作可恢复Snapshot：`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_relaxed_clearance_physical_branches_20261024/`。复现脚本为`research/gs_opd/repair/run_t236_physical_grasp_branches.py`；其执行上限是8支×80动作。当前预算下停止，不把离线或短前缀结果冒充真实安全抓取。

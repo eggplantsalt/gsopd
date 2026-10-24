@@ -1,6 +1,22 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：修复Approach重复handoff并寻找安全Pot 2重接入，已完成本轮有界筛查（2026-10-24）
+## 当前局部目标：t=236局部安全抓取分支停止，8次物理分支预算已用完（2026-10-24）
+
+### 本轮变化
+
+将安全净距改为逐对象显式配置：Pot 2非手指机器人Geom可设2 mm、必要时0 mm且不得穿透；Ginger Beer/Place Box仍默认10 mm，只在实际正间隙低于当前档位时才逐对象尝试5 mm、2 mm；目标夹爪许可精确限制到finger Geom 76/77/79/80，最大穿透2 mm。Bridge几何策略校验、RecoveryConfig、MuJoCo RRT与scratch候选筛选器均不再写死10 mm作为所有对象的最低可配置值；每个对象的碰撞分组阈值仍独立执行。Stage/BDDL、MuJoCo关节边界与任务谓词未改。
+
+从t=236归档Snapshot按正式native reset后恢复，模型SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`与Integration State SHA `a299ea309f78435c868306716bfa403834d20f3599473793b25612e93207c0f8`完全匹配。首次物理分支揭示：夹爪已在张开机械限位时，OSC仍重复发送`gripper=-1`，指关节 `gripper0_finger_joint2` 在25子步积分中的最大越界为 **4.186×10⁻⁶ rad**（qpos −0.0400041863，限位 −0.04）。安全监测因此正确fail-closed。关节比较epsilon保持`1e-8 rad`；分支入口现在先发一次1%闭合方向更新、之后接近时用neutral保持夹爪状态，避免继续推向张开限位。该调整尚未物理复验。
+
+已执行 **8个隔离分支、每支1个控制动作、共8动作**，每动作均有25个物理子步、双相机Observation、接触/间隙、reward/done、原生任务状态、grasp state与可恢复Snapshot；没有成功分支。各分支首个动作都被同一夹爪限位数值告警终止，实际上重复了这一基础控制问题，未完成设计的腕姿/接近差异验证。几何最小值在这些有限前缀中为Pot 2非手指 **10.571 mm**、Ginger Beer **11.734 mm**、Place Box **48.536 mm**；未观察到自碰撞、禁触物接触或Palm–Pot穿透。尽管该有限前缀实际距离均超过10 mm，Joint-limit监测未通过，所以不能标记为Strict-10mm Safe。
+
+最近物理里程碑仍为Pot 2 `approach`。未实现稳定双指抓持、30 mm真实抬升、safe exit、Pot 2放置、Pot 1抓放或原生完整任务成功；没有启动条件性的完整Episode预算，没有建立Round 0种子，也没有训练LoRA。8分支上限已经耗尽，本轮不再发起物理动作。数据归档及可复现入口：`/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_relaxed_clearance_physical_branches_20261024/`、`research/gs_opd/repair/run_t236_physical_grasp_branches.py`。
+
+### 下一道门
+
+先读审计已归档分支的joint-limit事件与首动作，再由用户授权新的有限物理分支预算后，从严格恢复的同一t=236 Snapshot重试。新执行保留`1e-8 rad`限位比较精度，验证全开夹爪的1%闭合方向更新与neutral保持策略；之后才有资格验证逼近、闭爪、连续双指持有、≥30 mm抬升及退出。只有该目标抓取/抬升通过，先前条件授权的最多两次完整Episode才可使用。
+
+## 前一阶段：修复Approach重复handoff并完成48组离线筛查（2026-10-24）
 
 ### 阶段判据冲突与停滞保护
 

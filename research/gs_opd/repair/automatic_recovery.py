@@ -137,6 +137,8 @@ class RecoveryConfig:
     risk_trigger_distance_m: float = 0.05
     risk_rearm_distance_m: float = 0.06
     hard_minimum_clearance_m: float = 0.01
+    target_object_clearance_m: float = 0.01
+    object_clearance_m: dict[str, float] = field(default_factory=dict)
     maximum_replans: int = 8
     maximum_replans_per_phase: int = 12
     planning_time_budget_s: float = 360.0
@@ -169,7 +171,6 @@ class RecoveryConfig:
         for name in (
             "risk_trigger_distance_m",
             "risk_rearm_distance_m",
-            "hard_minimum_clearance_m",
             "planning_time_budget_s",
             "total_wall_budget_s",
             "maximum_joint_path_deviation_rad",
@@ -180,8 +181,17 @@ class RecoveryConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        if self.hard_minimum_clearance_m < 0.01:
-            raise ValueError("hard_minimum_clearance_m cannot be below 10 mm")
+        for name in ("hard_minimum_clearance_m", "target_object_clearance_m"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not isinstance(self.object_clearance_m, dict):
+            raise ValueError("object_clearance_m must be an object-id-to-margin mapping")
+        for object_id, margin in self.object_clearance_m.items():
+            if not isinstance(object_id, str) or not object_id:
+                raise ValueError("object_clearance_m keys must be non-empty object ids")
+            if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(float(margin)) or float(margin) < 0.0:
+                raise ValueError(f"object_clearance_m[{object_id!r}] must be finite and non-negative")
         if self.risk_trigger_distance_m <= self.hard_minimum_clearance_m:
             raise ValueError("risk trigger must be greater than the hard clearance")
         if self.risk_rearm_distance_m <= self.risk_trigger_distance_m:

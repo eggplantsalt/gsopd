@@ -18,6 +18,9 @@ import sys
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
+
+JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD = 1e-8
+
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -3645,9 +3648,9 @@ def _normalize_safety_geometry_policy(raw_policy):
         isinstance(margin, bool)
         or not isinstance(margin, (int, float))
         or not np.isfinite(float(margin))
-        or float(margin) < 0.010
+        or float(margin) < 0.0
     ):
-        raise ValueError("minimum_clearance_m_must_be_at_least_10_mm")
+        raise ValueError("minimum_clearance_m_must_be_non_negative")
     robot_bodies = _robot_body_ids()
     if not robot_bodies:
         raise ValueError("complete_robot_body_inventory_unavailable")
@@ -3721,9 +3724,9 @@ def _normalize_safety_geometry_policy(raw_policy):
                 isinstance(object_margin, bool)
                 or not isinstance(object_margin, (int, float))
                 or not np.isfinite(float(object_margin))
-                or float(object_margin) < minimum_default
+                or float(object_margin) < 0.0
             ):
-                raise ValueError(f"{group_name}[{index}]_clearance_is_below_its_required_minimum")
+                raise ValueError(f"{group_name}[{index}]_clearance_must_be_non_negative")
             group = {
                 "object_id": object_id,
                 "body_ids": set(body_ids),
@@ -3737,8 +3740,16 @@ def _normalize_safety_geometry_policy(raw_policy):
             seen_geom_ids.update(geom_ids)
         return parsed
 
-    forbidden_groups = parse_groups(raw_policy.get("forbidden_objects"), "forbidden_objects", 0.010)
-    target_groups = parse_groups(raw_policy.get("allowed_target_objects", []), "allowed_target_objects", 0.010)
+    forbidden_groups = parse_groups(
+        raw_policy.get("forbidden_objects"),
+        "forbidden_objects",
+        max(0.010, float(margin)),
+    )
+    target_groups = parse_groups(
+        raw_policy.get("allowed_target_objects", []),
+        "allowed_target_objects",
+        max(0.010, float(margin)),
+    )
     other_groups = parse_groups(raw_policy.get("other_scene_objects", []), "other_scene_objects", 0.0)
     support_geom_ids = raw_policy.get("allowed_carried_support_contact_geom_ids", [])
     if (
@@ -4054,6 +4065,7 @@ def _substep_safety_geometry(monitor, contact_result):
         "unresolved_contacts": [],
         "forbidden_object_contacts": [],
         "unallowed_scene_contacts": [],
+        "joint_limit_violations": [],
     }
     try:
         if contact_result.get("status") not in ("contact", "no_contact"):
@@ -4201,6 +4213,35 @@ def _substep_safety_geometry(monitor, contact_result):
             item["status"] = "unsafe"
         if item["unresolved_contacts"]:
             item["status"] = "incomplete"
+        # Check every limited Panda hinge/slide joint at every native MuJoCo
+        # substep; EEF tracking cannot certify redundant-joint feasibility.
+        robot_bodies = _robot_body_ids()
+        for joint_id in range(int(model.njnt)):
+            if (
+                int(model.jnt_bodyid[joint_id]) not in robot_bodies
+                or not bool(model.jnt_limited[joint_id])
+                or int(model.jnt_type[joint_id])
+                not in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))
+            ):
+                continue
+            qpos_address = int(model.jnt_qposadr[joint_id])
+            value = float(sim.data.qpos[qpos_address])
+            lower, upper = (float(v) for v in model.jnt_range[joint_id])
+            if (
+                value < lower - JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD
+                or value > upper + JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD
+            ):
+                item["status"] = "unsafe"
+                item["joint_limit_violations"].append({
+                    "joint_id": int(joint_id),
+                    "joint_name": mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_JOINT, int(joint_id)
+                    ),
+                    "qpos": value,
+                    "lower": lower,
+                    "upper": upper,
+                    "numerical_tolerance_rad": JOINT_LIMIT_NUMERICAL_TOLERANCE_RAD,
+                })
         if item["minimum_clearance_m"] is None and policy["forbidden_objects"]:
             item["status"] = "incomplete"
     except Exception as exc:

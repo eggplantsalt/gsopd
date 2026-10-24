@@ -70,8 +70,8 @@ class JointSpacePlannerConfig:
                 raise ValueError(f"{name} must be finite and positive")
         if not 0.0 < self.goal_bias < 1.0:
             raise ValueError("goal_bias must lie in (0, 1)")
-        if self.minimum_clearance_m < 0.01:
-            raise ValueError("planner hard clearance cannot be below 10 mm")
+        if not math.isfinite(float(self.minimum_clearance_m)) or self.minimum_clearance_m < 0.0:
+            raise ValueError("planner clearance must be finite and non-negative")
 
 
 @dataclass

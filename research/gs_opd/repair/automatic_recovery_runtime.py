@@ -581,12 +581,15 @@ class AutomaticRecoveryBridgeBackend:
 
         def group(name: str, minimum: float) -> dict[str, Any]:
             binding = self.bindings[name]
+            object_margin = float(
+                self.config.object_clearance_m.get(name, minimum)
+            )
             return {
                 "object_id": name,
                 "body_ids": binding["collision_body_ids"],
                 "body_names": binding["collision_body_names"],
                 "geom_ids": binding["geom_ids"],
-                "minimum_clearance_m": float(minimum),
+                "minimum_clearance_m": object_margin,
             }
 
         inventory_geoms = inventory["geometries"]
@@ -660,7 +663,7 @@ class AutomaticRecoveryBridgeBackend:
             "minimum_clearance_m": self.config.hard_minimum_clearance_m,
             "forbidden_objects": [group(name, self.config.hard_minimum_clearance_m) for name in forbidden_names],
             "allowed_target_objects": [
-                group(name, 0.010)
+                group(name, self.config.target_object_clearance_m)
                 for name in target_names
                 if self.bindings[name]["geom_ids"]
             ],
@@ -2380,8 +2383,6 @@ def load_runtime_config(path: Path) -> tuple[dict[str, Any], RecoveryConfig]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     recovery = RecoveryConfig(**value["recovery"])
     recovery.validate()
-    if recovery.hard_minimum_clearance_m < 0.010:
-        raise ValueError("runtime_configuration_cannot_reduce_the_10_mm_hard_clearance")
     return value, recovery
 
 

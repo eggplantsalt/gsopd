@@ -426,8 +426,8 @@ def plan_current_scene(
     configured_margin = float(
         planner_values.pop("minimum_clearance_m", normalized_safety_policy["minimum_clearance_m"])
     )
-    if configured_margin < float(normalized_safety_policy["minimum_clearance_m"]):
-        raise ValueError("planner_clearance_cannot_weaken_the_task_hard_margin")
+    if not np.isfinite(configured_margin) or configured_margin < 0.0:
+        raise ValueError("planner_clearance_must_be_finite_and_non_negative")
     planner_cfg = JointSpacePlannerConfig(
         **planner_values,
         minimum_clearance_m=configured_margin,
@@ -506,8 +506,12 @@ def screen_grasp_candidates(
 
     if expected_instruction != actual_instruction:
         raise ValueError("task_instruction_does_not_match_the_active_BDDL_task")
-    if not 0.010 <= float(clearance_m) <= float(normalized_safety_policy["minimum_clearance_m"]):
-        raise ValueError("candidate_clearance_must_preserve_the_10mm_hard_margin")
+    if (
+        not np.isfinite(float(clearance_m))
+        or float(clearance_m) < 0.0
+        or float(clearance_m) > float(normalized_safety_policy["minimum_clearance_m"])
+    ):
+        raise ValueError("candidate_clearance_must_be_non_negative_and_within_the_declared_policy")
     if not isinstance(candidates, list) or len(candidates) > 24:
         raise ValueError("candidate_screen_requires_at_most_24_explicit_candidates")
     sim = environment.sim
@@ -782,8 +786,8 @@ def screen_grasp_candidates(
                 continue
             # Check the entire final approach using the live open-gripper
             # posture. Only the two verified finger sides may enter the
-            # target's contact envelope; Palm/hand remains in the full 10 mm
-            # geometry check performed by evaluate().
+            # target's contact envelope; Palm/hand remains constrained by the
+            # per-object clearance tier checked by evaluate().
             set_gripper(open_gripper)
             approach_checks = []
             approach_failure = None

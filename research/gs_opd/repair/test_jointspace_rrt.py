@@ -72,9 +72,8 @@ class JointSpaceRRTTests(unittest.TestCase):
         self.assertGreater(len(checked), 0)
         self.assertGreaterEqual(result.minimum_forbidden_clearance_m, 0.01)
 
-    def test_hard_clearance_cannot_be_lowered(self):
-        with self.assertRaisesRegex(ValueError, "cannot be below 10 mm"):
-            JointSpacePlannerConfig(minimum_clearance_m=0.009).validate()
+    def test_configured_clearance_can_be_lower_than_ten_millimetres(self):
+        JointSpacePlannerConfig(minimum_clearance_m=0.002).validate()
 
 
 if __name__ == "__main__":
