@@ -45,19 +45,13 @@ EXPECTED_MODEL_SHA256 = "1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14
 EXPECTED_T236_INTEGRATION_SHA256 = "a299ea309f78435c868306716bfa403834d20f3599473793b25612e93207c0f8"
 TARGET_OBJECT = "moka_pot_2"
 STANDARD_OBSTACLES = ("bottle_of_ginger_beer_1", "white_place_box_1")
-MAX_BRANCHES = 8
-MAX_ACTIONS_PER_BRANCH = 80
+MAX_BRANCHES = 2
+MAX_ACTIONS_PER_BRANCH = 100
 EXPECTED_SUBSTEPS = 25
 
 BRANCH_DESIGNS = [
-    {"name": "prior_axis2_rot+30_2mm_closed_loop", "step_mm": 2.0, "roll_deg": 0.0, "offset_object_mm": [0, 0, 0], "early_close_mm": 0.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_axis2_rot+30_fine1mm_close_8mm_early", "step_mm": 1.0, "roll_deg": 0.0, "offset_object_mm": [0, 0, 0], "early_close_mm": 8.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_plus_wrist_roll15_close_4mm_early", "step_mm": 2.0, "roll_deg": 15.0, "offset_object_mm": [0, 0, 0], "early_close_mm": 4.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_minus_wrist_roll15_lateral4mm", "step_mm": 2.0, "roll_deg": -15.0, "offset_object_mm": [4, 0, 0], "early_close_mm": 0.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_wrist_roll30_lateral_minus4mm", "step_mm": 1.5, "roll_deg": 30.0, "offset_object_mm": [-4, 0, 0], "early_close_mm": 6.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_wrist_roll_minus30_offset_y4mm", "step_mm": 1.5, "roll_deg": -30.0, "offset_object_mm": [0, 4, 0], "early_close_mm": 2.0, "lift_tilt_deg": 0.0},
-    {"name": "prior_wrist_roll15_offset_y_minus4mm_lift10deg", "step_mm": 2.0, "roll_deg": 15.0, "offset_object_mm": [0, -4, 0], "early_close_mm": 0.0, "lift_tilt_deg": 10.0},
-    {"name": "prior_wrist_roll_minus15_offset_z3mm_lift_minus10deg", "step_mm": 1.5, "roll_deg": -15.0, "offset_object_mm": [0, 0, 3], "early_close_mm": 4.0, "lift_tilt_deg": -10.0},
+    {"name": "prior_axis2_rot+30_current_eef_short_approach", "step_mm": 2.0, "roll_deg": 0.0, "offset_object_mm": [0, 0, 0], "early_close_mm": 0.0, "lift_tilt_deg": 0.0},
+    {"name": "prior_axis2_rot+30_wrist_roll15_current_eef", "step_mm": 1.5, "roll_deg": 15.0, "offset_object_mm": [0, 0, 0], "early_close_mm": 4.0, "lift_tilt_deg": 0.0},
 ]
 
 
@@ -247,6 +241,10 @@ class BranchRecorder:
             "native_task_success": reply.get("task_success"),
             "native_task_status": native_status,
             "grasp_state": grasp,
+            "gripper_command_scalar": float(np.asarray(action, dtype=np.float64)[-1]),
+            "gripper_formatted_current_action": grasp.get("gripper_current_action"),
+            "gripper_qpos": reply["snapshot_state"]["robot_states"][0].get("gripper_qpos"),
+            "arm_joint_qpos": reply["snapshot_state"]["robot_states"][0].get("joint_qpos"),
             "contact_monitoring": monitor,
             "safety_geometry": reply.get("safety_geometry"),
             "contacts": reply.get("contacts"),
@@ -382,11 +380,17 @@ def _run_one_branch(bridge, backend, branch_dir: Path, branch_index: int, design
     stagnation = 0
     first_grasp_pose = None
     action_budget = min(MAX_ACTIONS_PER_BRANCH, int(maximum_actions))
+    record["initial_gripper_state"] = {
+        "gripper_qpos": current["snapshot_state"]["robot_states"][0].get("gripper_qpos"),
+        "grasp_state": _grasp_state(bridge, backend, TARGET_OBJECT),
+        "joint_limit_monitor_tolerance_rad": 1e-8,
+    }
 
     def do_action(target_pos: np.ndarray, target_quat: np.ndarray, gripper_action: float, phase: str):
         nonlocal current, stable_streak, last_progress_pose, stagnation
         if len(recorder.rows) >= action_budget:
-            raise RuntimeError("branch_action_budget_80_exhausted")
+            raise RuntimeError(f"branch_action_budget_{action_budget}_exhausted")
+        record["failure_phase"] = phase
         robot = current["snapshot_state"]["robot_states"][0]
         action = world_pose_tracking_action(
             robot["eef_pos"], robot["eef_quat"], target_pos, target_quat, fields,
@@ -413,17 +417,30 @@ def _run_one_branch(bridge, backend, branch_dir: Path, branch_index: int, design
             or len(geometry.get("substeps", [])) != EXPECTED_SUBSTEPS
         ):
             failed_substeps = [
-                item for item in geometry.get("substeps", [])
+                (substep_index, item)
+                for substep_index, item in enumerate(geometry.get("substeps", []))
                 if item.get("status") != "complete"
             ]
-            record["monitor_failure"] = (
-                failed_substeps[0] if failed_substeps
-                else {
+            if failed_substeps:
+                first_index, first_failure = failed_substeps[0]
+                record["monitor_failure"] = {
+                    "physics_substep_index_zero_based": first_index,
+                    **first_failure,
+                }
+            else:
+                record["monitor_failure"] = {
                     "monitor_status": monitor.get("status"),
                     "geometry_status": geometry.get("status"),
                     "captured_substeps": monitor.get("captured_physics_substeps"),
                 }
-            )
+            record["monitor_failure"].update({
+                "control_action_index": row["step_index"],
+                "control_timestep": row["timestep"],
+                "action": row["action"],
+                "gripper_command_scalar": row["gripper_command_scalar"],
+                "gripper_formatted_current_action": row["gripper_formatted_current_action"],
+                "gripper_qpos_after_action": row["gripper_qpos"],
+            })
             raise RuntimeError(
                 "substep_safety_monitor_failed_closed:"
                 + str(geometry.get("status") or monitor.get("status"))
@@ -431,7 +448,16 @@ def _run_one_branch(bridge, backend, branch_dir: Path, branch_index: int, design
         if reply.get("done") is True:
             raise RuntimeError("native_episode_done_before_local_grasp_lift_exit")
         now = np.asarray(row["eef_position_world_m"], dtype=np.float64)
-        if float(np.linalg.norm(now - last_progress_pose)) < 0.00035:
+        if phase in {
+            "gripper_limit_preflight_closeward",
+            "gripper_limit_preflight_neutral_hold",
+            "close_gripper",
+        }:
+            # These are intentional stationary gripper controls. The gripper's
+            # internal command and qpos are the progress variables here.
+            stagnation = 0
+            last_progress_pose = now
+        elif float(np.linalg.norm(now - last_progress_pose)) < 0.00035:
             stagnation += 1
         else:
             stagnation = 0
@@ -445,56 +471,83 @@ def _run_one_branch(bridge, backend, branch_dir: Path, branch_index: int, design
         return row, grasp
 
     try:
-        start_rotation = Rotation.from_quat(np.r_[start_eef_q[1:], start_eef_q[0]])
-        pregrasp_rotation = Rotation.from_matrix(pregrasp_pose[:3, :3])
-        rotation_path = Slerp([0.0, 1.0], Rotation.from_quat(
-            np.stack([start_rotation.as_quat(), pregrasp_rotation.as_quat()])
-        ))
-        distance = float(np.linalg.norm(pregrasp_pose[:3, 3] - start_eef_p))
-        count = max(1, int(math.ceil(distance / (float(design["step_mm"]) * 0.001))))
-        for index in range(1, count + 1):
-            alpha = index / count
-            target_p = start_eef_p + alpha * (pregrasp_pose[:3, 3] - start_eef_p)
-            target_q = _quat_wxyz(rotation_path([alpha])[0])
-            # One 1% closeward update moves the already-open gripper controller
-            # off its outward saturation; later approach actions hold that
-            # command with zero so the fingers do not continue opening.
-            do_action(target_p, target_q, 1.0 if index == 1 else 0.0, "approach_to_pregrasp")
-        recorder.event({"event": "pregrasp_pose_reached", "timestep": current["timestep"], "eef_pose": current["state"]})
+        # t=236 is already at Approach, only 11.27 mm from the archived grasp
+        # target. Correct the gripper command in place before any approach
+        # motion; the one +1 action moves it inward and the two 0 actions hold
+        # the resulting command instead of continuing to drive the open stop.
+        preflight_p, preflight_q, _ = _pose_states(current, backend, TARGET_OBJECT)
+        preflight_rows = []
+        for index, command in enumerate((1.0, 0.0, 0.0)):
+            row, _ = do_action(
+                preflight_p,
+                preflight_q,
+                command,
+                "gripper_limit_preflight_closeward" if index == 0 else "gripper_limit_preflight_neutral_hold",
+            )
+            preflight_rows.append({
+                "timestep": row["timestep"],
+                "gripper_command_scalar": row["gripper_command_scalar"],
+                "gripper_formatted_current_action": row["gripper_formatted_current_action"],
+                "gripper_qpos": row["gripper_qpos"],
+                "joint_limit_substeps_passed": EXPECTED_SUBSTEPS,
+            })
+        record["gripper_limit_preflight"] = {
+            "status": "pass",
+            "controls": preflight_rows,
+            "format_action_semantics": "PandaGripper adds [-1,+1]*0.01*sign(action) on each low-level control call; measured 25 calls per monitored action, so +1 moved [1,-1] to [0.75,-0.75] and 0 holds",
+        }
+        recorder.event({"event": "gripper_limit_preflight_pass", **record["gripper_limit_preflight"]})
 
+        # Retarget to the live object after the in-place check. Follow a short
+        # interpolated path from the actual EEF to the grasp target; do not
+        # backtrack to the old 60.65 mm pregrasp pose and traverse it again.
+        live_object = _state_object(backend, current, TARGET_OBJECT)
+        object_world = _pose_matrix(live_object["root_pos"], live_object["root_quat"])
+        grasp_pose = object_world @ object_to_eef
+        approach_dir_world = object_world[:3, :3] @ np.asarray(
+            candidate["approach_direction_object"], dtype=np.float64
+        )
+        approach_dir_world /= np.linalg.norm(approach_dir_world)
         grasp_p = grasp_pose[:3, 3]
         grasp_q = _quat_wxyz(Rotation.from_matrix(grasp_pose[:3, :3]))
-        approach_steps = max(1, int(math.ceil(approach_distance / (float(design["step_mm"]) * 0.001))))
-        close_before = float(design["early_close_mm"]) * 0.001
-        for index in range(1, approach_steps + 1):
-            alpha = index / approach_steps
-            target_p = pregrasp_pose[:3, 3] + alpha * (grasp_p - pregrasp_pose[:3, 3])
-            remaining = float(np.linalg.norm(grasp_p - target_p))
-            grip = 1.0 if close_before > 0 and remaining <= close_before else 0.0
-            do_action(target_p, grasp_q, grip, "close_gripper" if grip > 0 else "approach")
-        current_p, _, _ = _pose_states(current, backend, TARGET_OBJECT)
-        if close_before <= 0:
-            for _ in range(4):
-                _, grasp = do_action(current_p, grasp_q, 1.0, "close_gripper")
-                if grasp.get("grasp_confirmed") is True:
-                    break
-        for micro in range(6):
-            grasp = _grasp_state(bridge, backend, TARGET_OBJECT)
-            if grasp.get("grasp_confirmed") is True and grasp.get("finger_contacts", {}).get("status") == "pass":
-                if first_grasp_pose is None:
-                    first_grasp_pose = _pose_states(current, backend, TARGET_OBJECT)[2]
-                if stable_streak >= 3:
-                    break
+        start_eef_p, start_eef_q, _ = _pose_states(current, backend, TARGET_OBJECT)
+        start_rotation = Rotation.from_quat(np.r_[start_eef_q[1:], start_eef_q[0]])
+        grasp_rotation = Rotation.from_matrix(grasp_pose[:3, :3])
+        rotation_path = Slerp([0.0, 1.0], Rotation.from_quat(
+            np.stack([start_rotation.as_quat(), grasp_rotation.as_quat()])
+        ))
+        direct_distance = float(np.linalg.norm(grasp_p - start_eef_p))
+        record["approach_retarget"] = {
+            "source": "live_EEF_after_gripper_preflight",
+            "current_eef_position_world_m": start_eef_p.tolist(),
+            "grasp_target_position_world_m": grasp_p.tolist(),
+            "direct_remaining_distance_m": direct_distance,
+            "historical_pregrasp_distance_m": approach_distance,
+            "historical_pregrasp_waypoint_distance_m": float(np.linalg.norm(pregrasp_pose[:3, 3] - start_eef_p)),
+        }
+        count = max(1, int(math.ceil(direct_distance / (float(design["step_mm"]) * 0.001))))
+        for index in range(1, count + 1):
+            alpha = index / count
+            target_p = start_eef_p + alpha * (grasp_p - start_eef_p)
+            target_q = _quat_wxyz(rotation_path([alpha])[0])
+            do_action(target_p, target_q, 0.0, "approach_from_current_eef")
+
+        # Keep the existing live bilateral-grasp predicate. Continue its
+        # close command in closed loop until three consecutive confirmations
+        # or the explicit per-branch action budget is exhausted.
+        close_step = 0
+        while stable_streak < 3 and len(recorder.rows) < action_budget:
             current_p, _, _ = _pose_states(current, backend, TARGET_OBJECT)
-            target_p = current_p + approach_dir_world * (0.0015 if micro < 3 else 0.001)
-            _, grasp = do_action(target_p, grasp_q, 1.0, "close_gripper_stabilize")
+            _, grasp = do_action(current_p, grasp_q, 1.0, "close_gripper")
+            close_step += 1
             if grasp.get("grasp_confirmed") is True and grasp.get("finger_contacts", {}).get("status") == "pass":
                 if first_grasp_pose is None:
                     first_grasp_pose = _pose_states(current, backend, TARGET_OBJECT)[2]
-                if stable_streak >= 3:
-                    break
+        record["close_control_actions"] = close_step
         grasp = _grasp_state(bridge, backend, TARGET_OBJECT)
         if grasp.get("grasp_confirmed") is not True or grasp.get("finger_contacts", {}).get("status") != "pass" or stable_streak < 3:
+            if len(recorder.rows) >= action_budget:
+                raise RuntimeError("branch_action_budget_exhausted_before_stable_bilateral_grasp")
             raise RuntimeError("physical_stable_two_finger_grasp_not_confirmed_for_three_consecutive_actions")
         record["stable_grasp"] = True
         held_start = _pose_states(current, backend, TARGET_OBJECT)[2]
@@ -697,25 +750,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 for item in failed_monitor.get("forbidden_contacts", [])
                 if isinstance(item, dict) and item.get("object_id") is not None
             }
-            margin_obstacle = next((
-                object_id for object_id in STANDARD_OBSTACLES
-                if object_id in failed_objects
-                and object_id in min_by_object
-                and 0.0 < float(min_by_object[object_id]) < float(obstacle_margins.get(object_id, 0.010))
-            ), None)
             target_min = min_by_object.get(TARGET_OBJECT)
-            if margin_obstacle is not None and "substep_safety_monitor_failed_closed" in failure:
-                current_margin = float(obstacle_margins.get(margin_obstacle, 0.010))
-                next_margin = 0.005 if current_margin > 0.005 else 0.002
-                obstacle_margins[margin_obstacle] = next_margin
-                report["obstacle_margin_tier_sequence"].append({
-                    "object_id": margin_obstacle,
-                    "from_m": current_margin,
-                    "to_m": next_margin,
-                    "evidence_minimum_m": float(min_by_object[margin_obstacle]),
-                    "reason": "positive gap below current explicit margin; no contact was observed",
-                })
-            elif TARGET_OBJECT in failed_objects and target_min is not None and 0.0 < float(target_min) < target_margin and "substep_safety_monitor_failed_closed" in failure:
+            if TARGET_OBJECT in failed_objects and target_min is not None and 0.0 < float(target_min) < target_margin and "substep_safety_monitor_failed_closed" in failure:
                 report["target_margin_tier_change"] = {
                     "from_m": target_margin,
                     "to_m": 0.0,

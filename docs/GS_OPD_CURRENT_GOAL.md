@@ -1,6 +1,18 @@
 # GS-OPD 当前局部目标
 
-## 当前局部目标：t=236局部安全抓取分支停止，8次物理分支预算已用完（2026-10-24）
+## 当前局部目标：t=236首个限位复验仍越界，物理执行停止（2026-10-24）
+
+本轮已按授权从精确恢复的 Episode 1 t=236 Snapshot 启动一个隔离物理分支。正式 reset 后模型指纹与 Integration State 均匹配；只执行了一个控制动作（25个MuJoCo子步），在 `gripper_limit_preflight_closeward` 阶段因子步0的真实关节限位告警立即停止，第二分支未启动。初始 `gripper0_finger_joint2` qpos 为 −0.04000417971758497 rad，下限 −0.04 rad，Bridge数值容差保持 `1e-8 rad`。越限持续在子步0–6（7/25子步）：首个qpos −0.04000415306424795 rad，子步6为 −0.04000046520674484 rad；命令为 `[0,0,0,0,0,0,+1]`。该动作结束时qpos已回到范围内 `[0.0394223180, −0.0395424718]`，但前7子步越限已使整步监测失败，故不能继续。
+
+更正夹爪调用语义：robosuite `PandaGripper.format_action()` 每次调用把内部状态按 `[-1,+1]×0.01×sign(action)` 累加；这条记录证明每个被监测的控制动作内它被调用25次。首步 `+1` 因此将 `gripper.current_action` 从 `[1,−1]` 推到动作末 `[0.75,−0.75]`，方向确实朝闭合；首子步时状态按公式为 `[0.99,−0.99]`。之前将其描述成“每个policy动作累计1%”是不准确的。neutral `0` 根据源代码不会改变内部状态，但本轮因首子步限位失败，没有提交后续neutral物理动作。关节range与比较容差未放宽。
+
+分支脚本已改为先在原位做 `+1,0,0` 限位验证，之后按t=236实时EEF姿态直接走剩余抓取距离，不再退回旧预抓取位姿再接近；上限固定为2支、每支100个动作。由于首次监测未通过，只有首个 `+1` 动作执行，Approach、闭爪、稳定抓持、抬升和退出均未物理验证。该动作的Pot 2非手指净距10.4561 mm、Ginger Beer 11.7887 mm、Place Box 48.5270 mm；安全监测的失败项只有指关节限位，禁触余量档位仍为Pot 2 2 mm、Ginger Beer/Place Box 10 mm。
+
+Episode 9 t=249只读复核现已完成：正式native reset后几何指纹匹配，t=249 Runtime Snapshot的317维Integration State精确恢复，物理动作与子步均为0。当前 `grasp_state` 为pass且原生双指抓持谓词成立；夹爪内部状态为`[-1,+1]`，qpos为`[0.00763703,−0.00738810]`；三处实际机器人接触分别是Geom 77、79、80与Pot 2 Geom 116、117、115，全部在四个finger Geom白名单76/77/79/80内，没有Palm/hand接触。原生完整任务成功仍为false。归档历史包含239动作、5,975/5,975个完整几何子步，未记录joint-limit、forbidden或unresolved事件；但逐子步原始接触身份没有保存，因此不能仅凭该旧前缀证明全程满足最新finger-only规则，也不建立安全种子。审计结果：`/opt/data/private/gs_opd/rollouts/task_success_first_safety_reconstruction_l0t2_20261023_attempt1/episode9_t249_finger_only_audit_20261024/restore_probe.json`。
+
+物理失败证据与双相机帧、25子步记录、Runtime Snapshot、视频及报告保存在 `/opt/data/private/gs_opd/rollouts/l0t2_round0_tsfs_safe_seed_20261024/episode1_t236_gripper_limit_fix_branches_20261024/`；首子步内部命令依来源公式重建的说明见该目录 `first_substep_controller_state_reconstruction.json`。本轮没有稳定抓持、30 mm抬升、safe exit、完整Episode、Round 0种子或LoRA训练。下一步要先选取一个按原生模型关节range已经有效的可恢复起点；不得改写qpos或放宽比较精度来挽救t=236首子步越限。历史1093步示范与所有Episode/LeRobot数据保留。
+
+## 上一轮局部目标记录：t=236局部安全抓取分支停止，8次物理分支预算已用完（2026-10-24）
 
 ### 本轮变化
 
