@@ -1,5 +1,15 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## 本轮补充：LIBERO-Safety 跨场景配置盘点与代码复用修订（2026-10-25）
+
+本地只读盘点 `obstacle_avoidance` 与 `obstacle_avoidance_human` 的 L0/L1/L2 共 30 个任务，逐项整理 BDDL、符号初始状态、原生目标、接触代价对象、动态定义、技能需求与静态采集可行性。机器清单和 Markdown 表见 [task manifest](GS_OPD_LIBERO_SAFETY_TASK_MANIFEST.json) 与 [任务清单](GS_OPD_LIBERO_SAFETY_TASK_CHECKLIST.md)。本轮未读取/下载官方安全示范，未运行 Rollout、MuJoCo 或训练。
+
+严格沿用：**原始 π₀.₅ Student Rollout → 暴力搜索成功轨迹（允许不安全）→ 仅用 GS-OPD 自身历史成功经验做几何重定位与安全重构 → MuJoCo 完整验证 → 生成 GS-OPD 安全训练 Episode。** 官方安全示范中的动作、关键帧、轨迹、专家标签不得作为当前搜索先验、冷启动经验、重定位来源或 GS-OPD Episode；仅保留未来独立 Offline SFT Baseline。
+
+代码复核来源是实验分支 `gs-opd-overfit-recovery-08a0198`，审计提交 `2af2ef2d8651fce1196ba0ee8317fb21c7bc7360`。此前只查主分支导致的“缺少 RRT/阶段控制器”结论现已修正：`research/gs_opd/repair/jointspace_rrt.py` 中的 `JointSpaceRRTConnect`、`mujoco_jointspace_planning.py` 的 MuJoCo scratch-scene 规划适配器，以及 `task_phase_controller.py` 的配置化阶段推进均可复用。需要扩展的是任务级 forbidden/allowed contact 映射、目标 IK、动态障碍相位同步、阶段证据配置，以及 caddy/basket/microwave 插入、铰链门和动态人手障碍策略；RRT 规划结果不替代完整 MuJoCo 执行轨迹验证。
+
+推荐首个新 L0 试点为 `obstacle_avoidance/L0T1`（书放入 caddy 后格），先核对 `bottle_of_beer__7_1`、`white_place_box_1` 的活动碰撞 Geom 绑定，并为现有阶段控制器配置插入与退爪证据。此准备记录与下方既有 L0T2 实验历史并存，不替换、不否定此前归档结果。
+
 ## 最新结果：L0T2已验收LeRobot Episode双相机视觉与时序审计完成（2026-10-25）
 
 本轮只读使用LeRobot 0.3.3官方`LeRobotDataset` Reader逐帧读取验收数据集`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025`，读取单Episode 1460帧、20 FPS。输出完整并排视频`/opt/data/private/gs_opd/audits/l0t2_round0_dataset_visual_audit_20261025/l0t2_round0_expert_dual_camera_20fps.mp4`：H.264、1024×712、73秒，回读解码确认1460帧完整。视频直接采用LeRobot Reader解码图像，只做CHW→HWC布局变换和显示放大，没有再旋转180°。每帧叠加全局pre-action timestep、task_phase、来源分段、真实7D OSC_POSE动作、夹爪指令与observed finger qpos。
