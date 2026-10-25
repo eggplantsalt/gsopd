@@ -194,6 +194,41 @@ class TaskPhaseController:
         self._phase_steps = 0
         self._last_timestep = -1
 
+    def adopt_released_object_withdrawal(
+        self,
+        object_id: str,
+        *,
+        satisfied_object_ids: tuple[str, ...],
+        held_object: str | None,
+    ) -> None:
+        """Reconstruct the live post-release clearance phase from observed state.
+
+        This is for a fresh controller attached to a Runtime Snapshot where a
+        native placement predicate is already true but the open gripper still
+        has legal finger-only contact with that placed object. No historical
+        phase counter or anchor is adopted; the caller supplies current native
+        predicate and grasp evidence, then anchors withdrawal at the live EEF.
+        """
+        if held_object is not None:
+            raise ValueError("released_object_withdrawal_requires_no_live_held_object")
+        satisfied = set(str(name) for name in satisfied_object_ids)
+        indices = [i for i, item in enumerate(self.objects) if item["object_id"] == object_id]
+        if len(indices) != 1:
+            raise ValueError(f"released_object_is_not_in_task_program:{object_id}")
+        index = indices[0]
+        preceding = {str(item["object_id"]) for item in self.objects[: index + 1]}
+        if not preceding.issubset(satisfied):
+            raise ValueError("released_object_withdrawal_requires_ordered_native_predicate_evidence")
+        if self.phase != "pregrasp" or self._expert_handoff:
+            raise RuntimeError(f"released_object_withdrawal_cannot_adopt_from:{self.phase}")
+        self.object_index = index
+        self.phase = "withdrawal"
+        self._expert_handoff = True
+        self._phase_steps = 0
+        self._last_timestep = -1
+        self._settle_samples.clear()
+        self._settle_last_timestep = -1
+
     def _transition(self, phase: str) -> None:
         if phase not in self._PHASES:
             raise ValueError(f"unsupported_task_phase:{phase}")

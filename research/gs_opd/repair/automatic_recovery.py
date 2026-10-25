@@ -996,7 +996,7 @@ class AutomaticSafetyRecoveryEngine:
                         self._fail(
                             "replan_without_physical_progress",
                             phase=phase,
-                            reason=replan_reason,
+                            replan_reason=replan_reason,
                             eef_displacement_m=moved_eef,
                             qpos_displacement_rad=moved_qpos,
                             clearance_change_m=clearance_change,
@@ -1006,7 +1006,7 @@ class AutomaticSafetyRecoveryEngine:
                         self._fail(
                             "repeated_replan_failure_reason",
                             phase=phase,
-                            reason=replan_reason,
+                            replan_reason=replan_reason,
                         )
                         break
                     used = phase_replans.get(phase, 0)

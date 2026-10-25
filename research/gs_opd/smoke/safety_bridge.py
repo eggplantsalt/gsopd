@@ -4866,6 +4866,10 @@ def _osc_prefix_probe(request):
     target_snapshot = snapshots[snapshot_id]
     path_qpos = np.asarray(request.get("jointspace_path_qpos"), dtype=np.float64)
     path_poses = np.asarray(request.get("eef_reference_poses_world"), dtype=np.float64)
+    native_action_prefix_raw = request.get("native_action_prefix")
+    native_action_prefix = None
+    if native_action_prefix_raw is not None:
+        native_action_prefix = np.asarray(native_action_prefix_raw, dtype=np.float64)
     start_index = request.get("path_start_index")
     max_steps = request.get("max_control_steps")
     gripper_action = request.get("gripper_action")
@@ -4897,6 +4901,15 @@ def _osc_prefix_probe(request):
         or not 1 <= max_steps <= 1200
     ):
         raise ValueError("path_start_index_or_max_control_steps_are_invalid")
+    if native_action_prefix is not None and (
+        qpos_reference_mode != "diagnostic_only"
+        or native_action_prefix.ndim != 2
+        or native_action_prefix.shape[1:] != (7,)
+        or len(native_action_prefix) < 1
+        or len(native_action_prefix) > max_steps
+        or not np.isfinite(native_action_prefix).all()
+    ):
+        raise ValueError("native_action_prefix_requires_finite_N_by_7_actions_and_diagnostic_qpos_mode")
     if (
         isinstance(gripper_action, bool)
         or not isinstance(gripper_action, (int, float))
@@ -4943,19 +4956,20 @@ def _osc_prefix_probe(request):
     integration_spec = mujoco.mjtState.mjSTATE_INTEGRATION
     mujoco.mj_setState(model, scratch, live_state, integration_spec)
     q_path_fk_errors = []
-    for index in range(start_index, min(len(path_qpos), start_index + max_steps + 1)):
-        scratch.qpos[qpos_addresses] = path_qpos[index]
-        mujoco.mj_forward(model, scratch)
-        quaternion = np.empty(4, dtype=np.float64)
-        mujoco.mju_mat2Quat(quaternion, np.asarray(scratch.site_xmat[robot.eef_site_id]).reshape(9))
-        quaternion /= np.linalg.norm(quaternion)
-        position_error = float(np.linalg.norm(scratch.site_xpos[robot.eef_site_id] - path_poses[index, :3]))
-        orientation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
-            quaternion_multiply(path_poses[index, 3:], quaternion_conjugate(quaternion))
-        )))
-        q_path_fk_errors.append(max(position_error, orientation_error))
-    if max(q_path_fk_errors, default=math.inf) > 1e-6:
-        raise ValueError("RRT_EEF_reference_does_not_match_current_compiled_model_FK")
+    if native_action_prefix is None:
+        for index in range(start_index, min(len(path_qpos), start_index + max_steps + 1)):
+            scratch.qpos[qpos_addresses] = path_qpos[index]
+            mujoco.mj_forward(model, scratch)
+            quaternion = np.empty(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(quaternion, np.asarray(scratch.site_xmat[robot.eef_site_id]).reshape(9))
+            quaternion /= np.linalg.norm(quaternion)
+            position_error = float(np.linalg.norm(scratch.site_xpos[robot.eef_site_id] - path_poses[index, :3]))
+            orientation_error = float(np.linalg.norm(quaternion_to_rotation_vector(
+                quaternion_multiply(path_poses[index, 3:], quaternion_conjugate(quaternion))
+            )))
+            q_path_fk_errors.append(max(position_error, orientation_error))
+        if max(q_path_fk_errors, default=math.inf) > 1e-6:
+            raise ValueError("RRT_EEF_reference_does_not_match_current_compiled_model_FK")
 
     caller_snapshot = _capture_snapshot()
     caller_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
@@ -4967,9 +4981,17 @@ def _osc_prefix_probe(request):
         "snapshot_id": snapshot_id,
         "current_state_sha256": live_state_hash,
         "path_start_index": start_index,
-        "requested_steps": min(max_steps, len(path_qpos) - 1 - start_index),
+        "requested_steps": min(
+            max_steps,
+            len(path_qpos) - 1 - start_index,
+            len(native_action_prefix) if native_action_prefix is not None else max_steps,
+        ),
         "executed_steps": 0,
         "qpos_reference_mode": qpos_reference_mode,
+        "action_source": (
+            "explicit_native_7d_action_prefix"
+            if native_action_prefix is not None else "world_pose_path_feedback"
+        ),
         "qpos_cursor_reference_error_rad": cursor_qpos_error,
         "maximum_joint_path_deviation_rad": float(max_joint_error),
         "actions": [],
@@ -4994,13 +5016,17 @@ def _osc_prefix_probe(request):
             path_index = start_index + local_index + 1
             before = _snapshot_diagnostics(canonicalize_kinematics=True)["robot_states"][0]
             target_pose = path_poses[path_index]
-            action = world_pose_tracking_action(
-                before["eef_pos"],
-                before["eef_quat"],
-                target_pose[:3],
-                target_pose[3:],
-                fields,
-                gripper_action=float(gripper_action),
+            action = (
+                native_action_prefix[local_index]
+                if native_action_prefix is not None
+                else world_pose_tracking_action(
+                    before["eef_pos"],
+                    before["eef_quat"],
+                    target_pose[:3],
+                    target_pose[3:],
+                    fields,
+                    gripper_action=float(gripper_action),
+                )
             )
             action = _validate_tracking_action(action, action_low, action_high).astype(np.float32)
             obs, reward, done, _info = _run_env_step_with_contact_monitor(action, local_index, monitor)
@@ -5062,7 +5088,7 @@ def _osc_prefix_probe(request):
                 break
             if geom_status != "complete":
                 break
-            if (
+            if native_action_prefix is None and (
                 (qpos_reference_mode == "enforced" and q_error > float(max_joint_error))
                 or eef_error > float(max_eef_error)
                 or eef_rotation_error > float(max_orientation_error)

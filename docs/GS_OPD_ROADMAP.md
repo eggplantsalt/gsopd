@@ -1,6 +1,60 @@
 # GS-OPD 总体路线
 
-## 最新总体状态：t=590→649 Pot 2局部安全放置成功；完整双壶任务未完成（2026-10-25）
+## 最新L0T2前缀审计：t=10→249当前策略通过且与完整任务成功链无缝一致（2026-10-25）
+
+已从原始π₀.₅ t=10已验证Snapshot，在隔离环境按Episode 9归档OA逐动作重放至t=249。239动作、5975子步的当前对象级Native/Operational结果全部通过，目标Pot 2非手指净距下限2 mm、Ginger Beer/Place Box各10 mm、仅四个指尖对Pot 2允许最多2 mm穿透、自碰撞及关节规则均保持。t=249终态与已有t=249→1460成功链源Runtime Snapshot字节完全一致；Integration State、OSC controller、gripper、robot buffers和task bookkeeping一致，Pot 2稳定双指抓持通过。实验没有执行t=249后缀，也未做轨迹搜索或LoRA。
+
+归档及可复现入口：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`、`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。t=0→10的真实动作来源与t=10快照边界匹配，但旧日志没有当前完整对象几何和逐子步关节字段；不得把它推断为当前策略安全。因此整体t=0→249前缀尚未完整认证，Round 0安全种子仍未建立。后续仅需补齐t=0→10当前规则证据，再可复用t=10→249审计与已有t=249→1460安全成功后缀进行连续性复验；保留所有历史示范与LeRobot数据。
+
+## 最新L0T2状态：同Episode任务成功，安全延续t=1061→1460已审计（2026-10-25）
+
+以t=1061 Pot 1已抓持抬升Snapshot为入口，连续串接6个哈希核验的耐久归档段，共399个新真实动作至t=1460。RRT仅在旧运输路线终点姿态与实时抓持目标相差0.39274 rad时从当前真实状态重规划一次（33点、16.286 s）；此前t=1064→1374已有路线完成运输，t=1403进入precise placement。t=1453严格恢复后依据同Episode真实记录的阶段事件进入release；Pot 1在t=1459达成原生On，任务同时返回`task_success=true, reward=1, done=true`，t=1460实际松爪，原生Pot 1/Pot 2 On和Stove Turnon保持为真。最终物体真实接触burner，末五帧位姿跨度0.896 mm、线/角速度低。
+
+t=1061→t=1460共有9975个记录MuJoCo子步，监测全部完整且没有硬安全违规；396个动作有最终预测/实执行一致证书，最早3个单步在提交后遇到日志/比较包装异常，仍保留完整动作、子步监测和逐段精确Snapshot连接，但没有最终提交比较证书。最终七步Native/Operational与逐子步证书齐全。Operational Pot 1目标间隙最低5.991 mm（规则下限2 mm），Ginger Beer携带间隙最低10.706 mm、Place Box最低91.736 mm，finger/support接触穿透均远低于2 mm；Strict-10mm整体为false。t=1460成功后运行器又用7.924 s生成一条33点withdrawal路线，但隔离预演预测On将丢失，故没有提交物理动作。源代码现已把“原生全任务成功+已释放”设为立即终止条件，避免后置RRT。
+
+本结果是**同一Episode原生任务成功且t=1061→1460安全延续已审计**，不是完整Round 0安全种子：t=0→1061前缀未按现规则统一复验，历史VLA Ginger Beer接触仍是阻塞证据。demonstration-only成功；标准1000步失败；未训练LoRA。轨迹、视频、逐子步证据、终态Snapshot及验收JSON位于 `/opt/data/private/gs_opd/rollouts/l0t1453_pot1_release_native_support_continue_20261025_attempt1/`。后续工作需先执行完整前缀统一安全复验/重建，再讨论安全种子或LoRA。
+
+## 最新总体状态：t=1061取得Pot 1安全抓持与32.4 mm真实抬升（2026-10-25）
+
+Pot 1 Approach曾因10 mm目标物余量预演拒绝而停在t=1042。本轮审计了已验证Pot 2目标对象Operational策略，并将同一2 mm非指尖正间隙应用于当前Pot 1目标；四个指定指尖Geoms保留最多2 mm合法穿透，Palm/hand和其他机器人部件仍必须保持非穿透且满足2 mm目标余量。Ginger Beer/Place Box仍为10 mm，自碰撞、关节限位及原生BDDL不变。此前拒绝的原OSC动作在当前真实t=1042 Snapshot的25子步预演通过后获准执行。
+
+同一连续物理状态链从t=1042到t=1061执行19步、475子步，全部Native/Operational检查通过。Pot 1双指真实稳定抓持，抬升32.438 mm并进入transport；Pot 2原生On=true全程保持。Pot 1非指尖最小间隙5.607 mm，Ginger Beer/Place Box最低47.329/68.368 mm；最大逐子步指尖对穿透0.694 mm。终点task_success=false、reward=0、done=false，完整双壶任务仍未完成；该结果是安全持物后缀，不是Round 0种子。全局Strict-10mm补充统计false（未映射环境几何记录0 mm），未将本段误标为Strict-10mm Safe。无新RRT、抓取搜索或LoRA。
+
+归档及t=1061 Snapshot：`/opt/data/private/gs_opd/rollouts/l0t1042_pot1_grasp_lift_20261025_032402/`。下一阶段从该Snapshot严格恢复，利用现有控制和持物检查继续Pot 1搬运、放置、释放与原生On谓词验收；之后仍需完整核验前缀，才可声称完整Round 0安全种子。
+
+## 最新总体状态：Pot 1 抓取停在 t=1042 的安全预演门槛（2026-10-25）
+
+从已验证 t=1019 状态连续执行到 t=1042：23 个真实动作、575/575 子步安全通过，Pot 2 原生 `On=true` 保持。Pot 1 仍在 Approach，未抓持或抬升。下一候选在隔离预演中使 hand–Pot 1 净距从第5子步的9.996994 mm降至最低8.009800 mm，违反现有10 mm Operational余量，因此未提交；无实际碰撞或禁触违规。该阻塞不能用辅助轨迹误差或风险预警解释，也不能通过降低安全阈值处理。
+
+执行与审计归档分别为 `/opt/data/private/gs_opd/rollouts/l0t1019_pot1_grasp_lift_20261025_030744/` 和 `/opt/data/private/gs_opd/rollouts/l0t1042_rejected_approach_preview_audit_20261025_031026/`。继续路线：取得满足冻结 Operational 余量的 Pot 1 Approach 接入动作/状态，再完成稳定双指抓持和真实≥30 mm抬升；之后才继续搬运放置及完整原生任务验收。保留原有禁触、碰撞、关节及BDDL标准，不重做此前已通过段，不训练 LoRA；所有局部后缀均不得冒充完整 Round 0 连续安全种子。
+
+## 最新总体状态：t=1019抵达Pot 1预抓取并进入Approach（2026-10-25）
+
+复核t=649→794阶段共3条接受的RRT路径（总计22,510构型检查、约427.06秒）与t=738/t=794两次Ginger Beer 49.581/49.204 mm风险预警后，本轮复用最后一条282点路径，不再调用规划器。预警无接触且大于Operational冻结的10 mm硬余量；50 mm边界仅作诊断，预警时以当前真实Snapshot的短段物理认证决定提交。没有重置历史同因保护或降低安全阈值。
+
+由t=796精确续接执行至t=1019，223个真实OSC动作、5,575/5,575子步通过Native Safety和Operational Safety，Pot 2原生On一直为真。Ginger Beer/Place Box/Pot 1段内最小净距24.470/86.082/30.778 mm；全机器人几何、禁触、自碰撞、限位、Pot 2谓词均持续核验。Pot 1状态机在t=1019进入`approach`，预抓取误差10.296 mm及0.04608 rad。该进度解决了“停留在second_object_recovery且重复重规划”的阻塞；抓取、Pot 1放置和完整原生任务仍待完成。
+
+当前状态和证据：主归档`/opt/data/private/gs_opd/rollouts/l0t796_pot1_execution_aware_pregrasp_20261025_021845/`，恢复入口`research/gs_opd/repair/continue_t794_pot1_execution_aware_pregrasp.py`。t=794→795→796两个单步恢复归档亦保留。全局Strict-10mm附加统计不通过（未映射环境组0 mm）；本段具体目标与禁触物均高于10 mm，Native/Operational通过。Pot1 On=false、Pot2 On=true、任务成功=false；标准1000步完整成功和demo-only 1800步完整成功均false。无完整Round 0种子，无LoRA训练。
+
+### 接续路线
+
+1. 从t=1019严格恢复，保持Pot 2 `On=true`，在同一条物理链上由Approach执行Pot 1闭爪、双指稳定抓持和真实抬升；逐动作继续使用当前安全Snapshot的短段MuJoCo认证，不把qpos参考差当成许可。
+2. 抓持稳定后复用已有持物几何检查、任务阶段控制和已验证控制接口完成Pot 1搬运与放置，验证原生Pot 1/2 On和最终task_success/reward/done。只有确需路线且证据支持时才按用户授权使用既有有界规划。
+3. 该t=1019后缀完成后仍需从原始安全t=10启动连续Episode并统一审计全物理前缀，才能命名Round 0安全种子；其后才考虑轨迹扩增至3条及LoRA训练。
+
+## 历史总体状态：Pot 2放置后Pot 1阶段在t=794触发重复路线风险（已推进至t=1019）
+
+Pot 2在t=649已通过稳定放置。t=649→794的旧后缀安全通过，但在t=738/t=794同一Ginger Beer 50 mm预警处重复重规划后停止；该预警未构成硬余量违规。该阶段的完整历史和诊断保留在下文，本轮已通过复用t=738第三条路线到达Pot 1预抓取并进入Approach。
+
+本轮从已核验的 t=649 Pot 2稳定放置Runtime Snapshot开始，在同一Episode真实执行145步至t=794。先完成Pot 2释放退出，按Native谓词进入Pot 1 `second_object_recovery`；Pot 2 `On`全程保留。3,625个物理子步的Native Safety与Operational Safety均通过，禁触、自碰撞、关节限位违规为0。Pot 2非手指最小余量4.242 mm、Ginger Beer 32.097 mm、Place Box 47.198 mm；附加Strict-10mm未通过。
+
+Pot 1恢复路径从t=699规划后，t=738首次因`gripper0_hand_collision`与Ginger Beer `bottle_of_ginger_beer_1_g102`间隙49.581 mm触发50/60 mm风险滞回并重规划；t=794同一Geom对的间隙49.204 mm，再次以相同`risk_margin_approaching`触发。距离仍高于10 mm硬余量，未发生接触；现有重复失败原因守卫应fail-closed，但其错误诊断调用因`reason`关键字重复而报TypeError。三次已接受RRT路径累计规划427.062秒、22,510次构型碰撞检查，qpos路径节点为49/417/282。该调用错误已在`research/gs_opd/repair/automatic_recovery.py`中做窄修复，没有更改RRT、安全阈值或物理状态。由于相同风险原因重复，不从t=794重新初始化后重试该路线，避免清除停滞保护并循环执行。
+
+Pot 1尚未抓取：Pot1 On=false、Pot2 On=true、Stove Turnon=true，task_success=false、reward=0、done=false。终点t=794在标准1000 horizon内，但标准完整任务成功和demo-only 1800 horizon成功均未取得；无Round 0完整种子、无LoRA训练。全程数据及失败分类归档于`/opt/data/private/gs_opd/rollouts/l0t2_t649_pot1_task_suffix_20261025_005902/`，重点文件为`failure_diagnosis.json`、`observation_action_trace.npz`、`recovery_events.jsonl`、`snapshots/main_timestep_000794.pkl`和双相机视频。
+
+后续路线：先用归档中t=699至794的真实几何、risk对象和RRT细节确定是否可提供不同Pot1接入路径；不复用相同风险边界失败路线，不拼接不同前缀。只有获得不同且有实据的可行路线后，才从严格恢复的同链Runtime Snapshot继续剩余Pot 1任务；Round 0完整种子仍需从安全t=10状态进行同Episode连续执行和全链统一复验。
+
+## 前一总体状态：t=590→649 Pot 2局部安全放置成功；完整双壶任务未完成（2026-10-25）
 
 从同一Episode的真实t=590连续状态继续，经严格t=642 Runtime Snapshot恢复、7个新OSC_POSE动作和每步25子步滚动认证，到t=649首次取得原生`On(moka_pot_2, flat_stove_1_cook_region)=true`，并通过5个连续样本的稳定放置验收。t=590→649共59个实际动作、1,475个完整物理子步，Native/Operational安全均通过，禁触、自碰撞、未解析/未许可接触及关节限制违规为0。Pot 2非手指间隙最低4.242 mm，机器人到Ginger Beer/Place Box最低32.678/52.850 mm；指尖最大合法穿透0.282 mm。Strict-10mm仅为附加统计且未通过，不影响本轮冻结的Operational门槛；没有安全阈值、qpos比较或BDDL成功标准更改，没有重复RRT。
 
