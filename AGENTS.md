@@ -133,6 +133,12 @@ Skills live in `.agents/skills/<name>/SKILL.md`, and `.claude/skills/` holds a s
 | Write or review `install.sh` and Dockerfile changes | `install-check` |
 | Build a model or env venv and run its e2e test | `test-install` |
 
+## GS-OPD research workspace
+
+- The `gs-opd-overfit-recovery-08a0198` branch in `/workspace/zy_workspace/RLinf-gs-opd-overfit-recovery` is the only primary GS-OPD research working tree. By default, do all GS-OPD code development, task inventories, experiment configuration, and progress-document updates in this directory and branch.
+- `/workspace/zy_workspace/RLinf` is only a source for existing dependencies, virtual environments, and shared resources. Treat it as read-only for GS-OPD work: do not modify its research files or stage, commit, or publish GS-OPD changes there without the user's explicit authorization.
+- These workspace rules supplement the repository-wide guidance above and do not replace it.
+
 ## Maintaining agent instructions
 
 - This file is loaded on every agent request. Keep it under 200 lines, and add a rule only when it applies across the repository and an agent would get it wrong without being told.
