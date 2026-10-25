@@ -1,5 +1,29 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## 最新进度：Round 0 L0T2候选转换为单个LeRobot v2.1成功Episode（2026-10-25）
+
+只使用统一验收报告引用的25段既有归档，生成独立数据集`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025/`。数据格式为LeRobot v2.1、20 Hz，只有**1个连续Episode、1460帧/动作**，没有把25段来源误当作25条成功样本。动作标签直接使用每步执行记录的float32 7D `actions`/`executed_actions`，不使用预测动作、不做动作归一化；观察取动作前双相机与机器人状态。LeRobot特征为`image`、`wrist_image`、8D（EEF xyz、轴角、夹爪qpos）`state`及7D `actions`。两路相机沿用现有OpenPI/LeRobot导出器的RGB 180°方向变换。
+
+使用LeRobot 0.3.3/v2.1 reader回读：1460/1460动作逐项精确一致，1460/1460状态精确一致，2920路相机帧经现有方向变换后逐像素一致；20Hz时间戳最大float32舍入差3.052 μs。单Episode边界为`[0,1460)`。10步Action Horizon共有**1451个无填充合法窗口**（起始帧0–1450），逐个经LeRobot时间戳采样器读取并与原始执行标签精确核对；最后窗口恰好截至1460终止动作，没有跨越终止状态。140个窗口包含一个或多个已认证Snapshot接缝，这些接缝属于同一连续Episode。
+
+每步provenance位于`per_action_provenance.jsonl`（1460行，含来源分段/动作行与trace哈希、阶段、动作前Observation来源、25子步Native/Operational验收、接缝、reward/done可用字段，以及逐行动作重复标记的终态、demo-only 1800成功、标准1000失败和Strict-10mm未通过状态）；`data_manifest.json`记录25段来源、24个接缝、验收文件和源trace/安全证据/Snapshot哈希；`round0_lerobot_acceptance.json`是机器可读回读报告。此数据仍只有**1条已验证成功的Operational安全Episode**：demo-only 1800成功、标准1000失败、Strict-10mm false；没有启动SFT/LoRA，没有修改或覆盖旧归档/LeRobot数据。
+
+可复现入口：`research/gs_opd/data/convert_round0_acceptance_to_lerobot.py`；输入统一验收报告`/opt/data/private/gs_opd/rollouts/round0_l0t2_complete_episode_readonly_acceptance_20261025/round0_complete_episode_acceptance.json`。转化中间的失败读取尝试未改动任何源归档；最终数据集和机器报告通过全量回读验收。
+
+## 最新进度：L0T2 Round 0完整安全成功数据候选通过统一验收（2026-10-25）
+
+本轮从raw π₀.₅ seed/init-state严格重建t=0，按正式初始化顺序启动Bridge并执行Rollout侧原生reset，再按原始7D动作逐步重放前10步。当前模型几何SHA为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，BDDL SHA为`901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c`；seed0、init-state0及初始317维Integration State与raw rollout完全一致。执行动作逐元素匹配归档π₀.₅前10步，250/250个子步的Native Safety与Operational Safety均通过，未出现机器人与Ginger Beer/Place Box接触、禁触、自碰撞或关节限位违规。
+
+t=10重放的Integration State SHA`ee2c079ea1c1231c757536a74583c373c579082c2c8b2869e98b1193eb0c2e32`与Episode 9已验证起点完全一致；两只Pot、Ginger Beer、Place Box位置/姿态/关节状态、OSC controller、夹爪当前命令、机器人控制缓存及task bookkeeping均逐项精确匹配。t=10原生谓词为Pot1 On=false、Pot2 On=false、Stove Turnon=true，reward=0、done=false。运行时Snapshot序列化哈希不同（本次`t=10`为`b13e030a…d976ec`，Episode 9规范源为`573d45db…8d343d`），因此报告标为**状态级精确兼容**，不声称文件字节相同；没有把非兼容Snapshot拼接进轨迹。
+
+对现有其余归档只读统一验收，没有重放任何后缀。t=10→249的239步/5,975子步当前策略重放全部通过；其t=249终态Snapshot SHA`3e142c23aa2e0cad30569b350b6a4a4e83e2152ec34891f0ecd580d30c3d81c0`与t=249→1460后缀起点字节相同。之后23个相邻接缝也全部SHA精确相同。25个连续归档覆盖t=0→1460共1,460条7D动作、36,500个25子步监测样本；动作/Observation索引连续，全部trace包含agentview和eye-in-hand相机数据，逐段Native/Operational验收通过，终点原生任务成功。详细路径、哈希与各段证据在机器报告中列明。
+
+验收结果：t=1459首次原生task_success=true，t=1460 Pot1 On=true、Pot2 On=true、Stove Turnon=true，`reward=1`、`done=true`。**Demonstration-only 1800步成功；标准1000步Benchmark失败**（任务完成时间超出1000步）。Native Safety与Operational Safety均通过；Strict-10mm附加统计为false，不作为Operational失败。t=10→249夹爪slide原始`1e-8 m`诊断有3,545次微小越界事件、最大7.375 μm，均在已有历史正常仿真校准的8 μm Operational容差内，未改MJCF、关节范围或安全规则。此结果建立首条**Round 0安全成功数据候选**，不是Strict-10mm Safe标签，也未启动LoRA训练。
+
+机器报告：`/opt/data/private/gs_opd/rollouts/round0_l0t2_complete_episode_readonly_acceptance_20261025/round0_complete_episode_acceptance.json`；人读摘要：同目录`round0_complete_episode_acceptance.md`。只读复现入口：`research/gs_opd/repair/audit_round0_complete_episode_archives.py`。t=0→10物理归档：`/opt/data/private/gs_opd/rollouts/l0t2_round0_raw_pi05_t0_to_t10_current_safety_20261025_attempt4/`；t=10→249复验归档：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`；t=249→1460各原有分段归档均保留原样。
+
+数据完整性备注：正式接受链只采用attempt4中完整记录的10步t=0→10重放。此前attempt1因首轮编译几何指纹不符而0动作退出；attempt2在t=1有25个子步且Native/Operational通过，但随后因下一步时间索引错误退出；attempt3归档中有t=1、t=2两条动作记录及50个子步（两行Native/Operational均标pass），但续接最终化失败，没有持久化t=2终态Snapshot或最终报告，因此不纳入可恢复候选链。三个孤立分支均原样保留，没有覆盖正式轨迹。历史1093步演示与所有LeRobot数据未修改。
+
 ## 最新进度：t=1042→1061 Pot 1 安全双指抓持与32.4 mm真实抬升完成（2026-10-25）
 
 严格恢复 t=1042 Snapshot（模型指纹和 Integration State 匹配），Pot 2 原生 `On=true`。核对此前成功抓取 Pot 2 的对象级Operational策略后，沿用其“操作目标非指尖几何最小净距2 mm”规则，只将当前目标 Pot 1 从10 mm调整为2 mm；Ginger Beer、Place Box仍各为10 mm，Pot 2维持2 mm，Native BDDL、全机器人自碰撞和关节限位不变。Pot 1只允许四个指定Panda指尖Geom（ID 76/77/79/80）与目标碰撞Geom接触，最大穿透2 mm；Palm/hand和其余机器人Geom没有接触许可。
@@ -3367,6 +3391,8 @@ t=1453→1458保持夹爪闭合并沿现有Placement EEF目标下降；Pot 1原�
 
 ## L0T2 Round 0：复验 Episode 9 t=10→249 安全前缀并精确接入成功链（2026-10-25）
 
+> 历史状态说明：本节记录t=0→10当前策略重放完成之前的阶段性结果。该缺口已由本文件顶部的t=0→1460统一验收补齐；当前候选结论以顶部报告为准。
+
 从已验证的原始 π₀.₅ t=10 Runtime Snapshot，在独立MuJoCo Bridge中逐个重放Episode 9归档的239个t=11…249动作；没有执行t=249以后的任何动作。t=0→10来源为`obstacle_avoidance_L0T2_base_pi05_rollout_400_20261022_attempt2/rollout_trace.npz`，动作源标记`raw_pi05_student_predicted_action_chunks`，前10个7D动作与`raw_pi05_t0_to_t10_replay.npz`逐元素完全一致。t=10快照SHA为`573d45db27ca1337c8b8cc1cf706ade88ff7f433ced4e78123f69cb7f48d343d`；本轮恢复后模型指纹为`1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，Integration State与Episode 9归档起点完全相同，最大差0。旧t=0→10验证记录250个物理子步并证明源状态重放精确，但缺少当前要求的完整几何/关节字段；没有用缺失字段推断本轮对象级安全。
 
 t=10当前策略预检通过，之后239/239动作记录齐全，共5975/5975个真实MuJoCo子步，Native与Operational均全通过：未发现机器人禁触、非白名单接触、自碰撞、非法对象接触、未解析接触、未授权场景接触或Operational关节限位违规。Pot 2非手指机器人几何最小净距4.033 mm（阈值2 mm）；Ginger Beer 10.191 mm、Place Box 47.480 mm（阈值均10 mm）；持物时Pot 2到两障碍的最低净距分别157.363/96.756 mm。实际机器人接触共187个子步事件，全部是四个授权指尖Geom 76/77/79/80与Pot 2的接触；最深实际穿透0.624 mm（允许2 mm）。Palm/hand及其他机器人Geom没有对Pot 2接触。
@@ -3377,4 +3403,4 @@ t=10当前策略预检通过，之后239/239动作记录齐全，共5975/5975个
 
 归档 `/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`，含OA/双相机NPZ、逐动作记录、5975行逐子步实际接触身份与几何/关节审计、起终点及每25步Snapshot、两路视频和机器报告`prefix_replay_report.json`。复现入口：`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。末态报告在物理重放完成后离线完成快照比较，没有重复执行物理动作。
 
-**范围结论：**Episode 9 t=10→249在当前Native/Operational规则下安全，并与t=249成功链源快照字节级兼容，可作为下一次完整同状态链复验的可靠t=249接缝。t=0→10的来源、动作与t=10 Snapshot连续性已核对，但现有历史字段不足以给这10步出具当前全几何/关节策略证书；因此当前还不能宣称t=0→249完整前缀安全或建立Round 0种子。无需重做t=249→1460后缀；当前未训练LoRA，历史示范、所有成功后缀及LeRobot数据均保留。
+**当时的范围结论：**Episode 9 t=10→249在当前Native/Operational规则下安全，并与t=249成功链源快照字节级兼容。t=0→10当前策略安全证据在当时尚未补齐；这一阶段性结论现已由顶部的完整t=0→1460验收取代。原有后缀仍未重放，LoRA未启动，历史示范与LeRobot数据保留。

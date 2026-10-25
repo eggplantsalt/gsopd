@@ -1,18 +1,42 @@
 # GS-OPD 总体路线
 
-## 最新L0T2前缀审计：t=10→249当前策略通过且与完整任务成功链无缝一致（2026-10-25）
+## 最新路线状态：首条L0T2 Operational安全成功候选已生成单Episode LeRobot v2.1数据（2026-10-25）
+
+统一验收通过的Round 0候选已转成独立LeRobot v2.1训练数据目录；25个原始分段在数据集中是**一个**20 Hz、1460步连续Episode。全部逐步真实7D动作、动作前双相机与8D状态已通过LeRobot 0.3.3 reader全量回读，1451个Action Horizon=10窗口均无跨终止填充。源段、阶段、24个Snapshot接缝、Native/Operational安全、逐动作重复记录的demo-only成功/标准1000失败/Strict-10mm附加失败项及源文件哈希均保存在数据manifest与逐动作provenance。
+
+数据路径：`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025/`；机器验收：`round0_lerobot_acceptance.json`；转换入口：`research/gs_opd/data/convert_round0_acceptance_to_lerobot.py`。样本资格仍是1条Operational安全成功Episode：demo-only 1800成功、标准1000失败、Strict-10mm未通过。未启动SFT/LoRA，历史1093步示范及旧LeRobot数据未覆盖。
+
+### 当前阶段结果与路线边界
+
+1. **Round 0物理轨迹候选：已通过统一Operational验收。** t=0→1460共1460动作、36500子步、24个兼容Snapshot接缝，最终原生task_success/reward/done成立。
+2. **LeRobot数据准备：已完成。** 一条Episode完整回读；不按分段拆分、去重或跨终止构造窗口。当前数据目录可供后续数据审查与训练配置使用。
+3. **后续训练：未启动。** 本轮没有训练授权，也未执行SFT/LoRA；等用户明确要求后再单独确定训练配置与启动条件。
+
+严格10 mm只是附加统计，当前候选仍标为Operational安全通过、Strict-10mm未通过。标准1000步Benchmark未成功，1800步demonstration-only任务成功。完整数据验收报告详见上述目录中的manifest与acceptance JSON。
+
+## 最新L0T2 Round 0状态：完整t=0→1460 Operational安全成功候选已通过验收（2026-10-25）
+
+当前首条Round 0安全成功数据候选已建立。为补齐最后缺口，从raw π₀.₅ seed/init-state重新物理执行前10个动作，所有250个子步通过当前Native/Operational规则，t=10 Integration State及控制器、夹爪、机器人缓存、任务bookkeeping和物体状态与Episode 9规范起点完全匹配。运行时Snapshot字节哈希不同，按状态级精确兼容处理。已验证的t=10→249回放接上t=249→1460归档链；除t=10外的23个Snapshot接缝字节SHA完全一致，OA时间索引连续。
+
+全链有1,460个真实7D动作、36,500个25子步审计项、双相机Observation–Action及完整终态快照。Native Safety和Operational Safety通过；t=1459首次原生task_success=true，t=1460 Pot1/ Pot2 On与Stove Turnon均为true、reward=1、done=true。Standard 1000-step Benchmark=false；demonstration-only 1800-step=true。Strict-10mm统计false，明确只作附加统计、不覆盖Operational结果。历史动作未回放拼接，LoRA未启动，1093步示范与LeRobot数据未改。
+
+完整机器报告和人读摘要位于`/opt/data/private/gs_opd/rollouts/round0_l0t2_complete_episode_readonly_acceptance_20261025/`；审计入口为`research/gs_opd/repair/audit_round0_complete_episode_archives.py`。旧版“t=0→10安全缺证、尚无Round 0候选”的进度段落由本次统一验收更新；未改变任何安全规则。
+
+## 前一阶段L0T2前缀审计：t=10→249当前策略通过（后续已补齐t=0→10，2026-10-25）
+
+> 以下为t=0→10当前策略安全重放完成前的阶段性状态；顶部统一验收已验证完整t=0→1460候选链。
 
 已从原始π₀.₅ t=10已验证Snapshot，在隔离环境按Episode 9归档OA逐动作重放至t=249。239动作、5975子步的当前对象级Native/Operational结果全部通过，目标Pot 2非手指净距下限2 mm、Ginger Beer/Place Box各10 mm、仅四个指尖对Pot 2允许最多2 mm穿透、自碰撞及关节规则均保持。t=249终态与已有t=249→1460成功链源Runtime Snapshot字节完全一致；Integration State、OSC controller、gripper、robot buffers和task bookkeeping一致，Pot 2稳定双指抓持通过。实验没有执行t=249后缀，也未做轨迹搜索或LoRA。
 
-归档及可复现入口：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`、`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。t=0→10的真实动作来源与t=10快照边界匹配，但旧日志没有当前完整对象几何和逐子步关节字段；不得把它推断为当前策略安全。因此整体t=0→249前缀尚未完整认证，Round 0安全种子仍未建立。后续仅需补齐t=0→10当前规则证据，再可复用t=10→249审计与已有t=249→1460安全成功后缀进行连续性复验；保留所有历史示范与LeRobot数据。
+归档及可复现入口：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`、`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。本段t=10→249证据仍为完整连续后缀；当时尚未认证的t=0→10现已按顶部统一验收完成物理重放与安全复核。Round 0候选状态、完整接缝和最终谓词以顶部新报告为准；保留所有历史示范与LeRobot数据。
 
-## 最新L0T2状态：同Episode任务成功，安全延续t=1061→1460已审计（2026-10-25）
+## 前一阶段L0T2状态：同Episode任务成功，t=1061→1460安全延续已审计（前缀复验前，2026-10-25）
 
 以t=1061 Pot 1已抓持抬升Snapshot为入口，连续串接6个哈希核验的耐久归档段，共399个新真实动作至t=1460。RRT仅在旧运输路线终点姿态与实时抓持目标相差0.39274 rad时从当前真实状态重规划一次（33点、16.286 s）；此前t=1064→1374已有路线完成运输，t=1403进入precise placement。t=1453严格恢复后依据同Episode真实记录的阶段事件进入release；Pot 1在t=1459达成原生On，任务同时返回`task_success=true, reward=1, done=true`，t=1460实际松爪，原生Pot 1/Pot 2 On和Stove Turnon保持为真。最终物体真实接触burner，末五帧位姿跨度0.896 mm、线/角速度低。
 
 t=1061→t=1460共有9975个记录MuJoCo子步，监测全部完整且没有硬安全违规；396个动作有最终预测/实执行一致证书，最早3个单步在提交后遇到日志/比较包装异常，仍保留完整动作、子步监测和逐段精确Snapshot连接，但没有最终提交比较证书。最终七步Native/Operational与逐子步证书齐全。Operational Pot 1目标间隙最低5.991 mm（规则下限2 mm），Ginger Beer携带间隙最低10.706 mm、Place Box最低91.736 mm，finger/support接触穿透均远低于2 mm；Strict-10mm整体为false。t=1460成功后运行器又用7.924 s生成一条33点withdrawal路线，但隔离预演预测On将丢失，故没有提交物理动作。源代码现已把“原生全任务成功+已释放”设为立即终止条件，避免后置RRT。
 
-本结果是**同一Episode原生任务成功且t=1061→1460安全延续已审计**，不是完整Round 0安全种子：t=0→1061前缀未按现规则统一复验，历史VLA Ginger Beer接触仍是阻塞证据。demonstration-only成功；标准1000步失败；未训练LoRA。轨迹、视频、逐子步证据、终态Snapshot及验收JSON位于 `/opt/data/private/gs_opd/rollouts/l0t1453_pot1_release_native_support_continue_20261025_attempt1/`。后续工作需先执行完整前缀统一安全复验/重建，再讨论安全种子或LoRA。
+当时的结果是**同一Episode原生任务成功且t=1061→1460安全延续已审计**，前缀缺口使其尚不具备完整候选资格。此状态现由顶部完整t=0→1460 Operational安全验收取代。demonstration-only成功；标准1000步失败；未训练LoRA。轨迹、视频、逐子步证据、终态Snapshot及验收JSON位于 `/opt/data/private/gs_opd/rollouts/l0t1453_pot1_release_native_support_continue_20261025_attempt1/`。
 
 ## 最新总体状态：t=1061取得Pot 1安全抓持与32.4 mm真实抬升（2026-10-25）
 

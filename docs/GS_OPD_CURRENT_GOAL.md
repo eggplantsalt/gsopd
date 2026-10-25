@@ -1,14 +1,36 @@
 # GS-OPD 当前局部目标
 
-## 最新局部结果：t=10→249当前安全前缀复验通过并与成功链t=249快照字节一致（2026-10-25）
+## 最新局部结果：Round 0 L0T2已导出并验证为一个LeRobot v2.1 Episode（2026-10-25）
+
+已将统一验收报告接受的25个连续物理归档段转换成一个1460步LeRobot v2.1 Episode，20 Hz、单任务`put both moka pots on the stove`。动作使用原始实际执行的7D float32标签，不归一化、不使用预测动作；图像与8D机器人状态均取动作前观察。沿用现有RGB 180°相机方向变换和LeRobot 8D状态表示。
+
+LeRobot 0.3.3 reader验证单Episode边界`[0,1460)`；1460/1460动作、状态逐项精确回读，两路共2920帧像素精确回读。有效Action Horizon=10窗口共1451个，逐个采样核验且没有越过终止动作；140个窗口跨越至少一个已验收快照接缝，接缝仍属于同一Episode。最大时间戳float32舍入误差3.052 μs。1460行provenance逐行携带Native/Operational验收、demo-only/标准Horizon终态资格及Strict-10mm未通过状态。
+
+数据：`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025/`。Manifest、1460行逐动作provenance/源文件哈希及机器报告分别为`data_manifest.json`、`per_action_provenance.jsonl`、`round0_lerobot_acceptance.json`。Safety仍按源验收报告定义为Native+Operational pass、Strict-10mm未通过附加统计；1800 demo-only成功、1000标准Horizon未成功。这是一条成功Episode，不是25条样本。没有训练、修改旧数据或增加轨迹。
+
+本轮数据转换入口：`research/gs_opd/data/convert_round0_acceptance_to_lerobot.py`。下一步目标只在用户另行启动训练后确定；当前保持不训练LoRA。
+
+## 最新局部结果：t=0→1460统一安全验收通过，建立Round 0成功数据候选（2026-10-25）
+
+本轮唯一新物理实验是从raw π₀.₅ seed/init-state重建t=0并重放前10个7D动作。正式reset序列下模型、BDDL、初始Integration State与归档完全一致；10/10动作与原始π₀.₅逐元素一致，250/250子步Native/Operational通过。得到的t=10完整Integration State、物体位置/姿态/关节、OSC控制器、夹爪当前命令、机器人缓存及task bookkeeping与Episode 9 t=10起点逐项相同；Runtime Snapshot字节哈希不同，已如实记为状态级精确兼容。
+
+其后只读审计t=10→249和t=249→1460归档：239步前缀、各段完整7D OA索引、双相机、25子步覆盖和原生谓词均通过；t=249之后的所有Snapshot边界SHA精确相同。完整链共1,460动作、36,500子步，无记录的硬安全违规。终态t=1460原生Pot1 On、Pot2 On、Stove Turnon均true，`task_success=true, reward=1, done=true`，首次成功t=1459。Demo-only horizon成功，标准1000步Benchmark不成功。
+
+结论：首条**Round 0 Operational安全成功数据候选**已建立；Strict-10mm附加统计仍为false，不能标注为Strict-10mm Safe。未重放后缀、未运行RRT、未训练LoRA，全部历史数据保留。
+
+验收材料：`/opt/data/private/gs_opd/rollouts/round0_l0t2_complete_episode_readonly_acceptance_20261025/round0_complete_episode_acceptance.json`及同目录Markdown摘要；只读入口`research/gs_opd/repair/audit_round0_complete_episode_archives.py`。本轮物理重放归档为`l0t2_round0_raw_pi05_t0_to_t10_current_safety_20261025_attempt4/`。
+
+## 历史局部结果：t=10→249前缀复验通过（后续完整验收已补齐t=0→10，2026-10-25）
+
+> 以下记录生成于t=0→10当前策略重放之前。其“t=0→249完整证书尚未成立”状态已被本文件顶部的统一验收结果取代。
 
 从已验证原始π₀.₅ t=10 Snapshot在隔离MuJoCo中重放Episode 9归档239动作至t=249。每个25子步均已重新检查当前对象级Native/Operational约束：5975/5975子步完整，Native与Operational全通过；自碰撞、禁触、未授权接触、未解析接触、Operational关节限位违规均为0。Pot 2非指手几何最小净距4.033 mm（规则2 mm），Ginger Beer 10.191 mm、Place Box 47.480 mm（均高于10 mm），四个白名单手指与Pot 2实际接触最深穿透0.624 mm（规则2 mm）。严格关节数值检查发现夹爪slide在1e-8 m raw判据下有微小越界，但最大7.375 μm，均低于既有、历史正常仿真校准的8 μm Operational容差；MJCF与关节标准没有调整。Strict-10mm附加统计未通过，不作为本策略失败。
 
 t=249重放终态Snapshot与t=249→1460成功链源Snapshot文件SHA完全相同（`3e142c23aa2e0cad30569b350b6a4a4e83e2152ec34891f0ecd580d30c3d81c0`）；Integration State、OSC controller、机器人控制缓存、夹爪内部命令和task bookkeeping均完全一致，Pot 2稳定双指抓持验证通过。可复用该t=249接缝进行下一次连续Episode复验；后续TaskPhaseController应由恢复的真实状态新初始化，不能伪造历史Python计数。
 
-归档：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`；复现：`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。t=0→10的π₀.₅动作与t=10快照来源及逐元素状态连续性已核实，但历史子步记录缺当前完整几何/关节字段，故不对t=0→10推断当前规则下安全；完整t=0→249证书及Round 0种子暂不成立。下一个安全复验缺口仅为对这10步在当前规则下补齐证据，再与已验证t=10→249和t=249后缀接续；不重做t=249→1460后缀，不训练LoRA，所有旧数据保留。
+归档：`/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`；复现：`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。本段的t=10→249结果仍有效；t=0→10旧字段不足这一临时缺口已经由顶部记录的attempt4当前策略重放及t=0→1460统一验收补齐。
 
-## 最新局部结果：t=1061→1460完成同Episode原生任务成功并审计安全延续（2026-10-25）
+## 历史局部结果：t=1061→1460完成同Episode原生任务成功（后续完整验收已补齐前缀，2026-10-25）
 
 Pot 1在t=1459首次原生On=true且task_success/reward=1/done=true；t=1460真实松爪后Pot 1仍On=true、Pot 2 On=true、Stove Turnon=true，物理释放由同Episode阶段事件确认。末五个Pot 1位置跨度0.896 mm，末态线/角速度低，存在真实burner支撑接触。最终状态t=1460，demonstration-only成功（horizon 1800），标准1000步Benchmark不成功。
 
@@ -16,7 +38,7 @@ Pot 1在t=1459首次原生On=true且task_success/reward=1/done=true；t=1460真�
 
 归档 `/opt/data/private/gs_opd/rollouts/l0t1453_pot1_release_native_support_continue_20261025_attempt1/`；机器验收 `native_success_safety_acceptance.json`，终态Snapshot `snapshots/main_timestep_001460.pkl`。运行器在t=1460成功后多做了一次33点withdrawal RRT及隔离预演，预演因预计Pot 1 On丢失而被fail-closed拒绝，未提交任何额外动作；程序现已修复为在原生任务完成、物体已释放时立刻停止。
 
-**本结果不是Round 0安全种子**：t=0→1061历史前缀尚未按当前规则统一复验，原始Ginger Beer接触仍保留。当前下一目标是评估从原始安全起点连续重建并复验完整前缀所需的工作；不启动LoRA，保留全部原始LeRobot与示范归档。
+**当时本结果还不是Round 0安全种子**：t=0→1061前缀尚未按当前规则统一复验。这个状态现已由顶部t=0→1460验收更新；完整轨迹候选成立，未启动LoRA，原始LeRobot与示范归档保留。
 
 ## 最新局部结果：Pot 1稳定抓持并真实抬升32.4 mm；终点t=1061（2026-10-25）
 
