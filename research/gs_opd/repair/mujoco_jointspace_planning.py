@@ -97,6 +97,106 @@ def validate_finger_only_contact_geoms(
     return allowed
 
 
+def _candidate_gripper_close_samples(open_qpos, closed_qpos, joint_limits, *, sample_count=9):
+    """Return a bounded, in-range gripper close sweep for scratch evaluation."""
+    opened = np.asarray(open_qpos, dtype=np.float64)
+    closed = np.asarray(closed_qpos, dtype=np.float64)
+    limits = np.asarray(joint_limits, dtype=np.float64)
+    if (
+        opened.ndim != 1
+        or closed.shape != opened.shape
+        or limits.shape != (opened.size, 2)
+        or not np.isfinite(opened).all()
+        or not np.isfinite(closed).all()
+        or not np.isfinite(limits).all()
+        or np.any(limits[:, 0] > limits[:, 1])
+    ):
+        raise ValueError("open_closed_gripper_postures_or_joint_limits_are_malformed")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 2 or sample_count > 33:
+        raise ValueError("gripper_close_sample_count_must_be_between_2_and_33")
+    tolerance = 1e-8
+    if (
+        np.any(opened < limits[:, 0] - tolerance)
+        or np.any(opened > limits[:, 1] + tolerance)
+        or np.any(closed < limits[:, 0] - tolerance)
+        or np.any(closed > limits[:, 1] + tolerance)
+    ):
+        raise ValueError("open_or_closed_gripper_posture_is_outside_joint_limits")
+    samples = []
+    for alpha in np.linspace(0.0, 1.0, sample_count):
+        qpos = (1.0 - float(alpha)) * opened + float(alpha) * closed
+        if np.any(qpos < limits[:, 0] - tolerance) or np.any(qpos > limits[:, 1] + tolerance):
+            raise ValueError("interpolated_gripper_posture_is_outside_joint_limits")
+        samples.append({"alpha": float(alpha), "qpos": qpos.tolist()})
+    return samples
+
+
+def _bilateral_finger_contact_result(side_distances_m, *, tolerance_m=0.002):
+    """Require both verified finger sides to reach the target within tolerance."""
+    if not isinstance(side_distances_m, dict) or set(side_distances_m) != {"left", "right"}:
+        return {"pass": False, "reason": "verified_left_and_right_finger_distances_are_required"}
+    failures = {}
+    for side, value in side_distances_m.items():
+        if value is None or not np.isfinite(float(value)):
+            failures[side] = "distance_unavailable"
+        elif float(value) > tolerance_m:
+            failures[side] = "finger_side_does_not_reach_target"
+        elif float(value) < -tolerance_m:
+            failures[side] = "finger_side_penetration_exceeds_tolerance"
+    return {
+        "pass": not failures,
+        "reason": None if not failures else "bilateral_finger_contact_geometry_failed",
+        "failed_sides": failures,
+        "tolerance_m": float(tolerance_m),
+    }
+
+
+def _candidate_robot_contact_violation(
+    geom_a,
+    geom_b,
+    body_a,
+    body_b,
+    distance_m,
+    *,
+    robot_body_ids,
+    target_body_ids,
+    gripper_geom_ids,
+    forbidden_scene_body_ids,
+    allowed_target_body_ids,
+    other_scene_body_ids,
+    allowed_static_installation_pair_ids,
+    allow_target_gripper,
+):
+    """Classify one MuJoCo contact using the screen's unchanged contact policy."""
+    robot_bodies = set(robot_body_ids)
+    body_a, body_b = int(body_a), int(body_b)
+    geom_a, geom_b = int(geom_a), int(geom_b)
+    if body_a in robot_bodies and body_b in robot_bodies:
+        return {"self_contact_geoms": [geom_a, geom_b], "distance_m": float(distance_m)}
+    if (body_a in robot_bodies) == (body_b in robot_bodies):
+        return None
+    pair = tuple(sorted((geom_a, geom_b)))
+    if pair in {tuple(sorted(map(int, item))) for item in allowed_static_installation_pair_ids}:
+        return None
+    scene_body = body_b if body_a in robot_bodies else body_a
+    robot_geom = geom_a if body_a in robot_bodies else geom_b
+    target_contact = scene_body in set(target_body_ids)
+    if (
+        allow_target_gripper
+        and target_contact
+        and robot_geom in set(gripper_geom_ids)
+        and float(distance_m) >= -0.002
+    ):
+        return None
+    if scene_body in set(forbidden_scene_body_ids) | set(allowed_target_body_ids) | set(other_scene_body_ids):
+        return {
+            "robot_scene_contact_geoms": [geom_a, geom_b],
+            "body_ids": [body_a, body_b],
+            "distance_m": float(distance_m),
+        }
+    return None
+
+
 def carried_object_world_transform(eef_world_transform, eef_to_object_transform):
     """Compose the measured grasp transform at a candidate EEF pose."""
     eef = np.asarray(eef_world_transform, dtype=np.float64)
@@ -580,6 +680,10 @@ def screen_grasp_candidates(
         gripper_geom_ids,
     )
     gripper_geoms = set(finger_ids)
+    static_installation_pairs = {
+        tuple(sorted(int(value) for value in pair))
+        for pair in normalized_safety_policy.get("allowed_static_installation_contact_pair_ids", set())
+    }
     object_geoms = np.asarray(sorted(target_geoms), dtype=np.int64)
     object_body_transform = np.eye(4, dtype=np.float64)
     object_body_transform[:3, :3] = np.asarray(live.xmat[root_body_id]).reshape(3, 3)
@@ -592,6 +696,12 @@ def screen_grasp_candidates(
     lower_all = lower + 1e-7
     upper_all = upper - 1e-7
     open_gripper = np.asarray(live.qpos[gripper_qadr], dtype=np.float64).copy()
+    if (
+        not np.isfinite(open_gripper).all()
+        or np.any(open_gripper < gripper_limits[:, 0] - 1e-8)
+        or np.any(open_gripper > gripper_limits[:, 1] + 1e-8)
+    ):
+        raise ValueError("active_open_gripper_qpos_is_outside_gripper_joint_limits")
 
     def set_arm(q):
         scratch.qpos[qadr] = np.asarray(q, dtype=np.float64)
@@ -656,6 +766,44 @@ def screen_grasp_candidates(
         scratch.qpos[target_qadr + 3:target_qadr + 7] = quat / np.linalg.norm(quat)
         mujoco.mj_forward(model, scratch)
 
+    pad_geom_ids = {}
+    for side, expected_suffix in (("left", "finger1_pad_collision"), ("right", "finger2_pad_collision")):
+        matches = [
+            geom_id for geom_id in finger_sides[side]
+            if str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id)) or "").endswith(expected_suffix)
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"verified_{side}_fingertip_pad_geom_is_not_unique")
+        pad_geom_ids[side] = int(matches[0])
+
+    close_samples = _candidate_gripper_close_samples(
+        open_gripper,
+        closed_gripper,
+        gripper_limits,
+        sample_count=9,
+    )
+
+    def fingertip_distances():
+        distances = {}
+        for side in ("left", "right"):
+            values = [
+                _exact_pair_distance(mujoco, model, scratch, pad_geom_ids[side], target_geom)
+                for target_geom in sorted(target_geoms)
+            ]
+            valid = [float(value) for value in values if value is not None]
+            distances[side] = min(valid) if valid else None
+        return distances
+
+    def pad_opening_width():
+        value = _exact_pair_distance(
+            mujoco,
+            model,
+            scratch,
+            pad_geom_ids["left"],
+            pad_geom_ids["right"],
+        )
+        return value
+
     def evaluate(q, *, held=False, eef_to_object=None, allow_target_gripper=False):
         set_arm(q)
         if held:
@@ -664,15 +812,20 @@ def screen_grasp_candidates(
         violations = []
         for group in all_groups:
             group_id = group["object_id"]
-            allowed = set()
+            excluded_pairs = set()
             if (allow_target_gripper or held) and group_id == target_object_id:
-                allowed = {
+                excluded_pairs.update({
                     tuple(sorted((int(gripper_geom), int(target))))
                     for gripper_geom in gripper_geoms for target in group["geom_ids"]
-                }
+                })
+            excluded_pairs.update(
+                pair for pair in static_installation_pairs
+                if any(geom_id not in robot_geoms for geom_id in pair)
+                and any(geom_id in set(group["geom_ids"]) for geom_id in pair)
+            )
             distance = _minimum_distance(
                 mujoco, model, scratch, robot_geoms,
-                np.asarray(sorted(group["geom_ids"]), dtype=np.int64), allowed,
+                np.asarray(sorted(group["geom_ids"]), dtype=np.int64), excluded_pairs,
             )
             if distance is None:
                 return {"status": "incomplete", "distances_m": distances, "violations": ["geom_distance_unavailable"]}
@@ -686,18 +839,32 @@ def screen_grasp_candidates(
             contact = scratch.contact[index]
             ga, gb = int(contact.geom1), int(contact.geom2)
             ba, bb = int(model.geom_bodyid[ga]), int(model.geom_bodyid[gb])
-            if ba in robot_bodies and bb in robot_bodies:
-                violations.append({"self_contact_geoms": [ga, gb], "distance_m": float(contact.dist)})
-                continue
-            if ba in robot_bodies or bb in robot_bodies:
-                scene_geom = gb if ba in robot_bodies else ga
-                scene_body = bb if ba in robot_bodies else ba
-                allowed = (allow_target_gripper or held) and scene_body in target_group["body_ids"] and (ga in gripper_geoms or gb in gripper_geoms)
-                if allowed and float(contact.dist) >= -0.002:
-                    continue
-                if scene_body in forbidden_body_ids or scene_body in allowed_target_body_ids or scene_body in other_scene_body_ids:
-                    violations.append({"robot_scene_contact_geoms": [ga, gb], "body_ids": [ba, bb], "distance_m": float(contact.dist)})
-            elif held and (ba in target_group["body_ids"] or bb in target_group["body_ids"]):
+            contact_violation = _candidate_robot_contact_violation(
+                ga,
+                gb,
+                ba,
+                bb,
+                float(contact.dist),
+                robot_body_ids=robot_bodies,
+                target_body_ids=target_group["body_ids"],
+                gripper_geom_ids=gripper_geoms,
+                forbidden_scene_body_ids=forbidden_body_ids,
+                allowed_target_body_ids=allowed_target_body_ids,
+                other_scene_body_ids=other_scene_body_ids,
+                allowed_static_installation_pair_ids=static_installation_pairs,
+                allow_target_gripper=allow_target_gripper or held,
+            )
+            if contact_violation is not None:
+                contact_violation["geom_names"] = [
+                    str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+                    for geom_id in contact_violation.get("robot_scene_contact_geoms", contact_violation.get("self_contact_geoms", []))
+                ]
+                contact_violation["body_names"] = [
+                    str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or "")
+                    for body_id in contact_violation.get("body_ids", [])
+                ]
+                violations.append(contact_violation)
+            if ba not in robot_bodies and bb not in robot_bodies and held and (ba in target_group["body_ids"] or bb in target_group["body_ids"]):
                 other_body = bb if ba in target_group["body_ids"] else ba
                 # The two fingers may hold the target, and a supporting surface
                 # may still touch it during the first lift millimeters. BDDL
@@ -744,8 +911,89 @@ def screen_grasp_candidates(
         return {"status": "unsafe" if violations else "pass", "distances_m": distances, "minimum_distance_m": minimum, "violations": violations}
 
     results = []
+    forbidden_object_ids = {item["object_id"] for item in forbidden_groups}
+    mujoco.mj_setState(model, scratch, integration, integration_spec)
+    mujoco.mj_forward(model, scratch)
+    set_gripper(open_gripper)
+    t0_baseline_check = evaluate(live.qpos[qadr].copy())
+    t0_forbidden_clearance = {
+        object_id: t0_baseline_check.get("distances_m", {}).get(object_id)
+        for object_id in forbidden_object_ids
+    }
+
+    def finish_entry():
+        if stage_failures and not entry.get("failure_reasons"):
+            entry["failure_reasons"] = list(stage_failures)
+        if stage_failures and not entry.get("reason"):
+            entry["reason"] = stage_failures[0]
+        checks = []
+        for key in ("pregrasp_check", "grasp_check"):
+            if isinstance(entry.get(key), dict):
+                checks.append(entry[key])
+        for key in ("approach_path_checks", "gripper_close_path_checks", "held_path_checks"):
+            for item in entry.get(key, []):
+                if not isinstance(item, dict):
+                    continue
+                checks.append(item.get("geometry_check", item))
+        minimum_by_object = {}
+        for check in checks:
+            for object_id, value in check.get("distances_m", {}).items():
+                if object_id in forbidden_object_ids or object_id.split("->")[-1] in forbidden_object_ids:
+                    if value is not None:
+                        minimum_by_object[object_id] = min(
+                            float(value), minimum_by_object.get(object_id, float("inf"))
+                        )
+        for object_id, value in entry.get("target_layout_clearances_m", {}).items():
+            if value is not None:
+                key = f"book->{object_id}"
+                minimum_by_object[key] = min(float(value), minimum_by_object.get(key, float("inf")))
+        entry["minimum_forbidden_clearance_by_object_m"] = minimum_by_object
+        entry["t0_robot_clearance_by_forbidden_object_m"] = t0_forbidden_clearance
+        entry["minimum_forbidden_clearance_m"] = min(minimum_by_object.values(), default=None)
+        reasons = list(dict.fromkeys(entry.get("failure_reasons", [])))
+        reason = str(entry.get("reason") or "")
+        if reason and reason not in reasons:
+            reasons.insert(0, reason)
+        classes = set()
+        for failure_reason in reasons:
+            if "ik_not_found" in failure_reason:
+                classes.add("ik_unreachable")
+            elif (
+                "bilateral_finger" in failure_reason
+                or "finger_contact_geometry" in failure_reason
+                or "gripper_opening_range" in failure_reason
+            ):
+                classes.add("grasp_geometry_infeasible")
+            elif any(token in failure_reason for token in ("collision", "geometry_failed", "clearance", "unsafe", "contact_semantics")):
+                classes.add("collision_constraint_failure")
+            else:
+                classes.add("candidate_or_screening_error")
+        if entry.get("status") == "offline_feasible_candidate":
+            entry["failure_class"] = None
+            entry["failure_classes"] = []
+        else:
+            entry["failure_classes"] = sorted(classes)
+            entry["failure_class"] = next(iter(reasons), "candidate_or_screening_error")
+            if entry["failure_class"] != "candidate_or_screening_error":
+                matching = next((
+                    failure_class for failure_class in (
+                        "ik_unreachable", "grasp_geometry_infeasible", "collision_constraint_failure"
+                    )
+                    if failure_class in classes
+                ), None)
+                entry["failure_class"] = matching or "candidate_or_screening_error"
+        results.append(entry)
+
     for candidate in candidates:
-        entry = {"candidate_id": str(candidate.get("candidate_id")), "status": "rejected", "screening_type": "offline_scratch_only"}
+        stage_failures = []
+        entry = {
+            "candidate_id": str(candidate.get("candidate_id")),
+            "status": "rejected",
+            "screening_type": "offline_scratch_only",
+            "finger_target_distance_m": {"left": None, "right": None},
+            "finger_distance_status": "not_evaluated_before_closed_grasp_ik",
+            "joint_reachability": {},
+        }
         try:
             mujoco.mj_setState(model, scratch, integration, integration_spec)
             mujoco.mj_forward(model, scratch)
@@ -770,20 +1018,37 @@ def screen_grasp_candidates(
             seeds = candidate.get("ik_seed_qpos", [])
             pre_ik = solve_ik(pregrasp_position, quaternion, seeds or [live.qpos[qadr].copy()])
             if pre_ik is None:
-                entry["reason"] = "pregrasp_ik_not_found_within_joint_limits"
-                results.append(entry)
-                continue
-            pre_check = evaluate(pre_ik[1])
-            if pre_check["status"] != "pass":
-                entry.update({"reason": "pregrasp_full_geom_or_self_collision", "pregrasp_check": pre_check})
-                results.append(entry)
-                continue
+                entry["joint_reachability"] = {"pregrasp": {"reachable": False}}
+                stage_failures.append("pregrasp_ik_not_found_within_joint_limits")
+            else:
+                entry["joint_reachability"] = {
+                    "pregrasp": {
+                        "reachable": True,
+                        "qpos": pre_ik[1].tolist(),
+                        "position_error_m": pre_ik[2],
+                        "rotation_error_rad": pre_ik[3],
+                    }
+                }
+            pre_check = evaluate(pre_ik[1]) if pre_ik is not None else None
+            if pre_check is not None:
+                entry["pregrasp_check"] = pre_check
+                if pre_check["status"] != "pass":
+                    stage_failures.append("pregrasp_full_geom_or_self_collision")
             set_gripper(closed_gripper)
-            grasp_ik = solve_ik(position, quaternion, [pre_ik[1], *(seeds or [])])
+            grasp_seeds = ([pre_ik[1]] if pre_ik is not None else []) + (seeds or []) + [live.qpos[qadr].copy()]
+            grasp_ik = solve_ik(position, quaternion, grasp_seeds)
             if grasp_ik is None:
-                entry["reason"] = "closed_gripper_grasp_ik_not_found_within_joint_limits"
-                results.append(entry)
+                entry["joint_reachability"]["grasp_closed_gripper"] = {"reachable": False}
+                stage_failures.append("closed_gripper_grasp_ik_not_found_within_joint_limits")
+                finish_entry()
                 continue
+            entry["joint_reachability"]["grasp_closed_gripper"] = {
+                "reachable": True,
+                "qpos": grasp_ik[1].tolist(),
+                "position_error_m": grasp_ik[2],
+                "rotation_error_rad": grasp_ik[3],
+            }
+            entry["finger_distance_status"] = "awaiting_target_close_sweep"
             # Check the entire final approach using the live open-gripper
             # posture. Only the two verified finger sides may enter the
             # target's contact envelope; Palm/hand remains constrained by the
@@ -791,20 +1056,16 @@ def screen_grasp_candidates(
             set_gripper(open_gripper)
             approach_checks = []
             approach_failure = None
-            for alpha in np.linspace(0.1, 1.0, 10):
-                q = pre_ik[1] + float(alpha) * (grasp_ik[1] - pre_ik[1])
-                check = evaluate(q, allow_target_gripper=True)
-                approach_checks.append(check)
-                if check["status"] != "pass":
-                    approach_failure = "approach_full_geom_or_contact_semantics_failed"
-                    break
-            if approach_failure:
-                entry.update({
-                    "reason": approach_failure,
-                    "approach_path_checks": approach_checks,
-                })
-                results.append(entry)
-                continue
+            if pre_ik is not None:
+                for alpha in np.linspace(0.1, 1.0, 10):
+                    q = pre_ik[1] + float(alpha) * (grasp_ik[1] - pre_ik[1])
+                    check = evaluate(q, allow_target_gripper=True)
+                    approach_checks.append(check)
+                    if check["status"] != "pass" and approach_failure is None:
+                        approach_failure = "approach_full_geom_or_contact_semantics_failed"
+                entry["approach_path_checks"] = approach_checks
+                if approach_failure:
+                    stage_failures.append(approach_failure)
             # The archived object moved during the successful bilateral close.
             # Reuse that object-seat pose only as a scratch hypothesis while all
             # obstacles remain at their verified t10 positions.
@@ -837,26 +1098,81 @@ def screen_grasp_candidates(
                     if distance_to_forbidden is None or distance_to_forbidden < clearance_m:
                         target_layout_safe = False
             set_target_pose(predicted_object)
+            entry["target_layout_clearances_m"] = target_layout_clearances
             if not target_layout_safe:
-                entry.update({"reason": "predicted_stable_target_pose_violates_forbidden_object_clearance", "target_layout_clearances_m": target_layout_clearances})
-                results.append(entry)
-                continue
-            grasp_check = evaluate(grasp_ik[1], allow_target_gripper=True)
-            side_distances = {}
-            for side, geom_ids in finger_sides.items():
-                pairs = []
-                for finger in geom_ids:
-                    for target in target_geoms:
-                        value = _exact_pair_distance(mujoco, model, scratch, finger, target)
-                        if value is not None:
-                            pairs.append(value)
-                side_distances[side] = min(pairs, default=None)
-            if grasp_check["status"] != "pass" or any(
-                value is None or value > 0.002 or value < -0.002
-                for value in side_distances.values()
+                stage_failures.append("predicted_stable_target_pose_violates_forbidden_object_clearance")
+            # The pregrasp-to-target path above is intentionally checked with
+            # the live OPEN posture. At the target, hold the arm at its closed-
+            # gripper IK and sweep only scratch gripper qpos through the full
+            # in-range close path, checking every robot/scene geometry pair.
+            set_arm(grasp_ik[1])
+            set_gripper(open_gripper)
+            close_path_checks = []
+            close_failure = None
+            for sample in close_samples:
+                set_gripper(sample["qpos"])
+                check = evaluate(grasp_ik[1], allow_target_gripper=True)
+                side_distances = fingertip_distances()
+                jaw_width = pad_opening_width()
+                close_path_checks.append({
+                    "alpha": sample["alpha"],
+                    "gripper_qpos": sample["qpos"],
+                    "joint_limits_valid": True,
+                    "fingertip_to_book_distance_m": side_distances,
+                    "pad_to_pad_opening_m": jaw_width,
+                    "geometry_check": check,
+                })
+                excessive_finger_penetration = any(
+                    value is not None and value < -0.002
+                    for value in side_distances.values()
+                )
+                if check["status"] != "pass" or excessive_finger_penetration:
+                    if close_failure is None:
+                        close_failure = "gripper_close_path_collision_or_contact_semantics_failed"
+            final_close = close_path_checks[-1] if close_path_checks else {}
+            side_distances = final_close.get("fingertip_to_book_distance_m", {})
+            grasp_check = final_close.get("geometry_check", {"status": "incomplete"})
+            bilateral_result = _bilateral_finger_contact_result(side_distances)
+            opening_values = [item.get("pad_to_pad_opening_m") for item in close_path_checks]
+            entry["gripper_close_path_checks"] = close_path_checks
+            entry["finger_target_distance_m"] = side_distances
+            entry["finger_distance_status"] = "measured_in_closed_gripper_scratch_state"
+            entry["bilateral_fingertip_contact"] = bilateral_result
+            entry["gripper_opening_range"] = {
+                "open_joint_qpos": open_gripper.tolist(),
+                "closed_joint_qpos": closed_gripper.tolist(),
+                "open_pad_gap_m": opening_values[0] if opening_values else None,
+                "closed_pad_gap_m": opening_values[-1] if opening_values else None,
+                "pad_gap_change_m": (
+                    opening_values[0] - opening_values[-1]
+                    if len(opening_values) >= 2
+                    and opening_values[0] is not None
+                    and opening_values[-1] is not None
+                    else None
+                ),
+                "sample_count": len(close_path_checks),
+                "all_joint_limits_valid": all(item["joint_limits_valid"] for item in close_path_checks),
+            }
+            entry["grasp_check"] = grasp_check
+            if (
+                len(opening_values) != len(close_samples)
+                or any(value is None for value in opening_values)
+                or any(
+                    float(opening_values[index + 1]) > float(opening_values[index]) + 1e-5
+                    for index in range(max(0, len(opening_values) - 1))
+                )
             ):
-                entry.update({"reason": "grasp_contact_semantics_or_geometry_failed", "grasp_check": grasp_check, "finger_target_distance_m": side_distances})
-                results.append(entry)
+                stage_failures.append("gripper_opening_range_or_close_sweep_invalid")
+            if close_failure:
+                stage_failures.append(close_failure)
+            if not bilateral_result["pass"]:
+                stage_failures.append("bilateral_fingertip_contact_geometry_failed")
+            if grasp_check["status"] != "pass":
+                stage_failures.append("closed_grasp_full_geometry_or_contact_semantics_failed")
+            if stage_failures:
+                entry["failure_reasons"] = stage_failures
+                entry["reason"] = stage_failures[0]
+                finish_entry()
                 continue
 
             # Candidate carried transform follows the candidate grasp, then the
@@ -874,7 +1190,14 @@ def screen_grasp_candidates(
                 lift_ik = solve_ik(lift_position, quaternion, [previous, *(seeds or [])])
                 if lift_ik is None:
                     failed = "lift_or_exit_ik_not_found_within_joint_limits"
+                    entry["joint_reachability"]["lift30" if lift_index == 0 else "exit80"] = {"reachable": False}
                     break
+                entry["joint_reachability"]["lift30" if lift_index == 0 else "exit80"] = {
+                    "reachable": True,
+                    "qpos": lift_ik[1].tolist(),
+                    "position_error_m": lift_ik[2],
+                    "rotation_error_rad": lift_ik[3],
+                }
                 for alpha in np.linspace(0.1, 1.0, 10):
                     q = previous + float(alpha) * (lift_ik[1] - previous)
                     check = evaluate(q, held=True, eef_to_object=eef_to_object)
@@ -888,7 +1211,7 @@ def screen_grasp_candidates(
                 held_q.append(previous)
             if failed:
                 entry.update({"reason": failed, "held_path_checks": held_checks})
-                results.append(entry)
+                finish_entry()
                 continue
             entry.update({
                 "status": "offline_feasible_candidate",
@@ -899,6 +1222,9 @@ def screen_grasp_candidates(
                 "exit80_qpos": held_q[2].tolist(),
                 "ik_position_error_m": {"pregrasp": pre_ik[2], "grasp": grasp_ik[2]},
                 "finger_target_distance_m": side_distances,
+                "bilateral_fingertip_contact": bilateral_result,
+                "gripper_close_path_checks": close_path_checks,
+                "gripper_opening_range": entry["gripper_opening_range"],
                 "pregrasp_check": pre_check,
                 "grasp_check": grasp_check,
                 "approach_path_checks": approach_checks,
@@ -906,29 +1232,37 @@ def screen_grasp_candidates(
                 "predicted_stable_object_pose_source": "historical_t141_close_result_as_unverified_scratch_prior",
                 "held_path_checks": held_checks,
                 "minimum_observed_clearance_m": min((item["minimum_distance_m"] for item in [pre_check, grasp_check, *held_checks] if item.get("minimum_distance_m") is not None), default=None),
-                "minimum_forbidden_clearance_m": min((
-                    distance
-                    for check in [pre_check, grasp_check, *held_checks]
-                    for name, distance in check.get("distances_m", {}).items()
-                    if name in {group["object_id"] for group in forbidden_groups}
-                    or name.split("->")[-1] in {group["object_id"] for group in forbidden_groups}
-                ), default=None),
                 "preferred_ik_seed_qpos": pre_ik[1].tolist(),
             })
         except Exception as exc:
             entry.update({"reason": f"{type(exc).__name__}:{exc}"})
-        results.append(entry)
+        finish_entry()
     live_after = np.zeros_like(integration)
     mujoco.mj_getState(model, live, live_after, integration_spec)
     unchanged = np.array_equal(integration, live_after)
     feasible = [item for item in results if item["status"] == "offline_feasible_candidate"]
-    feasible.sort(key=lambda item: -float(item.get("minimum_forbidden_clearance_m") or -1.0))
+    feasible.sort(key=lambda item: -float(
+        item.get("minimum_forbidden_clearance_m")
+        if item.get("minimum_forbidden_clearance_m") is not None else -1.0
+    ))
+    failure_counts = {}
+    failure_membership_counts = {}
+    for item in results:
+        failure_class = item.get("failure_class") or "pass"
+        failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
+        for member_class in item.get("failure_classes", []):
+            failure_membership_counts[member_class] = failure_membership_counts.get(member_class, 0) + 1
     return {
         "operation": "screen_grasp_candidates",
         "status": "complete" if unchanged else "unsafe",
         "screening_type": "offline_scratch_only_not_physical_execution",
         "candidate_count": len(candidates),
         "feasible_count": len(feasible),
+        "failure_class_counts": failure_counts,
+        "failure_class_membership_counts": failure_membership_counts,
+        "gripper_close_sweep_sample_count": len(close_samples),
+        "gripper_open_joint_qpos": open_gripper.tolist(),
+        "gripper_closed_joint_qpos": closed_gripper.tolist(),
         "candidates": results,
         "ranked_candidate_ids": [item["candidate_id"] for item in feasible],
         "live_state_unchanged": unchanged,

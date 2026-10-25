@@ -3706,6 +3706,125 @@ def _collision_geom_ids(body_ids):
     }
 
 
+_STATIC_INSTALLATION_MODEL_SIGNATURE_CACHE = {"model": None, "signature": None}
+_VERIFIED_STATIC_INSTALLATION_CONTACTS = (
+    {
+        "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e",
+        "robot_geom_id": 90,
+        "robot_geom_name": "mount0_pedestal_col",
+        "robot_body_id": 22,
+        "robot_body_name": "mount0_pedestal",
+        "scene_geom_id": 14,
+        "scene_geom_name": None,
+        "scene_body_id": 1,
+        "scene_body_name": "study_table",
+    },
+)
+
+
+def _fixed_body_ancestor_chain(model, body_id):
+    """Return a verified fixed Body chain, or fail if any ancestor is jointed."""
+    chain = []
+    current = int(body_id)
+    while True:
+        joints = [
+            joint_id
+            for joint_id in range(int(model.njnt))
+            if int(model.jnt_bodyid[joint_id]) == current
+        ]
+        if joints:
+            raise ValueError(
+                f"static_installation_body_has_jointed_ancestor:body={current},joints={joints}"
+            )
+        chain.append(current)
+        if current == 0:
+            return chain
+        parent = int(model.body_parentid[current])
+        if parent == current or parent < 0 or parent >= int(model.nbody):
+            raise ValueError("static_installation_body_ancestor_chain_is_invalid")
+        current = parent
+
+
+def _normalize_static_installation_contact_pairs(
+    raw_pairs, model, robot_body_ids, robot_geom_ids, other_scene_groups
+):
+    """Validate the narrowly pinned L0T1 fixed mount/table contact exception."""
+    if not isinstance(raw_pairs, list):
+        raise ValueError("allowed_static_installation_contact_pairs_must_be_an_array")
+    if not raw_pairs:
+        return set(), []
+    if len(raw_pairs) != 1 or len(_VERIFIED_STATIC_INSTALLATION_CONTACTS) != 1:
+        raise ValueError("static_installation_contact_pair_is_not_in_the_verified_allowlist")
+
+    expected = _VERIFIED_STATIC_INSTALLATION_CONTACTS[0]
+    pair = raw_pairs[0]
+    if not isinstance(pair, dict) or pair != expected:
+        raise ValueError("static_installation_contact_pair_identity_is_not_in_the_verified_allowlist")
+
+    cache = _STATIC_INSTALLATION_MODEL_SIGNATURE_CACHE
+    if cache["model"] is not model:
+        cache["model"] = model
+        cache["signature"] = _planning_model_signature(model)
+    if cache["signature"] != expected["model_geometry_sha256"]:
+        raise ValueError("static_installation_contact_model_fingerprint_is_not_verified")
+
+    robot_geom = int(expected["robot_geom_id"])
+    scene_geom = int(expected["scene_geom_id"])
+    robot_body = int(expected["robot_body_id"])
+    scene_body = int(expected["scene_body_id"])
+    if (
+        robot_geom not in robot_geom_ids
+        or scene_geom < 0
+        or scene_geom >= int(model.ngeom)
+        or robot_body not in robot_body_ids
+        or int(model.geom_bodyid[robot_geom]) != robot_body
+        or int(model.geom_bodyid[scene_geom]) != scene_body
+        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, robot_geom)
+        != expected["robot_geom_name"]
+        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, scene_geom)
+        != expected["scene_geom_name"]
+        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, robot_body)
+        != expected["robot_body_name"]
+        or mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, scene_body)
+        != expected["scene_body_name"]
+    ):
+        raise ValueError("static_installation_contact_geom_or_body_identity_mismatch")
+    if not any(
+        scene_geom in group["geom_ids"] and scene_body in group["body_ids"]
+        for group in other_scene_groups
+    ):
+        raise ValueError("static_installation_contact_scene_geom_is_not_a_verified_other_scene_geom")
+
+    robot_chain = _fixed_body_ancestor_chain(model, robot_body)
+    scene_chain = _fixed_body_ancestor_chain(model, scene_body)
+    pair_key = tuple(sorted((robot_geom, scene_geom)))
+    evidence = {
+        **expected,
+        "robot_fixed_body_ancestor_ids": robot_chain,
+        "scene_fixed_body_ancestor_ids": scene_chain,
+        "verification": "model_fingerprint_and_geom_body_identity_match; both ancestor chains contain no joints",
+    }
+    return {pair_key}, [evidence]
+
+
+def _static_installation_pairs_for_group(policy, group):
+    """Return only verified mount/scene pairs whose scene Geom is in this group."""
+    return {
+        pair
+        for pair in policy.get("allowed_static_installation_contact_pair_ids", set())
+        if any(
+            geom_id not in policy["robot_geom_ids"] and geom_id in group["geom_ids"]
+            for geom_id in pair
+        )
+    }
+
+
+def _is_allowed_static_installation_contact(policy, pair_key):
+    return tuple(sorted(int(value) for value in pair_key)) in policy.get(
+        "allowed_static_installation_contact_pair_ids", set()
+    )
+
+
 def _normalize_safety_geometry_policy(raw_policy):
     """Verify semantic Body/Geom bindings before substep safety checks."""
     model = env.sim.model._model
@@ -3822,6 +3941,27 @@ def _normalize_safety_geometry_policy(raw_policy):
         max(0.010, float(margin)),
     )
     other_groups = parse_groups(raw_policy.get("other_scene_objects", []), "other_scene_objects", 0.0)
+    static_installation_raw = raw_policy.get("allowed_static_installation_contact_pairs")
+    if static_installation_raw is None:
+        # Existing L0T1 policy builders predate this field. Apply the trusted
+        # installation registry only when Bridge metadata identifies its exact
+        # compiled model; the validator below independently fingerprints it.
+        static_installation_raw = [
+            dict(spec)
+            for spec in _VERIFIED_STATIC_INSTALLATION_CONTACTS
+            if scene_metadata.get("model_geometry_sha256")
+            == spec["model_geometry_sha256"]
+        ]
+    (
+        static_installation_pair_ids,
+        static_installation_pair_bindings,
+    ) = _normalize_static_installation_contact_pairs(
+        static_installation_raw,
+        model,
+        robot_bodies,
+        robot_geoms,
+        other_groups,
+    )
     support_geom_ids = raw_policy.get("allowed_carried_support_contact_geom_ids", [])
     if (
         not isinstance(support_geom_ids, list)
@@ -4038,6 +4178,8 @@ def _normalize_safety_geometry_policy(raw_policy):
         "other_scene_objects": other_groups,
         "allowed_contact_pair_ids": pair_ids,
         "allowed_pair_minimum_clearance_m": allowed_pair_min_clearance,
+        "allowed_static_installation_contact_pair_ids": static_installation_pair_ids,
+        "allowed_static_installation_contact_pair_bindings": static_installation_pair_bindings,
         "allowed_target_body_ids": allowed_body_ids,
         "classified_scene_body_ids": classified_scene_body_ids,
         "forbidden_scene_body_ids": set().union(*(item["body_ids"] for item in forbidden_groups)) if forbidden_groups else set(),
@@ -4140,6 +4282,9 @@ def _substep_safety_geometry(monitor, contact_result):
         "contact_identities": [],
         "joint_limit_violations": [],
         "strict_joint_limit_violations": [],
+        "allowed_static_installation_contact_pairs": policy[
+            "allowed_static_installation_contact_pair_bindings"
+        ],
     }
     try:
         if contact_result.get("status") not in ("contact", "no_contact"):
@@ -4152,12 +4297,15 @@ def _substep_safety_geometry(monitor, contact_result):
                     if geom_id not in policy["robot_geom_ids"]
                 ) in group["geom_ids"]
             } if group["policy_class"] == "allowed_target_objects" else set()
+            excluded_pairs = allowed_pairs | _static_installation_pairs_for_group(
+                policy, group
+            )
             clearance = _minimum_geom_clearance(
                 model,
                 sim.data._data,
                 policy["robot_geom_ids"],
                 group["geom_ids"],
-                allowed_pairs,
+                excluded_pairs,
             )
             item["clearances_by_object"][group["object_id"]] = clearance
             if clearance.get("status") != "complete":
@@ -4279,7 +4427,8 @@ def _substep_safety_geometry(monitor, contact_result):
                     if pair_key not in policy["allowed_contact_pair_ids"]:
                         item["forbidden_contacts"].append(contact)
                 elif scene_body in policy["other_scene_body_ids"]:
-                    item["unallowed_scene_contacts"].append(contact)
+                    if not _is_allowed_static_installation_contact(policy, pair_key):
+                        item["unallowed_scene_contacts"].append(contact)
                 else:
                     item["unresolved_contacts"].append(contact)
             else:

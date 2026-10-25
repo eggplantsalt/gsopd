@@ -1,6 +1,34 @@
 # GS-OPD 当前局部目标
 
-## 最新局部状态：L0T1 书本冷启动停在 t=0 全几何门禁（2026-10-26）
+## 最新局部状态：L0T1 24个书本抓取候选scratch筛选完成（2026-10-26）
+
+在研究分支修复 `research/gs_opd/repair/mujoco_jointspace_planning.py::screen_grasp_candidates`：接近路段仍在t=0张爪姿态检查；抓取阶段在目标姿态按几何推导的闭爪IK，独立scratch `MjData` 中从开爪到闭爪做9个限位内采样，每个采样测左右真实pad碰撞Geom到书的有符号距离，并运行完整机器人/场景几何、接触及自碰撞策略。最终双侧均须在原有±2 mm接触容差内。经过模型SHA、Geom/Body身份和固定祖先链核验的唯一静态安装Pair `(robot Geom 90 mount0_pedestal_col, scene Geom 14 study_table)`继续保留；未豁免其他Floor/Table或Pedestal几何，也未改变10 mm禁触余量、Hand接触、Beer、Place Box、关节或BDDL规则。
+
+从原始π₀.₅ t=0 Snapshot精确恢复：Snapshot SHA `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`、模型SHA `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`、Integration State SHA `41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522` 均匹配。原有24候选均完成预抓取与闭爪目标IK（24/24在关节限位内），24/24执行10点张爪接近几何检查和9点闭爪几何检查。夹爪pad间真实几何开口从39.699 mm降至27.680 mm，闭合采样全程在关节范围内。
+
+**筛选结果：0/24完整可行候选，无候选排名。** 六个候选两侧pad—书距离各约−0.500 mm，满足双指±2 mm几何容差；另18个为双侧过度穿透（12个约−3.042 mm、6个约−6.354 mm）。但24/24的闭爪姿态和全部9个闭合样本都触发书本非法Hand接触：`black_book_1_g1` Geom 92 与 `gripper0_hand_collision` Geom 79（Body 12）的signed distance约−59.758 mm；该接触不属于合法指垫Pair，故所有候选均按原安全规则拒绝。另有12个预抓取点的书本几何余量低于10 mm，另12个张爪接近路径低于10 mm；筛选没有因早期失败而跳过独立目标闭爪诊断。Beer/Place Box对候选机器人路径的最小已测余量分别为76.370 mm和13.553 mm，均未触发其禁触门槛。IK不可达0个；按失败类别并集计，碰撞约束失败24个、抓取几何/双指穿透失败18个（后者同时伴随Hand/路径碰撞）。
+
+全筛选期间没有动作或MuJoCo物理子步；Safety Bridge前后Integration State逐元素相同，hash仍为 `41a6cd…2522`。未执行RRT、OSC抓取、抬升/退爪、训练或LeRobot转换；没有新增抓取Snapshot、真实动作或视频。未加载/读取官方安全示范。该结果是候选假设被筛除，不代表任务或抓取路线整体不可行；下一局部目标需在原禁触规则下调整书本候选几何以避免Hand穿书并满足双侧指垫容差，之后再做独立scratch筛选。
+
+完整机器报告和人读摘要：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_grasp_candidate_screen_20261026_attempt4/candidate_screening.json` 与同目录 `candidate_screening_summary.md`。复现入口：`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python research/gs_opd/repair/screen_l0t1_book_grasp_candidates.py --output-dir <new-empty-dir> --bridge-port <unused-port>`。新增目标回归 `research/gs_opd/repair/test_mujoco_jointspace_grasp_screen.py` 覆盖Hand触书、其他桌面碰撞、单指假抓、闭爪关节采样及唯一固定安装Pair；连同静态安装策略回归共7项通过。
+
+## 最新局部状态：L0T1 t=0 固定安装几何门禁已解除（2026-10-26）
+
+对原始 Student 的 L0T1 t=0 Runtime Snapshot 在独立 MuJoCo scratch `MjData` 中恢复并核验：Snapshot SHA-256 `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`、模型几何 SHA-256 `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e` 和 Integration State SHA-256 `41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522` 均匹配。几何身份复核纠正了先前描述：Geom 14 不是 world Body 0 的 floor，而是未命名 `mjGEOM_BOX`，挂在 `study_table` Body 1；Geom 90 是 `mount0_pedestal_col` 圆柱，挂在 `mount0_pedestal` Body 22。两者的 Body 祖先链都没有关节；扰动 7 个 Panda 关节后两个 Geom 的世界位姿变化均为 0。模型指纹、精确名称/ID和固定关系共同表明，这是固定机器人安装座与桌面碰撞盒边缘的模型几何重叠，signed distance 为 −99.460 mm。
+
+只在 `safety_bridge.py` 增加可信静态安装pair注册表及可选 `allowed_static_installation_contact_pairs` 策略字段。为兼容已有L0T1调用方，只有Bridge元数据中的模型SHA精确匹配时才自动纳入该注册pair；显式空列表可关闭许可，其他模型不会获得默认许可。归一化器仍重新计算并核验指纹、Geom/Body身份及双方无关节祖先链。唯一被排除的是 `(robot geom 90, scene geom 14)` 这一对对 clearance 和 scene-contact 身份判定的影响。Floor/table其余几何、Pedestal其他 Geom、移动连杆、Beer、Place Box、目标物、自碰撞、关节限制和原 clearance 阈值仍照常检查。
+
+在独立 Safety Bridge 进程恢复同一 Snapshot 后重跑全几何只读门禁：修复前唯一违规为 `unmapped_scene_environment` 的 −0.099460 m；修复后状态 `complete`，最小剩余间距 +0.028005 m，Beer/Place Box间距仍为66.233/142.490 mm，禁止接触、自碰撞与关节违规均为空。两次门禁前后 Integration State SHA 保持不变，原生目标仍为 false、reward=0、done=false；未发动作、未执行MuJoCo物理子步、IK、RRT、抓取或训练。新增回归测试2项通过，其中不同移动连杆对同一Floor的负距离仍被保留并判为非法。
+
+证据归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_safety_gate_static_contact_fix_20261026/`（`geometry_evidence.json`、修复前后Safety Bridge结果、Snapshot只读校验、汇总及artifact hashes）。旧冷启动失败归档保留在 `obstacle_avoidance_L0T1_t0_book_cold_grasp_20261026_attempt1/`。初态全几何门禁这一唯一阻塞已解除；本轮未继续IK/RRT或抓取。已知开夹爪指垫筛选问题仍按此前记录延期，未在本轮处理；后续开始候选筛选前需单独解决并保持安全阈值不变。
+
+严格保持原始 Student rollout → 暴力搜索任务成功轨迹（允许不安全）→ 自身历史成功经验几何重定位与安全重构 → MuJoCo完整验证 → GS-OPD安全Episode路线。未使用LIBERO-Safety官方安全示范或其动作/关键帧/轨迹/专家标签。
+
+## 修复前记录：L0T1 书本冷启动停在 t=0 全几何门禁（2026-10-26）
+
+**勘误：**本节保留修复前的搜索状态；当时将 Geom 14 描述成 world floor/Body 0 是错误的身份标注。上方独立scratch模型核验及本节后的审计记录已更正为未命名桌面碰撞盒、`study_table` Body 1。原负距离与修复前 unsafe 结论仍是有效历史结果。
+
+## 修复前记录：L0T1 书本冷启动停在 t=0 全几何门禁（2026-10-26）
 
 已从原始 Student 的 `initial_runtime_snapshot.pkl` 严格恢复 `obstacle_avoidance/L0T1`、seed 0、init-state 0；Snapshot SHA-256 为 `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`，模型几何 SHA-256 为 `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`，Integration State SHA-256 与 manifest 一致（`41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522`）。指令、BDDL 哈希与原生目标均匹配；书、Caddy、Beer、Place Box 的真实 t=0 位姿及碰撞绑定已归档。按书本 group-0 碰撞盒和活动 Panda 指垫几何生成了24个不同候选。
 

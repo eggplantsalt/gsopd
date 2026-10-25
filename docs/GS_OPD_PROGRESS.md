@@ -1,6 +1,32 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## L0T1 书本冷启动：t=0 全几何门禁阻断（2026-10-26）
+## L0T1 书本抓取候选：开爪接近与闭爪双指几何筛选（2026-10-26）
+
+修正了 `research/gs_opd/repair/mujoco_jointspace_planning.py::screen_grasp_candidates` 最终指垫距离检查错误沿用开爪姿态的问题。候选预抓取/接近IK继续按原始张爪状态检查；目标处闭爪IK在实际gripper关节范围内求解，随后用独立 scratch `MjData` 对两侧指垫做9点闭合采样，并在每一点重跑完整机器人、目标物、Beer、Place Box、其余桌面几何、自碰撞与接触策略。左右pad必须各自满足−2至+2 mm；只碰到单侧不算抓住。静态安装例外仍只限经过模型SHA及Geom/Body固定关系核验的Geom `(90,14)` 精确Pair，其余安全规则和阈值不变。
+
+筛选严格恢复原始 π₀.₅ L0T1 t=0 Runtime Snapshot（Snapshot SHA `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`；模型SHA `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`；Integration State SHA `41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522`），加载已归档的24个唯一候选。24/24预抓取IK和24/24闭爪抓取IK可达且未越关节限位；每个候选完成10个张爪接近样本、9个张到闭爪几何样本。MuJoCo pad间距实测由开爪39.699 mm降至闭爪27.680 mm，过程关节范围有效。
+
+结果为**0个完整可行候选**，故没有排名或下一段Lift/Exit筛选。六个候选双侧指垫—书signed distance各约−0.500 mm，满足±2 mm；18个候选两侧过度穿透（12个约−3.042 mm、6个约−6.354 mm）。但全部24候选的预抓取/接近或闭爪几何检查存在碰撞约束失败；闭爪9个样本中均有非法手部接触：书本Geom 92 `black_book_1_g1` 与机器人Geom 79 `gripper0_hand_collision`（Body 12）相交约59.758 mm。此不是合法指垫接触，未放行。12个预抓取点、12个最终张爪接近路段还违反书本10 mm几何余量。候选路径中Beer最小间隙76.370 mm、Place Box最小间隙13.553 mm，未触发禁触门槛。按类别并集，24个有碰撞约束失败，18个另有指尖几何/穿透失败，0个IK不可达；所以应归因为候选几何/姿态问题，不是IK或禁触对象布局阻断。
+
+screen只调用IK、`mj_forward`和scratch几何距离查询：动作0、物理子步0、真实OSC抓取0、Snapshot物理分支0；Safety Bridge检查前后Integration State逐元素一致。没有执行RRT、训练或LeRobot转换，也没有加载官方安全示范。修复没有产生任何通过认证的抓取模板、物理抓取Snapshot、动作、视频或安全Episode。下一步是在安全阈值不变的前提下调整候选构型以避免Hand穿书和过度夹入，再重复只读scratch筛选。
+
+机器报告：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_grasp_candidate_screen_20261026_attempt4/candidate_screening.json`；摘要 `candidate_screening_summary.md`。逐候选记录含IK qpos/残差、左右pad距离、开闭夹爪几何宽度、Beer/Place Box间隙、每阶段碰撞和Geom/Body身份。复现入口为 `research/gs_opd/repair/screen_l0t1_book_grasp_candidates.py`，输出目录与Bridge端口通过参数指定。新增 `research/gs_opd/repair/test_mujoco_jointspace_grasp_screen.py`；与固定安装Pair回归合计7项通过，模块编译检查通过。
+
+## L0T1 t=0 安全门禁修复与独立复核（2026-10-26）
+
+针对原始书本冷启动预演的唯一前置阻塞进行了模型身份核查、最小Safety Bridge策略修正和只读回归。注意此前报告把 Geom 14 记为 world floor/Body 0，现已依据同一模型指纹更正：Geom 14 是未命名 `mjGEOM_BOX`，所属 `study_table` Body 1；Geom 90 是 `mount0_pedestal_col` `mjGEOM_CYLINDER`，所属 `mount0_pedestal` Body 22。桌面盒世界范围 `x=[−0.68946,0.68946] m, z=[0.81345,0.88513] m`，安装圆柱范围 `x=[−0.95,−0.59] m, z=[0.322,0.942] m`，两者沿X边缘交叠99.460 mm。双方Body祖先链（机器人 `[22,18,2,0]`；桌面 `[1,0]`）均无关节；对7个Panda关节做独立scratch扰动后两个固定Geom位姿不变。该重叠是编译模型中固定安装结构间的预期静态几何重叠，不是移动连杆接触。
+
+错误路径：`_safety_geometry_at_current_state` → `_normalize_safety_geometry_policy` → `_substep_safety_geometry`。原策略将该 pair 纳入 `unmapped_scene_environment` 组，`_minimum_geom_clearance` 返回 −0.099460 m，违反该组0 m门槛并置 `unsafe`；t=0 实际 `unallowed_scene_contacts` 为空，故触发点是全几何距离门禁而非接触事件记录。
+
+最小修正仅修改 `research/gs_opd/smoke/safety_bridge.py`：新增可信静态pair注册表和可选 `allowed_static_installation_contact_pairs`；为兼容旧L0T1策略，Bridge模型SHA精确匹配时自动纳入注册pair，显式空列表可关闭；随后仍以模型SHA `9e2f…451e`、Geom ID/名称、Body ID/名称、两侧固定祖先链完整验证唯一pair `(90,14)`。未排除 Floor/Table 或 Pedestal组；该pair以外的所有场景几何和动态/目标/禁止接触规则继续原样检查，Beer、Place Box距离门槛、书本合法指尖接触容差、自碰撞和关节规则未改。验证不匹配时拒绝策略，不默许放行。
+
+原始 Snapshot 在独立Bridge环境恢复成功后，两次只读全几何门禁及 native-task 查询未改变 Integration State SHA `41a6cd…2522`。修复前 `unsafe`，唯一违规为 Geom 90–14；修复后 `complete`，剩余全场景最小距离28.005 mm；Beer 66.233 mm、Place Box 142.490 mm保持不变，禁止对象、自碰撞、未许可场景接触和关节违规均为空。目标 `In(black_book_1, desk_caddy_1_back_contain_region)`仍false，reward 0、done false。0步动作、0个物理子步、0 IK/RRT调用。
+
+新增 `research/gs_opd/smoke/test_static_installation_contact_policy.py`，目标命令运行2项回归均通过：许可的固定安装pair从几何合并检查中精确排除；另一移动连杆与同一Floor的负距离仍为unsafe；有joint祖先的body不能归类为固定安装。只运行此目标测试与本轮只读安全门禁，没有运行广泛测试、Rollout、IK/RRT、抓取、训练或LeRobot转换。
+
+完整证据：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_safety_gate_static_contact_fix_20261026/`；旧搜索归档不覆盖、不修改。初始门禁阻塞已解除，但尚无抓取成功Snapshot。此前发现的开夹爪指垫筛选问题尚未处理，保持为候选筛选启动前的独立待办。
+
+## L0T1 书本冷启动：修复前 t=0 全几何门禁记录（2026-10-26）
 
 从原始 Student 归档严格恢复了 `obstacle_avoidance/L0T1`、init-state 0、seed 0。初始 Runtime Snapshot SHA-256 `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`、模型几何 SHA-256 `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`、Integration State SHA-256 `41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522` 全部匹配。原生指令与BDDL身份匹配。快照中的 Book/Caddy/Beer/Place Box 位姿已写入 `scene_start.json`；以黑书 group-0 碰撞盒、Panda实际指垫中心和 Beer/Place Box 最近邻方向生成24个独特候选，未复制 Moka Pot 姿态。
 

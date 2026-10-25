@@ -1,6 +1,26 @@
 # GS-OPD 总体路线
 
-## 最新路线状态：L0T1 书本抓取冷启动被静态底座—地面门禁阻断（2026-10-26）
+## 最新路线状态：L0T1 书本候选通过IK、未通过抓取安全几何筛选（2026-10-26）
+
+修复了已有MuJoCo规划适配器把最终指垫接触放在开爪状态测量的问题。当前候选筛选把张爪接近、闭爪目标IK、两侧pad距离和完整机器人几何闭合路径分开核验；保留精确静态安装Geom `(90,14)`例外，不放宽Hand、Floor/Table、Pedestal、Beer、Place Box或目标物安全要求。
+
+从原始L0T1 t=0 Snapshot对24个已归档书本候选完成有界IK和scratch几何筛选：预抓取与闭爪目标IK均24/24可达，左右指垫闭合采样及关节范围均有完整记录。六个候选的双指几何距离在现有±2 mm容差内，另外18个过度穿透；但所有24个闭爪候选均出现 `gripper0_hand_collision` Geom 79 对书本Geom 92的非法接触（约−59.758 mm）。候选集筛选成功数为0，故不进行RRT、OSC抓取或抬升。Beer/Place Box最小路径间隙76.370/13.553 mm，初始Snapshot在只读筛选前后保持完全一致。结果归档及逐候选证据见 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_grasp_candidate_screen_20261026_attempt4/`。
+
+总体采集路线不变：原始Student Rollout → 暴力搜索任务成功轨迹（允许不安全）→ 仅使用自身历史成功经验做几何重定位与安全重构 → MuJoCo完整验证 → GS-OPD安全Episode。当前L0T1阶段状态从“t=0安全门禁阻塞”推进到“24个候选IK均可达，但抓取姿态的Hand穿书/部分双指穿透阻断”；下一子目标是按现有安全规则生成并筛选不与书本相交的Hand姿态。该轮无物理抓取、RRT、Student Rollout、训练或LeRobot数据转换，官方安全示范未参与。
+
+## 最新路线状态：L0T1 固定安装几何门禁已精准解除（2026-10-26）
+
+独立scratch `MjData` 恢复并核验了原始 `obstacle_avoidance/L0T1`、seed 0、init-state 0 Runtime Snapshot。此前“world floor Geom 14”的描述已更正：Geom 14 是挂在 `study_table` Body 1 的未命名桌面Box；Geom 90 是固定 Panda 安装圆柱，挂在 `mount0_pedestal` Body 22。模型SHA精确匹配，双方祖先链无关节，7个Panda关节扰动下两者几何不移动；t=0 −99.460 mm是固定安装座与桌面边缘模型重叠。
+
+Safety Bridge仅在模型SHA精确命中可信静态pair注册表后纳入 `(90,14)` 局部接触例外（显式空列表可关闭）；策略归一化还要求Geom/Body身份全匹配且双方祖先链固定。旧L0T1策略省略新字段时也能兼容此精确模型。全场景门禁修复前 `unsafe`，修复后 `complete`、剩余最小间距 +28.005 mm；Beer/Place Box、安全阈值、BDDL、其他Floor/Table与Pedestal Geom、自碰撞和移动连杆规则未放宽。原始Snapshot的Integration State在只读前后校验中哈希不变；没有物理步、动作或IK/RRT。
+
+首个L0试点仍为书本放入Caddy后格，但当前初始安全门禁不再是阻塞。抓取候选筛选尚未开始；已知开夹爪状态下指垫末端距离检查问题仍待后续单独修复/适配，且不得放宽原安全阈值。回归测试覆盖精确Pair许可、同Floor非法移动连杆接触保留和jointed body拒绝，2项通过。修复前后门禁和几何证据归档在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_safety_gate_static_contact_fix_20261026/`。
+
+下一阶段路线仍是：原始 π₀.₅ Student Rollout → 暴力搜索任务成功轨迹（允许不安全）→ 仅用自身历史成功经验进行几何重定位与安全重构 → MuJoCo完整验证 → 生成GS-OPD安全Episode。官方安全示范只保留为独立Offline SFT Baseline，不进入当前搜索先验、冷启动、重定位或训练Episode。
+
+## 修复前路线快照：L0T1 抓取冷启动被静态底座门禁阻断（2026-10-26）
+
+## 修复前路线快照：L0T1 书本抓取冷启动被静态底座门禁阻断（2026-10-26）
 
 已从原始Student的t=0 Runtime Snapshot核对并恢复L0T1；场景、BDDL、原生目标及编译模型指纹一致。按活动黑书碰撞盒与真实Panda指垫生成24个几何候选，但现有全几何Safety Bridge在任何候选筛选前就判定初态unsafe：Panda固定底座 geom 90 与 world floor geom 14 有 `-99.460 mm` signed-distance重叠。该项不是 Beer 或 Place Box 违规；两者对机器人最小距离为66.233/142.490 mm，书与两者t=0无对象接触。
 
