@@ -1,6 +1,14 @@
 # GS-OPD 当前局部目标
 
-## 最新局部结果：L0T2 Round 0 Fresh LoRA配置与batch预检通过，正式训练未启动（2026-10-25）
+## 当前局部目标：已验收L0T2 LeRobot Episode视觉审计完成（2026-10-25）
+
+只读通过LeRobot 0.3.3官方Reader逐帧检查已验收1460帧单Episode，输出20 FPS、73秒并排双相机MP4、8个关键时间步截图、接缝复核图、机器JSON和人读摘要。图像直接读取LeRobot存储内容，无额外180°旋转。全行动作前Observation与t→t+1真实7D动作对齐、source segment与phase一致；25段、24接缝、t=1459训练末帧与t=1460终态证据明确区分。
+
+产物目录：`/opt/data/private/gs_opd/audits/l0t2_round0_dataset_visual_audit_20261025/`。视频为`l0t2_round0_expert_dual_camera_20fps.mp4`；关键帧总览`keyframes_contact_sheet.jpg`；可疑来源接缝前后对照`snapshot_seam_review_contact_sheet.jpg`；完整报告`l0t2_round0_lerobot_visual_audit.json`。复现入口：`research/gs_opd/data/audit_and_render_l0t2_round0_lerobot.py`。
+
+没有发现重复帧、错位标记或稳健阈值下的大幅图像跳变候选。t=10腕部图像变化、t=398 agentview变化仅作为已核对的来源接缝复查项；关键帧视觉顺序大体连贯。夹爪符号按robosuite PandaGripper核实为−开、+闭、0保持；t=6和t=9有两条轻微低于−1的原始张开命令，保留原值并在JSON标记。终态t=1460只引用provenance里的成功证据，没有加入视频。数据集、模型和训练代码均未更改，未运行训练或Rollout。
+
+## 前置局部结果：L0T2 Round 0 Fresh LoRA配置与batch预检通过（2026-10-25）
 
 已新增配置`examples/sft/config/gs_opd_l0t2_round0_fresh_lora_20261025.yaml`，并将`research/gs_opd/data/run_single_episode_sft.py`阶段窗口改为从训练集逐动作provenance读取，不再依赖845帧、固定三阶段名称或旧phase平衡策略。L0T2使用`task_phase`标签的12个实际阶段、1451个唯一Action Horizon=10合法窗口；每epoch对transport重复1窗以凑足batch=3，执行1452次曝光、484个完整batch。稀少抓取/释放阶段不会被过度复制。
 

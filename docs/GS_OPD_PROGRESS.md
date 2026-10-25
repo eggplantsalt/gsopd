@@ -1,6 +1,60 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
-## 最新进度：L0T2 Round 0 Fresh LoRA训练配置与单batch预检通过（2026-10-25）
+## 最新结果：L0T2已验收LeRobot Episode双相机视觉与时序审计完成（2026-10-25）
+
+本轮只读使用LeRobot 0.3.3官方`LeRobotDataset` Reader逐帧读取验收数据集`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025`，读取单Episode 1460帧、20 FPS。输出完整并排视频`/opt/data/private/gs_opd/audits/l0t2_round0_dataset_visual_audit_20261025/l0t2_round0_expert_dual_camera_20fps.mp4`：H.264、1024×712、73秒，回读解码确认1460帧完整。视频直接采用LeRobot Reader解码图像，只做CHW→HWC布局变换和显示放大，没有再旋转180°。每帧叠加全局pre-action timestep、task_phase、来源分段、真实7D OSC_POSE动作、夹爪指令与observed finger qpos。
+
+关键帧t=0/10/249/329/649/1019/1061/1459的双相机截图与总览表保存在同目录`keyframes/`、`keyframes_contact_sheet.jpg`；来源接缝t=10和t=398的前后帧另存于`snapshot_seam_review/`及`snapshot_seam_review_contact_sheet.jpg`。机器报告为`l0t2_round0_lerobot_visual_audit.json`，人读摘要为`l0t2_round0_lerobot_visual_audit.md`。可复现入口：`research/gs_opd/data/audit_and_render_l0t2_round0_lerobot.py`。
+
+全1460行Observation–Action时间关系、20Hz timestamp、task_phase/source段元数据与动作来源标记均通过，0行对齐错误；25个来源段长度及源行连续性通过，24个Snapshot接缝均检查了前后图像、EEF位置变化、动作和接缝证明。t=9→10腕部图像变化最高（MAE 12.766/255）且EEF位置变化6.829 mm，属于切换点人工复核候选；可视帧连续，t=10接缝按原验收为状态级逐组件兼容（序列化Snapshot不字节相同）。t=398 agentview变化略超过Episode p99（MAE 2.082/255），其Snapshot字节哈希精确一致，前后图像连续。1460帧未检出双相机同时完全重复、近重复伴随明显机器人/动作变化，稳健阈值下无大幅突变候选；这类视觉统计不替代物理安全证书。
+
+夹爪动作核对robosuite PandaGripper `format_action()`语义为负值张开、正值闭合、0保持。1460标签中265个张开、138个闭合、1057个保持。t=6与t=9的原始标签分别为−1.004655和−1.005875，略超名义[-1,1]下界；它们来自原始t=0前缀、符号仍对应张开，报告与视频保留精确源值，没有裁剪或修改训练集。最后训练帧是t=1459动作前Observation，标签动作推进到t=1460；t=1460的task_success/reward=1/done=true仅作为provenance终态证据记入JSON，没有合成/混入训练视频帧。
+
+**证据区分：**关键帧目测的任务场景与阶段顺序大体连贯；数据集内帧索引、来源段与provenance元数据一致；每行明确是pre-action Observation配该时刻真实执行动作、动作后时刻为t+1。视觉目测不独立证明物理抓持或安全。原始LeRobot文件、成功轨迹、LoRA权重、训练代码均未修改；没有运行训练或环境Rollout。
+
+## 最新结果：30k Fresh LoRA训练完成；30k L0T2 rollout未成功（2026-10-25）
+
+训练按配置完成30,000 optimizer steps，stop reason为`configured_optimizer_step_budget_completed`，自然退出；完整DCP与`full_weights.pt`均已保存。最终训练loss 0.002595、grad norm 0.04883。固定12样本Flow Matching MSE：step 0/2k/5k/10k/20k/30k分别为0.082770/0.008162/0.006052/0.007366/0.006572/0.002693；固定集曲线有波动，不能等同行为或安全性能。
+
+30k rank-32 Action Expert adapter有216张量/13,860,864参数。通过完整checkpoint与base+adapter的同输入动作对比，最大及平均绝对差均为0。随后使用同一初始状态、环境seed 0和policy seed 20261022运行1次L0T2 Student rollout：1800步没有原生成功，标准1000步与demo-only 1800步均失败，reward总和0、done=false。所有动作有限，记录1800步/180个chunk、双相机、物理状态、接触和45,000/45,000物理子步；Pot 2从首个后置状态到终态位移165.0 mm，Pot 1为0.62 mm，Ginger Beer为0.016 mm。
+
+该rollout没有安全证书：1800/1800个monitor row的完整25子步接触记录通过，但全几何clearance均不可用；监测到夹爪hand与Pot 2几何有22,190个子步接触事件，违反当前finger-only规则。未观察到Ginger Beer/Place Box直接机器人接触，但因缺少clearance扫描不能证明10 mm余量。故不能把该rollout作为Round 0安全数据。完整视频、OA trace、adapter校验及机器报告见`/opt/data/private/gs_opd/rollouts/l0t2_round0_lora30k_rollout_20261025/`；人读摘要为`rollout_summary.md`。
+
+30k完整checkpoint：`/opt/data/private/gs_opd/sft/l0t2_round0_fresh_rank32_lora_30k_20261025/checkpoints/global_step_30000/actor/model_state_dict/full_weights.pt`。当前训练进程已自然结束，没有停止或重启操作；原始训练数据和Round 0已验收LeRobot Episode未修改。
+
+## 训练中途loss快照：曲线导出至step 25,000（2026-10-25）
+
+从运行中的`step_metrics.jsonl`导出截至当时最新记录step 25,000的逐步loss CSV与曲线图；共25,000条有限loss记录。训练loss由step 1的0.054994降至step 25,000的0.001300，末尾200步均值0.000710；全程单步最低值0.0000293出现在step 13,382。固定12样本Flow Matching MSE在step 0/2k/5k/10k/20k分别为0.082770/0.008162/0.006052/0.007366/0.006572。固定评估曲线并未单调下降；训练loss只反映单Episode拟合，不代表rollout、安全或任务成功。
+
+图：`/opt/data/private/gs_opd/sft/l0t2_round0_fresh_rank32_lora_30k_20261025/loss_curve_until_step_25000.png`；逐步数据：`loss_curve_data_until_step_25000.csv`；固定评估：`fixed_eval_curve_until_step_25000.csv`；导出摘要：`loss_curve_export_summary_until_step_25000.json`。源训练日志保持追加，本图是本次导出时点的快照，后续训练不会自动更新该图。
+
+## 前期评测：20k Fresh LoRA checkpoint 的单次 L0T2 rollout 未完成任务（2026-10-25）
+
+从30k Fresh训练自动保存的`global_step_20000`导出rank-32 Action Expert adapter，并用已有推理校验入口对比全训练checkpoint与base+adapter：216个张量/13,860,864参数，预测差异最大值和均值均为0。rollout仅执行一次，基座仍为原始π₀.₅ Student；输入为L0T2 init-state 0、环境seed 0、policy seed 20261022。GPU1执行rollout，GPU0的30k训练PID 50239继续运行，没有停止、重启或覆盖训练状态。
+
+rollout在1800/1800步结束：标准1000步与demo-only扩展1800步均未成功，reward总和0、`task_success=false`、`done=false`。实际7D动作全部有限。完整保存了双相机的决策/后置Observation、1800步物理状态与接触、1800×25=45,000子步接触监测和agentview视频；Pot 1从首个后置状态到末步位移约0.00000063 m，Pot 2约0.10248 m，Ginger Beer约0.34933 m。
+
+这不是安全认证rollout：记录了全部25子步接触，但此Student入口未执行Safety Bridge的全几何/Operational clearance放行，所有步`geometry_monitoring.minimum_clearance_m=null`。接触日志含不符合当前规则的机器人—禁触对象接触，例如hand/Place Box 5,564次、link6/Place Box 2,925次、link5/Ginger Beer 679次；另有hand/Pot 2接触，不符合finger-only语义。故该行为结果不具备Native/Operational安全通过证书，不能加入Round 0训练数据或作为安全种子；不从接触日志推断未记录的精确穿透量。
+
+机器可读审计：`/opt/data/private/gs_opd/rollouts/l0t2_round0_lora20k_rollout_20261025/rollout_posthoc_audit.json`；同目录保留adapter、reload校验、完整`rollout_trace.npz`、视频及Student/Bridge日志。观察结果仅供后续模型评估参考；本轮未运行第二次rollout、未修改动作/安全阈值、没有停止训练。
+
+## 训练配置与运行记录：L0T2 Round 0 Fresh LoRA 30k已完成（2026-10-25）
+
+已由用户授权并启动单卡全新训练。独立配置 `examples/sft/config/gs_opd_l0t2_round0_fresh_lora_30k_20261025.yaml` 从已通过预检的10k配置复制，仅把实验名、`runner.max_steps`、`actor.optim.total_training_steps`改为30,000，把epoch上限设为63，并将固定评估点扩展至2k/5k/10k/20k/30k；保存间隔仍为5,000。`runner.resume_dir=null`、`gs_opd.initial_adapter_path=null`，基础π₀.₅冻结，rank-32 Action Expert LoRA从fresh初始化。学习率1e-4、constant、batch=3、GPU0、FSDP `no_shard`，数据集/变换/阶段采样/归一化与预检配置一致。
+
+运行输出目录 `/opt/data/private/gs_opd/sft/l0t2_round0_fresh_rank32_lora_30k_20261025/`，包含 `training_stdout.log`、`step_metrics.jsonl`、固定评估记录、最终`report.json`及周期Checkpoint。训练已完成30,000/30,000 optimizer steps，耗时26,256秒，stop reason为`configured_optimizer_step_budget_completed`；最终checkpoint见本节及顶部最新结果。训练loss不能解释为学会安全。
+
+**运行与自动保存核验：**训练最初由PID `50239`和exec session `81026`承载；达到30k后自然退出。未发送停止信号、未启动第二个训练进程。标准输出/错误、逐步指标、固定评估和每5,000步周期Checkpoint均保留；30k末步Checkpoint也已保存。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+EMBODIED_PATH=/workspace/zy_workspace/RLinf/examples/embodiment \
+PYTHONPATH=/workspace/zy_workspace/RLinf-gs-opd-overfit-recovery:/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
+/workspace/zy_workspace/RLinf/.venv/bin/python research/gs_opd/data/run_single_episode_sft.py \
+  --config-name gs_opd_l0t2_round0_fresh_lora_30k_20261025
+```
+
+## 前置进度：L0T2 Round 0 Fresh LoRA训练配置与单batch预检通过（正式训练前，2026-10-25）
 
 本轮只准备训练配置并做一次官方训练worker的前向/反向预检，没有运行训练loop、optimizer step或环境rollout，也没有改已验收LeRobot目录。配置文件为`examples/sft/config/gs_opd_l0t2_round0_fresh_lora_20261025.yaml`，预检入口为`research/gs_opd/data/preflight_round0_lora.py`；可复现正式启动命令见本节末。
 

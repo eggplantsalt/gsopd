@@ -1,6 +1,14 @@
 # GS-OPD 总体路线
 
-## 最新路线状态：L0T2 Round 0 Fresh LoRA配置已完成单batch预检（2026-10-25）
+## 当前路线状态：LeRobot训练Episode视觉与Observation–Action审计完成（2026-10-25）
+
+L0T2 Round 0仍有一条通过Native+Operational验收的1460步LeRobot v2.1训练Episode（Strict-10mm附加指标未通过）；本轮只读使用官方LeRobot 0.3.3 Reader逐帧检查数据，输出完整73秒双相机、20 FPS视频和机器可读审计。所有1460帧的索引、pre-action Observation、真实执行7D action及t→t+1时间对应通过；25个来源段及24个Snapshot接缝均在报告中逐项记录。t=1459是训练最后一帧，t=1460只保留为provenance终态证据。
+
+视觉报告无双相机重复帧、错位或超过稳健阈值的大幅跳变。t=10与t=398有小幅相机差异，被标作来源接缝人工查看项；对应前后画面连续且Snapshot兼容证据齐全。PandaGripper动作符号核对为负值张开、正值闭合、零值保持；t=6/9两条略低于−1的张开源动作原值保留并显式标注。视频、关键帧、接缝对照、JSON报告和复现入口在`/opt/data/private/gs_opd/audits/l0t2_round0_dataset_visual_audit_20261025/`与`research/gs_opd/data/audit_and_render_l0t2_round0_lerobot.py`。
+
+此前Fresh rank-32 LoRA 30k训练已自然完成；30k rollout 1800步任务未成功，且缺少全几何余量证书并出现hand–Pot 2接触，不作为安全样本。训练Checkpoint与失败rollout归档保留。本轮未修改数据集、源轨迹、训练代码或权重，也未启动训练或环境Rollout。
+
+## 前置路线状态：L0T2 Round 0 Fresh LoRA配置已完成单batch预检（2026-10-25）
 
 训练数据仍是已验收的单个LeRobot v2.1 L0T2 Episode（1460步、1451个合法10步窗口）。训练入口现在按逐动作provenance中的真实12阶段分类窗口，默认每个唯一窗口采样一次，并为batch=3补齐一个transport阶段窗口；不再使用旧L0T0 845帧和三阶段名称/采样数。
 
