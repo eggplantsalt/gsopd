@@ -1,5 +1,17 @@
 # GS-OPD 当前局部目标
 
+## 本轮结果：obstacle_avoidance/L0T1 原始 Student 基线（2026-10-25）
+
+复用现有 Safety Bridge 与 `research/gs_opd/smoke/pi05_rollout.py`，在 `obstacle_avoidance/L0T1`、init-state 0、seed 0 核实场景后，只运行一个最多 1000 步的原始 π₀.₅ Student Episode。实际指令为 `pick up the book and place it in the back compartment of the caddy`，BDDL SHA-256 为 `b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844`，原生目标是 `In(black_book_1, desk_caddy_1_back_contain_region)`。Student 使用 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`，未加载 LoRA；任务配置无需适配。
+
+本回合执行 1000 个真实 7D 动作、200 个决策块；原生成功从未为真，reward sum=0、`done=false`，到达步数上限。未观察到稳定抓书：1000 个动作步均没有机器人—书接触，书始终与桌面接触；最高书体 z 相对首个动作后只变化 17.0 mm。书未进入 caddy 后格，终态原生谓词为 false。Student 与 Beer 在 52 个动作步发生接触（步 37–99），与 Place Box 在 29 步接触（步 136–268）；书与 Beer 在第128步接触，未观察到书与 Place Box 或 caddy 的接触。失败轨迹和碰撞历史完整保留，不作为安全数据。
+
+全部 1000 个动作步均确认捕获 25/25 个 MuJoCo 子步，共 25,000 个；轨迹记录真实动作、200 个决策 Observation、每步双相机 Observation、机器人/物体状态、原生 reward/done/success 和被动接触监测。Safety Bridge 将接触按 Geom 对聚合为 occurrence count、首次子步和每动作覆盖计数，没有保存每个子步的原始接触点列表。起始与终止 Runtime Snapshot 均在活动 Bridge 模型内恢复校验通过；跨进程恢复还需匹配manifest中的模型几何 SHA 与场景元数据。视频为 1001 帧、20 FPS、agentview/wrist 并排 MP4。
+
+归档目录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_raw_student_seed0_init0_20261025_234627/`；任务摘要 `episode_summary.md`，机器报告 `episode_report.json`，原始 NPZ `raw_student_trace.npz`，双相机视频 `dual_camera_agentview_wrist_20fps.mp4`，Snapshot 位于 `snapshots/`。本轮没有使用官方安全示范、RRT、训练或 LeRobot 转换；安全 verdict 为 `not_evaluated`。下一步应基于该失败 trace 做离线阶段与碰撞归因，再按既定路线搜索任务成功轨迹；不得将它伪装为成功经验或安全 Episode。
+
+`pi05_rollout.py` 在模型加载后执行既有 Bridge reset。reset前后任务、BDDL、目标书/Beer/mug起始状态一致；caddy与Place Box的随机fixture根位置不同。实际Episode起始物理状态以 `raw_student_trace.npz` metadata中的 `initial_physical_state` 为准，已在归档报告中记录该差异。
+
 ## 本轮补充：LIBERO-Safety 跨场景配置盘点与代码复用修订（2026-10-25）
 
 本地只读盘点 `obstacle_avoidance` 与 `obstacle_avoidance_human` 的 L0/L1/L2 共 30 个任务，逐项整理 BDDL、符号初始状态、原生目标、接触代价对象、动态定义、技能需求与静态采集可行性。机器清单和 Markdown 表见 [task manifest](GS_OPD_LIBERO_SAFETY_TASK_MANIFEST.json) 与 [任务清单](GS_OPD_LIBERO_SAFETY_TASK_CHECKLIST.md)。本轮未读取/下载官方安全示范，未运行 Rollout、MuJoCo 或训练。

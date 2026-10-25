@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -70,6 +71,11 @@ def parse_args():
         "--trace-out",
         type=Path,
         help="Optional NPZ path for on-policy rollout transitions.",
+    )
+    parser.add_argument(
+        "--runtime-snapshot-dir",
+        type=Path,
+        help="Optional directory for recoverable initial and terminal Safety Bridge Snapshots.",
     )
     parser.add_argument(
         "--grasp-only-smoke",
@@ -176,6 +182,8 @@ def parse_args():
         parser.error("--video-out must use the .mp4 extension")
     if args.trace_out is not None and args.trace_out.suffix != ".npz":
         parser.error("--trace-out must use the .npz extension")
+    if args.runtime_snapshot_dir is not None and not args.record_physical_state:
+        parser.error("--runtime-snapshot-dir requires --record-physical-state")
     probe_inputs = (
         args.teacher_json,
         args.object_id,
@@ -2026,6 +2034,76 @@ def get_video_frame(data):
     return np.ascontiguousarray(get_libero_image({"agentview_image": frame}))
 
 
+def capture_runtime_snapshot(conn, snapshot_dir, label):
+    """Export, persist, and restore-verify one complete Bridge runtime Snapshot."""
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    conn.send({"op": "export_runtime_snapshot"})
+    exported = conn.recv()
+    payload = exported.get("payload") if isinstance(exported, dict) else None
+    if (
+        not isinstance(exported, dict)
+        or exported.get("status") != "complete"
+        or not isinstance(payload, bytes)
+        or not payload
+    ):
+        export_error = (
+            exported.get("error", exported.get("status", "invalid response"))
+            if isinstance(exported, dict)
+            else f"invalid response type {type(exported).__name__}"
+        )
+        raise RuntimeError(
+            f"{label} runtime Snapshot export failed: {export_error}"
+        )
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    if payload_sha256 != exported.get("payload_sha256"):
+        raise RuntimeError(f"{label} runtime Snapshot payload hash mismatch")
+
+    snapshot_path = snapshot_dir / f"{label}_runtime_snapshot.pkl"
+    temporary_path = snapshot_path.with_suffix(snapshot_path.suffix + ".tmp")
+    temporary_path.write_bytes(payload)
+    temporary_path.replace(snapshot_path)
+
+    before_state = np.asarray(
+        exported["snapshot_state"]["mujoco_integration_state"], dtype=np.float64
+    )
+    before_state_sha256 = hashlib.sha256(before_state.tobytes()).hexdigest()
+    conn.send({"op": "restore_runtime_snapshot", "payload": payload})
+    restored = conn.recv()
+    after_state = (
+        np.asarray(
+            restored.get("snapshot_state", {}).get("mujoco_integration_state", []),
+            dtype=np.float64,
+        )
+        if isinstance(restored, dict)
+        else np.asarray([], dtype=np.float64)
+    )
+    after_state_sha256 = hashlib.sha256(after_state.tobytes()).hexdigest()
+    restore_verified = (
+        isinstance(restored, dict)
+        and restored.get("status") == "restored"
+        and before_state.shape == after_state.shape
+        and before_state_sha256 == after_state_sha256
+    )
+    if not restore_verified:
+        restore_error = (
+            restored.get("error", restored.get("status", "state mismatch"))
+            if isinstance(restored, dict)
+            else f"invalid response type {type(restored).__name__}"
+        )
+        raise RuntimeError(
+            f"{label} runtime Snapshot restore verification failed: {restore_error}"
+        )
+    return {
+        "path": str(snapshot_path),
+        "payload_sha256": payload_sha256,
+        "model_geometry_sha256": exported.get("model_geometry_sha256"),
+        "schema_version": exported.get("schema_version"),
+        "restore_status": restored.get("status"),
+        "restore_verified": restore_verified,
+        "mujoco_integration_state_sha256": before_state_sha256,
+    }
+
+
 args = parse_args()
 
 if args.seed is not None:
@@ -2113,6 +2191,11 @@ try:
         ):
             raise RuntimeError("Bridge initial physical-state observation is unavailable")
         data = initial_observation
+    runtime_snapshot_records = {}
+    if args.runtime_snapshot_dir is not None:
+        runtime_snapshot_records["initial"] = capture_runtime_snapshot(
+            conn, args.runtime_snapshot_dir, "initial"
+        )
     trace_writer = None
     collection_enabled = args.on_policy_safety_collection
     trace_output_path = args.on_policy_safety_out if collection_enabled else args.trace_out
@@ -2151,6 +2234,8 @@ try:
         }
         if args.record_physical_state:
             trace_metadata["initial_physical_state"] = data.get("snapshot_state")
+        if args.runtime_snapshot_dir is not None:
+            trace_metadata["runtime_snapshot_dir"] = str(args.runtime_snapshot_dir.resolve())
         if args.grasp_only_smoke:
             trace_metadata.update({
                 "suite": active_scene.get("benchmark"),
@@ -3244,6 +3329,26 @@ try:
         if safety_summary_path is not None:
             print("SAFETY SUMMARY:", safety_summary_path, flush=True)
 
+    if args.runtime_snapshot_dir is not None:
+        runtime_snapshot_records["terminal"] = capture_runtime_snapshot(
+            conn, args.runtime_snapshot_dir, "terminal"
+        )
+        snapshot_manifest = {
+            "scene_metadata": data.get("scene_metadata"),
+            "instruction": data.get("instruction"),
+            "seed": args.seed,
+            "executed_steps": steps,
+            "snapshots": runtime_snapshot_records,
+            "safety_verdict": "not_evaluated",
+        }
+        manifest_path = args.runtime_snapshot_dir / "runtime_snapshot_manifest.json"
+        temporary_manifest_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        temporary_manifest_path.write_text(
+            json.dumps(snapshot_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_manifest_path.replace(manifest_path)
+
     active_scene = data.get("scene_metadata", {})
     result = {
         "suite": active_scene.get("benchmark", "obstacle_avoidance"),
@@ -3275,6 +3380,7 @@ try:
         "physical_state_recording": bool(args.record_physical_state),
         "substep_contact_recording": bool(args.record_substep_contacts),
         "seed": args.seed,
+        "runtime_snapshots": runtime_snapshot_records,
     }
     if args.grasp_only_smoke:
         scene = data.get("scene_metadata", {})

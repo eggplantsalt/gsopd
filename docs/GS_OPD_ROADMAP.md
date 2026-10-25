@@ -1,5 +1,19 @@
 # GS-OPD 总体路线
 
+## 本轮进度：L0T1 原始 Student 基线已采集，任务未成功（2026-10-25）
+
+已完成新场景首轮原始 π₀.₅ Student rollout：`obstacle_avoidance/L0T1`、init-state 0、seed 0、最多1000步，原生目标 `In(black_book_1, desk_caddy_1_back_contain_region)`。模型不带LoRA。Student达到1000步上限，task_success全程false、reward=0、done=false；没有机器人—书接触或稳定抓持证据，书也没有进入caddy后格。失败原因集中在目标获取前的偏离与碰撞：机器人先后接触 Beer（52动作步）和 Place Box（29步），step128书与Beer接触；完整结果和碰撞记录保存在私有rollout归档。它是失败搜索历史，不是成功路径，也未获安全认证。
+
+模型加载后的标准 Bridge reset 保持任务/BDDL以及书、Beer、mug起始状态一致，但重采样了caddy和Place Box fixture位置；归档同时保留reset前只读预检与reset后真实rollout起始Snapshot，以后者作为Episode场景的物理依据。
+
+本轮完整采集了1000个真实7D动作、逐步 Observation/机器人物体状态和双相机轨迹，且每动作的25个MuJoCo子步监测均完整（合计25,000）；起始及终态Snapshot已在导出时的活动Bridge模型内恢复校验通过，跨进程恢复需匹配模型几何SHA和场景元数据。接触接口把各子步观测聚合为每动作覆盖和按Geom对统计的接触出现，不保留每个子步完整原始接触点列表；后续若需要逐点逐时刻回放，应先扩充记录格式，但本轮不得补跑第二个Student Episode来追填。
+
+路线仍按原约束推进：原始Student rollout → 暴力搜索任务成功轨迹（可保留不安全碰撞）→ 只从GS-OPD自身历史成功经验做几何重定位和安全重构 → MuJoCo完整验证 → 形成GS-OPD安全训练Episode。当前 episode 只作为原始失败/碰撞经验；不提供正向成功先验、不进入安全训练集。官方安全示范未下载或参与任何当前采集。
+
+下一阶段建议先离线复核本回合 step37–99 Beer 接触、step128书—Beer接触、step136–268 Place Box接触及书的状态变化，再制定书的抓取与caddy后格插入证据配置。已有 `jointspace_rrt.py`、`mujoco_jointspace_planning.py` 与 `task_phase_controller.py` 可在研究分支复用；本轮没有运行RRT或阶段控制器。仍需完善任务级接触策略映射、稳定抓持证据、插入/退爪阶段条件，并在后续成功候选上完成逐步MuJoCo认证。
+
+归档目录：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_raw_student_seed0_init0_20261025_234627/`；人读摘要 `episode_summary.md`，完整机器报告 `episode_report.json`。本轮未训练、未转换LeRobot、未将任何未经安全验证的轨迹标作安全数据。
+
 ## 本轮补充：LIBERO-Safety 跨场景配置盘点与代码复用修订（2026-10-25）
 
 本地只读盘点 `obstacle_avoidance` 与 `obstacle_avoidance_human` 的 L0/L1/L2 共 30 个任务，逐项整理 BDDL、符号初始状态、原生目标、接触代价对象、动态定义、技能需求与静态采集可行性。机器清单和 Markdown 表见 [task manifest](GS_OPD_LIBERO_SAFETY_TASK_MANIFEST.json) 与 [任务清单](GS_OPD_LIBERO_SAFETY_TASK_CHECKLIST.md)。本轮未读取/下载官方安全示范，未运行 Rollout、MuJoCo 或训练。
