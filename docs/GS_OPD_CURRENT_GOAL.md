@@ -1,5 +1,15 @@
 # GS-OPD 当前局部目标
 
+## 最新局部结果：L0T2 Round 0 Fresh LoRA配置与batch预检通过，正式训练未启动（2026-10-25）
+
+已新增配置`examples/sft/config/gs_opd_l0t2_round0_fresh_lora_20261025.yaml`，并将`research/gs_opd/data/run_single_episode_sft.py`阶段窗口改为从训练集逐动作provenance读取，不再依赖845帧、固定三阶段名称或旧phase平衡策略。L0T2使用`task_phase`标签的12个实际阶段、1451个唯一Action Horizon=10合法窗口；每epoch对transport重复1窗以凑足batch=3，执行1452次曝光、484个完整batch。稀少抓取/释放阶段不会被过度复制。
+
+起点是L0T2 rollout既有Student checkpoint：`/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`，SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`。OpenPI审计确认667/667 base权重键覆盖且抽检权重差为0；训练时冻结base、新初始化rank-32 Action Expert LoRA（216 tensors、13,860,864参数），adapter及resume均为null。LIBERO norm stats SHA-256 `dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`。
+
+真实官方FSDP/OpenPI单batch forward/backward通过：actions=`[3,10,32]`、state=`[3,32]`；two real camera views map to base/left wrist slots, the official third right-wrist slot is zero-padded and masked false. Loss `0.05735647` finite，216个LoRA梯度均有限、108个非零；backward前后trainable权重digest不变，optimizer step=false。单RTX 4090峰值分配18.94 GB，峰值保留23.996 GB。当前3×4090，RLinf支持FSDP world-size数据并行，但单卡已满足batch资源需求，因此不用额外卡或模型切分。
+
+机器预检报告：`/opt/data/private/gs_opd/sft/round0_l0t2_fresh_lora_preflight_20261025/preflight_report.json`。主机有3×RTX 4090；官方RLinf FSDP可做数据并行，但当前GS-OPD provenance sampler约束world size=1，因此配置只用GPU 0的`no_shard`单卡方案。完整训练命令见`docs/GS_OPD_PROGRESS.md`本轮顶部或报告`resolved_config`。配置里的`1e-4`、constant schedule、0 warmup、batch 3、10,000 step预算取自此前成功fresh rank-32训练作为起始参考；正式LoRA训练仍未开始，下一目标是等用户明确开始训练后照该配置启动。
+
 ## 最新局部结果：Round 0 L0T2已导出并验证为一个LeRobot v2.1 Episode（2026-10-25）
 
 已将统一验收报告接受的25个连续物理归档段转换成一个1460步LeRobot v2.1 Episode，20 Hz、单任务`put both moka pots on the stove`。动作使用原始实际执行的7D float32标签，不归一化、不使用预测动作；图像与8D机器人状态均取动作前观察。沿用现有RGB 180°相机方向变换和LeRobot 8D状态表示。

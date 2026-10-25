@@ -1,5 +1,13 @@
 # GS-OPD 总体路线
 
+## 最新路线状态：L0T2 Round 0 Fresh LoRA配置已完成单batch预检（2026-10-25）
+
+训练数据仍是已验收的单个LeRobot v2.1 L0T2 Episode（1460步、1451个合法10步窗口）。训练入口现在按逐动作provenance中的真实12阶段分类窗口，默认每个唯一窗口采样一次，并为batch=3补齐一个transport阶段窗口；不再使用旧L0T0 845帧和三阶段名称/采样数。
+
+π₀.₅原Student checkpoint与L0T2 rollout所用本地文件相同（SHA-256 `4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`）。所有667个非LoRA权重键加载匹配；新建rank-32 Action Expert LoRA，基础模型冻结，未加载旧adapter/optimizer。官方OpenPI LIBERO图像、状态、7D动作与quantile normalization转换通过真实batch验证；loss有限、216个LoRA梯度有效且权重未变化。
+
+新配置：`examples/sft/config/gs_opd_l0t2_round0_fresh_lora_20261025.yaml`；机器报告：`/opt/data/private/gs_opd/sft/round0_l0t2_fresh_lora_preflight_20261025/preflight_report.json`。单GPU RTX 4090、FSDP `no_shard`即可做batch 3；RLinf后端支持多卡数据并行，但GS-OPD provenance sampler目前限定world size=1，因此本配置不调多卡或模型切分。正式优化训练仍未启动；10,000步、rank-32、`1e-4` constant lr等为此前成功配置的起始参考，是否开始训练由后续单独授权决定。
+
 ## 最新路线状态：首条L0T2 Operational安全成功候选已生成单Episode LeRobot v2.1数据（2026-10-25）
 
 统一验收通过的Round 0候选已转成独立LeRobot v2.1训练数据目录；25个原始分段在数据集中是**一个**20 Hz、1460步连续Episode。全部逐步真实7D动作、动作前双相机与8D状态已通过LeRobot 0.3.3 reader全量回读，1451个Action Horizon=10窗口均无跨终止填充。源段、阶段、24个Snapshot接缝、Native/Operational安全、逐动作重复记录的demo-only成功/标准1000失败/Strict-10mm附加失败项及源文件哈希均保存在数据manifest与逐动作provenance。

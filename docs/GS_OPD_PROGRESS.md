@@ -1,5 +1,29 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## 最新进度：L0T2 Round 0 Fresh LoRA训练配置与单batch预检通过（2026-10-25）
+
+本轮只准备训练配置并做一次官方训练worker的前向/反向预检，没有运行训练loop、optimizer step或环境rollout，也没有改已验收LeRobot目录。配置文件为`examples/sft/config/gs_opd_l0t2_round0_fresh_lora_20261025.yaml`，预检入口为`research/gs_opd/data/preflight_round0_lora.py`；可复现正式启动命令见本节末。
+
+入口`run_single_episode_sft.py`已移除旧845帧校验、三段旧阶段名称、固定48样本phase evaluation及旧阶段进展逻辑。现在从1460行`per_action_provenance.jsonl`读取逐动作`task_phase`，把每个10步窗口按起始动作阶段自动分类；每epoch覆盖1451个唯一合法窗口，按micro-batch 3补一个transport窗口使schedule为1452次曝光/484个完整batch。稀少的close/release阶段不重复平衡到transport规模。动作监督仍来自LeRobot记录的实际执行7D OSC_POSE标签；官方OpenPI/LeRobot transforms保留。
+
+**Checkpoint与初始化：**L0T2 rollout使用的原始π₀.₅ Student基础文件为`/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`，SHA-256=`4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7`，与L0T2已归档`student_checkpoint`路径一致。当前OpenPI装载审计匹配全部667个非LoRA模型权重，缺失/意外权重0，抽检`action_out_proj.weight`最大误差0。Rank-32 Action Expert产生216个新LoRA张量（13,860,864可训练参数）；base冻结、`initial_adapter_path=null`、`resume_dir=null`，未载入旧LoRA或旧优化器状态。归一化统计来自同一Student checkpoint的LIBERO `norm_stats.json`，SHA-256=`dae37d79a22108af83df9189c6710a3ec8e077d65b28e34bdf1da724e5ae30f1`。
+
+**兼容性与单batch证据：**官方`pi05_libero` transform载入20 Hz、2路动作前相机、8D原始状态及7D实际动作；图像resize为224×224，状态转为32维，动作chunk为10且7D标签按LIBERO quantile统计规范化、补齐到32维。LIBERO模型保留base/left/right三个视觉slot；右腕为零填充且mask=false，其余两个slot分别对应agentview与eye-in-hand。真实batch张量形状为图像`[3,3,224,224]`×3 slot、state`[3,32]`、actions`[3,10,32]`。一次真实官方FSDP SFT forward/backward得到loss `0.05735647`；216/216 LoRA张量有有限梯度，108个非零，梯度L2范数`0.0279677`；前后可训练权重digest完全相同，optimizer step=false。RTX 4090单卡峰值分配18,944,792,576 B、峰值保留23,995,613,184 B。
+
+当前主机有3×RTX 4090。RLinf FSDP/OpenPI worker本身按world size支持数据并行，但此GS-OPD provenance sampler明确只接受1个sampler replica；当前batch 3可在单卡完成，因此选`world_size=1`、`sharding_strategy=no_shard`，不添加模型切分或多卡调度。初始训练参考采用此前成功Fresh rank-32 run的`lr=1e-4`、constant schedule、0 warmup、micro/global batch 3；10,000步与30 epoch上限只保留为待用户后续启动时的配置参考，本轮未优化。
+
+机器可读预检：`/opt/data/private/gs_opd/sft/round0_l0t2_fresh_lora_preflight_20261025/preflight_report.json`；其中包含resolved config、数据manifest/验收哈希、逐阶段窗口统计、Checkpoint/Norm哈希、LoRA参数名、GPU与内存数据；同目录`launch_manifest.json`记录配置/脚本/报告SHA-256及预检和正式训练命令。正式训练启动命令（本轮未执行）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+EMBODIED_PATH=/workspace/zy_workspace/RLinf/examples/embodiment \
+PYTHONPATH=/workspace/zy_workspace/RLinf-gs-opd-overfit-recovery:/workspace/zy_workspace/RLinf:/workspace/zy_workspace/LIBERO-Safety \
+/workspace/zy_workspace/RLinf/.venv/bin/python research/gs_opd/data/run_single_episode_sft.py \
+  --config-name gs_opd_l0t2_round0_fresh_lora_20261025
+```
+
+训练尚未开始；这仍是1条1460步Operational安全成功Episode，demo-only成功、标准1000步失败、Strict-10mm未通过附加统计。LoRA未训练，LeRobot数据、历史1093步示范和归档均未覆盖。
+
 ## 最新进度：Round 0 L0T2候选转换为单个LeRobot v2.1成功Episode（2026-10-25）
 
 只使用统一验收报告引用的25段既有归档，生成独立数据集`/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025/`。数据格式为LeRobot v2.1、20 Hz，只有**1个连续Episode、1460帧/动作**，没有把25段来源误当作25条成功样本。动作标签直接使用每步执行记录的float32 7D `actions`/`executed_actions`，不使用预测动作、不做动作归一化；观察取动作前双相机与机器人状态。LeRobot特征为`image`、`wrist_image`、8D（EEF xyz、轴角、夹爪qpos）`state`及7D `actions`。两路相机沿用现有OpenPI/LeRobot导出器的RGB 180°方向变换。
