@@ -1,5 +1,19 @@
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
 
+## L0T1 书本冷启动：t=0 全几何门禁阻断（2026-10-26）
+
+从原始 Student 归档严格恢复了 `obstacle_avoidance/L0T1`、init-state 0、seed 0。初始 Runtime Snapshot SHA-256 `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`、模型几何 SHA-256 `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`、Integration State SHA-256 `41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522` 全部匹配。原生指令与BDDL身份匹配。快照中的 Book/Caddy/Beer/Place Box 位姿已写入 `scene_start.json`；以黑书 group-0 碰撞盒、Panda实际指垫中心和 Beer/Place Box 最近邻方向生成24个独特候选，未复制 Moka Pot 姿态。
+
+Bridge 初始全几何检查为 `unsafe`，唯一违规是固定底座 `mount0_pedestal_col`（robot geom 90）与world body 0未命名floor geom 14的静态基线重叠，signed distance `-0.09945999999982881 m`。Beer/Place Box机器人间隙为66.233/142.490 mm；没有书—Beer或书—Place Box对象接触、自碰撞或关节越限。现有Bridge把该底座—地面重叠纳入全几何门禁，故在不改变安全阈值或修改规划/仿真代码的限制下，执行在候选筛选之前停止。
+
+实际搜索预算：生成24个几何候选；IK/全几何候选筛选0，RRT-Connect预检0/4，Snapshot物理分支0/2，OSC动作0、MuJoCo子步0。没有任何候选获得IK可行结论，也没有成功或失败抓持Snapshot、真实动作、子步轨迹或视频。不得把这次静态候选生成写成抓取成功数据。
+
+组件盘点：已有 `grasp_retargeting.py`、7D RRT-Connect、`mujoco_jointspace_planning.py`、OSC_POSE、`GraspStabilityMonitor` 与 `task_phase_controller.py`。当前缺口是Bridge对固定底座—floor基线重叠的显式建模；下一次若要继续，需要在保持动态机器人—Beer/Place Box禁触、书本双指合法接触、其余全几何与关节阈值不变的前提下，为这个已核验的静态支持关系提供局部处理，然后重新从t=0筛选。该代码扩展本轮未做。
+
+附加静态审查：现有 `screen_grasp_candidates` 在末端指垫距离检查前会恢复开夹爪 qpos；其闭合接触几何结果可能是假阴性。本轮因初始全几何门禁而没有调用该筛选器，未修改规划/仿真代码。清除基线门禁后，需先为该接触检查增加不改变阈值的任务适配，再进行实际抓持分支。
+
+完整失败前置证据与24候选归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_cold_grasp_20261026_attempt1/`（`run_report.json`、`initial_safety_geometry.json`、`scene_start.json`、`geometry_candidates.json`、Snapshot副本及source包）。未读取/使用官方安全示范；未执行 Student Rollout、物理分支、Caddy插入、训练或LeRobot转换，`safety_certified=false`。原始Student → 暴力任务成功搜索（允许不安全）→ 仅用自身历史成功经验几何重定位与安全重构 → MuJoCo完整验证 → GS-OPD安全Episode 的路线保持不变。
+
 ## 本轮实验：L0T1 原始 π₀.₅ Student Rollout 完成（2026-10-25）
 
 ### 场景与模型

@@ -1,5 +1,15 @@
 # GS-OPD 总体路线
 
+## 最新路线状态：L0T1 书本抓取冷启动被静态底座—地面门禁阻断（2026-10-26）
+
+已从原始Student的t=0 Runtime Snapshot核对并恢复L0T1；场景、BDDL、原生目标及编译模型指纹一致。按活动黑书碰撞盒与真实Panda指垫生成24个几何候选，但现有全几何Safety Bridge在任何候选筛选前就判定初态unsafe：Panda固定底座 geom 90 与 world floor geom 14 有 `-99.460 mm` signed-distance重叠。该项不是 Beer 或 Place Box 违规；两者对机器人最小距离为66.233/142.490 mm，书与两者t=0无对象接触。
+
+本轮没有运行候选IK、RRT、OSC物理分支或抬升，故抓取Snapshot、双相机操作视频和实际动作/子步记录都未产生；24个候选只是几何生成结果，不代表可执行抓取。完整证据和失败分类保存在 `/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_cold_grasp_20261026_attempt1/`。
+
+已有 `grasp_retargeting.py`、`jointspace_rrt.py`、`mujoco_jointspace_planning.py`、OSC_POSE、抓持验证与`task_phase_controller.py`可复用，不能再记作“缺少RRT/阶段控制器”。重启该试点前需为固定底座—floor基线重叠设计局部、可审计的几何处理；不得降低Beer/Place Box禁触余量、书本指垫接触容差、关节限位或BDDL规则。该处理本轮没有授权实施。无官方安全示范数据参与，既定Student rollout、暴力搜索、自有成功经验重定位、安全重构与MuJoCo验收路线不变。
+
+解除初态门禁后还需处理一个未运行验证的接口风险：当前 `screen_grasp_candidates` 的最终对向指垫距离计算发生在开夹爪姿态；接触筛选需在不放宽容差的条件下与闭合几何一致。本轮未调用该筛选器，也未改规划/仿真源码。
+
 ## 本轮进度：L0T1 原始 Student 基线已采集，任务未成功（2026-10-25）
 
 已完成新场景首轮原始 π₀.₅ Student rollout：`obstacle_avoidance/L0T1`、init-state 0、seed 0、最多1000步，原生目标 `In(black_book_1, desk_caddy_1_back_contain_region)`。模型不带LoRA。Student达到1000步上限，task_success全程false、reward=0、done=false；没有机器人—书接触或稳定抓持证据，书也没有进入caddy后格。失败原因集中在目标获取前的偏离与碰撞：机器人先后接触 Beer（52动作步）和 Place Box（29步），step128书与Beer接触；完整结果和碰撞记录保存在私有rollout归档。它是失败搜索历史，不是成功路径，也未获安全认证。

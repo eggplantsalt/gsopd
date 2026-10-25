@@ -1,5 +1,17 @@
 # GS-OPD 当前局部目标
 
+## 最新局部状态：L0T1 书本冷启动停在 t=0 全几何门禁（2026-10-26）
+
+已从原始 Student 的 `initial_runtime_snapshot.pkl` 严格恢复 `obstacle_avoidance/L0T1`、seed 0、init-state 0；Snapshot SHA-256 为 `41e9846c4d6cc983816d866d3c24aa554740ff427cd3982bed9be8102342103d`，模型几何 SHA-256 为 `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`，Integration State SHA-256 与 manifest 一致（`41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522`）。指令、BDDL 哈希与原生目标均匹配；书、Caddy、Beer、Place Box 的真实 t=0 位姿及碰撞绑定已归档。按书本 group-0 碰撞盒和活动 Panda 指垫几何生成了24个不同候选。
+
+候选 IK/RRT 与物理分支尚未运行。初始全几何门禁报告 `unsafe`：唯一几何余量违规是固定 Panda 底座 `mount0_pedestal_col`（robot geom 90）与 world body 0 的未命名 floor geom 14 的基线 signed distance `-99.460 mm`。Beer、Place Box 对机器人的最小距离分别为 `66.233 mm`、`142.490 mm`；t=0 未见书—Beer或书—Place Box接触、机器人自碰撞或关节越限。由于既有 Safety Bridge 会把这个不随任务动作变化的底座—地面重叠判为 unsafe，本轮没有放宽阈值，也没有启动 RRT OSC 预演或物理动作。因此本轮没有书本抓取 Snapshot、动作 trace 或视频；不能把24个几何姿态称为IK可行或可抓取候选。
+
+搜索预算实际消耗：几何候选生成24/24；IK与完整候选筛选0，RRT预检0/4，Snapshot物理分支0/2，真实控制动作0，MuJoCo动作子步0。代码盘点确认 `grasp_retargeting.py`、7D `JointSpaceRRTConnect`、`mujoco_jointspace_planning.py` 适配器、OSC_POSE、抓持稳定验证器和 `task_phase_controller.py` 均已存在；当前阻塞是基线静态几何处理，不是缺少RRT或阶段控制器。需要先为已验证的固定底座—地面支撑重叠补充明确且局部的几何处理，并保留 Beer/Place Box、书本合法指垫接触、其他机器人几何、关节与BDDL门槛，再从原始 t=0 重新做筛选。该扩展本轮未实施。
+
+另一个静态代码审查发现：`screen_grasp_candidates` 在开夹爪姿态完成接近检查后，末端对向指垫距离检查仍沿用开夹爪 qpos；本轮未运行该筛选，也未修改规划代码。解除底座—地面门禁后，还需先修正/适配这一筛选接口，再将抓持接触判定交给物理分支核验。
+
+归档：`/opt/data/private/gs_opd/rollouts/obstacle_avoidance_L0T1_t0_book_cold_grasp_20261026_attempt1/`；关键文件为 `run_report.json`、`scene_start.json`、`geometry_candidates.json`、`initial_safety_geometry.json`、初始 Snapshot 副本及 `source/`。没有运行 Student Rollout、加载LoRA、使用官方安全示范、执行完整任务、训练或LeRobot转换；安全认证为 false。既定原始 Student → 暴力搜索（允许不安全）→ 自有历史成功经验几何重定位与安全重构 → MuJoCo完整验证 → GS-OPD安全Episode路线不变。
+
 ## 本轮结果：obstacle_avoidance/L0T1 原始 Student 基线（2026-10-25）
 
 复用现有 Safety Bridge 与 `research/gs_opd/smoke/pi05_rollout.py`，在 `obstacle_avoidance/L0T1`、init-state 0、seed 0 核实场景后，只运行一个最多 1000 步的原始 π₀.₅ Student Episode。实际指令为 `pick up the book and place it in the back compartment of the caddy`，BDDL SHA-256 为 `b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844`，原生目标是 `In(black_book_1, desk_caddy_1_back_contain_region)`。Student 使用 `/workspace/zy_workspace/checkpoints/gs_opd/pi05_rlinf_libero_sft/model.safetensors`，未加载 LoRA；任务配置无需适配。
