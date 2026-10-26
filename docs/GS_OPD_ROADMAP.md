@@ -518,3 +518,10 @@ run19→run46→run47→run48→run52→run53的1335个原始动作按timestep�
 1. 保持已重建L1T2 Episode为只读来源，先完成其Observation/action对齐、接触标签和来源链的独立离线复核；转换时保留done后77步的扩展horizon协议元数据。
 2. 仅把任务成功作为Task-Success候选；由既有严格Safety Reconstruction独立生成/拒绝安全后缀，不降低接触和安全余量规则。
 3. 安全认证与数据格式复核完成后，再由用户安排LeRobot转换或下一跨场景迁移；不把本次成功解释为标准horizon成功或安全Episode。
+## Round60执行停滞诊断更新（2026-10-26）
+
+L2T2 Round60的41步真实动作与1025个子步接触已完成只读诊断。Round60/61/62仍没有新的完整成功轨迹；本轮没有增加RRT候选、物理搜索或训练。首个明显控制失配在t=2607：执行器命令的平移与真实EEF运动方向开始冲突，随后24步的真实位移均值0.742 mm，23/24步方向相反。
+
+优先级调整为先补齐“规划路线—物理执行”证据链：Round60代码路径会把RRT `qpos_path`转成压缩EEF waypoint并交给独立OSC跟踪，分支归档只保留规划摘要，没有保存选中关节路径或逐动作局部目标。关节限位违规为0；Hand Geom 74—Pot2 Geom 117非指垫接触从起始Snapshot持续存在，且停滞时穿透/法向负载未增加，不能据此判定它为直接根因。后续应先持久化关节与EEF参考、Waypoint映射和局部误差，再针对性验证路线跟踪；不放宽安全约束，不用重复增加同类搜索轮次替代诊断。
+
+Round60诊断机器报告和逐步指标见归档`evidence/round60_stagnation_diagnostic.json`及`evidence/round60_stagnation_diagnostic.md`。准确局部Waypoint误差、实际qpos相对RRT路径偏差和Hand–Pot接触的因果影响仍标为unknown。L1T2完整稳定Episode继续保留为已验收的GS-OPD经验来源，且不视为Safety-Certified数据。

@@ -574,4 +574,10 @@ t=20 Snapshot 恢复通过，模型几何指纹为 `1a0c219c…f7a9f752`。运�
 最终`t=1412`原生Pot1 On、Pot2 On、Stove Turnon均真，reward=1、done=true。77步后缀跨越t=1335的原生done：使用demo-only horizon=1600，同一环境继续执行真实动作，未改BDDL/成功判据、未写入物体状态；因此它不是标准1000步Benchmark协议。Settling 500个物理子步谓词全真、Pot2零位姿跨度，末态和整个Settling均无手爪–Pot2接触。后成功阶段仍记录到678个手爪–Pot2接触子步（t=1336–1364与1366–1367），不做安全认证。
 
 完整数据及hash清单位于 `/opt/data/private/gs_opd/rollouts/l1t2_success_episode_reconstruction_20261026_attempt2/`。可用于后续LeRobot转换的Action/Observation素材已保存，本轮没有转换或训练。当前局部任务完成；下一步如继续GS-OPD，应先对该数据执行独立Safety Reconstruction/接触分层审计，再由用户安排LeRobot转换或其它场景任务，不把task-success样本自动并入安全训练集。
+## 当前局部目标更新（2026-10-26）：Round60停滞只读诊断完成，暂停新搜索
 
+Round60的41步/1025子步归档已完成离线对照；Round60/61/62不因本次报告而增加新的RRT候选或物理搜索。首个可观察到的OSC命令与实际EEF运动失配发生在t=2607，后24步平均EEF位移0.742 mm，23/24步实际平移方向与命令相反。目标RRT局部Waypoint和选中7D `qpos_path`未归档，所以精确局部误差及实际关节轨迹相对RRT轨迹均为unknown。
+
+代码审计发现执行器将RRT输出降为压缩EEF路径后以OSC重新跟踪，未保留关节构型参考；这是优先排查项，不是已经证明的唯一失败原因。Geom 74 Hand–Pot2 Geom 117接触从t=2589起始Snapshot持续贯穿1025子步，最大穿透0.179 mm；停滞期间穿透与法向力没有恶化。接触可能限制运动，因果仍unknown；安全策略保持原样。
+
+诊断JSON与Markdown保存在Round60归档`evidence/round60_stagnation_diagnostic.{json,md}`。后续如继续，先在不执行物理分支的工作中补齐RRT qpos/EEF参考、压缩Waypoint索引和逐步局部目标记录，并修复keypose位姿matrix同步；得到可复核实现后，再由用户安排下一次物理验证。保留L1T2完整稳定Episode为只读经验源；不启动训练。

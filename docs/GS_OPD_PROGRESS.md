@@ -3762,3 +3762,16 @@ t=1335首次出现原生task success；`On(moka_pot_1, flat_stove_1_cook_region)
 机器报告 `episode_report.json` SHA-256 `a7e5a5c748ee3b9dc141a9bac7209f16f0b9c2002d2b4089c69e28a74ae14cd6`；动作SHA `998b3f69a323f1e2970f6c4298f7c737ce0d79e070e5a91c5f917977a8c2116e`，Observation SHA `152ec641c9ff48b78d588ff1e6be8da09e95d713da70a8218585cea57e6f58f4`，物理子步SHA `cf0339062ea8f4a424ddc5f6e0ae5b22856de2b996c053a6ee37de82e8cac0ad`，视频SHA `a0f7a2d41cb2ce122cceac312bf60d2bdcde0cc252554d15f57808385dcf34bb`。重放结束后首个汇总器因接触容器格式差异报错；动作和物理执行已全部落盘。修正读档器后直接离线复核完整归档，没有重跑物理动作，最终报告状态为`complete_physical_success_episode_reconstructed`。
 
 复现入口：`research/gs_opd/repair/replay_l1t2_success_episode.py`；来源序列、hash、失败恢复与报告重算都有针对性回归。`test_replay_l1t2_success_episode.py`：4 passed；Ruff通过。没有使用官方示范、训练或LeRobot转换。
+## L2T2 Round60预放置停滞只读诊断（2026-10-26）
+
+按本轮范围只读取Round60归档、Round55起始物理记录、Safety Bridge日志及规划/执行代码；没有启动新MuJoCo分支或RRT搜索，没有修改代码、停滞阈值或安全规则。Round60从Round55在t=2589的物理状态续接，模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`、BDDL SHA `58b3db56352473e7c4534769911a0ad48ea7c214f934fcb4403b6c1da5467b523`；报告的Snapshot恢复为`verified_exact`。分支中有41个真实动作（t=2590–2630）和1025/1025条接触子步记录，Pot2 On=false、task_success=false、reward=0、done=false。
+
+使用OSC_POSE归一化输入对应的世界平移增益0.05 m/input还原命令后，前17步真实EEF位移均值3.213 mm、命令/运动方向余弦均值0.718。动作记录#17（执行后t=2607）开始出现显著失配：请求平移`[-1.35,-2.45,-7.50] mm`，真实位移`[+2.52,+0.73,-0.81] mm`；之后24步的真实位移均值降至0.742 mm、方向余弦均值−0.300，其中23/24步方向相反。到最终keypose的位置误差仍由t=2606的66.31 mm降至t=2630的54.82 mm；执行器的停滞逻辑检查的是压缩RRT路径上的当前局部子目标，而不是这个最终keypose。局部子目标误差和Waypoint索引没有写入动作记录，因而无法逐值复原触发停滞判断的数据。
+
+路径代码审计确认：`mujoco_jointspace_planning.py`返回`qpos_path`与EEF参考路径；`task_success_first_executor.py`仅把EEF路径交给`_compress_eef_route`，再由`_advance_pose`使用OSC跟踪。所选RRT 7D关节参考没有被执行或写入本分支报告。Round60仅保留RRT状态`offline_feasible`、规划11.190 s、161次configuration checks、1次迭代等摘要。因此，RRT可行路线在转换/压缩/OSC跟踪中丢失关节构型信息是最有力的系统性根因假设；实际qpos与所选RRT qpos的偏差为unknown，不能证明其单独造成本次失败。另发现keypose的`position_m`与同一行matrix平移不一致约186.84 mm；本次执行器使用`position_m`，这是报告/序列化问题，不能据此认定它改变了执行目标。
+
+关节记录显示7个Panda关节在41步及1025个子步均无关节限位违规；本地MJCF计算的最小限位余量为joint4的0.398 rad，不支持关节限位阻塞。非指垫Hand–Pot2接触对为`gripper0_hand_collision`（Geom 74，Body `gripper0_right_gripper` 12）与`moka_pot_2_g14`（Geom 117，Body `moka_pot_2_main` 24）。它已存在于t=2589起始`start_contacts`，并出现在1025/1025个物理子步；有符号距离范围−0.179至−0.156 mm，负值为穿透。控制边界有42个力样本，法向分量1.848–2.134 N，三轴合力范数1.856–2.312 N；没有逐子步wrench。后24步的平均穿透深度略减，法向力均值由前17步窗口的1.990 N降至1.867 N。因此，接触确实存在且可能限制运动，但“停滞时接触加重”不受证据支持，机械阻挡因果为unknown。该接触仍按既有规则记录为forbidden，没有白名单化。
+
+机器逐步报告：`/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/round60_stagnation_diagnostic.json`（SHA-256 `22fc96c134d86fb7d39f0a20668a6be46320eee44e6b8634700a4eba8b0397d9`）；可读摘要同目录`round60_stagnation_diagnostic.md`。报告分别列出已证实问题、推测根因和缺失字段。最小建议是后续获准执行时持久化所选RRT关节路径、完整EEF参考、压缩后Waypoint及逐动作局部目标误差，保留或验证7D参考跟踪；继续把Hand–Pot接触保留为真实物理约束，并同步修正keypose `position_m`与matrix的序列化一致性。本轮没有实施修复，也没有运行测试或Rollout。
+
+Round60/61/62未成功的轮次保持归档，本轮不增加候选或物理搜索；L1T2完整稳定Episode与其历史记录未改。
