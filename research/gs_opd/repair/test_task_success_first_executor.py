@@ -19,6 +19,8 @@ from multiprocessing.connection import Client, Listener
 import numpy as np
 
 from research.gs_opd.repair.task_success_first_executor import (
+    _make_precomputed_rrt_route_cache,
+    _validate_precomputed_rrt_route,
     _phase_evidence,
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
@@ -27,6 +29,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _native_placement_planner_target,
     _object_contact_escape_direction,
     _placement_ik_seed_portfolio,
+    _preflight_row_is_task_success_admissible,
     _register_verified_operation_skill_from_report,
     _release_retreat_target,
     _select_active_target_predicate,
@@ -35,6 +38,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _verified_runtime_snapshot_descriptor,
     _verify_planner_live_state,
     _transport_exception_outcome,
+    _task_success_waypoint_fallback_reason,
 )
 from research.gs_opd.repair.task_success_first_grasp_search import BridgeSession
 from research.gs_opd.repair.task_success_first_grasp_search import (
@@ -47,6 +51,113 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_task_success_search_can_physically_try_valid_ik_after_rrt_timeout(self):
+        row = {
+            "admitted_to_physical_search": False,
+            "preplace_RRT": {
+                "status": "no_safe_path",
+                "failure_reason": "planning_time_budget_exhausted",
+                "ik_candidate_count": 3,
+            },
+            "terminal_pose_IK_RRT_diagnostic": {
+                "status": "not_run_after_unreachable_preplace_route",
+                "ik_candidate_count": 0,
+            },
+        }
+        self.assertIsNotNone(_task_success_waypoint_fallback_reason(row["preplace_RRT"]))
+        self.assertTrue(_preflight_row_is_task_success_admissible(row))
+        blocked_ik = {
+            **row,
+            "preplace_RRT": {**row["preplace_RRT"], "ik_candidate_count": 0},
+        }
+        self.assertIsNone(_task_success_waypoint_fallback_reason(blocked_ik["preplace_RRT"]))
+        self.assertFalse(_preflight_row_is_task_success_admissible(blocked_ik))
+        collision_rejection = {
+            **row,
+            "preplace_RRT": {
+                "status": "no_safe_path",
+                "failure_reason": "IK_solution_collides_with_hard_joint_limit",
+                "ik_candidate_count": 3,
+            },
+        }
+        self.assertFalse(_preflight_row_is_task_success_admissible(collision_rejection))
+
+    def test_precomputed_rrt_route_requires_exact_planning_identity_and_intact_paths(self):
+        goal = {
+            "position_world_m": [0.1, -0.2, 0.3],
+            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        }
+        policy = {"carried_object": {"object_id": "pot_2"}, "forbidden": [5, 9]}
+        config = {"seed": 83, "search_time_budget_s": 12.0, "require_safe_configurations": False}
+        result = {
+            "status": "offline_feasible",
+            "qpos_path": np.arange(21, dtype=np.float64).reshape(3, 7).tolist(),
+            "eef_reference_poses_world": [
+                [0.1, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+                [0.11, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+                [0.12, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+            ],
+            "planning_seconds": 1.25,
+            "config_checks": 17,
+            "iterations": 8,
+        }
+        cache = _make_precomputed_rrt_route_cache(
+            result=result, model_sha256="model", bddl_sha256="bddl",
+            start_state_sha256="start", goal_pose_world=goal,
+            safety_geometry_policy=policy, planner_config=config,
+        )
+        self.assertIsNotNone(cache)
+        accepted = _validate_precomputed_rrt_route(
+            cache, model_sha256="model", bddl_sha256="bddl",
+            start_state_sha256="start", goal_pose_world=goal,
+            safety_geometry_policy=policy, planner_config=config,
+        )
+        self.assertTrue(accepted["reusable"])
+        self.assertEqual(accepted["qpos_path"].shape, (3, 7))
+        self.assertEqual(accepted["eef_reference_poses_world"].shape, (3, 7))
+
+        mismatches = (
+            {"model_sha256": "other"}, {"bddl_sha256": "other"},
+            {"start_state_sha256": "other"},
+            {"goal_pose_world": {**goal, "position_world_m": [0.100001, -0.2, 0.3]}},
+            {"safety_geometry_policy": {**policy, "forbidden": [5, 10]}},
+            {"planner_config": {**config, "seed": 84}},
+        )
+        for change in mismatches:
+            kwargs = {
+                "model_sha256": "model", "bddl_sha256": "bddl",
+                "start_state_sha256": "start", "goal_pose_world": goal,
+                "safety_geometry_policy": policy, "planner_config": config,
+            }
+            kwargs.update(change)
+            with self.subTest(change=next(iter(change))):
+                rejected = _validate_precomputed_rrt_route(cache, **kwargs)
+                self.assertFalse(rejected["reusable"])
+                self.assertIn("mismatch", rejected["reason"])
+
+        damaged = json.loads(json.dumps(cache))
+        damaged["paths"]["qpos_path_rad"][1][0] += 0.01
+        rejected = _validate_precomputed_rrt_route(
+            damaged, model_sha256="model", bddl_sha256="bddl",
+            start_state_sha256="start", goal_pose_world=goal,
+            safety_geometry_policy=policy, planner_config=config,
+        )
+        self.assertEqual(rejected["reason"], "route_cache_path_integrity_mismatch")
+
+    def test_precomputed_rrt_route_rejects_unaligned_or_malformed_paths(self):
+        with self.assertRaisesRegex(ValueError, "unaligned_joint_and_EEF_paths"):
+            _make_precomputed_rrt_route_cache(
+                result={
+                    "status": "offline_feasible",
+                    "qpos_path": [[0.0] * 7, [1.0] * 7],
+                    "eef_reference_poses_world": [[0.0] * 7],
+                },
+                model_sha256="model", bddl_sha256="bddl",
+                start_state_sha256="start",
+                goal_pose_world={"position_world_m": [0, 0, 0], "quaternion_wxyz": [1, 0, 0, 0]},
+                safety_geometry_policy={}, planner_config={},
+            )
+
     def test_eef_route_compression_preserves_source_index_mapping(self):
         poses = np.zeros((5, 7), dtype=np.float64)
         poses[:, 0] = [0.0, 0.004, 0.021, 0.024, 0.050]

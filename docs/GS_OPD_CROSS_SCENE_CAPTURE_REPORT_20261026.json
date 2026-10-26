@@ -1,0 +1,152 @@
+{
+  "schema_version": "gs_opd_cross_scene_capture_report.v1",
+  "date": "2026-10-26",
+  "branch": "gs-opd-overfit-recovery-08a0198",
+  "objective": "generic exact-identity RRT route reuse followed by bounded L2T2 physical attempt and human/L0T2 fallback",
+  "outcome": {
+    "complete_task_success_episodes": 0,
+    "native_bddl_success_required": true,
+    "all_physical_actions_used_mujoco": true,
+    "direct_robot_or_object_state_writes": false,
+    "official_demonstrations_used": false,
+    "training_started": false,
+    "safety_certified_episodes": 0,
+    "new_task_specific_scripts": 0,
+    "manual_scene_pose_adjustments": 0
+  },
+  "elapsed_time_accounting": {
+    "total_wall_seconds_persisted": false,
+    "reason": "executor reports do not persist trustworthy end-to-end wall duration; filesystem timestamps were inconsistent",
+    "human_l0t2_time_to_first_verified_stable_grasp_seconds": 454.4161392226815,
+    "l2t2_cached_route_planning_seconds": 11.427326861768961
+  },
+  "route_cache": {
+    "schema_version": "gs_opd_precomputed_rrt_route.v1",
+    "source_scene": "obstacle_avoidance/L1T2 GS-OPD-owned successful keypose experience",
+    "identity_fields": [
+      "model_geometry_sha256",
+      "bddl_sha256",
+      "start_state_sha256",
+      "goal_pose_world",
+      "safety_geometry_policy_sha256",
+      "planner_config_sha256"
+    ],
+    "path_payload_integrity_checked": true,
+    "stores_aligned_full_7d_qpos_and_eef_paths": true,
+    "exact_l2t2_reuse": true,
+    "l2t2_route_identity_sha256": "943fc33111f23eaea648ed158245a9a77938a8387aeb4a80696ce592ea022e9c",
+    "l2t2_route_paths_sha256": "8ce8a9bdc3a529687cebeb574385842ca8127cd46cd82544a41ea534210a5f24",
+    "l2t2_route_rows": 65,
+    "duplicate_planning_call_on_reuse": false,
+    "safety_certified": false
+  },
+  "scenes": [
+    {
+      "suite": "obstacle_avoidance",
+      "level": "L2",
+      "task": "T2",
+      "task_success": false,
+      "native_predicates_final": {
+        "On(moka_pot_1, flat_stove_1_cook_region)": true,
+        "On(moka_pot_2, flat_stove_1_cook_region)": false,
+        "Turnon(flat_stove_1)": true
+      },
+      "elapsed_wall_seconds": null,
+      "elapsed_wall_seconds_note": "not reliably persisted",
+      "time_to_first_task_success_seconds": null,
+      "physical_actions": 42,
+      "student_actions": 0,
+      "expert_actions": 42,
+      "physical_snapshot_branches": 1,
+      "planning_route_reused": true,
+      "route_reused_without_replanning": true,
+      "route_rows": 65,
+      "route_preflight_seconds": 11.427326861768961,
+      "experience_reused": [
+        "GS-OPD-owned L1T2 object/Region-relative keypose sequence"
+      ],
+      "historical_source_actions_replayed": false,
+      "eef_tracking_progress": {
+        "start_world_m": [-0.012205600327885376, -0.2594057279510754, 1.4918351615888141],
+        "end_world_m": [0.044990061187906646, -0.2607245161298282, 1.4808072437746556],
+        "net_distance_m": 0.058264035818035353,
+        "termination": "stagnated after 42 actions before preplace"
+      },
+      "failure_reason": "transport_preplace_dense_RRT_path_waypoint_stagnated_for_24_actions",
+      "native_success_snapshot": false,
+      "full_release_and_stable_placement": false,
+      "contact_samples_expected_and_recorded": {
+        "expected": 1050,
+        "recorded": 1050,
+        "substep_monitoring_complete_flag": false
+      },
+      "best_snapshot": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/task_success_first_executor_obstacle_avoidance_L2T2_20261026_200327_567640623/expert_native_goal_stage_control/placement_branch_00_route_01_region_layout_20_v1_yaw+180_h380/native_goal_transport_failed_runtime_snapshot.pkl",
+      "run_report": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/task_success_first_executor_obstacle_avoidance_L2T2_20261026_200327_567640623/run_report.json",
+      "safety_certified": false
+    },
+    {
+      "suite": "obstacle_avoidance_human",
+      "level": "L0",
+      "task": "T2",
+      "task_success": false,
+      "native_predicates_final": {
+        "On(moka_pot_1, flat_stove_1_cook_region)": false,
+        "On(moka_pot_2, flat_stove_1_cook_region)": false,
+        "Turnon(flat_stove_1)": true
+      },
+      "elapsed_wall_seconds": null,
+      "elapsed_wall_seconds_note": "not reliably persisted",
+      "time_to_first_verified_stable_grasp_seconds": 454.4161392226815,
+      "physical_actions": 575,
+      "actions_by_phase": {
+        "stable_grasp_and_lift": 215,
+        "transport_attempt": 360,
+        "followup_replan": 0
+      },
+      "student_actions": 0,
+      "expert_actions": 575,
+      "physical_snapshot_branches": 2,
+      "experience_reused": [
+        "GS-OPD-owned L0T2 complete-success keypose experience",
+        "GS-OPD-owned L1T2 complete-success keypose experience",
+        "existing moka-pot stable-grasp and transfer skill experience"
+      ],
+      "historical_source_actions_replayed": false,
+      "first_grasp": {
+        "object_id": "moka_pot_1",
+        "stable_bilateral_grasp": true,
+        "lift_height_m": 0.03440414905732203,
+        "runtime_snapshot_sha256": "48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a",
+        "safety_certified": false
+      },
+      "transport_progress": {
+        "eef_start_world_m": [-0.18478959702461925, 0.2175038209097831, 1.0473837175363758],
+        "eef_end_world_m": [-0.20184891847700465, -0.23353851684917948, 1.2794251103721184],
+        "net_distance_m": 0.5075169148793341,
+        "distance_to_preplace_at_termination_m": 0.085,
+        "termination": "360-action bound reached before preplace; object remained grasped"
+      },
+      "failure_reason": "TimeoutError: transport_preplace_did_not_reach_pose_within_360_actions; a single follow-up RRT from the saved failure Snapshot then rejected current_real_qpos_is_outside_controller_joint_limits",
+      "native_success_snapshot": false,
+      "full_release_and_stable_placement": false,
+      "contact_samples": {
+        "grasp_expected": 5375,
+        "grasp_monitoring_incomplete_actions": 49,
+        "transport_expected_and_recorded": 9000,
+        "transport_substep_monitoring_complete_flag": false
+      },
+      "best_snapshot": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/human_L0T2/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_202154_293951476/expert_native_placement/placement_branch_00_route_00_region_layout_04_v1_yaw-090_h320/native_goal_transport_failed_runtime_snapshot.pkl",
+      "grasp_run_report": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/human_L0T2/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_200726_204334329/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T2_20261026_200740_526863937/run_report.json",
+      "placement_run_report": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/human_L0T2/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_202154_293951476/run_report.json",
+      "followup_replan_report": "/opt/data/private/gs_opd/rollouts/gs_opd_route_cache_handoff_20261026/human_L0T2/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_203410_126057230/run_report.json",
+      "safety_certified": false
+    }
+  ],
+  "common_blocker": "A geometrically planned or task-equivalent OSC path does not yet guarantee efficient physical tracking to preplace. L2T2 exact route reuse still stagnated under OSC; human L0T2 made substantial OSC progress but timed out short of preplace, and its changed posture was rejected by the existing RRT joint-limit guard.",
+  "tests": {
+    "python_compile": "passed",
+    "targeted_executor_tests": "passed: 28",
+    "git_diff_check": "passed",
+    "report_json_validation": "passed"
+  }
+}

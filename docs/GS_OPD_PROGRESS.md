@@ -1,3 +1,20 @@
+## 2026-10-26：缓存完整RRT路径并转human/L0T2尝试，尚无新完整Episode
+
+本轮实现并实测预筛规划结果复用：缓存完整7D关节路径和EEF参考，按模型几何、活动BDDL、精确起始状态、目标位姿、安全几何策略、规划器配置及路径内容哈希验证；只有对应输入变化时才重新规划。L2T2从Round60精确持抓Snapshot启动（payload SHA `70b9bfa20d8caf0eb3a71309ad58eed471100b8293f6e35b61fbb42c70a9326d`，Integration State SHA `836981a4fd3507c6a384db7e0e3088d78c8ad64a2519fab4b07a7030bae4d208`）。L1T2来源路线65组7D/EEF状态全部精确匹配并直接复用，没有执行重复RRT；真实OSC执行42步、记录1050条预期子步接触采样后，在预放置阶段停滞。末端位移约58.3 mm，原生谓词仍2/3，`task_success=false`；完整失败Snapshot、双相机视频、动作和状态归档均保留。
+
+按单场景预算立即转至`obstacle_avoidance_human/L0T2`，从seed=0/init-state=0核验的原始Snapshot开始，使用GS-OPD自有L0T2与L1T2完整成功Keypose经验及已有Moka Pot抓取/转移技能，不回放历史动作。真实分支先以215步获得Pot1稳定双指抓持和34.404 mm抬升（首次成功耗时454.416 s），随后从精确抓持Snapshot执行360步真实闭环运输，EEF净行程约0.508 m，距预放置点约85 mm时达到动作上限；Pot1/Pot2 `On`均false、Stove `Turnon`为true，未松爪。再从失败Snapshot只尝试一次局部RRT续接，0物理动作，因起始实际关节状态超出既有控制器关节限位而停止，未放宽限位。没有成功Episode、真实释放或稳定放置。
+
+| 场景 | Task-Success | 物理动作 | 分支 | 经验复用 | 耗时记录 |
+|---|---:|---:|---:|---|---|
+| `obstacle_avoidance/L2T2` | 否，2/3谓词 | 42 | 1 | L1T2 Keypose；精确复用完整路线 | 总墙钟耗时未可靠持久化；缓存路线筛选11.427 s |
+| `obstacle_avoidance_human/L0T2` | 否，0/3 On谓词，Stove开 | 575 | 2（抓取、运输） | L0T2/L1T2成功经验及Moka Pot技能库 | 总墙钟耗时未可靠持久化；首次稳定抓持454.416 s |
+
+两场景均有25个预期MuJoCo子步/控制动作的接触记录计数，但若干`substep_monitoring_complete`标记为false：L2运输42/42步均为false；Human L0T2抓持215步中49步不完整、运输360步均为false。搜索轨迹不是Safety-Certified Episode。新增任务专用脚本0、固定场景姿态0、人工位置调整0；官方示范0、训练0、直接状态写入0。结果、精确哈希和归档索引见[跨场景机器报告](GS_OPD_CROSS_SCENE_CAPTURE_REPORT_20261026.json)及[可读报告](GS_OPD_CROSS_SCENE_CAPTURE_REPORT_20261026.md)。
+
+本轮已验证缓存身份/路径交接有效，尚未解决通用阻塞：离线路径可行不代表OSC能在预算内跟踪到预放置；退化物理状态的局部重规划又会被真实控制器关节限位拒绝。任务成功前不应靠提高停滞阈值或改变关节限位掩盖问题。下一轮停止这两条失败路线的同类追加搜索，优先为后续任务族实现通用、可恢复的闭环路径续接，同时把安全认证留给独立Safety Reconstruction。
+
+---
+
 ## Round63：L2T2稠密RRT路径跟踪单次验证未进入OSC，暂列未解决（2026-10-26）
 
 本轮从Round60归档的t=2589 Pot2双指抓持Snapshot启动，payload SHA `70b9bfa20d8caf0eb3a71309ad58eed471100b8293f6e35b61fbb42c70a9326d`，Integration State SHA `836981a4fd3507c6a384db7e0e3088d78c8ad64a2519fab4b07a7030bae4d208`；模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`、BDDL SHA `58b3db56352473e7c4534769911a0ad48ea7c214f934fcb4403b6c1da5467b523`一致。Pot1 On、Stove Turnon为true，Pot2 On与任务成功为false。Keypose来源为GS-OPD自有L1T2成功轨迹，未回放其动作。

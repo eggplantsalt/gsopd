@@ -57,6 +57,162 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _canonical_payload_sha256(value: Any) -> str:
+    """Hash a JSON-compatible planner identity without platform-specific spacing."""
+    def normalize(item: Any) -> Any:
+        if isinstance(item, np.ndarray):
+            return normalize(item.tolist())
+        if isinstance(item, np.generic):
+            return item.item()
+        if isinstance(item, dict):
+            return {str(key): normalize(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [normalize(child) for child in item]
+        if isinstance(item, float) and not np.isfinite(item):
+            raise ValueError("planner_identity_contains_non_finite_float")
+        return item
+
+    payload = json.dumps(
+        normalize(value), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return _sha(payload)
+
+
+def _keypose_rrt_planner_config(
+    *, seed: int, search_time_budget_s: float,
+    maximum_iterations: int, maximum_config_checks: int,
+) -> dict[str, Any]:
+    return {
+        "step_rad": 0.22,
+        "connect_max_steps": 16,
+        "goal_bias": 0.18,
+        "max_iterations": int(maximum_iterations),
+        "max_config_checks": int(maximum_config_checks),
+        "max_candidate_routes": 1,
+        "search_time_budget_s": float(search_time_budget_s),
+        "shortcut_attempts": 12,
+        "minimum_clearance_m": 0.0,
+        "require_safe_configurations": False,
+        "seed": int(seed),
+    }
+
+
+def _canonical_eef_pose_identity(pose: Any) -> dict[str, list[float]]:
+    """Canonicalize an EEF pose, ignoring only sub-picometer serialization noise."""
+    if isinstance(pose, dict):
+        values = np.r_[
+            np.asarray(pose.get("position_world_m"), dtype=np.float64),
+            np.asarray(pose.get("quaternion_wxyz"), dtype=np.float64),
+        ]
+    else:
+        values = np.asarray(pose, dtype=np.float64)
+    if values.shape != (7,) or not np.isfinite(values).all():
+        raise ValueError("planner_goal_pose_must_be_finite_seven_vector")
+    quaternion = values[3:].copy()
+    norm = float(np.linalg.norm(quaternion))
+    if norm < 1e-12:
+        raise ValueError("planner_goal_quaternion_is_degenerate")
+    quaternion /= norm
+    if quaternion[0] < 0:
+        quaternion *= -1
+    # A pose generated from the same rigid transform can differ in the last
+    # few bits after matrix/quaternion round trips. This canonicalization is
+    # much tighter than the controller's execution tolerances.
+    return {
+        "position_world_m": np.round(values[:3], 12).tolist(),
+        "quaternion_wxyz": np.round(quaternion, 12).tolist(),
+    }
+
+
+def _make_precomputed_rrt_route_cache(
+    *, result: dict[str, Any], model_sha256: str, bddl_sha256: str,
+    start_state_sha256: str, goal_pose_world: Any,
+    safety_geometry_policy: dict[str, Any], planner_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if result.get("status") != "offline_feasible":
+        return None
+    qpos_path = np.asarray(result.get("qpos_path"), dtype=np.float64)
+    eef_path = np.asarray(result.get("eef_reference_poses_world"), dtype=np.float64)
+    if (
+        qpos_path.ndim != 2 or qpos_path.shape[1:] != (7,)
+        or eef_path.ndim != 2 or eef_path.shape[1:] != (7,)
+        or len(qpos_path) < 2 or len(qpos_path) != len(eef_path)
+        or not np.isfinite(qpos_path).all() or not np.isfinite(eef_path).all()
+    ):
+        raise ValueError("feasible_RRT_result_has_invalid_or_unaligned_joint_and_EEF_paths")
+    identity = {
+        "model_geometry_sha256": str(model_sha256),
+        "bddl_sha256": str(bddl_sha256),
+        "start_state_sha256": str(start_state_sha256),
+        "goal_pose_world": _canonical_eef_pose_identity(goal_pose_world),
+        "safety_geometry_policy_sha256": _canonical_payload_sha256(safety_geometry_policy),
+        "planner_config_sha256": _canonical_payload_sha256(planner_config),
+    }
+    paths = {
+        "qpos_path_rad": qpos_path.tolist(),
+        "eef_reference_poses_world": eef_path.tolist(),
+    }
+    return {
+        "schema_version": "gs_opd_precomputed_rrt_route.v1",
+        "identity": identity,
+        "identity_sha256": _canonical_payload_sha256(identity),
+        "paths": paths,
+        "paths_sha256": _canonical_payload_sha256(paths),
+        "planner_status": result.get("status"),
+        "planning_seconds": result.get("planning_seconds"),
+        "configuration_checks": result.get("config_checks"),
+        "iterations": result.get("iterations"),
+        "safety_certified": False,
+    }
+
+
+def _validate_precomputed_rrt_route(
+    cache: Any, *, model_sha256: str, bddl_sha256: str,
+    start_state_sha256: str, goal_pose_world: Any,
+    safety_geometry_policy: dict[str, Any], planner_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Accept a route only when all planning inputs and both paths still match."""
+    if not isinstance(cache, dict) or cache.get("schema_version") != "gs_opd_precomputed_rrt_route.v1":
+        return {"reusable": False, "reason": "route_cache_missing_or_unsupported"}
+    identity = cache.get("identity")
+    if not isinstance(identity, dict):
+        return {"reusable": False, "reason": "route_cache_identity_missing"}
+    if cache.get("identity_sha256") != _canonical_payload_sha256(identity):
+        return {"reusable": False, "reason": "route_cache_identity_integrity_mismatch"}
+    expected = {
+        "model_geometry_sha256": str(model_sha256),
+        "bddl_sha256": str(bddl_sha256),
+        "start_state_sha256": str(start_state_sha256),
+        "goal_pose_world": _canonical_eef_pose_identity(goal_pose_world),
+        "safety_geometry_policy_sha256": _canonical_payload_sha256(safety_geometry_policy),
+        "planner_config_sha256": _canonical_payload_sha256(planner_config),
+    }
+    for key, value in expected.items():
+        if identity.get(key) != value:
+            return {"reusable": False, "reason": f"route_cache_{key}_mismatch"}
+    paths = cache.get("paths")
+    if not isinstance(paths, dict) or cache.get("paths_sha256") != _canonical_payload_sha256(paths):
+        return {"reusable": False, "reason": "route_cache_path_integrity_mismatch"}
+    qpos_path = np.asarray(paths.get("qpos_path_rad"), dtype=np.float64)
+    eef_path = np.asarray(paths.get("eef_reference_poses_world"), dtype=np.float64)
+    if (
+        qpos_path.ndim != 2 or qpos_path.shape[1:] != (7,)
+        or eef_path.ndim != 2 or eef_path.shape[1:] != (7,)
+        or len(qpos_path) < 2 or len(qpos_path) != len(eef_path)
+        or not np.isfinite(qpos_path).all() or not np.isfinite(eef_path).all()
+    ):
+        return {"reusable": False, "reason": "route_cache_joint_and_EEF_paths_invalid"}
+    return {
+        "reusable": True,
+        "reason": "all_planning_inputs_and_route_paths_match",
+        "qpos_path": qpos_path,
+        "eef_reference_poses_world": eef_path,
+        "route_identity_sha256": cache["identity_sha256"],
+        "route_paths_sha256": cache["paths_sha256"],
+    }
+
+
 def _json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
@@ -92,6 +248,34 @@ def _keypose_rrt_call_count(candidate_rows: list[dict[str, Any]]) -> int:
         terminal = row.get("terminal_pose_IK_RRT_diagnostic")
         count += int(was_called(terminal))
     return count
+
+
+def _task_success_waypoint_fallback_reason(preplace_result: Any) -> str | None:
+    """Identify a valid-IK waypoint whose RRT stopped only at its time bound."""
+    if not isinstance(preplace_result, dict):
+        return None
+    if (
+        preplace_result.get("status") == "no_safe_path"
+        and "planning_time_budget_exhausted" in str(preplace_result.get("failure_reason", ""))
+        and int(preplace_result.get("ik_candidate_count", 0)) > 0
+    ):
+        return "RRT_time_budget_exhausted_with_valid_IK;_try_bounded_real_OSC_waypoint"
+    return None
+
+
+def _preflight_row_is_task_success_admissible(row: dict[str, Any]) -> bool:
+    preplace = row.get("preplace_RRT", {})
+    terminal = row.get("terminal_pose_IK_RRT_diagnostic", {})
+    if preplace.get("status") == "offline_feasible":
+        return bool(
+            row.get("admitted_to_physical_search") is True
+            or terminal.get("status") == "budget_exhausted"
+            or (
+                int(terminal.get("ik_candidate_count", 0)) > 0
+                and terminal.get("status") in {"offline_feasible", "no_safe_path"}
+            )
+        )
+    return _task_success_waypoint_fallback_reason(preplace) is not None
 
 
 def _verify_planner_live_state(
@@ -1634,38 +1818,107 @@ def _native_place_single(
                     placement_candidate.get("preplace_rrt_seed", 74103 + waypoint_index)
                     if placement_candidate is not None else 74103 + waypoint_index
                 )
-                keypose_plan = bridge.request({
-                    "op": "task_success_first_rrt",
-                    "expected_instruction": instruction,
-                    "model_geometry_sha256": model_sha,
-                    "start_state_sha256": live_state_sha,
-                    "goal_pose_world": {
-                        "position_world_m": waypoint[:3].tolist(),
-                        "quaternion_wxyz": waypoint[3:].tolist(),
-                    },
-                    "safety_geometry_policy": planning_policy,
-                    "planner_config": {
-                        "step_rad": 0.22,
-                        "connect_max_steps": 16,
-                        "goal_bias": 0.18,
-                        "max_iterations": keypose_planner_iterations,
-                        "max_config_checks": keypose_planner_checks,
-                        "max_candidate_routes": 1,
-                        "search_time_budget_s": keypose_planner_budget_s,
-                        "shortcut_attempts": 12,
-                        "minimum_clearance_m": 0.0,
-                        "require_safe_configurations": False,
-                        "seed": keypose_planner_seed,
-                    },
-                    "ik_seed_qpos": _placement_ik_seed_portfolio(live["snapshot_state"]["robot_states"][0]),
-                })
-                after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
-                after_plan_sha = _state_sha(_snapshot_state_vector(after_plan.get("snapshot_state", {})))
-                plan_state_check = _verify_planner_live_state(
-                    keypose_plan, after_plan_sha, live_state_sha,
+                planner_config = _keypose_rrt_planner_config(
+                    seed=keypose_planner_seed,
+                    search_time_budget_s=keypose_planner_budget_s,
+                    maximum_iterations=keypose_planner_iterations,
+                    maximum_config_checks=keypose_planner_checks,
                 )
+                goal_pose_request = {
+                    "position_world_m": waypoint[:3].tolist(),
+                    "quaternion_wxyz": waypoint[3:].tolist(),
+                }
+                route_cache = (
+                    keypose_experience.get("_precomputed_keypose_routes", {}).get(keypose["name"])
+                    if keypose_experience is not None else None
+                )
+                route_reuse = _validate_precomputed_rrt_route(
+                    route_cache,
+                    model_sha256=model_sha,
+                    bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256", "")),
+                    start_state_sha256=live_state_sha,
+                    goal_pose_world=goal_pose_request,
+                    safety_geometry_policy=planning_policy,
+                    planner_config=planner_config,
+                )
+                use_task_success_osc_fallback = bool(
+                    keypose.get("name") == "preplace"
+                    and placement_candidate is not None
+                    and placement_candidate.get("task_success_waypoint_fallback") is True
+                    and route_reuse.get("reusable") is not True
+                )
+                route_source = "live_RRT_replanned_segment"
+                if use_task_success_osc_fallback:
+                    keypose_plan = {
+                        "status": "task_success_waypoint_fallback",
+                        "failure_reason": placement_candidate.get(
+                            "task_success_waypoint_fallback_reason"
+                        ),
+                        "live_state_unchanged": True,
+                        "RRT_skipped": True,
+                        "safety_certified": False,
+                    }
+                    after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
+                    after_plan_sha = _state_sha(
+                        _snapshot_state_vector(after_plan.get("snapshot_state", {}))
+                    )
+                    plan_state_check = _verify_planner_live_state(
+                        keypose_plan, after_plan_sha, live_state_sha,
+                    )
+                    route_source = "task_success_closed_loop_OSC_waypoint_after_RRT_timeout"
+                elif route_reuse.get("reusable") is True:
+                    after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
+                    after_plan_sha = _state_sha(
+                        _snapshot_state_vector(after_plan.get("snapshot_state", {}))
+                    )
+                    unchanged = after_plan_sha == live_state_sha
+                    if unchanged:
+                        keypose_plan = {
+                            "status": "offline_feasible",
+                            "live_state_unchanged": True,
+                            "qpos_path": route_reuse["qpos_path"].tolist(),
+                            "eef_reference_poses_world": route_reuse["eef_reference_poses_world"].tolist(),
+                            "planning_seconds": route_cache.get("planning_seconds"),
+                            "config_checks": route_cache.get("configuration_checks"),
+                            "iterations": route_cache.get("iterations"),
+                            "route_cache_reused": True,
+                        }
+                        plan_state_check = _verify_planner_live_state(
+                            keypose_plan, after_plan_sha, live_state_sha,
+                        )
+                        route_source = "exact_preflight_route_cache_reused"
+                    else:
+                        route_reuse = {
+                            "reusable": False,
+                            "reason": "route_cache_live_state_changed_after_cache_validation",
+                        }
+                if route_source not in {
+                    "exact_preflight_route_cache_reused",
+                    "task_success_closed_loop_OSC_waypoint_after_RRT_timeout",
+                }:
+                    keypose_plan = bridge.request({
+                        "op": "task_success_first_rrt",
+                        "expected_instruction": instruction,
+                        "model_geometry_sha256": model_sha,
+                        "start_state_sha256": live_state_sha,
+                        "goal_pose_world": goal_pose_request,
+                        "safety_geometry_policy": planning_policy,
+                        "planner_config": planner_config,
+                        "ik_seed_qpos": _placement_ik_seed_portfolio(live["snapshot_state"]["robot_states"][0]),
+                    })
+                    after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
+                    after_plan_sha = _state_sha(
+                        _snapshot_state_vector(after_plan.get("snapshot_state", {}))
+                    )
+                    plan_state_check = _verify_planner_live_state(
+                        keypose_plan, after_plan_sha, live_state_sha,
+                    )
                 if not plan_state_check["live_state_unchanged"]:
                     raise RuntimeError(f"keypose_RRT_mutated_live_state:{keypose['name']}")
+                route_reuse_report = {
+                    key: value for key, value in route_reuse.items()
+                    if key not in {"qpos_path", "eef_reference_poses_world"}
+                }
                 keypose_rrt_runs.append({
                     "keypose": keypose["name"],
                     "source_timestep_after": keypose["source_timestep_after"],
@@ -1678,6 +1931,16 @@ def _native_place_single(
                     "maximum_iterations": keypose_planner_iterations,
                     "maximum_config_checks": keypose_planner_checks,
                     "seed": keypose_planner_seed,
+                    "route_source": route_source,
+                    "preflight_ik_candidate_count": (
+                        placement_candidate.get("preplace_rrt_ik_candidate_count")
+                        if use_task_success_osc_fallback and placement_candidate is not None
+                        else None
+                    ),
+                    "route_reuse_validation": route_reuse_report,
+                    "route_cache_identity_sha256": (
+                        route_cache.get("identity_sha256") if route_source == "exact_preflight_route_cache_reused" else None
+                    ),
                     "minimum_forbidden_clearance_m": keypose_plan.get("minimum_forbidden_clearance_m"),
                     "record_only_diagnostics": True,
                     "carried_object_geometry_included": True,
@@ -1704,6 +1967,11 @@ def _native_place_single(
                     route_archive = {
                         "schema_version": "gs_opd_rrt_osc_route_archive.v1",
                         "keypose": keypose["name"],
+                        "route_source": route_source,
+                        "route_cache_identity_sha256": (
+                            route_cache.get("identity_sha256")
+                            if route_source == "exact_preflight_route_cache_reused" else None
+                        ),
                         "model_geometry_sha256": model_sha,
                         "start_state_sha256": live_state_sha,
                         "goal_eef_pose_world": waypoint.tolist(),
@@ -1752,6 +2020,15 @@ def _native_place_single(
                     keypose_rrt_runs[-1]["execution_tracking_mode"] = (
                         "dense_RRT_EEF_path_existing_slow_closed_loop_feedback"
                     )
+                elif keypose_plan.get("status") == "task_success_waypoint_fallback":
+                    subroute = np.asarray([waypoint], dtype=np.float64)
+                    keypose_rrt_runs[-1]["execution_fallback"] = {
+                        "mode": "existing_slow_OSC_POSE_live_feedback_to_task_equivalent_preplace",
+                        "RRT_failure_was_only_time_budget_with_valid_IK": True,
+                        "physical_collision_response_enabled": True,
+                        "contacts_recorded_only": True,
+                        "safety_certified": False,
+                    }
                 else:
                     keypose_rrt_runs[-1]["execution_fallback"] = None
                     raise RuntimeError(
@@ -1761,7 +2038,11 @@ def _native_place_single(
             else:
                 keypose = {"name": "native_goal_transport_waypoint"}
                 subroute = np.asarray([waypoint], dtype=np.float64)
-            if keypose_sequence is not None:
+            if (
+                keypose_sequence is not None
+                and keypose_rrt_runs[-1].get("route_source")
+                != "task_success_closed_loop_OSC_waypoint_after_RRT_timeout"
+            ):
                 route_info = keypose_rrt_runs[-1]["route_archive"]
                 for source_path_index in closed_loop_source_indices:
                     reference_pose = raw_eef_route[source_path_index]
@@ -1799,6 +2080,24 @@ def _native_place_single(
                         raise RuntimeError("native_goal_transport_action_budget_exhausted")
             else:
                 for subgoal in subroute:
+                    fallback_tracking = None
+                    if (
+                        keypose_sequence is not None
+                        and keypose_rrt_runs[-1].get("route_source")
+                        == "task_success_closed_loop_OSC_waypoint_after_RRT_timeout"
+                    ):
+                        fallback_tracking = {
+                            "tracking_mode": "existing_slow_OSC_POSE_feedback_task_success_waypoint",
+                            "keypose": keypose["name"],
+                            "preflight_failure_reason": keypose_rrt_runs[-1].get("failure_reason"),
+                            "preflight_ik_candidate_count": keypose_rrt_runs[-1].get(
+                                "preflight_ik_candidate_count"
+                            ),
+                            "target_pose_world": subgoal.tolist(),
+                            "RRT_skipped_after_bounded_timeout": True,
+                            "physical_collision_response_enabled": True,
+                            "safety_certified": False,
+                        }
                     _advance_pose(
                         bridge, subgoal[:3], subgoal[3:],
                         f"transport_{keypose['name']}", "native_goal_transport", counter,
@@ -1808,6 +2107,7 @@ def _native_place_single(
                         stagnation_window_actions=24,
                         position_tolerance_m=0.010,
                         rotation_tolerance_rad=0.10,
+                        planning_tracking=fallback_tracking,
                     )
                     if counter[0] > transport_action_budget:
                         raise RuntimeError("native_goal_transport_action_budget_exhausted")
@@ -2112,6 +2412,7 @@ def _screen_native_keypose_candidates(
     predicate: list[str],
     instruction: str,
     model_sha: str,
+    bddl_sha: str,
     safety_policy: dict[str, Any],
     start_snapshot_state: dict[str, Any],
     start_state_sha256: str,
@@ -2215,29 +2516,24 @@ def _screen_native_keypose_candidates(
         live_state_sha = _state_sha(_snapshot_state_vector(live.get("snapshot_state", {})))
         if live_state_sha != start_state_sha256:
             raise RuntimeError("keypose_candidate_screen_start_snapshot_drifted")
+        planner_config = _keypose_rrt_planner_config(
+            seed=seed,
+            search_time_budget_s=search_time_budget_s,
+            maximum_iterations=maximum_iterations,
+            maximum_config_checks=maximum_config_checks,
+        )
+        goal_pose_request = {
+            "position_world_m": goal_pose[:3, 3].tolist(),
+            "quaternion_wxyz": _wxyz(goal_pose[:3, :3]).tolist(),
+        }
         result = bridge.request({
             "op": "task_success_first_rrt",
             "expected_instruction": instruction,
             "model_geometry_sha256": model_sha,
             "start_state_sha256": live_state_sha,
-            "goal_pose_world": {
-                "position_world_m": goal_pose[:3, 3].tolist(),
-                "quaternion_wxyz": _wxyz(goal_pose[:3, :3]).tolist(),
-            },
+            "goal_pose_world": goal_pose_request,
             "safety_geometry_policy": planning_policy,
-            "planner_config": {
-                "step_rad": 0.22,
-                "connect_max_steps": 16,
-                "goal_bias": 0.18,
-                "max_iterations": int(maximum_iterations),
-                "max_config_checks": int(maximum_config_checks),
-                "max_candidate_routes": 1,
-                "search_time_budget_s": float(search_time_budget_s),
-                "shortcut_attempts": 12,
-                "minimum_clearance_m": 0.0,
-                "require_safe_configurations": False,
-                "seed": int(seed),
-            },
+            "planner_config": planner_config,
             "ik_seed_qpos": _placement_ik_seed_portfolio(robot),
         })
         preflight_count += 1
@@ -2250,6 +2546,18 @@ def _screen_native_keypose_candidates(
             1 for row in result.get("ik_candidates", [])
             if float(row.get("position_error_m", float("inf"))) <= 0.003
             and float(row.get("orientation_error_rad", float("inf"))) <= 0.03
+        )
+        route_cache = (
+            _make_precomputed_rrt_route_cache(
+                result=result,
+                model_sha256=model_sha,
+                bddl_sha256=bddl_sha,
+                start_state_sha256=live_state_sha,
+                goal_pose_world=goal_pose_request,
+                safety_geometry_policy=planning_policy,
+                planner_config=planner_config,
+            )
+            if unchanged else None
         )
         return {
             "status": result.get("status"),
@@ -2267,6 +2575,7 @@ def _screen_native_keypose_candidates(
             "ik_candidate_count": valid_ik_count,
             "minimum_forbidden_clearance_m": result.get("minimum_forbidden_clearance_m"),
             "live_state_unchanged": unchanged,
+            "route_cache": route_cache,
             "full_robot_link_geometry_included": True,
             "held_object_geometry_included": True,
             "safety_certified": False,
@@ -2385,13 +2694,57 @@ def _screen_native_keypose_candidates(
                 "bounded_extended_RRT_attempt": extended,
             }
         row["preplace_RRT"] = preplace_plan
+        if preplace_plan.get("bounded_extended_RRT_attempt", {}).get("status") == "offline_feasible":
+            candidate.update({
+                "preplace_rrt_search_time_budget_s": 20.0,
+                "preplace_rrt_max_iterations": 2000,
+                "preplace_rrt_max_config_checks": 8000,
+                "preplace_rrt_seed": 84201 + variant_index,
+            })
+        else:
+            candidate.update({
+                "preplace_rrt_search_time_budget_s": 12.0,
+                "preplace_rrt_max_iterations": 750,
+                "preplace_rrt_max_config_checks": 3000,
+                "preplace_rrt_seed": 74201 + variant_index * 2,
+            })
+        row["placement_candidate"] = candidate
         if preplace_plan.get("status") == "offline_feasible":
+            route_cache = preplace_plan.get("route_cache")
+            if route_cache is not None:
+                runtime_experience["_precomputed_keypose_routes"] = {
+                    "preplace": route_cache,
+                }
             terminal_plan = screen_pose(goal_eef, 74202 + variant_index * 2)
             row["terminal_pose_IK_RRT_diagnostic"] = terminal_plan
+            terminal_deferred = terminal_plan.get("status") == "budget_exhausted"
             terminal_ik_feasible = bool(
                 terminal_plan.get("status") == "offline_feasible"
                 or int(terminal_plan.get("ik_candidate_count", 0)) > 0
+                or terminal_deferred
             )
+            row["defer_terminal_ik_to_live_keypose_planning"] = terminal_deferred
+        elif _task_success_waypoint_fallback_reason(preplace_plan) is not None:
+            fallback_reason = _task_success_waypoint_fallback_reason(preplace_plan)
+            candidate["task_success_waypoint_fallback"] = True
+            candidate["task_success_waypoint_fallback_reason"] = fallback_reason
+            candidate["preplace_rrt_ik_candidate_count"] = int(
+                preplace_plan.get("ik_candidate_count", 0)
+            )
+            row["placement_candidate"] = candidate
+            row["task_success_waypoint_fallback"] = {
+                "enabled": True,
+                "reason": fallback_reason,
+                "physical_validation_required": True,
+                "safety_certified": False,
+            }
+            row["terminal_pose_IK_RRT_diagnostic"] = {
+                "status": "deferred_until_preplaced_by_real_OSC",
+                "failure_class": "terminal_segment_is_planned_only_after_physical_progress",
+                "ik_candidate_count": 0,
+            }
+            row["defer_terminal_ik_to_live_keypose_planning"] = True
+            terminal_ik_feasible = True
         else:
             row["terminal_pose_IK_RRT_diagnostic"] = {
                 "status": "not_run_after_unreachable_preplace_route",
@@ -2399,8 +2752,11 @@ def _screen_native_keypose_candidates(
                 "ik_candidate_count": 0,
             }
             terminal_ik_feasible = False
+            row["defer_terminal_ik_to_live_keypose_planning"] = False
         row["admitted_to_physical_search"] = bool(
-            preplace_plan.get("status") == "offline_feasible" and terminal_ik_feasible
+            (
+                preplace_plan.get("status") == "offline_feasible" and terminal_ik_feasible
+            ) or _task_success_waypoint_fallback_reason(preplace_plan) is not None
         )
         row["terminal_contact_policy"] = "bounded_OSC_descent_only_after_valid_terminal_IK"
         preflight_rows.append(row)
@@ -2514,10 +2870,19 @@ def _native_place(
         prior_scope = keypose_preflight_report.get("scope", {})
         prior_task = keypose_preflight_report.get("task", {})
         prior_resume = keypose_preflight_report.get("resumed_from_runtime_snapshot", {})
+        if not prior_resume:
+            handoff = keypose_preflight_report.get("student_handoff_snapshot_restore", {})
+            handoff_path = Path(str(handoff.get("path") or ""))
+            if handoff.get("status") == "verified_exact" and handoff_path.is_file():
+                prior_resume = {
+                    "path": str(handoff_path),
+                    "payload_sha256": _sha(handoff_path.read_bytes()),
+                    "integration_state_sha256": handoff.get("mujoco_integration_state_sha256"),
+                }
         if (
-            prior_scope.get("benchmark") != "obstacle_avoidance"
-            or int(prior_scope.get("level", -1)) != 2
-            or int(prior_scope.get("task_id", -1)) != 2
+            not isinstance(prior_scope, dict)
+            or prior_task.get("instruction") != instruction
+            or prior_task.get("native_goal_predicate") != predicate
             or prior_task.get("model_geometry_sha256") != model_sha
             or expected_bddl_sha256 is None
             or prior_task.get("BDDL_sha256") != expected_bddl_sha256
@@ -2541,23 +2906,29 @@ def _native_place(
         current_pairs = sorted((tuple(row.get("predicate", [])), row.get("value")) for row in current_native)
         if prior_pairs != current_pairs:
             raise ValueError("precomputed_keypose_route_native_predicates_differ_from_restored_snapshot")
-        feasible_rows = [
-            row for row in prior_search.get("keypose_candidate_preflight", [])
-            if row.get("admitted_to_physical_search") is True
-            and row.get("preplace_RRT", {}).get("status") == "offline_feasible"
-            and (
-                int(row.get("terminal_pose_IK_RRT_diagnostic", {}).get("ik_candidate_count", 0)) > 0
-                or (
-                    row.get("defer_terminal_ik_to_live_keypose_planning") is True
-                    and row.get("terminal_pose_IK_RRT_diagnostic", {}).get("status")
-                    == "budget_exhausted"
-                )
-            )
-        ]
+        prior_preflight_rows = prior_search.get("keypose_candidate_preflight", [])
+        if not prior_preflight_rows:
+            prior_preflight_rows = next((
+                row.get("keypose_route_preflight")
+                for row in reversed(prior_segments)
+                if isinstance(row.get("keypose_route_preflight"), list)
+                and row.get("keypose_route_preflight")
+            ), [])
+        feasible_rows = [row for row in prior_preflight_rows
+                         if _preflight_row_is_task_success_admissible(row)]
         if not feasible_rows:
             raise ValueError("precomputed_keypose_route_report_has_no_admitted_candidate")
         selected = feasible_rows[0]
         candidate = dict(selected["placement_candidate"])
+        fallback_reason = _task_success_waypoint_fallback_reason(
+            selected.get("preplace_RRT", {})
+        )
+        if fallback_reason is not None:
+            candidate["task_success_waypoint_fallback"] = True
+            candidate["task_success_waypoint_fallback_reason"] = fallback_reason
+            candidate["preplace_rrt_ik_candidate_count"] = int(
+                selected.get("preplace_RRT", {}).get("ik_candidate_count", 0)
+            )
         experience_id = selected.get("source_experience_id")
         experience = next((row for row in experience_portfolio
                            if row.get("experience_id") == experience_id), None)
@@ -2569,6 +2940,11 @@ def _native_place(
             if row.get("name") in {"grasp", "lift", "preplace", "release"}
         ]
         runtime_experience["_route_start_after"] = "lift"
+        cached_route = selected.get("preplace_RRT", {}).get("route_cache")
+        if isinstance(cached_route, dict):
+            runtime_experience["_precomputed_keypose_routes"] = {
+                "preplace": cached_route,
+            }
         candidate_id = str(selected.get("candidate_id", ""))
         try:
             variant_index = int(candidate_id.split("_")[1])
@@ -2590,7 +2966,7 @@ def _native_place(
                 "preplace_rrt_seed": 74201 + variant_index * 2,
             })
         candidates = [candidate]
-        keypose_preflight = list(prior_search.get("keypose_candidate_preflight", []))
+        keypose_preflight = list(prior_preflight_rows)
         candidate_experiences[candidate_id] = runtime_experience
         preflight_reuse_summary = {
             "status": "reused_after_exact_snapshot_hash_and_native_predicate_recheck",
@@ -2602,7 +2978,11 @@ def _native_place(
             "source_preflight_run_archive": keypose_preflight_report.get("archive"),
             "resume_snapshot_payload_sha256": expected_start_snapshot_sha256,
             "start_snapshot_state_sha256": _state_digest(base_state),
-            "physical_waypoint_RRT_replanned_before_execution": True,
+            "physical_waypoint_RRT_replanned_before_execution": cached_route is None,
+            "precomputed_route_cache_available": cached_route is not None,
+            "precomputed_route_cache_identity_sha256": (
+                cached_route.get("identity_sha256") if cached_route else None
+            ),
             "safety_certified": False,
         }
     elif experience_portfolio:
@@ -2613,6 +2993,7 @@ def _native_place(
             predicate=predicate,
             instruction=instruction,
             model_sha=model_sha,
+            bddl_sha=str(expected_bddl_sha256 or ""),
             safety_policy=safety_policy,
             start_snapshot_state=base.get("snapshot_state", {}),
             start_state_sha256=_state_digest(base_state),
@@ -2621,6 +3002,24 @@ def _native_place(
             experiences=experience_portfolio,
             maximum_rrt_preflights=maximum_rrt_preflights,
         )
+        route_cache_dir = output_dir / "preflight_route_cache"
+        for row in keypose_preflight:
+            route_cache = row.get("preplace_RRT", {}).get("route_cache")
+            if not isinstance(route_cache, dict):
+                continue
+            route_cache_dir.mkdir(parents=True, exist_ok=True)
+            route_file = route_cache_dir / f"{row['candidate_id']}.json"
+            route_bytes = json.dumps(
+                route_cache, ensure_ascii=False, separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            route_file.write_bytes(route_bytes)
+            route_cache["archive_ref"] = {
+                "path": str(route_file),
+                "sha256": _sha(route_bytes),
+                "qpos_path_rows": len(route_cache["paths"]["qpos_path_rad"]),
+                "eef_path_rows": len(route_cache["paths"]["eef_reference_poses_world"]),
+            }
         if not candidates:
             screen_snapshot_path = output_dir / "keypose_candidate_screen_start_runtime_snapshot.pkl"
             screen_snapshot_path.write_bytes(base_payload)
@@ -3140,7 +3539,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 maximum_physical_branches=args.maximum_physical_branches,
                 maximum_rrt_preflights=args.maximum_rrt_preflights,
                 keypose_preflight_report=keypose_preflight_report,
-                expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
+                expected_start_snapshot_sha256=(
+                    direct_resume.get("payload_sha256") if direct_resume
+                    else _sha(resume["path"].read_bytes())
+                ),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
             report["segments"].append({"type": "resumed_expert_native_goal_stage_control", **place_result})
@@ -3393,10 +3795,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ])
             if args.experience_library is not None:
                 command.extend(["--experience-library", str(args.experience_library)])
-            for keypose_path in args.keypose_experience:
-                command.extend(["--keypose-experience", str(keypose_path.resolve())])
-            if args.keypose_start_after is not None:
-                command.extend(["--keypose-start-after", args.keypose_start_after])
             previous_search_report = getattr(args, "previous_search_report", None)
             if previous_search_report is not None:
                 previous_reports = (
@@ -3600,8 +3998,14 @@ def _parse_args() -> argparse.Namespace:
     ]
     if sum(source is not None for source in resume_sources) > 1:
         parser.error("choose only one Runtime Snapshot resume source")
-    if args.resume_from_keypose_preflight_report is not None and args.resume_from_runtime_snapshot is None:
-        parser.error("--resume-from-keypose-preflight-report requires --resume-from-runtime-snapshot")
+    if (
+        args.resume_from_keypose_preflight_report is not None
+        and args.resume_from_runtime_snapshot is None
+        and args.resume_from_grasp_report is None
+    ):
+        parser.error(
+            "--resume-from-keypose-preflight-report requires a matching Runtime Snapshot or grasp report"
+        )
     for name in ("student_action_budget", "student_handoff_action_budget"):
         if not 1 <= getattr(args, name) <= 256:
             parser.error(f"--{name.replace('_', '-')} must be in 1..256")
