@@ -1403,6 +1403,128 @@ def _native_placement_planner_target(
     return np.asarray(high_eef, dtype=np.float64), role
 
 
+def _native_region_progress_route(
+    start_object_world: np.ndarray,
+    goal_object_world: np.ndarray,
+    *,
+    region: dict[str, Any],
+    route_variant: str,
+    keypose_side_region: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Build a task-equivalent object-space route from live and native goal poses."""
+    from scipy.spatial.transform import Rotation
+
+    start = np.asarray(start_object_world, dtype=np.float64)
+    goal = np.asarray(goal_object_world, dtype=np.float64)
+    region_position = np.asarray(region.get("site_position_world_m"), dtype=np.float64)
+    region_rotation = np.asarray(region.get("site_rotation_world"), dtype=np.float64)
+    region_size = np.asarray(region.get("site_size_m"), dtype=np.float64)
+    if (
+        start.shape != (4, 4) or goal.shape != (4, 4)
+        or region_position.shape != (3,) or region_rotation.shape != (3, 3)
+        or region_size.shape != (3,)
+        or not all(np.isfinite(row).all() for row in (start, goal, region_position, region_rotation, region_size))
+        or route_variant not in {"direct_region_progress", "keypose_side_region_progress"}
+    ):
+        raise ValueError("native_region_progress_route_requires_valid_poses_region_and_route_variant")
+    rotation = region_rotation
+    local_start = rotation.T @ (start[:3, 3] - region_position)
+    local_goal = rotation.T @ (goal[:3, 3] - region_position)
+    horizontal_delta = local_goal[:2] - local_start[:2]
+    horizontal_distance = float(np.linalg.norm(horizontal_delta))
+    clearance_delta = float(np.clip(
+        max(0.35 * float(np.max(region_size[:2])), 0.20 * horizontal_distance),
+        0.045, 0.16,
+    ))
+    transit_height = max(float(local_start[2]), float(local_goal[2]) + clearance_delta)
+    side = None
+    if route_variant == "keypose_side_region_progress" and horizontal_distance > 0.04:
+        if keypose_side_region is not None:
+            side = np.asarray(keypose_side_region, dtype=np.float64).copy()
+            if side.shape != (2,) or not np.isfinite(side).all():
+                raise ValueError("keypose_side_reference_must_be_a_finite_region_plane_vector")
+            side_norm = float(np.linalg.norm(side))
+        else:
+            side_norm = 0.0
+        if side_norm <= 1e-8:
+            side = np.asarray([-horizontal_delta[1], horizontal_delta[0]], dtype=np.float64)
+            side_norm = float(np.linalg.norm(side))
+        if side_norm <= 1e-8:
+            side = np.asarray([0.0, 1.0], dtype=np.float64)
+        else:
+            side /= side_norm
+        offset = float(np.clip(0.25 * horizontal_distance, 0.045, 0.12))
+        midpoint_local = np.asarray([
+            0.5 * (local_start[0] + local_goal[0]) + side[0] * offset,
+            0.5 * (local_start[1] + local_goal[1]) + side[1] * offset,
+            transit_height,
+        ])
+    else:
+        midpoint_local = None
+
+    rotation_start = Rotation.from_matrix(start[:3, :3])
+    rotation_delta = (Rotation.from_matrix(goal[:3, :3]) * rotation_start.inv()).as_rotvec()
+    points: list[tuple[np.ndarray, str]] = []
+    needs_clearance = transit_height - float(local_start[2]) > 0.012
+    combined_side_lift = bool(needs_clearance and midpoint_local is not None)
+    if needs_clearance and not combined_side_lift:
+        lifted = start.copy()
+        lifted[:3, 3] = region_position + rotation @ np.asarray([
+            local_start[0], local_start[1], transit_height,
+        ])
+        points.append((lifted, "adaptive_clearance"))
+    if midpoint_local is not None:
+        midpoint = np.eye(4, dtype=np.float64)
+        midpoint[:3, :3] = start[:3, :3]
+        midpoint[:3, 3] = region_position + rotation @ midpoint_local
+        points.append((
+            midpoint,
+            "adaptive_clearance_with_keypose_side_detour"
+            if combined_side_lift else "keypose_side_detour",
+        ))
+
+    transit_start = (midpoint_local if midpoint_local is not None else local_start.copy())
+    transit_goal = local_goal.copy()
+    transit_start[2] = transit_height
+    transit_goal[2] = transit_height
+    transit_distance = float(np.linalg.norm(transit_goal[:2] - transit_start[:2]))
+    segment_count = max(1, int(np.ceil(transit_distance / 0.045)))
+    for index in range(1, segment_count + 1):
+        fraction = index / segment_count
+        local = transit_start + fraction * (transit_goal - transit_start)
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = region_position + rotation @ local
+        pose[:3, :3] = (
+            Rotation.from_rotvec(rotation_delta * fraction) * rotation_start
+        ).as_matrix()
+        points.append((pose, "region_progress"))
+    final = goal.copy()
+    points.append((final, "native_region_placement"))
+    deduplicated: list[dict[str, Any]] = []
+    previous = start
+    for pose, role in points:
+        if float(np.linalg.norm(pose[:3, 3] - previous[:3, 3])) < 0.006 and role != "native_region_placement":
+            continue
+        deduplicated.append({"object_pose_world": pose.tolist(), "role": role})
+        previous = pose
+    return {
+        "route_variant": route_variant,
+        "waypoints": deduplicated,
+        "start_region_local_m": local_start.tolist(),
+        "goal_region_local_m": local_goal.tolist(),
+        "goal_object_world": goal.tolist(),
+        "horizontal_goal_distance_m": horizontal_distance,
+        "adaptive_transit_height_region_m": transit_height,
+        "adaptive_clearance_delta_m": clearance_delta,
+        "keypose_side_reference_region": (
+            np.asarray(keypose_side_region, dtype=np.float64).tolist()
+            if keypose_side_region is not None else None
+        ),
+        "no_fixed_preplace_pose": True,
+        "waypoint_frame": "target_object_world_pose_retargeted_from_live_object_to_EEF_transform",
+    }
+
+
 def _generate_native_region_placement_candidates(
     *,
     predicate: list[str],
@@ -1792,6 +1914,10 @@ def _native_place_single(
     ).as_matrix()
     eef_world[:3, 3] = robot["eef_pos"]
     object_to_eef = np.linalg.inv(object_world) @ eef_world
+    route_strategy = (
+        str(placement_candidate.get("route_strategy", "jointspace_rrt"))
+        if placement_candidate is not None else "jointspace_rrt"
+    )
     goal_object = np.eye(4)
     if placement_candidate is None:
         goal_object[:3, :3] = object_world[:3, :3]
@@ -1816,19 +1942,35 @@ def _native_place_single(
         region_world = np.eye(4, dtype=np.float64)
         region_world[:3, :3] = np.asarray(region["site_rotation_world"], dtype=np.float64)
         region_world[:3, 3] = np.asarray(region["site_position_world_m"], dtype=np.float64)
-        relocated = retarget_keypose_sequence(
-            keypose_experience,
-            held_object_world=object_world,
-            current_eef_world=eef_world,
-            destination_region_world=region_world,
-            destination_object_world=goal_object,
-        )
-        keypose_sequence = [row for row in relocated if row["name"] in {
-            "lift", "high_west_clearance", "high_south_corridor",
-            "yaw_alignment", "preplace", "place",
-        }]
-        route_start_after = keypose_experience.get("_route_start_after")
-        keypose_sequence = select_keypose_suffix(keypose_sequence, route_start_after)
+        if route_strategy != "native_region_progress_osc":
+            relocated = retarget_keypose_sequence(
+                keypose_experience,
+                held_object_world=object_world,
+                current_eef_world=eef_world,
+                destination_region_world=region_world,
+                destination_object_world=goal_object,
+            )
+            keypose_sequence = [row for row in relocated if row["name"] in {
+                "lift", "high_west_clearance", "high_south_corridor",
+                "yaw_alignment", "preplace", "place",
+            }]
+            route_start_after = keypose_experience.get("_route_start_after")
+            keypose_sequence = select_keypose_suffix(keypose_sequence, route_start_after)
+    keypose_side_reference_region = None
+    if keypose_experience is not None and route_strategy == "native_region_progress_osc":
+        rows = {
+            row.get("name"): row for row in keypose_experience.get("keypose_sequence", [])
+        }
+        lift = rows.get("lift", {}).get("region_to_object", {}).get("matrix")
+        preplace = rows.get("preplace", {}).get("region_to_object", {}).get("matrix")
+        if lift is not None and preplace is not None:
+            lift_position = np.asarray(lift, dtype=np.float64)[:3, 3]
+            preplace_position = np.asarray(preplace, dtype=np.float64)[:3, 3]
+            approach = preplace_position[:2] - lift_position[:2]
+            norm = float(np.linalg.norm(approach))
+            if norm > 1e-8:
+                approach /= norm
+                keypose_side_reference_region = np.asarray([-approach[1], approach[0]])
     entry_direction = np.asarray(
         placement_candidate.get("entry_direction_world", [0.0, 0.0, 0.0])
         if placement_candidate is not None else [0.0, 0.0, 0.0],
@@ -1865,10 +2007,6 @@ def _native_place_single(
     rrt_goal_eef, rrt_goal_role = _native_placement_planner_target(
         predicate, goal_eef, high_eef,
     )
-    route_strategy = (
-        str(placement_candidate.get("route_strategy", "jointspace_rrt"))
-        if placement_candidate is not None else "jointspace_rrt"
-    )
     start_snapshot = bridge.request({"op": "export_runtime_snapshot"})
     if start_snapshot.get("status") != "complete" or not isinstance(start_snapshot.get("payload"), bytes):
         raise RuntimeError("native_goal_transport_start_snapshot_export_failed")
@@ -1898,6 +2036,13 @@ def _native_place_single(
         planned = {
             "status": "bounded_alternative_route_selected",
             "failure_reason": "RRT route family skipped by placement portfolio",
+            "live_state_unchanged": True,
+            "safety_certified": False,
+        }
+    elif route_strategy == "native_region_progress_osc":
+        planned = {
+            "status": "native_region_progress_route_selected",
+            "planner_skipped": "RRT/IK are optional diagnostics; physical OSC progress decides continuation",
             "live_state_unchanged": True,
             "safety_certified": False,
         }
@@ -1945,6 +2090,9 @@ def _native_place_single(
     keypose_rrt_runs: list[dict[str, Any]] = []
     monitor = GraspStabilityMonitor(required_samples=3)
     counter = [0]
+    region_progress_route: dict[str, Any] | None = None
+    region_progress_history: list[dict[str, Any]] = []
+    region_progress_snapshots: list[dict[str, Any]] = []
     durable_records_path = output_dir / "durable_physical_step_records.jsonl"
     durable_frames_dir = output_dir / "durable_dual_camera_frames"
     durable_frames_dir.mkdir(parents=True, exist_ok=True)
@@ -2001,9 +2149,13 @@ def _native_place_single(
             "final_native_task_status": final_native,
             "transport_route_source": route_source,
             "target_object_contact_escape": contact_escape,
+            "region_progress_route": region_progress_route,
+            "region_progress_feedback": region_progress_history,
+            "region_progress_snapshots": region_progress_snapshots,
             "placement_candidate": placement_candidate,
             "transport_route_RRT": {
-                "status": planned.get("status"),
+                "status": "not_run" if planned.get("planner_skipped") else planned.get("status"),
+                "route_selection_status": planned.get("status"),
                 "failure_reason": planned.get("failure_reason"),
                 "time_budget_s": rrt_time_budget_s,
                 "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
@@ -2080,6 +2232,25 @@ def _native_place_single(
             np.r_[high_eef[:3, 3], high_quat],
         )))
         transport_route_source = "portfolio_alternative_vertical_lift_then_high_OSC_waypoints"
+    elif route_strategy == "native_region_progress_osc":
+        region_progress_route = _native_region_progress_route(
+            object_world,
+            goal_object,
+            region=region,
+            route_variant=str(
+                placement_candidate.get("route_variant", "direct_region_progress")
+                if placement_candidate is not None else "direct_region_progress"
+            ),
+            keypose_side_region=keypose_side_reference_region,
+        )
+        route_rows = [
+            np.r_[robot["eef_pos"], _wxyz(eef_world[:3, :3])]
+        ]
+        for row in region_progress_route["waypoints"]:
+            eef_pose = np.asarray(row["object_pose_world"], dtype=np.float64) @ object_to_eef
+            route_rows.append(np.r_[eef_pose[:3, 3], _wxyz(eef_pose[:3, :3])])
+        route = np.asarray(route_rows, dtype=np.float64)
+        transport_route_source = "native_region_progress_object_relative_short_segment_OSC"
     else:
         if planned.get("live_state_unchanged") is not True:
             raise RuntimeError("native_goal_transport_RRT_modified_live_state")
@@ -2091,7 +2262,10 @@ def _native_place_single(
             ),
             "jointspace_RRT_preflight_rejected",
         )
-    if not resume_at_release and keypose_sequence is None:
+    if (
+        not resume_at_release and keypose_sequence is None
+        and route_strategy != "native_region_progress_osc"
+    ):
         live_contacts = bridge.request({"op": "inspect_contacts"})
         contact_escape = _object_contact_escape_direction(
             live_contacts, target_binding, obj["root_pos"],
@@ -2127,7 +2301,10 @@ def _native_place_single(
     # Move laterally to a high point above the native region before descending
     # to the physical object target pose. This keeps On routes from repeatedly
     # pushing a held object through the same blocked vertical approach.
-    if not resume_at_release and keypose_sequence is None:
+    if (
+        not resume_at_release and keypose_sequence is None
+        and route_strategy != "native_region_progress_osc"
+    ):
         target_high = goal_eef.copy()
         target_high[:3, 3] += np.asarray([0.0, 0.0, 0.14])
         route = _compress_eef_route(np.vstack((
@@ -2147,6 +2324,141 @@ def _native_place_single(
     transport_action_budget = int(transport_budget_details["actions"])
 
     try:
+        if route_strategy == "native_region_progress_osc":
+            if region_progress_route is None:
+                raise RuntimeError("native_region_progress_route_was_not_generated")
+            region_position = np.asarray(region["site_position_world_m"], dtype=np.float64)
+            region_rotation = np.asarray(region["site_rotation_world"], dtype=np.float64)
+            goal_local = np.asarray(region_progress_route["goal_region_local_m"], dtype=np.float64)
+            flat_distance = lambda position: float(np.linalg.norm(
+                (region_rotation.T @ (np.asarray(position, dtype=np.float64) - region_position))[:2]
+                - goal_local[:2]
+            ))
+            stagnant_segments = 0
+            for waypoint_index, waypoint_row in enumerate(region_progress_route["waypoints"]):
+                live = bridge.request({"op": "observe", "include_snapshot_state": True})
+                live_state = live["snapshot_state"]
+                live_object = _object_state(live_state, int(target_binding["body_id"]))
+                live_robot = live_state["robot_states"][0]
+                live_object_world = np.eye(4, dtype=np.float64)
+                live_object_world[:3, :3] = Rotation.from_quat(
+                    np.asarray(live_object["root_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+                ).as_matrix()
+                live_object_world[:3, 3] = live_object["root_pos"]
+                live_eef_world = np.eye(4, dtype=np.float64)
+                live_eef_world[:3, :3] = Rotation.from_quat(
+                    np.asarray(live_robot["eef_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+                ).as_matrix()
+                live_eef_world[:3, 3] = live_robot["eef_pos"]
+                live_object_to_eef = np.linalg.inv(live_object_world) @ live_eef_world
+                target_object_world = np.asarray(
+                    waypoint_row["object_pose_world"], dtype=np.float64,
+                ).copy()
+                role = str(waypoint_row["role"])
+                distance_before = flat_distance(live_object_world[:3, 3])
+                if role == "region_progress":
+                    local_current = region_rotation.T @ (live_object_world[:3, 3] - region_position)
+                    delta = goal_local[:2] - local_current[:2]
+                    distance_to_goal = float(np.linalg.norm(delta))
+                    if distance_to_goal <= 0.035:
+                        continue
+                    segment_m = min(0.045, distance_to_goal)
+                    next_local = local_current.copy()
+                    next_local[:2] += delta * (segment_m / distance_to_goal)
+                    next_local[2] = float(region_progress_route["adaptive_transit_height_region_m"])
+                    target_object_world[:3, 3] = region_position + region_rotation @ next_local
+                target_eef_world = target_object_world @ live_object_to_eef
+                action_budget_remaining = max(0, transport_action_budget - counter[0])
+                if action_budget_remaining <= 0:
+                    raise RuntimeError("native_region_progress_transport_horizon_budget_exhausted")
+                # The short waypoint is bounded by the route-derived remaining
+                # budget; OSC feedback stops at the waypoint or on real stagnation.
+                segment_steps = action_budget_remaining
+                progress_context = {
+                    "tracking_mode": "native_region_progress_OSC_feedback",
+                    "route_variant": region_progress_route["route_variant"],
+                    "waypoint_role": role,
+                    "waypoint_index": waypoint_index,
+                    "native_goal_predicate": predicate,
+                    "native_region_world_pose": {
+                        "position_m": region_position.tolist(),
+                        "rotation": region_rotation.tolist(),
+                    },
+                    "object_goal_world_pose": goal_object.tolist(),
+                    "object_goal_distance_before_m": distance_before,
+                    "object_goal_distance_metric": "actual_object_xy_distance_in_native_region_frame",
+                    "soft_keypose_reference_id": (
+                        keypose_experience.get("experience_id") if keypose_experience else None
+                    ),
+                    "keypose_is_a_soft_route_reference": keypose_experience is not None,
+                    "fixed_high_preplace_required": False,
+                    "RRT_or_IK_timeout_is_terminal": False,
+                    "physical_collision_response_enabled": True,
+                    "safety_certified": False,
+                }
+                _advance_pose(
+                    bridge, target_eef_world[:3, 3], _wxyz(target_eef_world[:3, :3]),
+                    f"transport_region_progress_{role}", "native_region_progress",
+                    counter, segment_steps, target_binding, instruction,
+                    safety_policy, monitor, records, frames,
+                    step_callback=persist_step,
+                    stagnation_window_actions=12,
+                    position_tolerance_m=0.015,
+                    rotation_tolerance_rad=0.12,
+                    planning_tracking=progress_context,
+                    absolute_action_limit=None,
+                )
+                after = bridge.request({"op": "observe", "include_snapshot_state": True})
+                after_state = after["snapshot_state"]
+                after_object = _object_state(after_state, int(target_binding["body_id"]))
+                distance_after = flat_distance(after_object["root_pos"])
+                grasp = bridge.request({
+                    "op": "grasp_state",
+                    "carried_binding": target_binding,
+                    "expected_instruction": instruction,
+                })
+                row = {
+                    "waypoint_index": waypoint_index,
+                    "role": role,
+                    "action_count_after": counter[0],
+                    "object_position_world_before_m": live_object["root_pos"],
+                    "object_position_world_after_m": after_object["root_pos"],
+                    "goal_distance_before_m": distance_before,
+                    "goal_distance_after_m": distance_after,
+                    "goal_distance_progress_m": distance_before - distance_after,
+                    "bilateral_grasp_confirmed": grasp.get("grasp_confirmed") is True
+                    and grasp.get("finger_contacts", {}).get("left") is True
+                    and grasp.get("finger_contacts", {}).get("right") is True,
+                    "native_goal_satisfied": native_goal_satisfied(),
+                }
+                region_progress_history.append(row)
+                if not row["bilateral_grasp_confirmed"]:
+                    raise RuntimeError("native_region_progress_transport_lost_bilateral_grasp")
+                if role == "region_progress":
+                    stagnant_segments = stagnant_segments + 1 if row["goal_distance_progress_m"] < 0.004 else 0
+                    if stagnant_segments >= 3:
+                        raise RuntimeError("native_region_progress_transport_object_goal_stagnated_across_three_segments")
+                if row["goal_distance_progress_m"] > 0.003 or role in {
+                    "adaptive_clearance", "keypose_side_detour",
+                    "adaptive_clearance_with_keypose_side_detour", "native_region_placement",
+                }:
+                    snap = bridge.request({"op": "export_runtime_snapshot"})
+                    if snap.get("status") == "complete" and isinstance(snap.get("payload"), bytes):
+                        snapshot_path = output_dir / "region_progress_snapshots" / (
+                            f"waypoint_{waypoint_index:03d}_{role}.pkl"
+                        )
+                        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                        snapshot_path.write_bytes(snap["payload"])
+                        region_progress_snapshots.append({
+                            "waypoint_index": waypoint_index,
+                            "role": role,
+                            "path": str(snapshot_path),
+                            "sha256": hashlib.sha256(snap["payload"]).hexdigest(),
+                            "native_goal_distance_m": distance_after,
+                        })
+                if row["native_goal_satisfied"]:
+                    break
+        route = route[:1]
         for waypoint_index, waypoint in enumerate(route[1:]):
             if keypose_sequence is not None:
                 keypose = keypose_sequence[waypoint_index]
@@ -2425,6 +2737,7 @@ def _native_place_single(
                         position_tolerance_m=0.010,
                         rotation_tolerance_rad=0.10,
                         planning_tracking=tracking_context,
+                        absolute_action_limit=None,
                     )
                     keypose_rrt_runs[-1].setdefault(
                         "closed_loop_source_path_indices_executed", []
@@ -2461,6 +2774,7 @@ def _native_place_single(
                         position_tolerance_m=0.010,
                         rotation_tolerance_rad=0.10,
                         planning_tracking=fallback_tracking,
+                        absolute_action_limit=None,
                     )
                     if counter[0] > transport_action_budget:
                         raise RuntimeError("native_goal_transport_action_budget_exhausted")
@@ -2491,8 +2805,12 @@ def _native_place_single(
             "final_native_task_status": final_native,
             "transport_route_source": transport_route_source,
             "target_object_contact_escape": contact_escape,
+            "region_progress_route": region_progress_route,
+            "region_progress_feedback": region_progress_history,
+            "region_progress_snapshots": region_progress_snapshots,
             "transport_route_RRT": {
-                "status": planned.get("status"),
+                "status": "not_run" if planned.get("planner_skipped") else planned.get("status"),
+                "route_selection_status": planned.get("status"),
                 "failure_reason": planned.get("failure_reason"),
                 "time_budget_s": rrt_time_budget_s,
                 "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
@@ -2548,6 +2866,7 @@ def _native_place_single(
                 stop_condition=native_goal_satisfied,
                 step_callback=persist_step,
                 stagnation_window_actions=24,
+                absolute_action_limit=None,
             )
         except Exception as exc:
             return archive_failure("precise_placement", exc, transport_route_source)
@@ -2621,6 +2940,7 @@ def _native_place_single(
                 "withdrawal", "native_goal_place", counter, MAX_NATIVE_WITHDRAWAL_ACTIONS, target_binding,
                 instruction, safety_policy, monitor, records, frames,
                 step_callback=persist_step,
+                absolute_action_limit=None,
             )
         except Exception as exc:
             return archive_failure("withdrawal", exc, transport_route_source)
@@ -2713,8 +3033,12 @@ def _native_place_single(
         "release_contact_escape_actions": release_contact_escape_actions,
         "transport_route_source": transport_route_source,
         "target_object_contact_escape": contact_escape,
+        "region_progress_route": region_progress_route,
+        "region_progress_feedback": region_progress_history,
+        "region_progress_snapshots": region_progress_snapshots,
         "transport_route_RRT": {
-            "status": planned.get("status"),
+            "status": "not_run" if planned.get("planner_skipped") else planned.get("status"),
+            "route_selection_status": planned.get("status"),
             "failure_reason": planned.get("failure_reason"),
             "time_budget_s": rrt_time_budget_s,
             "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
@@ -2736,7 +3060,8 @@ def _native_place_single(
             item.get("contact_monitoring", {}).get("captured_physics_substeps", 0) for item in records
         )),
         "transport_rrt": {
-            "status": planned.get("status"),
+            "status": "not_run" if planned.get("planner_skipped") else planned.get("status"),
+            "route_selection_status": planned.get("status"),
             "safety_certified": False,
             "diagnostic_minimum_clearance_m": planned.get("minimum_forbidden_clearance_m"),
         },
@@ -3157,6 +3482,7 @@ def _native_place(
     demonstration_horizon: int = 1000,
     rrt_time_budget_s: float = NATIVE_PLACEMENT_RRT_BUDGET_S,
     recovery_fallback_snapshot: dict[str, Any] | None = None,
+    transport_strategy: str = "native_region_progress_osc",
 ) -> dict[str, Any]:
     """Search distinct native-region layouts from one exact held-object Snapshot."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3387,6 +3713,39 @@ def _native_place(
             ),
             "safety_certified": False,
         }
+    elif transport_strategy == "native_region_progress_osc":
+        matching_experiences = [
+            experience for experience in experience_portfolio
+            if (
+                experience.get("object_family") == target_id.rsplit("_", 1)[0]
+                and str(experience.get("target_relation", "")).lower() == predicate[0].lower()
+                and experience.get("target_region_name") == predicate[-1]
+            )
+        ]
+        for variant_index, candidate in enumerate(candidates):
+            candidate["route_strategy"] = "native_region_progress_osc"
+            candidate["route_variant"] = (
+                "direct_region_progress" if variant_index % 2 == 0
+                else "keypose_side_region_progress"
+            )
+            candidate["candidate_id"] = (
+                f"{candidate['candidate_id']}_{candidate['route_variant']}"
+            )
+            if matching_experiences:
+                experience = matching_experiences[min(variant_index, len(matching_experiences) - 1)]
+                candidate["source_keypose_experience_id"] = experience.get("experience_id")
+                candidate["source_keypose_task"] = experience.get("source", {}).get("task")
+                candidate_experiences[candidate["candidate_id"]] = experience
+        candidates = candidates[:max(1, min(2, int(maximum_physical_branches)))]
+        keypose_preflight = [{
+            "status": "soft_reference_only_no_RRT_gate",
+            "source_experience_ids": [
+                row.get("experience_id") for row in matching_experiences
+            ],
+            "physical_route_generation": "native_region_geometry_and_live_object_state",
+            "RRT_or_IK_timeout_terminates_search": False,
+            "safety_certified": False,
+        }]
     elif experience_portfolio:
         candidates, candidate_experiences, keypose_preflight = _screen_native_keypose_candidates(
             bridge,
@@ -3556,11 +3915,17 @@ def _native_place(
         }
     last_result["placement_search"] = {
         "mode": (
+            "native_region_progress_OSC_with_soft_keypose_and_shared_physical_branch_budget"
+            if transport_strategy == "native_region_progress_osc"
+            else
             "L0_L1_keypose_guided_native_region_full_geometry_preflight"
             if experience_portfolio
             else "native_region_multi_candidate_snapshot_branches"
         ),
-        "candidate_count": len(keypose_preflight) if experience_portfolio else len(candidates),
+        "candidate_count": (
+            len(candidates) if transport_strategy == "native_region_progress_osc"
+            else len(keypose_preflight) if experience_portfolio else len(candidates)
+        ),
         "RRT_preflight_count": _keypose_rrt_call_count(keypose_preflight),
         "keypose_candidate_preflight": keypose_preflight,
         "preflight_reuse": preflight_reuse_summary,
@@ -3684,6 +4049,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "demonstration_horizon": args.demonstration_horizon,
             "standard_benchmark_horizon": 1000,
             "horizon_mode": "standard_benchmark" if args.demonstration_horizon == 1000 else "demonstration_only_extension",
+            "transport_strategy": args.transport_strategy,
         },
         "segments": [],
     }
@@ -3979,6 +4345,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 demonstration_horizon=args.demonstration_horizon,
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
+                transport_strategy=args.transport_strategy,
                 expected_start_snapshot_sha256=(
                     direct_resume.get("payload_sha256") if direct_resume
                     else _sha(resume["path"].read_bytes())
@@ -4087,6 +4454,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 demonstration_horizon=args.demonstration_horizon,
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
+                transport_strategy=args.transport_strategy,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
@@ -4180,6 +4548,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 demonstration_horizon=args.demonstration_horizon,
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
+                transport_strategy=args.transport_strategy,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
@@ -4380,6 +4749,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         demonstration_horizon=args.demonstration_horizon,
                         rrt_time_budget_s=args.rrt_time_budget_s,
                         recovery_fallback_snapshot=recovery_fallback_snapshot,
+                        transport_strategy=args.transport_strategy,
                         expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                         expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
                     )
@@ -4438,6 +4808,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-rrt-preflights", type=int, default=8)
     parser.add_argument("--maximum-physical-branches", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=20.0)
+    parser.add_argument(
+        "--transport-strategy",
+        choices=("native_region_progress_osc", "legacy_rrt"),
+        default="native_region_progress_osc",
+        help="task-success transport route; native region progress uses live object feedback with real OSC",
+    )
     parser.add_argument("--experience-library", type=Path, default=None)
     parser.add_argument("--keypose-experience", type=Path, action="append", default=[])
     parser.add_argument("--keypose-start-after", default=None)

@@ -28,6 +28,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _phase_evidence,
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
+    _native_region_progress_route,
     _keypose_rrt_call_count,
     _native_region_entry_offset_m,
     _native_placement_planner_target,
@@ -55,6 +56,34 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_region_progress_routes_are_object_relative_and_use_keypose_only_as_a_soft_side_hint(self):
+        start = np.eye(4, dtype=np.float64)
+        start[:3, 3] = [0.30, -0.18, 0.94]
+        goal = np.eye(4, dtype=np.float64)
+        goal[:3, 3] = [0.02, 0.01, 0.91]
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.90],
+            "site_rotation_world": np.eye(3).tolist(),
+            "site_size_m": [0.16, 0.12, 0.01],
+        }
+        direct = _native_region_progress_route(
+            start, goal, region=region, route_variant="direct_region_progress",
+        )
+        side = _native_region_progress_route(
+            start, goal, region=region,
+            route_variant="keypose_side_region_progress",
+            keypose_side_region=np.asarray([0.0, 1.0]),
+        )
+        self.assertTrue(direct["no_fixed_preplace_pose"])
+        self.assertGreater(direct["adaptive_transit_height_region_m"], goal[2, 3] - 0.90)
+        self.assertEqual(direct["waypoints"][0]["role"], "adaptive_clearance")
+        self.assertEqual(
+            side["waypoints"][0]["role"],
+            "adaptive_clearance_with_keypose_side_detour",
+        )
+        np.testing.assert_allclose(side["waypoints"][-1]["object_pose_world"], goal)
+        np.testing.assert_allclose(direct["waypoints"][-1]["object_pose_world"], goal)
+
     def test_joint_limit_diagnostic_reports_the_measured_small_overage(self):
         ranges = np.asarray([[-2.9, 2.9]] * 6 + [[-2.8973, 2.8973]], dtype=np.float64)
         qpos = np.asarray([0.0] * 6 + [2.897506367677], dtype=np.float64)

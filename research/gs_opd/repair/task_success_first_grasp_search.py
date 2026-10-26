@@ -771,6 +771,7 @@ def _advance_pose(
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
     planning_tracking: dict[str, Any] | None = None,
+    absolute_action_limit: int | None = MAX_BRANCH_CONTROL_ACTIONS,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
         quaternion_conjugate,
@@ -868,7 +869,7 @@ def _advance_pose(
             step_callback(records[-1], frames[-1])
         if records[-1].get("done"):
             raise RuntimeError("environment_done_during_grasp_only_branch")
-        if action_counter[0] > MAX_BRANCH_CONTROL_ACTIONS:
+        if absolute_action_limit is not None and action_counter[0] > absolute_action_limit:
             raise RuntimeError("physical_branch_control_action_budget_exceeded")
         actual = np.asarray(
             records[-1]["snapshot_state"]["robot_states"][0]["eef_pos"], dtype=np.float64

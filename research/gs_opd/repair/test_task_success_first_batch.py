@@ -17,11 +17,31 @@ from research.gs_opd.repair.task_success_first_batch import (
     _find_terminal_snapshot,
     _next_distinct_goal,
     _stage_action_count,
+    _stage_physical_branch_count,
     _task_summary,
 )
 
 
 class TaskSuccessFirstBatchTests(unittest.TestCase):
+    def test_task_branch_budget_counts_physical_region_branches_across_goals(self):
+        report = {
+            "segments": [
+                {
+                    "placement_search": {
+                        "physical_branch_count": 1,
+                        "candidate_attempts": [{"candidate_id": "region_layout_00"}],
+                    },
+                },
+                {
+                    "placement_search": {
+                        "physical_branch_count": 1,
+                        "candidate_attempts": [{"candidate_id": "region_layout_01"}],
+                    },
+                },
+            ],
+        }
+        self.assertEqual(_stage_physical_branch_count(report), 2)
+
     def test_multigoal_schedule_advances_only_after_native_goal_changes(self):
         first = ["on", "moka_pot_1", "stove"]
         second = ["on", "moka_pot_2", "stove"]

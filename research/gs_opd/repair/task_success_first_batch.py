@@ -378,6 +378,23 @@ def _stage_action_count(report: dict[str, Any]) -> int:
     return total
 
 
+def _stage_physical_branch_count(report: dict[str, Any]) -> int:
+    """Count real placement Snapshot branches in one native task stage."""
+    count = 0
+    for segment in report.get("segments", []):
+        placement = segment.get("placement_search")
+        if isinstance(placement, dict):
+            count += int(placement.get("physical_branch_count", 0) or 0)
+        nested_path = segment.get("report")
+        if nested_path and Path(nested_path).is_file():
+            nested = json.loads(Path(nested_path).read_text(encoding="utf-8"))
+            for nested_segment in nested.get("segments", []):
+                nested_placement = nested_segment.get("placement_search")
+                if isinstance(nested_placement, dict):
+                    count += int(nested_placement.get("physical_branch_count", 0) or 0)
+    return count
+
+
 def _find_terminal_snapshot(report: dict[str, Any]) -> str | None:
     for segment in reversed(report.get("segments", [])):
         path = segment.get("terminal_snapshot")
@@ -579,7 +596,10 @@ def _run_stage(
         "--demonstration-horizon", str(args.demonstration_horizon),
         "--target-predicate", *[str(token) for token in predicate],
         "--experience-library", str(args.experience_library),
+        "--transport-strategy", args.transport_strategy,
     ]
+    for keypose_path in args.keypose_experience:
+        command.extend(["--keypose-experience", str(Path(keypose_path).resolve())])
     if stage_index == 0 and args.recovery_fallback_runtime_snapshot is not None:
         command.extend([
             "--recovery-fallback-runtime-snapshot",
@@ -782,6 +802,9 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
         "expert_actions": expert_actions,
         "physical_actions": student_actions + expert_actions,
         "snapshot_branches": branches,
+        "placement_route_branches": sum(
+            _stage_physical_branch_count(stage) for stage in stages
+        ),
         "maximum_progress": progress,
         "stable_grasp_verified": stable_grasp,
         "maximum_verified_lift_m": maximum_lift,
@@ -892,10 +915,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             predicate = _next_goal(current_native)
             if predicate is None:
                 break
+            remaining_branches = max(
+                0, args.physical_branches - sum(
+                    _stage_physical_branch_count(row) for row in task_stages
+                ),
+            )
             estimated_stage_actions = (
                 args.student_actions + args.student_handoff_actions
-                + args.physical_branches * 192
+                + remaining_branches * 192
             )
+            if remaining_branches == 0:
+                task_stages.append({
+                    "status": "task_physical_branch_budget_exhausted_before_next_goal",
+                    "requested_goal_predicate": predicate,
+                    "physical_branches_used": args.physical_branches,
+                    "physical_branch_budget": args.physical_branches,
+                    "final_native_task_status": current_native,
+                    "segments": [],
+                })
+                break
             if (
                 global_actions + estimated_stage_actions > args.global_action_budget
                 or task_actions + estimated_stage_actions > args.per_task_action_budget
@@ -912,8 +950,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "task_actions_used": task_actions,
                 })
                 break
+            stage_args = argparse.Namespace(**vars(args))
+            stage_args.physical_branches = min(args.physical_branches, remaining_branches)
             stage_report, _, stage_root = _run_stage(
-                args, task_id=task_id, stage_index=stage_index,
+                stage_args, task_id=task_id, stage_index=stage_index,
                 predicate=predicate, snapshot_root=current_root, task_dir=task_dir,
             )
             task_stages.append(stage_report)
@@ -997,10 +1037,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "geometry_candidates": args.maximum_candidates,
             "RRT_preflights_per_goal": args.rrt_preflights,
             "physical_snapshot_branches_per_goal": args.physical_branches,
+            "physical_snapshot_branch_budget_per_task": args.physical_branches,
+            "physical_snapshot_branches_used": sum(
+                _stage_physical_branch_count(stage)
+                for task in results for stage in task.get("stages", [])
+            ),
             "RRT_time_budget_s": args.rrt_time_budget_s,
             "demonstration_horizon": args.demonstration_horizon,
             "standard_benchmark_horizon": 1000,
             "horizon_mode": "standard_benchmark" if args.demonstration_horizon == 1000 else "demonstration_only_extension",
+            "transport_strategy": args.transport_strategy,
+            "keypose_experience_references": [str(path.resolve()) for path in args.keypose_experience],
             "maximum_stages_per_task": args.maximum_stages_per_task,
         },
         "tasks": [item["summary"] for item in results],
@@ -1107,6 +1154,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--global-action-budget", type=int, default=5000)
     parser.add_argument("--per-task-action-budget", type=int, default=1800)
     parser.add_argument("--experience-library", type=Path, default=DEFAULT_EXPERIENCE_LIBRARY)
+    parser.add_argument("--keypose-experience", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--transport-strategy",
+        choices=("native_region_progress_osc", "legacy_rrt"),
+        default="native_region_progress_osc",
+    )
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.output_dir.exists() and not args.resume:
@@ -1128,6 +1181,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error("--resume-from-runtime-snapshot requires exactly one explicit --task-ids value")
         if not args.resume_from_runtime_snapshot.is_file():
             parser.error("--resume-from-runtime-snapshot must reference an existing Snapshot")
+    if any(not path.is_file() for path in args.keypose_experience):
+        parser.error("--keypose-experience must reference existing GS-OPD experience JSON files")
     if (
         args.recovery_fallback_runtime_snapshot is not None
         and not args.recovery_fallback_runtime_snapshot.is_file()

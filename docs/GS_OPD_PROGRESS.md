@@ -3828,3 +3828,18 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 从合法回退Snapshot开始的一次有界运输规划因RRT `planning_time_budget_exhausted`停止（实际规划预算12秒，未进入OSC运输）。本次启动命令请求8秒，但原执行器主运输规划仍读取12秒模块默认值；此配置传播缺陷已在代码中修复为统一使用CLI RRT时间预算，不为修复而重跑物理分支。所以Pot1尚未放置/释放，Pot2未开始抓取，原生`task_success=false`，本轮新增完整成功Episode为0；真实物理动作共8步，均为限位恢复尝试，未产生运输动作。最佳可恢复Snapshot仍是t=215双指持Pot1状态，与源合法Snapshot Integration State逐元素一致。8步共记录200个子步接触样本；每步记录25个子步，但几何监测器报告`incomplete`（真实接触及严格几何检查失败仍保留，不代表完整安全监测或安全认证）。动作/状态、接触JSONL、双相机帧和视频保存在`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_transport_budget_recovery_20261026_retry2/`；综合机器报告为`human_l0t2_transport_recovery_attempt_report.json`，并保留`batch_report.json`、Human L0T2 `task_report.json`与stage `run_report.json`。
 
 最初两次启动错误均在物理动作前退出（导入路径与Bridge状态名检查问题），零动作归档保留在相邻的`...transport_budget_recovery_20261026/`与`..._retry1/`；唯一实际物理恢复尝试在`..._retry2/`，没有继续追加搜索。动态预算单元回归覆盖超过360步的路线预算；恢复和失抓终止回归核对了真实Bridge `status=available`限位字段及运输段失抓。定向测试`test_task_success_first_executor.py`及`test_task_success_first_batch.py`：37 passed、6 subtests passed。报告统计已离线纠正为已验证持抓、未执行运输、1次RRT尝试；监测不完整如实保留。
+
+
+## Human L0T2任务区域进展运输尝试（2026-10-26）
+
+本轮将固定高位Preplace/RRT前置门槛改为通用的物体坐标系运输路线：从Pot当前真实位姿与BDDL目标Region几何生成自适应抬升、区域内短段和最终放置目标；L0T2/L1T2历史Keypose只作软侧向参考。运输候选经真实OSC_POSE在MuJoCo中执行，不写入机器人或物体状态；RRT/IK不是终止门槛，完整成功仍由原生BDDL判定。最多两个物理分支均从已核验的合法t=215 Pot1持抓Snapshot开始。
+
+结果：原生task_success=false，新增完整Task-Success Episode为0。Pot1仍双指稳定抓持但尚未放置；最佳上抬32.85 mm、XY位移2.34 mm，原生Pot1 On=false；Pot2阶段未开始；Stove Turnon=true。两分支共执行36个真实OSC动作、900个MuJoCo子步，无RRT调用。每支18步后都在自适应抬升Waypoint退出，原因为局部18步目标预算耗尽，而Pot和EEF仍实际上升约32.8/33.6 mm。两支共享初始抬升段，第二支的L1 Keypose侧向路线尚未物理执行，因此本轮没有证明替代路线有效。
+
+物理分支后修正了Waypoint动作预算：现在使用运输路线剩余预算，允许实际OSC持续到子目标完成，并由真实停滞检测结束；第二候选路线也改为第一Waypoint同时上抬和侧移。该后置修正通过代码回归检查，但**本轮没有物理验证**。本轮双分支预算已耗尽，不追加相似搜索。Safety Bridge记录了36/36动作对应的900个子步样本，但几何监测均标记incomplete；不构成安全认证。
+
+批处理入口曾在首个阶段启动前无物理动作地停滞，保留的t=0 Snapshot仍在归档中。后续代码复核发现剩余分支预算保护错误包住正常调度代码，现已纠正缩进并通过批处理单元回归；该控制流缺陷不能单独解释之前观察到的CPU停滞。
+
+完整JSON及可读摘要：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.json`、`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.md`。分支视频、动作/状态NPZ、逐步接触记录和终态Runtime Snapshot均按JSON清单保存。定向验证：39 passed、6 subtests passed，三模块py_compile通过。
+
+**结论：本轮运输策略的物理尝试失败，主要已证实阻塞是过短的局部Waypoint动作分配；修正后的预算和侧向路线尚未在物理上验证。保留t=233可恢复Snapshot与失败证据，不启动Pot2，不训练。**

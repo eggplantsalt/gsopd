@@ -560,3 +560,18 @@ Round60诊断机器报告和逐步指标见归档`evidence/round60_stagnation_di
 固定360步运输截断已由路线长度与剩余demo horizon/后续对象预算取代，并增加限位OSC恢复与合法Snapshot回退。单次Human L0T2续接未完成任务：失败t=575 Snapshot的joint7越限0.000206368 rad；8个真实OSC动作仍剩0.000127443 rad越限，随后准确回退至同场景合法Pot1持抓Snapshot。RRT接续规划12秒超时，没有物理运输动作；Pot1仍未放置，Pot2阶段未运行，原生任务完整成功为false。启动参数请求8秒但未传入主运输RRT，运行值为12秒；接口传播已修复，未为此重跑。未追加搜索。
 
 后续实现应优先改进任务等价目标区域的RRT候选与失败分类/预算，避免将规划超时变成物理动作空转；关节状态必须始终来自真实合法状态，继续使用MuJoCo反馈与BDDL完成判据。保留本轮8步动作、200子步样本、接触日志、双相机视频和t=215最佳Snapshot作失败前缀。子步几何门禁标记incomplete，严格安全认证仍独立执行。定向测试37 passed及6 subtests；详见`GS_OPD_PROGRESS.md`及归档`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_transport_budget_recovery_20261026_retry2/`。
+
+
+## Human L0T2任务区域进展运输尝试（2026-10-26）
+
+本轮将固定高位Preplace/RRT前置门槛改为通用的物体坐标系运输路线：从Pot当前真实位姿与BDDL目标Region几何生成自适应抬升、区域内短段和最终放置目标；L0T2/L1T2历史Keypose只作软侧向参考。运输候选经真实OSC_POSE在MuJoCo中执行，不写入机器人或物体状态；RRT/IK不是终止门槛，完整成功仍由原生BDDL判定。最多两个物理分支均从已核验的合法t=215 Pot1持抓Snapshot开始。
+
+结果：原生task_success=false，新增完整Task-Success Episode为0。Pot1仍双指稳定抓持但尚未放置；最佳上抬32.85 mm、XY位移2.34 mm，原生Pot1 On=false；Pot2阶段未开始；Stove Turnon=true。两分支共执行36个真实OSC动作、900个MuJoCo子步，无RRT调用。每支18步后都在自适应抬升Waypoint退出，原因为局部18步目标预算耗尽，而Pot和EEF仍实际上升约32.8/33.6 mm。两支共享初始抬升段，第二支的L1 Keypose侧向路线尚未物理执行，因此本轮没有证明替代路线有效。
+
+物理分支后修正了Waypoint动作预算：现在使用运输路线剩余预算，允许实际OSC持续到子目标完成，并由真实停滞检测结束；第二候选路线也改为第一Waypoint同时上抬和侧移。该后置修正通过代码回归检查，但**本轮没有物理验证**。本轮双分支预算已耗尽，不追加相似搜索。Safety Bridge记录了36/36动作对应的900个子步样本，但几何监测均标记incomplete；不构成安全认证。
+
+批处理入口曾在首个阶段启动前无物理动作地停滞，保留的t=0 Snapshot仍在归档中。后续代码复核发现剩余分支预算保护错误包住正常调度代码，现已纠正缩进并通过批处理单元回归；该控制流缺陷不能单独解释之前观察到的CPU停滞。
+
+完整JSON及可读摘要：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.json`、`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.md`。分支视频、动作/状态NPZ、逐步接触记录和终态Runtime Snapshot均按JSON清单保存。定向验证：39 passed、6 subtests passed，三模块py_compile通过。
+
+**结论：本轮运输策略的物理尝试失败，主要已证实阻塞是过短的局部Waypoint动作分配；修正后的预算和侧向路线尚未在物理上验证。保留t=233可恢复Snapshot与失败证据，不启动Pot2，不训练。**
