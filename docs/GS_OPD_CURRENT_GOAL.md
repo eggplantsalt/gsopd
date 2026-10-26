@@ -1,3 +1,11 @@
+## 最新局部目标：暂停L2T2相似搜索，优先验证T0跨Level技能迁移（2026-10-26）
+
+Round63从t=2589精确Pot2持抓Snapshot出发，使用L1T2自有Keypose经验。唯一被选择的路线预放置RRT预筛可行，但执行阶段同状态RRT重规划在20.053秒/265项配置检查后超时，尚未发出OSC动作；因此本轮动作数为0，原生任务仍2/3且`task_success=false`。起点与失败终态Snapshot字节一致；闭环执行路径尚无物理验证证据。Round63证据和hash见`GS_OPD_PROGRESS.md`顶部机器/人读报告。
+
+本轮关闭L2T2连续专项搜索，不追加候选或物理分支。下一步转到T0跨Level迁移：使用经验库中L0T0自有的黑碗稳定抓持技能验证同任务族重定位。该技能记录了36.3 mm真实抬升，但源任务未完整成功；只作为抓持技能先验，最终仍以目标场景原生BDDL `task_success=true`为唯一完整任务成功判据。跨Level执行继续使用真实MuJoCo动作、Snapshot与碰撞记录，危险接触只做Task-Success风险记录，安全认证保持独立。
+
+---
+
 ## 最新局部目标：L2T2 Keypose续接已取得可恢复持抓前缀，完整成功仍未取得（2026-10-26）
 
 从run55 Pot2双指持抓Snapshot（t=2589）严格恢复，核对模型SHA `718ba2a082c0…`、BDDL SHA `58b3db563524…`、payload SHA `9b0a9942…`、Integration State SHA `836981a4…`及2/3初始原生谓词。只用GS-OPD自有L0T2与L1T2成功关键姿态经验，不回放历史动作。L0来源路线唯一通过首轮整机/持物预放置RRT和末端IK筛选；L1来源候选受RRT预算阻挡。

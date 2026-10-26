@@ -1,3 +1,12 @@
+## 2026-10-26 路线更新：L2T2单次闭环路线验证未触发OSC，转向T0经验迁移
+
+- 从精确t=2589持抓Snapshot核验模型、BDDL、状态和双指抓持来源后，复用L1T2自有Keypose经验；路线预筛4个有界RRT候选，其中`route_01`预放置离线RRT可行，终端IK/RRT因预算耗尽为unknown。
+- 唯一Snapshot物理分支执行阶段重新规划预放置路线，20.053秒/265项检查后`planning_time_budget_exhausted`。OSC未启动，动作0、真实控制子步0，故无法判断稠密路径反馈能否改善Round60的OSC跟踪。状态仍2/3原生谓词，L2T2暂时未解决；不再增加相似L2轮次。
+- 执行器将Keypose RRT完整7D关节路径和EEF参考保留为跟踪输入，不再压缩EEF路径，并复用现有实时观察与小步OSC反馈。相关执行逻辑通过25项executor测试和Python编译检查；本轮没有物理控制执行验证。Strict Safety Reconstruction、BDDL、物体状态与训练均未修改。
+- 下一优先级是T0跨Level迁移，复用经验库中GS-OPD自有L0T0黑碗稳定抓持/真实抬升36.3 mm的子技能。源L0T0任务本身未完整成功，因此只当抓持技能先验；跨Level任务仍须独立满足原生`task_success=true`。所有历史记录保留，Round63证据见`GS_OPD_PROGRESS.md`顶部链接。
+
+---
+
 ## 最新总体里程碑：L2T2 Keypose跨Level续接保留2/3原生前缀，第三条稳定成功未取得（2026-10-26）
 
 - **经验迁移：** L0T2与已完成L1T2的GS-OPD自有关键姿态经验均按活动BDDL和当前区域几何重定位；源动作未回放。首轮仅L0来源路线通过预放置全几何RRT/末端IK门槛，说明在当前L2摆位上L0经验更适配。

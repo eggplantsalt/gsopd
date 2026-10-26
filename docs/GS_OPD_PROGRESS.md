@@ -1,3 +1,15 @@
+## Round63：L2T2稠密RRT路径跟踪单次验证未进入OSC，暂列未解决（2026-10-26）
+
+本轮从Round60归档的t=2589 Pot2双指抓持Snapshot启动，payload SHA `70b9bfa20d8caf0eb3a71309ad58eed471100b8293f6e35b61fbb42c70a9326d`，Integration State SHA `836981a4fd3507c6a384db7e0e3088d78c8ad64a2519fab4b07a7030bae4d208`；模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`、BDDL SHA `58b3db56352473e7c4534769911a0ad48ea7c214f934fcb4403b6c1da5467b523`一致。Pot1 On、Stove Turnon为true，Pot2 On与任务成功为false。Keypose来源为GS-OPD自有L1T2成功轨迹，未回放其动作。
+
+执行器已调整为保留每段完整7D RRT `qpos_path`与EEF参考路径，取消Keypose路径压缩，继续复用既有 `_advance_pose` 的真实状态反馈与小步OSC。严格安全认证和原生BDDL未变。一次初始化尝试在候选筛选前因缺少`update_pose_record`导入退出（0动作）；修正导入后，4次有界RRT预筛共约62.011秒。`route_00`预放置无路；`route_01`在相同Snapshot下预放置RRT离线可行（17.938秒、307项配置检查），但末端IK/RRT因预检预算用尽未执行，状态为unknown；`route_02/03`未筛查。
+
+唯一Snapshot分支复用`route_01`后，在真实阶段RRT重规划时以`planning_time_budget_exhausted`退出（20.053秒、265项配置检查），发生在第一条OSC动作之前。故本轮Student动作0、专家控制动作0、真实控制子步0，闭环跟踪改进**尚未经过物理验证**；未产生新的OA轨迹或视频，Task状态仍2/3谓词、`task_success=false`。终态Snapshot与起点payload字节完全相同，可恢复且未覆盖原始归档。没有局部重规划或第二物理分支。
+
+报告：[/opt/data/private/gs_opd/rollouts/l2t2_dense_rrt_closed_loop_20261026_round63/round63_summary.md](/opt/data/private/gs_opd/rollouts/l2t2_dense_rrt_closed_loop_20261026_round63/round63_summary.md)；[机器汇总](/opt/data/private/gs_opd/rollouts/l2t2_dense_rrt_closed_loop_20261026_round63/round63_summary.json)。L2T2本轮暂时标记未解决，停止继续相似搜索。下一阶段回到跨场景采集，优先做T0跨Level迁移：经验库已有GS-OPD自有L0T0黑碗稳定抓持/36.3 mm抬升技能，可作为技能先验；它不是完整任务成功轨迹，不得作为完整成功来源。
+
+---
+
 ## L2T2 跨Level Keypose续接尝试（2026-10-26；限额路线失败后停止）
 
 ### 起点与迁移来源

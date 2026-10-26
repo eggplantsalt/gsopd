@@ -1231,7 +1231,6 @@ def _native_place_single(
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _advance_pose,
         _compress_eef_route,
-        _compress_eef_route_with_indices,
         _record_step,
         _snapshot_state_vector,
         _state_sha,
@@ -1610,6 +1609,7 @@ def _native_place_single(
         route, observed_speed_m_s=0.012, minimum_actions=74,
         maximum_actions=MAX_NATIVE_TRANSPORT_ACTIONS,
     )
+
     try:
         for waypoint_index, waypoint in enumerate(route[1:]):
             if keypose_sequence is not None:
@@ -1699,7 +1699,8 @@ def _native_place_single(
                         raise RuntimeError(
                             f"keypose_RRT_joint_and_EEF_path_alignment_invalid:{keypose['name']}"
                         )
-                    subroute, compressed_source_indices = _compress_eef_route_with_indices(raw_eef_route)
+                    source_path_indices = list(range(len(raw_eef_route)))
+                    closed_loop_source_indices = source_path_indices[1:]
                     route_archive = {
                         "schema_version": "gs_opd_rrt_osc_route_archive.v1",
                         "keypose": keypose["name"],
@@ -1711,21 +1712,23 @@ def _native_place_single(
                         "planning_seconds": keypose_plan.get("planning_seconds"),
                         "qpos_path_rad": qpos_path.tolist(),
                         "raw_eef_reference_poses_world": raw_eef_route.tolist(),
-                        "compressed_waypoints": [
+                        "closed_loop_tracking_reference": [
                             {
-                                "compressed_index": index,
                                 "source_path_index": source_index,
-                                "eef_pose_world": subroute[index].tolist(),
+                                "eef_pose_world": raw_eef_route[source_index].tolist(),
                                 "rrt_reference_qpos_rad": qpos_path[source_index].tolist(),
                             }
-                            for index, source_index in enumerate(compressed_source_indices)
+                            for source_index in source_path_indices
                         ],
                         "compression": {
-                            "translation_threshold_m": 0.020,
-                            "rotation_threshold_rad": 0.10,
-                            "compressed_source_path_indices": compressed_source_indices,
+                            "applied": False,
+                            "reason": "existing_live_feedback_tracker_consumes_full_RRT_reference_path",
+                            "source_path_indices": source_path_indices,
                         },
-                        "execution_policy": "OSC_POSE feedback toward each compressed EEF waypoint",
+                        "execution_policy": (
+                            "existing_slow_OSC_POSE_feedback_to_each_dense_RRT_path_pose; "
+                            "full_RRT_joint_and_EEF_paths_preserved; contacts_recorded_only"
+                        ),
                         "safety_certified": False,
                     }
                     route_bytes = json.dumps(
@@ -1740,11 +1743,15 @@ def _native_place_single(
                         "sha256": hashlib.sha256(route_bytes).hexdigest(),
                         "qpos_path_rows": int(len(qpos_path)),
                         "raw_eef_path_rows": int(len(raw_eef_route)),
-                        "compressed_waypoint_count": int(len(subroute)),
-                        "compressed_source_path_indices": compressed_source_indices,
+                        "compressed_waypoint_count": 0,
+                        "closed_loop_reference_count": int(len(raw_eef_route)),
+                        "closed_loop_source_path_indices": closed_loop_source_indices,
                     }
                     keypose_rrt_runs[-1]["selected_qpos_path_saved"] = True
                     keypose_rrt_runs[-1]["raw_eef_path_saved"] = True
+                    keypose_rrt_runs[-1]["execution_tracking_mode"] = (
+                        "dense_RRT_EEF_path_existing_slow_closed_loop_feedback"
+                    )
                 else:
                     keypose_rrt_runs[-1]["execution_fallback"] = None
                     raise RuntimeError(
@@ -1754,32 +1761,56 @@ def _native_place_single(
             else:
                 keypose = {"name": "native_goal_transport_waypoint"}
                 subroute = np.asarray([waypoint], dtype=np.float64)
-            for subgoal_index, subgoal in enumerate(subroute):
-                tracking_context = None
-                if keypose_sequence is not None:
-                    source_path_index = compressed_source_indices[subgoal_index]
+            if keypose_sequence is not None:
+                route_info = keypose_rrt_runs[-1]["route_archive"]
+                for source_path_index in closed_loop_source_indices:
+                    reference_pose = raw_eef_route[source_path_index]
                     tracking_context = {
-                        "rrt_archive_path": keypose_rrt_runs[-1]["route_archive"]["path"],
-                        "rrt_route_sha256": keypose_rrt_runs[-1]["route_archive"]["sha256"],
+                        "tracking_mode": "dense_RRT_EEF_path_existing_slow_closed_loop_feedback",
+                        "rrt_archive_path": route_info["path"],
+                        "rrt_route_sha256": route_info["sha256"],
                         "keypose": keypose["name"],
-                        "compressed_waypoint_index": subgoal_index,
                         "rrt_source_path_index": source_path_index,
-                        "rrt_reference_eef_pose_world": raw_eef_route[source_path_index].tolist(),
+                        "rrt_reference_eef_pose_world": reference_pose.tolist(),
                         "rrt_reference_qpos_rad": qpos_path[source_path_index].tolist(),
                     }
-                _advance_pose(
-                    bridge, subgoal[:3], subgoal[3:],
-                    f"transport_{keypose['name']}", "native_goal_transport", counter,
-                    max(1, transport_action_budget - counter[0]), target_binding,
-                    instruction, safety_policy, monitor, records, frames,
-                    step_callback=persist_step,
-                    stagnation_window_actions=24,
-                    position_tolerance_m=0.010,
-                    rotation_tolerance_rad=0.10,
-                    planning_tracking=tracking_context,
-                )
-                if counter[0] > transport_action_budget:
-                    raise RuntimeError("native_goal_transport_action_budget_exhausted")
+                    _advance_pose(
+                        bridge, reference_pose[:3], reference_pose[3:],
+                        f"transport_{keypose['name']}_dense_RRT_path",
+                        "native_goal_transport",
+                        counter,
+                        max(1, transport_action_budget - counter[0]),
+                        target_binding,
+                        instruction,
+                        safety_policy,
+                        monitor,
+                        records,
+                        frames,
+                        step_callback=persist_step,
+                        stagnation_window_actions=24,
+                        position_tolerance_m=0.010,
+                        rotation_tolerance_rad=0.10,
+                        planning_tracking=tracking_context,
+                    )
+                    keypose_rrt_runs[-1].setdefault(
+                        "closed_loop_source_path_indices_executed", []
+                    ).append(source_path_index)
+                    if counter[0] > transport_action_budget:
+                        raise RuntimeError("native_goal_transport_action_budget_exhausted")
+            else:
+                for subgoal in subroute:
+                    _advance_pose(
+                        bridge, subgoal[:3], subgoal[3:],
+                        f"transport_{keypose['name']}", "native_goal_transport", counter,
+                        max(1, transport_action_budget - counter[0]), target_binding,
+                        instruction, safety_policy, monitor, records, frames,
+                        step_callback=persist_step,
+                        stagnation_window_actions=24,
+                        position_tolerance_m=0.010,
+                        rotation_tolerance_rad=0.10,
+                    )
+                    if counter[0] > transport_action_budget:
+                        raise RuntimeError("native_goal_transport_action_budget_exhausted")
     except Exception as exc:
         _write_recording(output_dir, records, frames)
         failure_snapshot_path = output_dir / "native_goal_transport_failed_runtime_snapshot.pkl"
@@ -2101,6 +2132,7 @@ def _screen_native_keypose_candidates(
     from research.gs_opd.repair.keypose_driven_planning import (
         retarget_keypose_sequence,
         select_keypose_suffix,
+        update_pose_record,
     )
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _snapshot_state_vector,
@@ -2513,7 +2545,14 @@ def _native_place(
             row for row in prior_search.get("keypose_candidate_preflight", [])
             if row.get("admitted_to_physical_search") is True
             and row.get("preplace_RRT", {}).get("status") == "offline_feasible"
-            and int(row.get("terminal_pose_IK_RRT_diagnostic", {}).get("ik_candidate_count", 0)) > 0
+            and (
+                int(row.get("terminal_pose_IK_RRT_diagnostic", {}).get("ik_candidate_count", 0)) > 0
+                or (
+                    row.get("defer_terminal_ik_to_live_keypose_planning") is True
+                    and row.get("terminal_pose_IK_RRT_diagnostic", {}).get("status")
+                    == "budget_exhausted"
+                )
+            )
         ]
         if not feasible_rows:
             raise ValueError("precomputed_keypose_route_report_has_no_admitted_candidate")
@@ -2557,6 +2596,9 @@ def _native_place(
             "status": "reused_after_exact_snapshot_hash_and_native_predicate_recheck",
             "candidate_id": candidate_id,
             "source_experience_id": experience_id,
+            "terminal_ik_deferred_to_per_keypose_live_RRT": bool(
+                selected.get("defer_terminal_ik_to_live_keypose_planning") is True
+            ),
             "source_preflight_run_archive": keypose_preflight_report.get("archive"),
             "resume_snapshot_payload_sha256": expected_start_snapshot_sha256,
             "start_snapshot_state_sha256": _state_digest(base_state),
