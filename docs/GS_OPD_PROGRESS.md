@@ -3872,3 +3872,16 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 机器报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_collision_aware_rrt_20261026_run1/batch_report.json`、`batch_report.md`、`cross_task_summary.csv`，任务报告位于`obstacle_avoidance_human_L0T2/task_report.json`，分支和执行报告位于`stage_00/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_224008_781508768/`。因物理动作数为0，没有视频。
 
 定向测试：`test_task_success_first_executor.py`、`test_jointspace_rrt.py`、`test_task_success_first_batch.py`共53 passed、6 subtests passed；相关模块py_compile通过。完成两条路线预算后停止，不追加相似RRT或OSC调参；新增Task-Success Episode为0。
+
+
+## Human L0T2 CuRobo运输尝试：t=215 Snapshot模型身份不匹配（2026-10-26）
+
+本轮先复核既有CuRobo环境：隔离环境`/workspace/gsopd_curobo_eval/.venv`可直接导入`nvidia-curobo 0.0.post1.dev1`，源码commit `78fd485`；CUDA可用、可见GPU数3。未安装依赖、未升级CuRobo。
+
+选择了上一轮已验收的合法Pot1持抓t=215 Runtime Snapshot，文件SHA `b348a065ccb7259a69fd0dc042b42264d257e9f3aba4adb271ff23956729801e`，内部模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`。重新启动同任务`obstacle_avoidance_human/L0T2`、seed=0、init-state=0 Bridge，任务名和指令匹配，BDDL SHA同为`2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`，但当前编译模型SHA为`3b942cf306a7decd7dcf576e7970d7a4dcb5af3c663db26da508dd5dd0a56fc8`。Bridge拒绝快照恢复：`Runtime Snapshot model geometry differs from the active Bridge`。严格模型门禁未绕过，未写入状态，控制动作0、MuJoCo子步0。
+
+当前t=0只读盘点得到723个Geom、机器人分类完整；活动语义绑定列出Pot1、Pot2、番茄酱瓶和炉灶。因为这些是当前t=0模型查询，且与持抓Snapshot指纹不同，未将其冒充为t=215有效场景，也未转换CuRobo场景、附着Pot或启动IK/规划。CuRobo路径生成数0，物理执行0；Pot1未运输/放置/松爪，native `task_success=false`，无完整Observation–Action轨迹、视频或可用于训练的数据。
+
+未用旧MuJoCo RRT、未用Region-Progress、未调整OSC阈值、未回退旧路线；BDDL和物理状态均未改。报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_run1/run_report.json`及同目录Markdown。探测日志位于`..._probe/safety_bridge.log`和`..._probe2/safety_bridge.log`。
+
+**结论：**实际任务尝试在Snapshot身份校验阶段阻塞，不能报告为规划失败或OSC执行失败。下次继续前必须先取得模型指纹匹配的合法Pot1持抓Snapshot，或恢复其精确原模型环境；在此之前不运行规划与物理分支。

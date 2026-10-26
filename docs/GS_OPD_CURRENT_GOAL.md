@@ -1,3 +1,13 @@
+## 最新局部目标：Human L0T2 CuRobo迁移被t=215 Snapshot模型指纹门禁阻断（2026-10-26）
+
+本轮未运行旧MuJoCo 7D RRT、Region-Progress路线或OSC停滞阈值调试。CuRobo隔离环境已可用（`nvidia-curobo 0.0.post1.dev1`，源码commit `78fd485`），未安装或升级。只读启动Human L0T2 seed=0/init-state=0 Bridge时得到完整723 Geom清单和Pot1/Pot2/番茄酱瓶/炉灶语义绑定；但该信息来自t=0，不能替代抓持状态模型证明。
+
+所选合法t=215 Pot1持抓Snapshot SHA `b348a065ccb7259a69fd0dc042b42264d257e9f3aba4adb271ff23956729801e`，归档模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`。当前Bridge模型SHA为`3b942cf306a7decd7dcf576e7970d7a4dcb5af3c663db26da508dd5dd0a56fc8`，虽然BDDL SHA一致，Snapshot仍因模型身份不匹配被严格拒绝。未绕过校验，未开始CuRobo场景转换或规划，控制动作、物理子步均为0；Pot1未放置，原生task_success=false，无Episode或视频。
+
+**阻塞与下一步：**需要取得与当前活动编译模型指纹完全一致的合法Pot1持抓Snapshot，或恢复先前生成该Snapshot的准确模型环境；否则不得把旧物理状态混入当前场景。按用户要求在此停止，不回退旧RRT、不继续调OSC。完整报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_run1/run_report.md`。
+
+---
+
 ## 最新局部目标：Human L0T2碰撞感知RRT两路线均预算耗尽，停止追加搜索（2026-10-26）
 
 已从合法t=215 Pot1双指持抓Snapshot精确恢复：payload SHA `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`、Integration State SHA `853f54dfb585cbc54d3d72067608f42743d0bccdc6bfeaca11976b5c1f282a6b9`、模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`、BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`。运行前原生谓词1/3（Stove Turnon=true，Pot1/Pot2 On=false），持抓验证通过。

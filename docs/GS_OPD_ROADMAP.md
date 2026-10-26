@@ -1,3 +1,12 @@
+## 最新更新：Human L0T2 CuRobo尝试因Snapshot模型指纹不匹配而停止（2026-10-26）
+
+- CuRobo既有环境可用，版本`0.0.post1.dev1`/源码commit `78fd485`；没有重装或升级。
+- 合法t=215 Pot1持抓Snapshot内部模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`，当前相同任务Bridge模型SHA `3b942cf306a7decd7dcf576e7970d7a4dcb5af3c663db26da508dd5dd0a56fc8`。BDDL相同但模型不匹配，安全恢复门禁拒绝。
+- 活动t=0 Bridge完成723 Geom只读清点及Pot/番茄酱瓶/炉灶语义绑定，但这不能证明Snapshot状态下的几何。CuRobo世界模型、规划和控制执行均未启动；动作、物理子步、成功Episode均为0。
+- 保持停止旧RRT、Region-Progress和OSC阈值调试；先解决精确模型/Snapshot来源匹配，再继续场景建模与规划。详细报告见归档目录`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_run1/`。
+
+---
+
 ## 2026-10-26 路线更新：L2T2单次闭环路线验证未触发OSC，转向T0经验迁移
 
 - 从精确t=2589持抓Snapshot核验模型、BDDL、状态和双指抓持来源后，复用L1T2自有Keypose经验；路线预筛4个有界RRT候选，其中`route_01`预放置离线RRT可行，终端IK/RRT因预算耗尽为unknown。
