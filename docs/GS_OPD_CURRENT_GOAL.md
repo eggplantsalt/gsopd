@@ -1,3 +1,13 @@
+## 最新局部目标：run53 原生成功后的 Release/Retreat/Settling 诊断（2026-10-26）
+
+本轮暂停新 L1/L2 搜索、训练及 Keypose/IK/RRT 算法改动。run53 的原生 L1T2 成功仍成立：t=1335 `Pot1 On=true`、`Pot2 On=true`、`Stove Turnon=true`，原生 `task_success=true/reward=1/done=true`。独立分支从 run53 成功前最近的物理 Snapshot 精确恢复并重放118步后执行真实松爪、撤爪和20步 Settling。指尖接触在t=1338完全消失；该时刻两个Pot的On谓词仍成立。Pot2在撤爪中t=1342失去On，之后接触桌面/玩具球；Settling后Pot2位姿跨度40.174 mm、最大线速度0.119 m/s、角速度1.876 rad/s，稳定性失败。诊断分支终态不能覆盖原run53成功结论。
+
+run19→46→47→48→52→53的t=0…1335物理Snapshot/动作/机器人与物体状态来源连续，边界Snapshot payload SHA及Integration State与恢复报告匹配；run48根报告缺失，但中断索引、动作状态记录及Snapshot仍在。全链每步双相机视频与机器人/物体物理状态可追溯，但未保存完整逐步原始策略Observation张量。因此物理来源链可精确恢复，完整原始Observation–Action数据不完整。四项判定分别为：原生任务成功（原run53：true）、释放后稳定（false）、轨迹完整性（物理状态/动作连续，策略Observation不完整）、安全认证（false；本诊断仅记录控制步末状态，没有25子步安全监测）。
+
+主诊断归档：`/opt/data/private/gs_opd/rollouts/run53_release_stability_diagnostic_20261026_150815_continued/`；摘要、逐动作/接触JSONL、NPZ、双相机视频、Snapshot和来源审计均已保存。没有改动原成功报告、原生任务判据、安全标准或训练数据。下一步先离线分析Pot2离开Cook Region的物理时序及Release/Retreat证据；没有新的场景搜索授权时不启动L1/L2搜索。
+
+---
+
 ## 当前局部目标：Keypose迁移的通用可达性与阶段续接（2026-10-26）
 
 旧版跨场景Task-Success-First暴力轮次已暂停。唯一最新成功证据是L1T2从已有Pot2持抓Snapshot经L0T2自有Keypose经验真实MuJoCo接续后取得原生`task_success=true`（3/3谓词），不是reset冷启动；478个专家OSC动作、两个精确Snapshot分支，安全认证false；L1终态时Pot2仍双指夹持，release/retreat没有执行（原生done提前结束），当前只认定原生BDDL成功，不认定释放后稳定放置。run48旧路线同一持抓起点为920动作/3分支且未成功。L2T2用同一关键姿态经验测试两次局部续接，合计236个真实动作后到高位西侧持抓状态，仍2/3谓词；主要阻塞是当前场景有界IK无解及OSC在已记录关键姿态附近停滞。

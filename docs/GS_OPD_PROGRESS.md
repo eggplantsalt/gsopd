@@ -1,3 +1,32 @@
+## run53 原生成功来源链与释放后稳定性复核（2026-10-26）
+
+### 来源链审计
+
+对象为 `obstacle_avoidance/L1T2`、seed=0、init-state=0，模型SHA-256 `6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf`，BDDL SHA-256 `88c64be300fa5934a096c6ef545514e1f541cc67c7c1f09bed1bc4f7e6583bc6`。run53成功前的物理来源链从t=0至t=1335连续，由六段真实动作组成：run19 reset→Pot1 lift（t=1–182，182步）、run46 branch03放置（183–542，360步）、run47 release续接（543–598，56步）、run48 Pot2抓取（599–857，259步）、run52 Pot2运输（858–1217，360步）、run53成功后缀（1218–1335，118步）。相邻边界Snapshot payload SHA与续接报告逐项匹配；边界Integration State SHA一致。t=1217源Snapshot SHA为 `e360e2c0728f12352456290cb666e69ab254b326d1b3cf09ac355a7c5000b522`。run53后缀从该精确状态独立恢复并重放，118/118步Integration State序列匹配。
+
+每一段均有连续7D动作、机器人/物体物理状态和双相机视频；从reset到t=1335的物理动作/状态来源链连续且各边界可精确恢复。**缺失项：**没有保存全链逐步原始策略Observation张量/字典，故不是完整的raw policy OA轨迹。run48根report缺失；`interruption_recovery.json`、`run48_archive_index.json`、连续动作/状态记录及Snapshot仍存在，来源可按耐久证据重建，但缺失的根报告不可恢复。来源审计JSON：`source_chain_audit.json`；原run53 report SHA-256 `ad19b1a7ebdeae1ddd4b4bbc05950dc7e982c47b0e90c6ab943d4bf1841c0a49`，本轮未覆盖该report。
+
+### 独立真实物理分支
+
+从t=1217 Snapshot精确重放run53的118步，复制原生成功态Snapshot后，在独立Bridge分支执行t=1336松爪、t=1337–1348共12步向上撤爪（100 mm目标尚余40.841 mm）、t=1349–1368共20步Settling。归档 `/opt/data/private/gs_opd/rollouts/run53_release_stability_diagnostic_20261026_150815_continued/` 包含逐步物理/接触记录 `diagnostic_physical_step_records.jsonl`、OA和状态NPZ、151帧双相机视频、t=1217前缀Snapshot、原生成功/松爪/撤爪/Settling Snapshots、报告与hash清单；原始run53归档未被改写。
+
+松爪动作后t=1336仍有四组指垫接触，t=1337仍有手指碰Pot2；t=1338首次完全没有夹爪–Pot2接触。t=1338的Pot1 On、Pot2 On、Stove Turnon均为true。撤爪中t=1342 Pot2 On首次变false，当时仍与炉灶burner接触；t=1349开始接触桌面，之后出现与toy ball接触。20步Settling后Pot2位姿跨度40.174 mm，最大线速度0.11895 m/s、最大角速度1.87582 rad/s，末态仍运动且Pot2 On=false；Pot1全程保持On且位置不变。接触记录也显示撤爪期间残余非pad手指接触以及后续桌面/玩具球新接触。证据支持“Pot2在撤爪和沉降中离开原生目标区”，但不单凭现有数据断言单一接触力是唯一成因。
+
+`grasp_state`查询因该诊断运行时绑定字段为`root_body_id`而接口要求`body_id`未能使用；松爪时刻改由MuJoCo编译Geom接触名的逐步记录确定。首次报告组装错误发生在物理动作及耐久记录全部落盘之后，已从记录离线修复；没有丢动作或重写原成功报告。
+
+### 四项结论与监测边界
+
+| 指标 | 结果 |
+| --- | --- |
+| 原生完整任务成功 | 原run53 t=1335为true（3/3谓词，reward=1，done=true）；独立诊断继续物理后末态为false，不回写原run53结论。 |
+| 松爪后稳定性 | false；t=1338短暂保持两Pot On，但撤爪t=1342 Pot2 On丢失，Settling末仍运动且不在区域内。 |
+| 轨迹完整性 | 物理动作、各段状态、接缝和视频连续并可精确Snapshot恢复；全链raw policy Observation未保存，因此原始OA观测部分缺失。诊断动作/状态完整落盘。 |
+| 安全认证 | false；诊断仅检查控制步末状态/接触，缺少每个动作25个MuJoCo子步的安全监测，不进入安全训练集。 |
+
+未改BDDL成功条件、安全阈值、Safety Reconstruction、Keypose/IK/RRT或训练代码；未使用官方安全示范、未训练、未启动L1/L2新搜索、未修改/伪造物体状态。四项针对性回归测试通过（`test_run53_release_diagnostic.py`：4 passed），两个诊断脚本编译通过，`git diff --check`通过。后续优先分析并改善通用Release/Retreat/Settling及物理支撑确认，再决定其他场景搜索。
+
+---
+
 ## 最新进展：Keypose-Driven Planning L1完成原生成功、L2部分迁移（2026-10-26）
 
 ### 暂停旧暴力搜索与归档run48

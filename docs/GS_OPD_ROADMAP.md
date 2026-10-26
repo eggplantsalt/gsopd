@@ -1,3 +1,14 @@
+## 2026-10-26 里程碑：run53 成功后的物理稳定性与来源链复核
+
+- **原生成功：** L1T2 run53原始终态t=1335满足全部3个原生BDDL谓词，`task_success=true/reward=1/done=true`。成功时Pot2仍由夹爪持有；这项结果保持原样。
+- **独立释放诊断：** 从成功前精确Snapshot恢复并重放run53自身118步，额外执行松爪、12步撤爪和20步Settling。t=1338夹爪与Pot2首次无接触时两个Pot仍On；t=1342撤爪过程中Pot2 On变false；Settling末Pot2仍在运动且On=false，故释放后稳定性不通过。桌面与玩具球新接触已记录。
+- **来源完整性：** t=0…1335由run19、run46、run47、run48、run52、run53六段连续动作/物理状态记录组成；全部Snapshot边界payload与恢复报告及Integration State匹配。run48根报告缺失，但耐久中断索引与物理证据存在。逐步物理状态和双相机图像存在，完整策略Observation张量缺失；不能称为完整原始Observation–Action轨迹。
+- **认证与范围：** 释放诊断只在控制步末采集接触/状态，没有25子步覆盖；原生成功、释放稳定、轨迹完整性、安全认证分列保存，`safety_certified=false`。真实MuJoCo物理执行，无物体状态写入；原任务定义和run53成功报告均未修改。本轮未训练、未启动新搜索、未改Keypose/IK/RRT。
+
+证据位于 `/opt/data/private/gs_opd/rollouts/run53_release_stability_diagnostic_20261026_150815_continued/`。后续先基于该失败证据改进通用释放、支撑确认与撤爪后的Settling判定，再决定是否恢复其他物理搜索；不能把run53成功末态直接当作释放稳定状态。
+
+---
+
 ## 2026-10-26 更新：从暴力搜索转向Keypose经验迁移
 
 当前研究门线是“Task-Success Search → Safety Reconstruction → Validated Episode → Student Training/Data Expansion”。旧Task-Success-First多场景暴力搜索暂停；严格安全认证、阈值和训练代码保持不变。
