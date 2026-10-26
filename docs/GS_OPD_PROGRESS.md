@@ -1,3 +1,25 @@
+## run53 稳定释放完成：末端放置修正与真实子步验收（2026-10-26）
+
+### 对照结论与原因
+
+三种原始释放方式都从同一个t=1335精确Runtime Snapshot恢复（SHA-256 `32bdc4296106e794df472092698fece507e697e7169ff4771b1a9bf0c72c9563`，模型及BDDL指纹匹配）。原撤爪33动作/825子步、松爪后原地等待27动作/675子步、缓慢上撤57动作/1425子步最终都没有Pot2 `On`：原地等待分支在机械臂未移动时也于t=1342丢失`On`，因此不只是撤爪干扰；原始Pot2中心距Cook Region的负Y边界仅约7.7 mm，松爪后自身滑移即可离开原生区域。原run53 t=1335的`task_success=true`保持不变。
+
+### 最小末端修正与稳定结果
+
+仅对最后持抓放置位置做Region相对修正，未改抓取/运输前缀、BDDL、物体状态或安全规则。25 mm候选实际将Pot2向区域中心移动`[15.797,18.213] mm`，随后真实松爪和缓慢上撤；完整动作77步、1925/1925子步。35 mm候选实际移动`[21.912,25.283] mm`，83步、2075/2075子步。两者最终均得到Pot1 On、Pot2 On、Stove Turnon全真及原生`task_success=true`。优选25 mm分支，因为它用更小的位置调整和更少控制动作达到同样结果。
+
+最佳后缀为`placement_branch_01_25mm`： t=1335 Snapshot精确恢复，释放后目标区域谓词在短暂释放动态中有17个子步为false，退爪阶段恢复为true；20步Settling的500/500物理子步中三个谓词全部为true，Pot2位置跨度0、最大线速度`2.13e-14 m/s`、角速度`4.37e-15 rad/s`。退爪期间记录到22个短暂夹爪–Pot2接触子步（t=1363、1364、1366、1367），随后完全分离；Settling 500子步无夹爪接触，最终距离约157 mm、`final_hand_pot2_contact=false`。故物理稳定释放验收通过，但记录明确保留退爪中的短暂重接触，不将其宣称为安全轨迹。
+
+35 mm分支亦稳定（500子步全谓词为真、Settling无手壶接触），但退爪期间仍有11个接触子步，动作更多。独立25 mm侧向后上抬分支保存101步、2525子步；侧向阶段短暂接触25个子步，3个子步的Pot2 `On`为false，之后恢复且Settling稳定。它不优于25 mm缓慢上撤分支。45 mm候选未在有界OSC预算内到达目标，保留失败证据。侧向分支第一次30步上抬预算耗尽后，使用相同源Snapshot提高到45步复试并成功完成；两次结果均归档。
+
+### 物理证据与范围
+
+对照归档：`/opt/data/private/gs_opd/rollouts/run53_release_strategy_comparison_20261026_attempt1/`。25/35 mm放置对照及45 mm失败分支：`/opt/data/private/gs_opd/rollouts/run53_release_local_placement_20261026_attempt1/`。侧向对照：`/opt/data/private/gs_opd/rollouts/run53_release_local_placement_lateral_20261026_attempt1/`与`..._attempt2/`。可读验收报告为`run53_release_stable_release_acceptance.md`，机器报告为同目录JSON。动作/25子步状态与接触、双相机视频、释放/撤爪/Settling及最终Runtime Snapshot均保留。
+
+本次只续接run53已有成功前缀，未产生从reset冷启动的新Episode；该后缀`task_success=true`但`safety_certified=false`。原run53成功报告SHA仍为`ad19b1a7ebdeae1ddd4b4bbc05950dc7e982c47b0e90c6ab943d4bf1841c0a49`。未使用官方示范、未修改BDDL或直接写物体状态，未启动其他任务/训练。相关回归测试6项通过；检查视频共102帧，动作与25子步数量匹配。
+
+---
+
 ## run53 原生成功来源链与释放后稳定性复核（2026-10-26）
 
 ### 来源链审计

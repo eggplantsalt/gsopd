@@ -1,3 +1,15 @@
+## 最新里程碑：run53后缀实现稳定物理释放（2026-10-26）
+
+- **初始失稳成因：** 从同一t=1335成功前Snapshot对照原撤爪、原地松爪等待、缓慢上撤；无撤爪动作的等待分支同样在t=1342失去Pot2 `On`，说明原位置的边界支撑与释放滑移是主要问题。严格Safety Reconstruction阈值不变。
+- **末端后缀修复：** 自动读取活动Cook Region并将最后持抓放置目标向区域中心移动25 mm，实测Pot2移动约24.1 mm；完成真实开放夹爪、缓慢上撤及Settling。未修改抓取/运输前缀、原生谓词或物体状态。
+- **验收结果：** 77步、1925个完整物理子步；末态`task_success=true`、三项原生谓词全真、最终无手壶接触。Settling覆盖500子步且全程无夹爪接触；Pot2位置跨度0、最大线速度约`2.13e-14 m/s`。上撤早期有22个子步记录到短暂手壶重接触，记录不隐去；Settling及末态确认已完全分离。
+- **证据位置：** `/opt/data/private/gs_opd/rollouts/run53_release_local_placement_20261026_attempt1/`，摘要`run53_release_stable_release_acceptance.md/.json`。35 mm同样成功但动作更多；侧向分支动作更多且短暂接触更多；45 mm放置偏移未能在预算内到位。所有候选从同一精确Snapshot恢复，视频、动作、25子步状态/接触及可恢复Snapshot均留档。
+- **数据标签：** 这是基于run53既有成功前缀的稳定释放后缀，不是新的reset Episode。原生任务成功=true、轨迹物理执行可恢复、安全认证=false；无官方示范或训练。
+
+本地释放目标已完成。本轮之后保持原路线：Task-Success成功与Safety Reconstruction分离；未经严格重构验证不得将此数据标为安全Episode。暂不启动其他场景搜索，除非后续目标明确要求。
+
+---
+
 ## 2026-10-26 里程碑：run53 成功后的物理稳定性与来源链复核
 
 - **原生成功：** L1T2 run53原始终态t=1335满足全部3个原生BDDL谓词，`task_success=true/reward=1/done=true`。成功时Pot2仍由夹爪持有；这项结果保持原样。

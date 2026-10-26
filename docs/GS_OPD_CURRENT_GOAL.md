@@ -1,3 +1,13 @@
+## 最新局部目标：完成run53最后几厘米的稳定释放（2026-10-26）
+
+L1T2 run53原生成功前缀t=1335的精确Snapshot SHA为`32bdc4296106e794df472092698fece507e697e7169ff4771b1a9bf0c72c9563`。原地完全松爪但不撤离时，Pot2仍于t=1342失去Cook Region的原生`On`，确认Pot2原放置中心靠近区域边缘，释放后存在自身滑移风险。
+
+通过仅修正最后持抓放置位置，25 mm Region相对移动（实测`[15.797,18.213] mm`）后真实松爪、缓慢上撤并Settling，取得run53成功后缀的稳定原生终态。77个真实控制动作、1925个子步完整记录，夹爪最终完全脱离；Settling 500/500子步Pot1/Pot2 On和Stove Turnon为真，Pot2位姿跨度0、速度近零。退爪途中22个子步存在短暂手壶重接触，后续完全分离且Settling阶段无接触，已在报告中逐项标注。35 mm候选也成功但更耗动作；侧向先行策略更慢且发生更长短暂接触，故不选作最佳后缀。
+
+证据与报告：`/opt/data/private/gs_opd/rollouts/run53_release_local_placement_20261026_attempt1/`，侧向对照在`.../run53_release_local_placement_lateral_20261026_attempt2/`。该结果从已成功前缀续接，非从初始化冷启动Episode；原生完整成功为真，严格安全认证仍为假。当前目标已完成；下一步仅按用户后续指示处理安全重构或其他工作，不继续扩大本次局部释放分支。
+
+---
+
 ## 最新局部目标：run53 原生成功后的 Release/Retreat/Settling 诊断（2026-10-26）
 
 本轮暂停新 L1/L2 搜索、训练及 Keypose/IK/RRT 算法改动。run53 的原生 L1T2 成功仍成立：t=1335 `Pot1 On=true`、`Pot2 On=true`、`Stove Turnon=true`，原生 `task_success=true/reward=1/done=true`。独立分支从 run53 成功前最近的物理 Snapshot 精确恢复并重放118步后执行真实松爪、撤爪和20步 Settling。指尖接触在t=1338完全消失；该时刻两个Pot的On谓词仍成立。Pot2在撤爪中t=1342失去On，之后接触桌面/玩具球；Settling后Pot2位姿跨度40.174 mm、最大线速度0.119 m/s、角速度1.876 rad/s，稳定性失败。诊断分支终态不能覆盖原run53成功结论。
