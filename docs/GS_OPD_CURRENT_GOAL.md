@@ -553,3 +553,13 @@ t=20 Snapshot 恢复通过，模型几何指纹为 `1a0c219c…f7a9f752`。运�
 
 **当前局部工作已完成，停止等待复核。** 复核前不继续 OSC 搬运/放置，不训练。
 
+---
+
+# 当前局部目标更新（2026-10-26）：L1T2成功Episode来源链重建完成
+
+本轮已从L1T2 seed=0/init-state=0 fresh reset连续重放run19→46→47→48→52→53的1335步真实动作，再在同一个MuJoCo实例中接续77步已验证稳定释放后缀。完成1412个控制动作、1413组双相机Observation、35300个25子步完整监测样本；源Snapshot的6个段边界最大Integration State差为`1.2862e-10`，都通过明确的`1e-7`绝对容差核验，t=0 reset则与归档状态逐位一致。接缝bitwise不等的事实保留在机器报告中。
+
+最终`t=1412`原生Pot1 On、Pot2 On、Stove Turnon均真，reward=1、done=true。77步后缀跨越t=1335的原生done：使用demo-only horizon=1600，同一环境继续执行真实动作，未改BDDL/成功判据、未写入物体状态；因此它不是标准1000步Benchmark协议。Settling 500个物理子步谓词全真、Pot2零位姿跨度，末态和整个Settling均无手爪–Pot2接触。后成功阶段仍记录到678个手爪–Pot2接触子步（t=1336–1364与1366–1367），不做安全认证。
+
+完整数据及hash清单位于 `/opt/data/private/gs_opd/rollouts/l1t2_success_episode_reconstruction_20261026_attempt2/`。可用于后续LeRobot转换的Action/Observation素材已保存，本轮没有转换或训练。当前局部任务完成；下一步如继续GS-OPD，应先对该数据执行独立Safety Reconstruction/接触分层审计，再由用户安排LeRobot转换或其它场景任务，不把task-success样本自动并入安全训练集。
+

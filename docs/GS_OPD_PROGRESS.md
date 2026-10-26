@@ -3714,3 +3714,19 @@ t=10当前策略预检通过，之后239/239动作记录齐全，共5975/5975个
 归档 `/opt/data/private/gs_opd/rollouts/l0t2_episode9_prefix_t10_to_t249_current_safety_20261025/`，含OA/双相机NPZ、逐动作记录、5975行逐子步实际接触身份与几何/关节审计、起终点及每25步Snapshot、两路视频和机器报告`prefix_replay_report.json`。复现入口：`research/gs_opd/repair/replay_episode9_t10_to_t249_current_safety.py`。末态报告在物理重放完成后离线完成快照比较，没有重复执行物理动作。
 
 **当时的范围结论：**Episode 9 t=10→249在当前Native/Operational规则下安全，并与t=249成功链源快照字节级兼容。t=0→10当前策略安全证据在当时尚未补齐；这一阶段性结论现已由顶部的完整t=0→1460验收取代。原有后缀仍未重放，LoRA未启动，历史示范与LeRobot数据保留。
+
+## L1T2 reset→成功→稳定释放的连续物理Episode重建（2026-10-26）
+
+将run19→run46→run47→run48→run52→run53的六段动作（1–1335）与已物理验证的run53稳定释放后缀77步（1336–1412）连接。源动作文件SHA、timestep覆盖和段数均锁定在`reconstruction_input.json`：182+360+56+259+360+118+77步。run48根报告缺失，但其耐久物理step记录、Snapshot链和动作文件均保留且SHA核验通过。
+
+从seed=0/init-state=0执行fresh reset；未恢复或注入Snapshot来启动。t=0 Integration State与原始reset Snapshot逐元素一致（SHA-256 `6494373b0f5670cfd2e33e096b35c5f85f732a8767b85241c660f36f5563ae2a`）。attempt1只重放到t=182，原因是对比器要求bitwise相等；最大差为`1.2714e-10`，不是物理失败。attempt2重新从fresh reset完整执行，不在中途Snapshot跳接；六个源边界t=182/542/598/857/1217/1335逐项比较，最大Integration State绝对差为`1.2862e-10`，均在预先记录的`1e-7`容差内。六处bitwise SHA不同但边界native `done`和`task_success`值均与源一致，真实物体/机器人状态连续；报告明确保留bitwise不等与数值容差，不将其描述成逐位精确恢复。
+
+完整归档 `/opt/data/private/gs_opd/rollouts/l1t2_success_episode_reconstruction_20261026_attempt2/`：1412个真实7D Action、1413个按控制状态对齐的双相机Observation及lossless PNG、35300/35300个MuJoCo物理子步（每动作25步，完整Integration State/机器人与两只Pot状态/原生谓词/接触）、20 fps双相机视频（1413帧）、t=0/六个段边界/t=1412可恢复Snapshot和`artifact_hashes.json`。数据布局为JSONL动作/Observation、PNG相机帧、压缩逐子步JSONL，可供后续LeRobot转换；本轮没有执行转换。
+
+t=1335首次出现原生task success；`On(moka_pot_1, flat_stove_1_cook_region)`、`On(moka_pot_2, flat_stove_1_cook_region)`与`Turnon(flat_stove_1)`均为true，reward=1、done=true。随后用demo-only horizon=1600在**同一连续MuJoCo实例**物理执行稳定释放分支的全部77步至t=1412；这不是标准1000步Benchmark episode。未改官方BDDL、native success或done定义，也未伪造状态。最终三谓词仍全真、reward=1、done=true。Settling的500/500子步中三谓词全真，Pot2位姿跨度0，最大线速度`2.36e-14 m/s`、角速度`1.17e-14 rad/s`；500/500子步与最终状态均无夹爪–Pot2接触。Pot2已稳定且夹爪完全脱离。
+
+完整接触记录保留了Pot2抓取/搬运和释放后的真实接触：全链Pot2–夹爪接触共13165个子步样本（t=836–1364及1366–1367）；成功后的后缀有678个接触子步，最后记录接触在t=1367。Settling期间接触为0。报告列出43种真实Geom接触对。稳定释放验收不等于Safety Reconstruction或安全认证，`safety_certified=false`；释放/退爪的接触仍作为后续重构证据保留。
+
+机器报告 `episode_report.json` SHA-256 `a7e5a5c748ee3b9dc141a9bac7209f16f0b9c2002d2b4089c69e28a74ae14cd6`；动作SHA `998b3f69a323f1e2970f6c4298f7c737ce0d79e070e5a91c5f917977a8c2116e`，Observation SHA `152ec641c9ff48b78d588ff1e6be8da09e95d713da70a8218585cea57e6f58f4`，物理子步SHA `cf0339062ea8f4a424ddc5f6e0ae5b22856de2b996c053a6ee37de82e8cac0ad`，视频SHA `a0f7a2d41cb2ce122cceac312bf60d2bdcde0cc252554d15f57808385dcf34bb`。重放结束后首个汇总器因接触容器格式差异报错；动作和物理执行已全部落盘。修正读档器后直接离线复核完整归档，没有重跑物理动作，最终报告状态为`complete_physical_success_episode_reconstructed`。
+
+复现入口：`research/gs_opd/repair/replay_l1t2_success_episode.py`；来源序列、hash、失败恢复与报告重算都有针对性回归。`test_replay_l1t2_success_episode.py`：4 passed；Ruff通过。没有使用官方示范、训练或LeRobot转换。

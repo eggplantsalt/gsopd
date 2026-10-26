@@ -490,3 +490,17 @@ L0T2 的 1093 步真实任务成功示范与 759 条隔离 LeRobot `expert_osc` 
 - 实验与历史阻塞：`docs/GS_OPD_PROGRESS.md`
 - 当前局部目标：`docs/GS_OPD_CURRENT_GOAL.md`
 - 原始 Student Checkpoint、成功示范和 LeRobot 数据集仍保留。attempt3 训练日志、报告、Adapter 和 RLinf checkpoint，以及本次 Student rollout 视频、NPZ、Compiler 审计和轨迹图，均保留于各自独立目录。详细记录见 `docs/GS_OPD_PROGRESS.md`。
+
+## 最新里程碑（2026-10-26）：L1T2从reset到稳定释放的完整物理成功经验已重建
+
+run19→run46→run47→run48→run52→run53的1335个原始动作按timestep连续接在新reset后执行，再续接77步经物理验证的稳定释放后缀。1412步、1413双相机Observation、35300个MuJoCo子步、各阶段源边界Snapshot与hash均归档。t=0 reset bitwise一致；六个动作段末Integration State和源Snapshot数值差最大`1.2862e-10`，按报告记录的`1e-7`容差通过，SHA不相同的情况如实保留。
+
+原生任务在t=1335首次成功；done=true后同一实例继续77步demo-only horizon执行至t=1412，未改BDDL或done定义。这属于扩展示范/诊断协议，不应标作标准1000步Benchmark episode。释放、退爪、500子步Settling后Pot1/Pot2 On与Stove Turnon全真；Pot2没有可测位姿变化、末态无夹爪接触，Settling子步也全部无夹爪接触。释放后退爪期间仍有678个真实夹爪–Pot2接触子步，完整记录未过滤。
+
+数据位于 `/opt/data/private/gs_opd/rollouts/l1t2_success_episode_reconstruction_20261026_attempt2/`，可作为后续LeRobot转换的Observation–Action物理成功Episode来源；`safety_certified=false`，不能直接用作安全训练数据，必须后续单独经过Safety Reconstruction及完整验证。本轮没有启动训练、转换或其他场景搜索。
+
+### 当前建议路线
+
+1. 保持已重建L1T2 Episode为只读来源，先完成其Observation/action对齐、接触标签和来源链的独立离线复核；转换时保留done后77步的扩展horizon协议元数据。
+2. 仅把任务成功作为Task-Success候选；由既有严格Safety Reconstruction独立生成/拒绝安全后缀，不降低接触和安全余量规则。
+3. 安全认证与数据格式复核完成后，再由用户安排LeRobot转换或下一跨场景迁移；不把本次成功解释为标准horizon成功或安全Episode。
