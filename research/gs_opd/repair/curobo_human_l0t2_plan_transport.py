@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import time
 import traceback
@@ -103,9 +104,16 @@ def _payload_sphere_coverage(source_components, fitted_spheres):
     golden = np.pi * (3.0 - np.sqrt(5.0))
     component_rows = []
     total_samples = covered_samples = 0
-    for component in source_components:
+    box_cells: dict[int, list[dict]] = {}
+    analytic_geom_ids = set()
+    for index, component in enumerate(source_components):
+        if component.get("source_geometry_shape") == "cuboid_cell":
+            box_cells.setdefault(int(component["source_geom_id"]), []).append(
+                {"index": index, **component}
+            )
+            continue
         center = np.asarray(component["center_object_root_m"], dtype=np.float64)
-        radius = float(component["radius_m"])
+        radius = float(component.get("source_enclosure_radius_m", component["radius_m"]))
         points = [center]
         for index in range(512):
             z = 1.0 - 2.0 * (index + 0.5) / 512.0
@@ -133,21 +141,71 @@ def _payload_sphere_coverage(source_components, fitted_spheres):
             "deterministic_surface_sample_coverage": float(np.mean(covered)),
             "coverage_is_sampling_only_not_a_containment_proof": True,
         })
+        if contains_whole_source_sphere:
+            analytic_geom_ids.add(int(component["source_geom_id"]))
+
+    for geom_id, cells in sorted(box_cells.items()):
+        subdivisions = tuple(int(value) for value in cells[0]["source_box_subdivisions"])
+        expected_indices = set(itertools.product(*(range(value) for value in subdivisions)))
+        cell_indices = [tuple(int(value) for value in cell["source_box_cell_index"]) for cell in cells]
+        source_half = np.asarray(cells[0]["source_box_half_extents_geom_axes_m"], dtype=np.float64)
+        expected_cell_half = source_half / np.asarray(subdivisions, dtype=np.float64)
+        source_center = np.asarray(cells[0]["source_box_center_object_root_m"], dtype=np.float64)
+        source_rotation = np.asarray(cells[0]["source_box_rotation_object_root"], dtype=np.float64)
+        centers_valid = True
+        cells_contained = True
+        radii = []
+        for cell in cells:
+            cell_half = np.asarray(cell["source_box_cell_half_extents_geom_axes_m"], dtype=np.float64)
+            cell_local_center = np.asarray(cell["source_box_cell_center_geom_m"], dtype=np.float64)
+            expected_center = source_center + source_rotation @ cell_local_center
+            actual_center = np.asarray(cell["center_object_root_m"], dtype=np.float64)
+            sphere_center = fitted[int(cell["index"]), :3]
+            sphere_radius = float(fitted[int(cell["index"]), 3])
+            cell_radius = float(np.linalg.norm(cell_half))
+            radii.append(sphere_radius)
+            centers_valid = centers_valid and bool(
+                np.allclose(actual_center, expected_center, rtol=0.0, atol=1e-8)
+                and np.allclose(sphere_center, actual_center, rtol=0.0, atol=1e-7)
+                and np.allclose(cell_half, expected_cell_half, rtol=0.0, atol=1e-9)
+            )
+            cells_contained = cells_contained and sphere_radius + 1e-9 >= cell_radius
+        exact_partition = (
+            len(cell_indices) == len(expected_indices)
+            and len(set(cell_indices)) == len(cell_indices)
+            and set(cell_indices) == expected_indices
+        )
+        analytic_cover = bool(exact_partition and centers_valid and cells_contained)
+        if analytic_cover:
+            analytic_geom_ids.add(geom_id)
+        component_rows.append({
+            "source_geom_id": geom_id,
+            "source_geom_name": cells[0].get("source_geom_name"),
+            "source_geometry_shape": "compiled_MuJoCo_box",
+            "source_box_half_extents_geom_axes_m": source_half.tolist(),
+            "subdivisions": list(subdivisions),
+            "attached_sphere_count": len(cells),
+            "expected_cell_count": len(expected_indices),
+            "unique_cell_count": len(set(cell_indices)),
+            "cell_spheres_analytically_contain_partition": cells_contained,
+            "cell_centers_match_box_transform": centers_valid,
+            "cells_form_exact_box_partition": exact_partition,
+            "fully_covered_by_attached_spheres": analytic_cover,
+            "maximum_attached_sphere_radius_m": max(radii) if radii else None,
+            "coverage_proof": "the box is partitioned into disjoint cells; each attached circumscribed sphere contains all eight cell corners and therefore the full cell",
+        })
+    source_geom_count = len({int(component["source_geom_id"]) for component in source_components})
+    all_geoms_covered = len(analytic_geom_ids) == source_geom_count
     return {
-        "source_collision_geom_count": len(source_components),
+        "source_collision_geom_count": source_geom_count,
         "fitted_attached_sphere_count": int(len(fitted)),
         "source_component_frame": "moka_pot_1 object root",
         "fitted_sphere_frame": "moka_pot_1 object root before AttachmentManager object-to-panda_hand transform",
         "components": component_rows,
         "aggregate_surface_sample_coverage": float(covered_samples / total_samples) if total_samples else None,
-        "fully_enclosed_component_count": sum(
-            row["fully_enclosed_by_one_attached_sphere"] for row in component_rows
-        ),
-        "coverage_conclusion": (
-            "sampled_union_covers_all_component_boundaries"
-            if covered_samples == total_samples else
-            "fitted_spheres_undercover_sampled_source_geometry"
-        ),
+        "fully_enclosed_component_count": len(analytic_geom_ids),
+        "coverage_is_analytic_for_tiled_boxes_and_uses_original_enclosure_proofs_for_other_geoms": True,
+        "coverage_conclusion": "all source MuJoCo collision Geoms are covered by analytic box-cell spheres or their verified original enclosure spheres" if all_geoms_covered else "one_or_more_source_MuJoCo_collision_Geoms_lack_a_complete_enclosure_proof",
     }
 
 
@@ -168,11 +226,16 @@ def _payload_attachment_frame_audit(planner, current_state, attached_spheres, pa
     )
     actual_world = []
     expected_world = []
-    for sphere_index, fitted_sphere in zip(attached_indices, fitted):
+    payload_components = payload.get("collision_components", [])
+    for component_index, (sphere_index, fitted_sphere) in enumerate(zip(attached_indices, fitted)):
         actual = world_base[:3, :3] @ sphere_tensor[sphere_index, :3] + world_base[:3, 3]
         expected = object_world[:3, :3] @ fitted_sphere[:3] + object_world[:3, 3]
+        source_component = payload_components[component_index]
         actual_world.append({
             "robot_collision_sphere_index": int(sphere_index),
+            "payload_component_index": int(component_index),
+            "source_geom_id": int(source_component["source_geom_id"]),
+            "source_box_cell_index": source_component.get("source_box_cell_index"),
             "center_world_m": actual.tolist(),
             "radius_m": float(sphere_tensor[sphere_index, 3]),
         })
@@ -790,9 +853,20 @@ def _run(source: dict, diagnostic_only: bool = False) -> dict:
             if source.get("attached_payload") is not None else None
         ),
         "attached_payload_geometry_source": (
-            "one attached sphere per verified MuJoCo collision-Geom enclosure; centers and radii preserved exactly"
+            "verified MuJoCo Geom enclosures; the long moka-pot g3 box is tiled by circumscribed cell spheres"
             if source.get("attached_payload") is not None else None
         ),
+        "attached_payload_sphere_sources": [
+            {
+                "payload_component_index": index,
+                "source_geom_id": int(component["source_geom_id"]),
+                "source_geom_name": component.get("source_geom_name"),
+                "source_box_cell_index": component.get("source_box_cell_index"),
+                "center_object_root_m": component["center_object_root_m"],
+                "radius_m": float(component["radius_m"]),
+            }
+            for index, component in enumerate(payload_components)
+        ],
         "attached_payload_source_geometry_coverage": payload_geometry_coverage,
         "attached_payload_frame_and_gripper_audit": payload_attachment_frame_audit,
         "goal_candidates": source["goal_poses_world"],

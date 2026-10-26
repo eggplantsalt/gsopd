@@ -708,3 +708,13 @@ Round60的41步/1025子步归档已完成离线对照；Round60/61/62不因本�
 从原模型/BDDL精确的t=215 Snapshot恢复；15项路线身份比对通过，复用旧预放置路径。真实执行20步后EEF位置误差18.83 mm、角误差0.00756 rad，Pot1仍抓持、`On=false`。t=235重新规划放置路线时，CuRobo预检因Pot1代理球与番茄酱瓶主体mesh包络重叠6.735 mm拒绝起点；17/24目标配置可行，但MotionPlanner未启动。500个已保存子步未观察到body25/26实际接触。松爪未到达，Pot2未启动，原生task_success=false；完整成功Episode仍为0。
 
 报告与视频、动作/状态、Snapshot见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_020247/`。本轮只做一次物理接续，已停止；不继续增加该场景物理分支或调整碰撞表示。本地代码验证：`py_compile`、有效长度检查、时间重采样边界检查、`git diff --check`通过。动作标签与π₀.₅原生OSC不兼容，安全认证未通过/未尝试。
+
+## 当前局部目标更新（2026-10-27）：L0T2已到Pot1目标，但松爪/撤离被真实接触阻断
+
+t=235只读几何对照证实旧CuRobo长盒粗球代理误碰撞：Pot1 Geom 89与瓶体Geom 489的真实MuJoCo最小间距37.498 mm，完整机器人到瓶体最小间距146.926 mm；单球代理制造6.735 mm重叠。仅将Pot1长盒分成8个覆盖源盒的外接球后，代理与瓶体mesh最小间隙21.728 mm。真实MuJoCo路线没有记录到番茄酱瓶接触。
+
+从t=235恢复执行21点有效放置路中的20步，另有30步基于实测qpos/qvel的终点反馈。最大关节误差由13.365降至12.565 mrad，最大关节速度降至1.124 mrad/s；t=285 EEF仍有15.102 mm与0.02512 rad终点残差，但Pot1原生`On=true`。执行接口现允许真实新满足BDDL谓词且关节速度稳定时保留任务进展并继续后缀，同时记录残差，不会因纯位置误差要求重跑填充点。
+
+从准确t=285 Snapshot进行10步真实开爪；t=295 Pot1 `On=true`但仍有Hand和两指与Pot1几何接触。Geom 74对Pot1 Geom 98最深穿透1.015 mm、最大力23.154 N；CuRobo因此拒绝撤爪起点。没有执行撤离、settling或Pot2；稳定释放=false、原生任务成功=false、完整Episode为0。本轮停止，不继续加路线或绕开碰撞门禁。
+
+完整来源链、Observation/Action、80步动作及2,000个子步接触、双相机视频、t=295 Snapshot和post-hoc接触审计见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_t285_release_and_pot2_20261027_131000/`。t=235代理审计见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_020247/t235_proxy_geometry_comparison.json`。80步几何clearance监测均不可用；关节质量矩阵PD扭矩动作与π₀.₅原生OSC标签不兼容，未做安全认证。

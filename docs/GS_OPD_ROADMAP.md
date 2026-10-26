@@ -647,3 +647,11 @@ Round60诊断机器报告和逐步指标见归档`evidence/round60_stagnation_di
 **物理验证：**t=215旧预放置路线身份精确匹配并复用，1800缓冲仅21点有效，当前真实执行20步而非1799步。随后从真实t=235状态生成的新放置输入在规划前被门禁拒绝：attached-object sphere与番茄酱瓶主体mesh包络的代理重叠为6.735 mm；17/24目标终态无代理碰撞，但起点不清。500个物理子步未记录对应瓶体接触。Pot1未松爪、Pot2未启动，`task_success=false`，新增完整成功Episode为0。
 
 **当前状态：**代码修复通过单次物理验证，但Human L0T2端到端目标未达成。具体运行、诊断、动作、双相机视频和Snapshot归档于`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_020247/`。当前工作停在t=235的CuRobo预检起点碰撞，下一轮任何执行须先基于此归档判断代理重叠与真实状态差异；本轮不再运行搜索、不训练、不更改规划器或碰撞模型。
+
+## 当前路线调整（2026-10-27）：L0T2代理误碰撞已排除，真实松爪接触仍阻挡退出
+
+任务搜索优先级保持跨场景Episode采集；但Human L0T2此分支已停止。新证据将两类接触分开：t=235 Pot1盒体与番茄酱瓶真实间隙37.498 mm，旧单球代理误报6.735 mm；保守覆盖的8球表示有21.728 mm正间隙。该精确代理修正后CuRobo路径实际执行到Pot1原生On=true。
+
+目前剩余阻塞不是瓶体运输，而是夹爪尚未离开Pot1。t=295逐步接触证明Hand Geom 74与Pot1 Geom 98最深穿透1.015 mm、最大力23.154 N，左右指也继续接触；CuRobo从此配置拒绝规划撤离。释放核验已修改为要求夹爪完全打开、左右指无接触且MuJoCo接触记录无机器人—目标物体接触。后续如重新打开该场景，优先从t=295合法Snapshot解决真实脱离与无碰撞撤离，不重新跑t=215抓取/运输，也不删除Pot1世界几何。
+
+本轮物理状态：Pot1 On=true，Pot2 On=false，Stove Turnon=true，`task_success=false`；未稳定Settling，无完整Episode。80步来源链和2,000子步接触、双相机视频、t=295 Snapshot、CuRobo失败输入/输出与接触审计均在`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_t285_release_and_pot2_20261027_131000/`。关节扭矩动作与π₀.₅ OSC监督不兼容，安全认证独立待做。

@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import itertools
 import json
 import math
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 import traceback
@@ -46,6 +48,16 @@ SNAPSHOT = Path(
     "placement_branch_00_region_layout_04/"
     "native_goal_transport_start_runtime_snapshot.pkl"
 )
+T235_TERMINAL_SNAPSHOT = Path(
+    "/opt/data/private/gs_opd/rollouts/"
+    "gs_opd_human_l0t2_curobo_transport_20261027_020247/terminal_runtime_snapshot.pkl"
+)
+T285_FAILURE_SNAPSHOT = Path(
+    "/opt/data/private/gs_opd/rollouts/"
+    "gs_opd_human_l0t2_curobo_t235_refined_final_20261027_123000/"
+    "failure_terminal_runtime_snapshot.pkl"
+)
+T235_GEOMETRY_DIAGNOSTIC = T235_TERMINAL_SNAPSHOT.parent / "t235_proxy_geometry_comparison.json"
 CUROBO_PYTHON = Path("/workspace/gsopd_curobo_eval/.venv/bin/python")
 CUROBO_HELPER = Path(__file__).with_name("curobo_human_l0t2_plan_transport.py")
 ARCHIVE_ROOT = Path("/opt/data/private/gs_opd/rollouts")
@@ -208,33 +220,122 @@ def _collision_obstacles(
     return rows
 
 
-def _object_sphere(geometry: dict[str, Any], object_name: str, root_pose: np.ndarray) -> dict[str, Any]:
+def _object_sphere(
+    geometry: dict[str, Any],
+    object_name: str,
+    root_pose: np.ndarray,
+    collision_export: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     obj = geometry.get("objects", {}).get(object_name)
     if not isinstance(obj, dict) or not obj.get("components"):
         raise ValueError(f"complete_collision_geometry_missing_for_{object_name}")
     inverse_root = np.linalg.inv(root_pose)
-    radius = max(
-        float(np.linalg.norm((inverse_root @ np.r_[component["center_world_m"], 1.0])[:3]))
-        + float(component["radius_m"])
-        for component in obj["components"]
-    )
-    collision_components = [
-        {
-            "center_object_root_m": (
-                inverse_root @ np.r_[component["center_world_m"], 1.0]
-            )[:3].tolist(),
+    root_rotation = root_pose[:3, :3]
+    scene_geometries = (collision_export or {}).get("scene_collision_geometries", [])
+    source_geom_rows: dict[int, dict[str, Any]] = {}
+    for row in scene_geometries:
+        ids = row.get("geom_ids", [row.get("geom_id")])
+        for value in ids:
+            if value is not None:
+                source_geom_rows[int(value)] = row
+
+    collision_components: list[dict[str, Any]] = []
+    refinements: list[dict[str, Any]] = []
+    for component in obj["components"]:
+        geom_id = int(component["geom_id"])
+        source_row = source_geom_rows.get(geom_id)
+        source_name = str(
+            component.get("geom_name")
+            or (source_row or {}).get("geom_name")
+            or ""
+        )
+        half = np.asarray(
+            (source_row or {}).get("half_extents_world_axes_m", []),
+            dtype=np.float64,
+        )
+        is_long_moka_pot_box = bool(
+            source_row is not None
+            and source_row.get("shape") == "cuboid"
+            and source_name.startswith("moka_pot_")
+            and source_name.endswith("_g3")
+            and half.shape == (3,)
+            and np.allclose(half, [0.00505, 0.025, 0.06655], rtol=0.0, atol=1e-7)
+        )
+        if is_long_moka_pot_box:
+            subdivisions = np.asarray([1, 2, 4], dtype=np.int64)
+            world_center = np.asarray(source_row["center_world_m"], dtype=np.float64)
+            world_rotation = np.asarray(source_row["rotation_world"], dtype=np.float64).reshape(3, 3)
+            box_center_object_root = (
+                inverse_root @ np.r_[world_center, 1.0]
+            )[:3]
+            box_rotation_object_root = root_rotation.T @ world_rotation
+            cell_half = half / subdivisions
+            cell_radius = float(np.linalg.norm(cell_half))
+            cell_count = 0
+            for cell_index in itertools.product(*(range(int(value)) for value in subdivisions)):
+                cell_local_center = (
+                    -half + (np.asarray(cell_index, dtype=np.float64) + 0.5)
+                    * (2.0 * half / subdivisions)
+                )
+                cell_world_center = world_center + world_rotation @ cell_local_center
+                cell_root_center = (
+                    inverse_root @ np.r_[cell_world_center, 1.0]
+                )[:3]
+                collision_components.append({
+                    "center_object_root_m": cell_root_center.tolist(),
+                    "radius_m": cell_radius,
+                    "source_geom_id": geom_id,
+                    "source_geom_name": source_name,
+                    "source_geometry_shape": "cuboid_cell",
+                    "source_box_center_object_root_m": box_center_object_root.tolist(),
+                    "source_box_half_extents_geom_axes_m": half.tolist(),
+                    "source_box_rotation_object_root": box_rotation_object_root.tolist(),
+                    "source_box_cell_index": [int(value) for value in cell_index],
+                    "source_box_subdivisions": subdivisions.tolist(),
+                    "source_box_cell_center_geom_m": cell_local_center.tolist(),
+                    "source_box_cell_half_extents_geom_axes_m": cell_half.tolist(),
+                    "source_enclosure_radius_m": float(component["radius_m"]),
+                    "coverage_proof": "circumscribed sphere analytically contains this partition cell; cells tile the source MuJoCo box",
+                })
+                cell_count += 1
+            refinements.append({
+                "source_geom_id": geom_id,
+                "source_geom_name": source_name,
+                "source_geometry_shape": "compiled_MuJoCo_box",
+                "source_half_extents_geom_axes_m": half.tolist(),
+                "subdivisions": subdivisions.tolist(),
+                "attached_sphere_count": cell_count,
+                "attached_sphere_radius_m": cell_radius,
+                "old_single_enclosure_radius_m": float(component["radius_m"]),
+                "coverage": "each box partition cell is enclosed by its circumscribed sphere; all cells form an exact partition of the source box",
+            })
+            continue
+
+        component_center_root = (
+            inverse_root @ np.r_[component["center_world_m"], 1.0]
+        )[:3]
+        collision_components.append({
+            "center_object_root_m": component_center_root.tolist(),
             "radius_m": float(component["radius_m"]),
-            "source_geom_id": int(component["geom_id"]),
-        }
-        for component in obj["components"]
-    ]
+            "source_geom_id": geom_id,
+            "source_geom_name": source_name,
+            "source_geometry_shape": "verified_geom_enclosure_sphere",
+            "source_enclosure_radius_m": float(component["radius_m"]),
+        })
+
+    radius = max(
+        float(np.linalg.norm(component["center_object_root_m"]))
+        + float(component["radius_m"])
+        for component in collision_components
+    )
     return {
         "object_id": object_name,
         "root_position_world_m": root_pose[:3, 3].tolist(),
         "root_quaternion_world_wxyz": _matrix_pose(root_pose)[1],
         "conservative_root_sphere_radius_m": float(radius),
-        "source_collision_geom_count": len(obj["components"]),
+        "source_collision_geom_count": len({int(row["geom_id"]) for row in obj["components"]}),
         "covers_all_collision_geoms": bool(obj.get("covers_all_associated_collision_geoms")),
+        "refined_payload_geometry_approximations": refinements,
         "collision_components": collision_components,
     }
 
@@ -719,6 +820,13 @@ def _arm_q_from_snapshot(snapshot_state: dict[str, Any]) -> np.ndarray:
     return row[:7].copy()
 
 
+def _arm_qvel_from_snapshot(snapshot_state: dict[str, Any]) -> np.ndarray:
+    row = np.asarray(snapshot_state["robot_states"][0]["joint_qvel"], dtype=np.float64)
+    if row.ndim != 1 or row.size < 7 or not np.isfinite(row[:7]).all():
+        raise ValueError("snapshot_robot_arm_joint_velocity_unavailable")
+    return row[:7].copy()
+
+
 def _object_pose_from_goal_query(result: dict[str, Any]) -> np.ndarray:
     subject = result["subject"]
     return _pose_matrix(subject["root_position_world_m"], subject["root_quaternion_wxyz"])
@@ -779,9 +887,11 @@ class EpisodeRecorder:
         self.wrist_frames_dir.mkdir(parents=True, exist_ok=True)
         self.records = gzip.open(output_dir / "physical_step_records.jsonl.gz", "at", encoding="utf-8")
         self.action_count = 0
+        self.recorded_physics_substeps = 0
         self.snapshot_paths: list[str] = []
         self.monitoring_incomplete_actions = 0
         self.control_mode = "joint_space_mass_matrix_PD_torque"
+        self.endpoint_convergence_events: list[dict[str, Any]] = []
 
     def snapshot(self, label: str) -> str | None:
         result = self.bridge.request({"op": "export_runtime_snapshot"})
@@ -791,6 +901,76 @@ class EpisodeRecorder:
         path.write_bytes(result["payload"])
         self.snapshot_paths.append(str(path))
         return str(path)
+
+    def seed_verified_prefix(self, prefix_archive: Path, expected_state: np.ndarray) -> dict[str, Any]:
+        """Copy archived actions/observations ending at the exact resumed Snapshot."""
+        report_path = prefix_archive / "run_report.json"
+        records_path = prefix_archive / "physical_step_records.jsonl.gz"
+        if not report_path.is_file() or not records_path.is_file():
+            raise FileNotFoundError("t235_source_episode_prefix_archive_is_incomplete")
+        source_report = json.loads(report_path.read_text(encoding="utf-8"))
+        source_timestep = int(source_report.get("end_timestep", -1))
+        snapshot_ref = Path(source_report.get("terminal_runtime_snapshot", "")).resolve()
+        if (
+            source_report.get("status") not in {"complete", "failed"}
+            or source_timestep not in {235, 285}
+            or int(source_report.get("recorded_actions", -1)) <= 0
+            or snapshot_ref != (prefix_archive / (
+                "terminal_runtime_snapshot.pkl"
+                if source_report.get("status") == "complete"
+                else "failure_terminal_runtime_snapshot.pkl"
+            )).resolve()
+        ):
+            raise ValueError("source_episode_prefix_report_identity_mismatch")
+        with gzip.open(records_path, "rt", encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream if line.strip()]
+        if (
+            len(records) != int(source_report.get("recorded_actions", -1))
+            or [int(row.get("step_index", -1)) for row in records] != list(range(len(records)))
+        ):
+            raise ValueError("source_episode_prefix_action_count_or_order_mismatch")
+        prefix_state = _snapshot_state_vector(records[-1].get("snapshot_state", {}))
+        if not np.array_equal(prefix_state, expected_state):
+            raise ValueError("source_episode_prefix_does_not_end_at_resumed_snapshot")
+
+        image_key_map = {
+            "agentview_image": self.agent_frames_dir,
+            "robot0_eye_in_hand_image": self.wrist_frames_dir,
+            "composite_dual_camera_frame": self.frames_dir,
+        }
+        for expected_index, row in enumerate(records):
+            images = row.get("observation", {}).get("images", {})
+            for key, target_dir in image_key_map.items():
+                source = Path(str(images.get(key, "")))
+                if not source.is_file():
+                    raise FileNotFoundError(f"source_prefix_camera_frame_missing:{source}")
+                target = target_dir / f"frame_{expected_index:06d}.jpg"
+                shutil.copy2(source, target)
+                images[key] = str(target)
+            row["observation"]["images"] = images
+            self.records.write(json.dumps(
+                row, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            ) + "\n")
+            if row.get("contact_monitoring", {}).get("status") != "complete":
+                self.monitoring_incomplete_actions += 1
+        self.records.flush()
+        self.action_count = len(records)
+        self.recorded_physics_substeps = sum(
+            len(row.get("substep_contacts", [])) for row in records
+        )
+        return {
+            "status": "complete",
+            "source_archive": str(prefix_archive),
+            "source_records_sha256": _sha(records_path.read_bytes()),
+            "source_report_sha256": _sha(report_path.read_bytes()),
+            "actions_reused": len(records),
+            "physics_substeps_reused": sum(
+                len(row.get("substep_contacts", [])) for row in records
+            ),
+            "final_integration_state_exact_match": True,
+            "camera_frames_copied": 3 * len(records),
+            "state_source": f"verified t={source_timestep} Runtime Snapshot boundary",
+        }
 
     def record(
         self,
@@ -863,6 +1043,7 @@ class EpisodeRecorder:
         }
         self.records.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
         self.records.flush()
+        self.recorded_physics_substeps += len(record["substep_contacts"])
         self.action_count += 1
 
     def close(self) -> None:
@@ -910,6 +1091,119 @@ def _joint_step(
     return reply
 
 
+def _contact_events_with_bodies(reply: dict[str, Any], body_ids: set[int]) -> list[dict[str, Any]]:
+    if not body_ids:
+        return []
+    events = []
+    for substep_index, substep in enumerate(reply.get("substep_contacts", [])):
+        for contact in substep.get("contacts", []):
+            bodies = [contact.get("body1", {}), contact.get("body2", {})]
+            matched = [body for body in bodies if int(body.get("id", -1)) in body_ids]
+            if matched:
+                events.append({
+                    "physics_substep_index": substep_index,
+                    "geom1": contact.get("geom1"),
+                    "geom2": contact.get("geom2"),
+                    "body1": bodies[0],
+                    "body2": bodies[1],
+                    "signed_contact_distance_m": contact.get("signed_contact_distance_m"),
+                })
+    return events
+
+
+def _endpoint_tracking_metrics(snapshot_state: dict[str, Any], target_q: np.ndarray) -> dict[str, Any]:
+    q_actual = _arm_q_from_snapshot(snapshot_state)
+    q_velocity = _arm_qvel_from_snapshot(snapshot_state)
+    error = np.asarray(target_q, dtype=np.float64) - q_actual
+    return {
+        "actual_joint_qpos_rad": q_actual.tolist(),
+        "actual_joint_qvel_rad_s": q_velocity.tolist(),
+        "target_joint_qpos_rad": np.asarray(target_q, dtype=np.float64).tolist(),
+        "joint_error_rad": error.tolist(),
+        "joint_error_norm_rad": float(np.linalg.norm(error)),
+        "maximum_absolute_joint_error_rad": float(np.max(np.abs(error))),
+        "maximum_absolute_joint_velocity_rad_s": float(np.max(np.abs(q_velocity))),
+    }
+
+
+def _native_goal_values(status: dict[str, Any]) -> dict[tuple[str, ...], bool]:
+    return {
+        tuple(str(token) for token in row.get("predicate", [])): bool(row["value"])
+        for row in status.get("native_goal_values", [])
+        if isinstance(row, dict) and isinstance(row.get("value"), bool)
+    }
+
+
+def _converge_joint_endpoint(
+    bridge: BridgeSession,
+    recorder: EpisodeRecorder,
+    target_q: np.ndarray,
+    phase: str,
+    *,
+    max_actions: int,
+    hold_gripper_action: float | None,
+    forbidden_contact_body_ids: set[int],
+) -> dict[str, Any]:
+    """Close terminal joint tracking error using only MuJoCo torque feedback."""
+    state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
+    initial = _endpoint_tracking_metrics(state, target_q)
+    actions = 0
+    collision_events = []
+    latest = initial
+    while actions < max_actions:
+        if (
+            latest["maximum_absolute_joint_error_rad"] <= 0.005
+            and latest["maximum_absolute_joint_velocity_rad_s"] <= 0.03
+        ):
+            return {
+                "status": "converged",
+                "converged": True,
+                "actions": actions,
+                "action_budget": max_actions,
+                "position_tolerance_rad": 0.005,
+                "velocity_tolerance_rad_s": 0.03,
+                "initial_feedback": initial,
+                "final_feedback": latest,
+                "forbidden_collision_events": collision_events,
+            }
+        reply = _joint_step(
+            bridge,
+            recorder,
+            target_q,
+            f"{phase}_endpoint_feedback",
+            gripper_action=hold_gripper_action,
+        )
+        actions += 1
+        collision_events.extend(_contact_events_with_bodies(reply, forbidden_contact_body_ids))
+        state = reply.get("snapshot_state", {})
+        latest = _endpoint_tracking_metrics(state, target_q)
+        if collision_events:
+            return {
+                "status": "stopped_on_tomato_bottle_contact",
+                "converged": False,
+                "actions": actions,
+                "action_budget": max_actions,
+                "initial_feedback": initial,
+                "final_feedback": latest,
+                "forbidden_collision_events": collision_events,
+            }
+    converged = bool(
+        latest["maximum_absolute_joint_error_rad"] <= 0.005
+        and latest["maximum_absolute_joint_velocity_rad_s"] <= 0.03
+    )
+    return {
+        "status": "converged" if converged else "bounded_action_budget_exhausted",
+        "converged": converged,
+        "actions": actions,
+        "action_budget": max_actions,
+        "position_tolerance_rad": 0.005,
+        "velocity_tolerance_rad_s": 0.03,
+        "initial_feedback": initial,
+        "final_feedback": latest,
+        "forbidden_collision_events": collision_events,
+    }
+
+
 def _execute_joint_path(
     bridge: BridgeSession,
     recorder: EpisodeRecorder,
@@ -917,6 +1211,8 @@ def _execute_joint_path(
     phase: str,
     hold_gripper_action: float | None = 0.0,
     reserve_actions: int = 0,
+    endpoint_convergence_action_budget: int = 30,
+    forbidden_contact_body_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     if plan.get("status") != "planned" or not plan.get("joint_path_rad"):
         raise RuntimeError(f"CuRobo route unavailable for {phase}:{plan.get('status')}:{plan.get('error')}")
@@ -924,13 +1220,15 @@ def _execute_joint_path(
     path = prepared["joint_path_rad"]
     before_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
     before_q = _arm_q_from_snapshot(before_state)
+    native_before_path = bridge.request({"op": "native_task_status"})
     if not np.allclose(path[0], before_q, rtol=0.0, atol=5e-4):
         raise ValueError(
             f"CuRobo_path_start_state_mismatch:{phase}:"
             f"max_abs_error={float(np.max(np.abs(path[0] - before_q))):.9g}"
         )
     start = recorder.action_count
-    required_actions = max(0, len(path) - 1)
+    forbidden_contact_body_ids = forbidden_contact_body_ids or set()
+    required_actions = max(0, len(path) - 1) + max(0, int(endpoint_convergence_action_budget))
     available_actions = MAX_DEMO_ACTIONS - recorder.action_count - int(reserve_actions)
     if required_actions > available_actions:
         raise RuntimeError(
@@ -938,13 +1236,66 @@ def _execute_joint_path(
             f"required={required_actions}:available={max(0, available_actions)}:"
             f"reserved={reserve_actions}"
         )
+    trajectory_start_actions = recorder.action_count
+    reply = None
     for row in path[1:]:
         reply = _joint_step(bridge, recorder, row, phase, gripper_action=hold_gripper_action)
+        collisions = _contact_events_with_bodies(reply, forbidden_contact_body_ids)
+        if collisions:
+            raise RuntimeError(
+                f"physical_route_contacted_forbidden_tomato_bottle:{phase}:"
+                + json.dumps(collisions[:4], ensure_ascii=False)
+            )
         if reply.get("task_success") is True:
             break
+    after_path_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
+    pre_convergence = _endpoint_tracking_metrics(after_path_state, path[-1])
+    endpoint_convergence = _converge_joint_endpoint(
+        bridge,
+        recorder,
+        path[-1],
+        phase,
+        max_actions=max(0, int(endpoint_convergence_action_budget)),
+        hold_gripper_action=hold_gripper_action,
+        forbidden_contact_body_ids=forbidden_contact_body_ids,
+    )
+    native_after_feedback = bridge.request({"op": "native_task_status"})
+    before_values = _native_goal_values(native_before_path)
+    after_values = _native_goal_values(native_after_feedback)
+    newly_satisfied = [
+        list(predicate)
+        for predicate, value in after_values.items()
+        if value and before_values.get(predicate) is not True
+    ]
+    final_qvel = np.asarray(
+        endpoint_convergence.get("final_feedback", {}).get("actual_joint_qvel_rad_s", []),
+        dtype=np.float64,
+    )
+    max_final_speed = float(np.max(np.abs(final_qvel))) if final_qvel.shape == (7,) else math.inf
+    if (
+        endpoint_convergence.get("converged") is not True
+        and newly_satisfied
+        and max_final_speed <= 0.03
+    ):
+        endpoint_convergence = {
+            **endpoint_convergence,
+            "status": "accepted_at_settled_native_task_progress",
+            "converged": True,
+            "strict_joint_position_tolerance_met": False,
+            "maximum_joint_speed_rad_s_at_acceptance": max_final_speed,
+            "newly_satisfied_native_predicates": newly_satisfied,
+            "acceptance_basis": "native task predicate made physical progress and measured joint velocity settled; residual waypoint error is retained as a diagnostic",
+        }
+    recorder.endpoint_convergence_events.append({"phase": phase, **endpoint_convergence})
+    if endpoint_convergence.get("converged") is not True:
+        raise RuntimeError(
+            f"bounded_real_joint_endpoint_convergence_failed:{phase}:"
+            + json.dumps(endpoint_convergence, ensure_ascii=False)
+        )
     recorder.snapshot(f"{phase}_end")
     after_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
     actual_q = _arm_q_from_snapshot(after_state)
+    actual_qvel = _arm_qvel_from_snapshot(after_state)
     actual_eef = _eef_from_snapshot(after_state)
     valid_count = int(prepared["effective_valid_point_count"])
     target_eef = None
@@ -975,11 +1326,20 @@ def _execute_joint_path(
         "control_sample_dt_s": prepared["control_sample_dt_s"],
         "execution_resampling": {key: value for key, value in prepared.items() if key not in {"joint_path_rad"}},
         "executed_control_actions": recorder.action_count - start,
+        "trajectory_control_actions": recorder.action_count - trajectory_start_actions - int(endpoint_convergence["actions"]),
+        "endpoint_convergence": endpoint_convergence,
+        "pre_convergence_tracking": pre_convergence,
+        "final_joint_velocity_rad_s": actual_qvel.tolist(),
+        "target_endpoint_joint_qpos_rad": path[-1].tolist(),
+        "actual_endpoint_joint_qpos_rad": actual_q.tolist(),
         "reserved_future_actions": int(reserve_actions),
         "post_execution_joint_error_rad": (actual_q - path[-1]).tolist(),
         "post_execution_joint_error_norm_rad": float(np.linalg.norm(actual_q - path[-1])),
         "post_execution_eef_endpoint_error": endpoint_error,
         "final_native_task_success": bool(reply.get("task_success")) if len(path) > 1 else None,
+        "native_task_status_before_path": native_before_path,
+        "native_task_status_after_endpoint_feedback": native_after_feedback,
+        "newly_satisfied_native_predicates": newly_satisfied,
     }
 
 
@@ -997,8 +1357,9 @@ def _release_gripper(
     actions = 0
     separated = False
     last_check = None
+    last_contact_audit: dict[str, Any] | None = None
     while actions < action_budget:
-        _joint_step(bridge, recorder, release_q, phase, gripper_action=-1.0)
+        step_reply = _joint_step(bridge, recorder, release_q, phase, gripper_action=-1.0)
         actions += 1
         if actions % 10 == 0 or actions == action_budget:
             last_check = bridge.request({
@@ -1007,7 +1368,38 @@ def _release_gripper(
                 "expected_instruction": INSTRUCTION,
             })
             closure = last_check.get("gripper_closure", {})
-            if last_check.get("grasp_confirmed") is False and closure.get("closed") is False:
+            finger_contacts = last_check.get("finger_contacts", {})
+            object_body_ids = set(int(value) for value in binding.get("body_ids", []))
+            if not object_body_ids and binding.get("root_body_id") is not None:
+                object_body_ids.add(int(binding["root_body_id"]))
+            robot_object_contacts = []
+            for event in step_reply.get("contact_monitoring", {}).get("events", []):
+                body_pair = event.get("body_pair", [])
+                if (
+                    event.get("robot_involved") is True
+                    and any(int(row.get("id", -1)) in object_body_ids for row in body_pair)
+                ):
+                    robot_object_contacts.append({
+                        "body_pair": body_pair,
+                        "geom_pair": event.get("geom_pair"),
+                        "occurrence_count": event.get("occurrence_count"),
+                    })
+            fingers_clear = (
+                finger_contacts.get("left") is False
+                and finger_contacts.get("right") is False
+            )
+            last_contact_audit = {
+                "finger_contacts_clear": fingers_clear,
+                "robot_object_contact_events": robot_object_contacts,
+                "contact_monitoring_status": step_reply.get("contact_monitoring", {}).get("status"),
+                "contact_evidence_source": "all recorded MuJoCo substeps aggregated for the latest control action",
+            }
+            if (
+                last_check.get("grasp_confirmed") is False
+                and closure.get("closed") is False
+                and fingers_clear
+                and not robot_object_contacts
+            ):
                 separated = True
                 break
     if separated:
@@ -1022,6 +1414,7 @@ def _release_gripper(
         "reserved_future_actions": int(reserve_actions),
         "contact_separated": separated,
         "last_grasp_state_check": last_check,
+        "last_contact_audit": last_contact_audit,
         "failure_reason": reason,
         "check_interval_actions": 10,
         "final_check_performed_when_budget_below_10": bool(action_budget < 10 and last_check is not None),
@@ -1100,21 +1493,84 @@ def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     setattr(sys.modules["__main__"], "_PythonObjectState", _PythonObjectState)
     recovery_config = json.loads(RECOVERY_CONFIG.read_text(encoding="utf-8"))
-    payload = SNAPSHOT.read_bytes()
+    snapshot_path = Path(args.resume_snapshot).resolve() if args.resume_snapshot else SNAPSHOT.resolve()
+    payload = snapshot_path.read_bytes()
     envelope = pickle.loads(payload)
     source_state = np.asarray(envelope["snapshot"]["mujoco_state"], dtype=np.float64)
+    source_timestep = int(envelope.get("snapshot", {}).get("task_bookkeeping", {}).get("timestep", -1))
+    scene = envelope.get("scene_metadata", {})
+    t235_source_report = None
+    t285_source_report = None
+    if source_timestep == 235:
+        if snapshot_path != T235_TERMINAL_SNAPSHOT.resolve():
+            raise ValueError("t235_resume_requires_the_archived_terminal_snapshot_path")
+        t235_source_report = json.loads((snapshot_path.parent / "run_report.json").read_text(encoding="utf-8"))
+    if source_timestep == 285:
+        if snapshot_path != T285_FAILURE_SNAPSHOT.resolve():
+            raise ValueError("t285_resume_requires_the_archived_failure_terminal_snapshot_path")
+        t285_source_report = json.loads((snapshot_path.parent / "run_report.json").read_text(encoding="utf-8"))
     if (
         envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1"
         or envelope.get("model_geometry_sha256") != EXPECTED_MODEL_SHA
-        or envelope.get("scene_metadata", {}).get("bddl_sha256") != EXPECTED_BDDL_SHA
-        or int(envelope["snapshot"].get("task_bookkeeping", {}).get("timestep", -1)) != 215
-        or _sha(payload) != EXPECTED_SNAPSHOT_SHA
+        or scene.get("bddl_sha256") != EXPECTED_BDDL_SHA
+        or scene.get("benchmark") != "obstacle_avoidance_human"
+        or int(scene.get("level", -1)) != 0
+        or int(scene.get("task_id", -1)) != 2
+        or int(scene.get("environment_seed", -1)) != 0
+        or int(scene.get("init_state_index", -1)) != 0
+        or source_timestep not in {215, 235, 285}
         or source_state.shape != (331,)
-        or recovery_config.get("source_snapshot", {}).get("payload_sha256") != EXPECTED_SNAPSHOT_SHA
         or recovery_config.get("source_snapshot", {}).get("model_geometry_sha256") != EXPECTED_MODEL_SHA
         or recovery_config.get("task", {}).get("bddl_sha256") != EXPECTED_BDDL_SHA
+        or (
+            source_timestep == 215
+            and (
+                snapshot_path != SNAPSHOT.resolve()
+                or _sha(payload) != EXPECTED_SNAPSHOT_SHA
+                or recovery_config.get("source_snapshot", {}).get("payload_sha256") != EXPECTED_SNAPSHOT_SHA
+            )
+        )
+        or (
+            source_timestep == 235
+            and (
+                not isinstance(t235_source_report, dict)
+                or t235_source_report.get("status") != "complete"
+                or int(t235_source_report.get("end_timestep", -1)) != 235
+                or Path(t235_source_report.get("terminal_runtime_snapshot", "")).resolve() != snapshot_path
+            )
+        )
+        or (
+            source_timestep == 285
+            and (
+                not isinstance(t285_source_report, dict)
+                or t285_source_report.get("status") != "failed"
+                or int(t285_source_report.get("end_timestep", -1)) != 285
+                or t285_source_report.get("source_model_sha256") != EXPECTED_MODEL_SHA
+                or t285_source_report.get("bddl_sha256") != EXPECTED_BDDL_SHA
+                or Path(t285_source_report.get("terminal_runtime_snapshot", "")).resolve() != snapshot_path
+                or t285_source_report.get("failure_native_task_status", {}).get("native_goal_values", [{}])[0].get("value") is not True
+            )
+        )
     ):
-        raise ValueError("source_t215_Runtime_Snapshot_or_recovery_config_identity_mismatch")
+        raise ValueError("source_Runtime_Snapshot_or_recovery_config_identity_mismatch")
+    t235_geometry_evidence = None
+    if source_timestep in {235, 285}:
+        t235_geometry_evidence = json.loads(T235_GEOMETRY_DIAGNOSTIC.read_text(encoding="utf-8"))
+        exact_pot_gap = t235_geometry_evidence.get("pot1_vs_bottle_exact_mujoco", {}).get("minimum_signed_distance_m")
+        robot_gap = t235_geometry_evidence.get("robot_vs_bottle", {}).get("minimum_distance_m")
+        refined_gap = t235_geometry_evidence.get("refined_box_sphere_cover", {}).get("minimum_sphere_to_body25_mesh_clearance_m")
+        if (
+            t235_geometry_evidence.get("snapshot", {}).get("payload_sha256") != _sha(T235_TERMINAL_SNAPSHOT.read_bytes())
+            or t235_geometry_evidence.get("mujoco_read_only_restore_exact") is not True
+            or not isinstance(exact_pot_gap, (int, float))
+            or exact_pot_gap <= 0.0
+            or not isinstance(robot_gap, (int, float))
+            or robot_gap <= 0.0
+            or not isinstance(refined_gap, (int, float))
+            or refined_gap <= 0.0
+            or t235_geometry_evidence.get("prior_substeps", {}).get("bottle_contact_count") != 0
+        ):
+            raise ValueError("t235_exact_geometry_evidence_does_not_clear_the_CuRobo_start")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir or ARCHIVE_ROOT / f"gs_opd_human_l0t2_curobo_transport_{stamp}"
@@ -1137,27 +1593,27 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "bddl_sha256": EXPECTED_BDDL_SHA,
         },
         "snapshot": {
-            "path": str(SNAPSHOT),
+            "path": str(snapshot_path),
             "payload_sha256": _sha(payload),
             "model_geometry_sha256": EXPECTED_MODEL_SHA,
-            "timestep": 215,
+            "timestep": source_timestep,
         },
         "startup_sequence": [
             "BridgeSession.start() -> seed/reset/set_init_state",
             "one additional Bridge reset from historical executor",
             "require compiled_model_fingerprint_details == source SHA",
-            "restore exact t=215 Snapshot",
+            f"restore exact t={source_timestep} Snapshot",
             "no reset after Snapshot restore",
         ],
         "planner": {
             "existing_environment": str(CUROBO_PYTHON),
             "planner": "CuRobo MotionPlanner goalset with packaged Franka self-collision and complete active MuJoCo scene collision export",
-            "payload": "one attached sphere per bound Pot1 MuJoCo collision-Geom enclosure, preserving all 15 source centers/radii",
-            "obstacles": "all collision-enabled non-robot MuJoCo Geoms except the carried object and native target support during final docking; cuboids/meshes enclosed by oriented boxes, other finite shapes by exact spheres or verified broadphase spheres",
+            "payload": "verified MuJoCo Geom enclosures; elongated moka-pot g3 boxes use a 1x2x4 tiling of circumscribed spheres per exact box partition cell",
+            "obstacles": "all collision-enabled non-robot MuJoCo Geoms except the carried object and native target support during final docking; compiled meshes retain exact triangles and finite primitives retain their compiled shape",
             "floor": "bounded 5 m workspace cuboid representing the active infinite MuJoCo floor plane",
             "robot": "CuRobo packaged Franka collision model with self_collision_check=true; current MuJoCo robot Geom inventory saved for identity audit",
             "route_cache": str(REUSABLE_POT1_PREPLACE_ARCHIVE),
-            "route_cache_policy": "reuse Pot1 preplace only when task, 7D start, tool/base transforms, full obstacle geometry, goals, attached payload, random seed, and interpolation settings match within 1e-9",
+            "route_cache_policy": "reuse a route only when task, 7D start, tool/base transforms, full obstacle geometry, goals, attached payload, random seed, and interpolation settings match within 1e-9",
         },
         "trajectory_execution": {
             "control_timestep_s": CONTROL_TIMESTEP_S,
@@ -1182,6 +1638,26 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "result": "blocked_before_planning",
         "task": "obstacle_avoidance_human/L0T2",
         "source_snapshot_sha256": _sha(payload),
+        "source_snapshot_timestep": source_timestep,
+        "t235_geometry_evidence": {
+            "archive_report": str(T235_GEOMETRY_DIAGNOSTIC),
+            "pot1_bottle_minimum_exact_geom_distance_m": (
+                t235_geometry_evidence.get("pot1_vs_bottle_exact_mujoco", {}).get("minimum_signed_distance_m")
+                if t235_geometry_evidence else None
+            ),
+            "robot_bottle_minimum_exact_geom_distance_m": (
+                t235_geometry_evidence.get("robot_vs_bottle", {}).get("minimum_distance_m")
+                if t235_geometry_evidence else None
+            ),
+            "refined_box_sphere_cover_minimum_mesh_clearance_m": (
+                t235_geometry_evidence.get("refined_box_sphere_cover", {}).get("minimum_sphere_to_body25_mesh_clearance_m")
+                if t235_geometry_evidence else None
+            ),
+            "recorded_bottle_contacts_before_resume": (
+                t235_geometry_evidence.get("prior_substeps", {}).get("bottle_contact_count")
+                if t235_geometry_evidence else None
+            ),
+        },
         "output_dir": str(output_dir),
         "source_model_sha256": EXPECTED_MODEL_SHA,
         "bddl_sha256": EXPECTED_BDDL_SHA,
@@ -1240,8 +1716,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "integration_state_exact_match": True,
             "integration_state_sha256": hashlib.sha256(restored_state.tobytes()).hexdigest(),
         }
+        if source_timestep in {235, 285}:
+            report["source_episode_prefix"] = {
+                "archive": str(snapshot_path.parent),
+                "source_report": str(snapshot_path.parent / "run_report.json"),
+                "source_records": str(snapshot_path.parent / "physical_step_records.jsonl.gz"),
+                "actions": int((snapshot_path.parent / "run_report.json").exists() and (t235_source_report or t285_source_report).get("recorded_actions", 0)),
+                "physics_substeps": int((t235_source_report or t285_source_report or {}).get("recorded_physics_substeps", 0)),
+                "state_boundary": f"t={source_timestep} terminal Runtime Snapshot",
+            }
         recorder = EpisodeRecorder(output_dir, bridge)
-        recorder.snapshot("initial_t215")
+        if source_timestep in {235, 285}:
+            report["source_episode_prefix"] = recorder.seed_verified_prefix(
+                snapshot_path.parent, source_state
+            )
+        recorder.snapshot(f"initial_t{source_timestep}")
         initial_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
         initial_snapshot_state = initial_observation["snapshot_state"]
         initial_eef = _eef_from_snapshot(initial_snapshot_state)
@@ -1252,6 +1741,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         bindings = bindings_response.get("bindings", {})
         if not {"moka_pot_1", "moka_pot_2"}.issubset(bindings):
             raise RuntimeError("active_BDDL_Pot1_or_Pot2_binding_missing")
+        bottle_binding = bindings.get("bottle_of_tomato_paste_2_with_hand_1", {})
+        bottle_body_ids = set(int(value) for value in bottle_binding.get("body_ids", []))
+        if not bottle_body_ids and bottle_binding.get("root_body_id") is not None:
+            bottle_body_ids.add(int(bottle_binding["root_body_id"]))
         grasp_start = bridge.request({
             "op": "grasp_state",
             "carried_binding": _binding(bindings["moka_pot_1"]),
@@ -1290,13 +1783,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         obstacle_spheres = _collision_obstacles(
             collision_export, bindings, excluded_objects={"moka_pot_1"}
         )
-        _save_json(output_dir / "mujoco_collision_world_t215.json", {
+        _save_json(output_dir / f"mujoco_collision_world_t{source_timestep}.json", {
             "model_geometry_sha256": EXPECTED_MODEL_SHA,
-            "state_timestep": 215,
+            "state_timestep": source_timestep,
             "integration_state_sha256": hashlib.sha256(
                 _snapshot_state_vector({"mujoco_integration_state": initial_snapshot_state["mujoco_integration_state"]}).tobytes()
             ).hexdigest(),
-            "geometry_source": "read-only Safety Bridge full compiled-model collision export; boxes and meshes use conservative oriented enclosures, spheres are exact, other finite geoms use verified compiled bounds",
+            "geometry_source": "read-only Safety Bridge full compiled-model collision export; mesh obstacles use their complete compiled triangles, primitive boxes and spheres retain exact shape, and other finite Geoms use verified conservative bounds",
             "registered_object_ids": list(initial_scene.get("objects", {})),
             "obstacle_geometry_count": len(obstacle_spheres),
             "obstacle_shape_counts": {
@@ -1310,13 +1803,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "target_region": region,
             "Pot1_geometry": initial_scene["objects"]["moka_pot_1"],
         })
-        payload_sphere = _object_sphere(initial_scene, "moka_pot_1", pot1_pose)
+        payload_sphere = _object_sphere(
+            initial_scene, "moka_pot_1", pot1_pose, collision_export
+        )
         report.update({
             "result": "planning",
             "start_state": {
                 "timestep": initial_observation.get("timestep"),
                 "eef_pose_world": _matrix_pose(initial_eef),
                 "arm_qpos_rad": initial_q.tolist(),
+                "arm_qvel_rad_s": _arm_qvel_from_snapshot(initial_snapshot_state).tolist(),
                 "native_task_status": bridge.request({"op": "native_task_status"}),
                 "pot1_grasp_state": grasp_start,
             },
@@ -1334,29 +1830,42 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "placement_candidates": candidates,
         })
 
-        t0 = time.monotonic()
-        preplan = _plan(
-            bridge, output_dir, "pot1_preplace", initial_q, initial_eef,
-            obstacle_spheres, preplace_goals, payload_sphere,
-            reusable_archive=REUSABLE_POT1_PREPLACE_ARCHIVE,
-        )
-        report["curobo_plan_count"] += 1
-        report["planning_seconds"] += time.monotonic() - t0
-        report["pot1"]["preplace_plan"] = preplan
-        if preplan.get("status") != "planned":
-            report["result"] = "curobo_preplace_route_unavailable"
-            report["status"] = "complete"
-            report["blocking_reason"] = preplan.get("error") or preplan.get("planner_status")
-            return report
-        recorder.snapshot("before_pot1_transport")
-        report["pot1"]["preplace_execution"] = _execute_joint_path(
-            bridge, recorder, preplan, "pot1_curobo_transport", hold_gripper_action=0.0,
-            reserve_actions=POT1_PREPLACE_FUTURE_RESERVE_ACTIONS,
-        )
-        report["trajectory_execution"]["route_executions"].append({
-            "phase": "pot1_curobo_transport",
-            **report["pot1"]["preplace_execution"],
-        })
+        if source_timestep == 215:
+            t0 = time.monotonic()
+            preplan = _plan(
+                bridge, output_dir, "pot1_preplace", initial_q, initial_eef,
+                obstacle_spheres, preplace_goals, payload_sphere,
+                reusable_archive=REUSABLE_POT1_PREPLACE_ARCHIVE,
+            )
+            report["curobo_plan_count"] += 1
+            report["planning_seconds"] += time.monotonic() - t0
+            report["pot1"]["preplace_plan"] = preplan
+            if preplan.get("status") != "planned":
+                report["result"] = "curobo_preplace_route_unavailable"
+                report["status"] = "complete"
+                report["blocking_reason"] = preplan.get("error") or preplan.get("planner_status")
+                return report
+            recorder.snapshot("before_pot1_transport")
+            report["pot1"]["preplace_execution"] = _execute_joint_path(
+                bridge, recorder, preplan, "pot1_curobo_transport", hold_gripper_action=0.0,
+                reserve_actions=POT1_PREPLACE_FUTURE_RESERVE_ACTIONS,
+                forbidden_contact_body_ids=bottle_body_ids,
+            )
+            report["trajectory_execution"]["route_executions"].append({
+                "phase": "pot1_curobo_transport",
+                **report["pot1"]["preplace_execution"],
+            })
+        else:
+            report["pot1"]["preplace_plan"] = {
+                "status": f"not_replanned_from_t{source_timestep}_source_snapshot",
+                "source_prefix_archive": str(snapshot_path.parent),
+                "reason": "resume_after_saved_physical_transport_prefix",
+            }
+            report["pot1"]["preplace_execution"] = {
+                "status": "prefix_reused_without_action_replay",
+                "actions_added": 0,
+                "source_actions": recorder.action_count,
+            }
         live = bridge.request({"op": "observe", "include_snapshot_state": True})
         live_state = live["snapshot_state"]
         live_eef = _eef_from_snapshot(live_state)
@@ -1391,34 +1900,57 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             bindings,
             excluded_objects={"flat_stove_1", "moka_pot_1"},
         )
-        t1 = time.monotonic()
-        final_plan = _plan(
-            bridge,
-            output_dir,
-            "pot1_place",
-            live_q,
-            live_eef,
-            final_obstacles,
-            final_goals,
-            _object_sphere(live_scene, "moka_pot_1", live_pot1_pose),
-        )
-        report["curobo_plan_count"] += 1
-        report["planning_seconds"] += time.monotonic() - t1
-        report["pot1"]["placement_plan"] = final_plan
-        if final_plan.get("status") != "planned":
-            report["result"] = "curobo_final_placement_route_unavailable"
-            report["status"] = "complete"
-            report["blocking_reason"] = final_plan.get("error") or final_plan.get("planner_status")
-            return report
-        report["pot1"]["selected_candidate_id"] = final_plan["goal_candidates"][final_plan["selected_goal_index"]]["candidate_id"]
-        report["pot1"]["placement_execution"] = _execute_joint_path(
-            bridge, recorder, final_plan, "pot1_curobo_place", hold_gripper_action=0.0,
-            reserve_actions=POT1_PLACEMENT_FUTURE_RESERVE_ACTIONS,
-        )
-        report["trajectory_execution"]["route_executions"].append({
-            "phase": "pot1_curobo_place",
-            **report["pot1"]["placement_execution"],
-        })
+        if source_timestep == 285:
+            native_pot1_at_target = bridge.request({
+                "op": "native_goal_query",
+                "predicate": ["on", "moka_pot_1", "flat_stove_1_cook_region"],
+            })
+            if native_pot1_at_target.get("predicate_value") is not True:
+                raise RuntimeError("t285_resume_no_longer_satisfies_native_Pot1_target_region")
+            report["pot1"]["placement_plan"] = {
+                "status": "previously_executed_route_reused_without_replanning",
+                "source_archive": str(snapshot_path.parent),
+                "route_archive": str(snapshot_path.parent / "pot1_place_curobo_plan.json"),
+                "target_region_native_predicate": native_pot1_at_target,
+            }
+            report["pot1"]["placement_execution"] = {
+                "status": "already_at_native_target_after_real_CuRobo_execution",
+                "actions_added": 0,
+                "source_actions": 50,
+                "current_grasp_confirmed": True,
+            }
+        else:
+            t1 = time.monotonic()
+            final_plan = _plan(
+                bridge,
+                output_dir,
+                "pot1_place",
+                live_q,
+                live_eef,
+                final_obstacles,
+                final_goals,
+                _object_sphere(
+                    live_scene, "moka_pot_1", live_pot1_pose, live_collision_export
+                ),
+            )
+            report["curobo_plan_count"] += 1
+            report["planning_seconds"] += time.monotonic() - t1
+            report["pot1"]["placement_plan"] = final_plan
+            if final_plan.get("status") != "planned":
+                report["result"] = "curobo_final_placement_route_unavailable"
+                report["status"] = "complete"
+                report["blocking_reason"] = final_plan.get("error") or final_plan.get("planner_status")
+                return report
+            report["pot1"]["selected_candidate_id"] = final_plan["goal_candidates"][final_plan["selected_goal_index"]]["candidate_id"]
+            report["pot1"]["placement_execution"] = _execute_joint_path(
+                bridge, recorder, final_plan, "pot1_curobo_place", hold_gripper_action=0.0,
+                reserve_actions=POT1_PLACEMENT_FUTURE_RESERVE_ACTIONS,
+                forbidden_contact_body_ids=bottle_body_ids,
+            )
+            report["trajectory_execution"]["route_executions"].append({
+                "phase": "pot1_curobo_place",
+                **report["pot1"]["placement_execution"],
+            })
 
         release_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
         release_q = _arm_q_from_snapshot(release_state)
@@ -1480,6 +2012,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             report["pot1"]["retreat_execution"] = _execute_joint_path(
                 bridge, recorder, retreat_plan, "pot1_curobo_retreat", hold_gripper_action=0.0,
                 reserve_actions=POT1_RETREAT_FUTURE_RESERVE_ACTIONS,
+                forbidden_contact_body_ids=bottle_body_ids,
             )
             report["trajectory_execution"]["route_executions"].append({
                 "phase": "pot1_curobo_retreat",
@@ -1504,12 +2037,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             bindings["moka_pot_1"],
         )
         report["pot1"].update({
-            "native_on_after_release_retreat_settling": final_pot1.get("value"),
+            "native_on_after_release_retreat_settling": final_pot1.get("predicate_value"),
             "settling_actions": 40,
             "settling_evidence": pot1_stability,
             "stable_release_verified": bool(
                 release_confirmed
-                and final_pot1.get("value") is True
+                and final_pot1.get("predicate_value") is True
                 and pot1_stability.get("stable_under_report_policy") is True
             ),
             "post_release_native_task_status": final_native,
@@ -1554,6 +2087,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 report["pot2"]["pregrasp_execution"] = _execute_joint_path(
                     bridge, recorder, pot2_preplan, "pot2_curobo_pregrasp", hold_gripper_action=-1.0,
                     reserve_actions=1000,
+                    forbidden_contact_body_ids=bottle_body_ids,
                 )
                 report["trajectory_execution"]["route_executions"].append({
                     "phase": "pot2_curobo_pregrasp",
@@ -1581,6 +2115,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     report["pot2"]["grasp_execution"] = _execute_joint_path(
                         bridge, recorder, approach_plan, "pot2_curobo_grasp_approach", hold_gripper_action=-1.0,
                         reserve_actions=800,
+                        forbidden_contact_body_ids=bottle_body_ids,
                     )
                     report["trajectory_execution"]["route_executions"].append({
                         "phase": "pot2_curobo_grasp_approach",
@@ -1648,7 +2183,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     bridge,
                     output_dir, "pot2_preplace", pot2_q, pot2_eef,
                     pot2_transport_obstacles, pot2_preplace_goals,
-                    _object_sphere(pot2_live_scene, "moka_pot_2", pot2_live_pose),
+                    _object_sphere(
+                        pot2_live_scene, "moka_pot_2", pot2_live_pose, current_export
+                    ),
                 )
                 report["curobo_plan_count"] += 1
                 report["planning_seconds"] += time.monotonic() - t3
@@ -1660,6 +2197,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     report["pot2"]["preplace_execution"] = _execute_joint_path(
                         bridge, recorder, pot2_transport_plan, "pot2_curobo_transport", hold_gripper_action=0.0,
                         reserve_actions=500,
+                        forbidden_contact_body_ids=bottle_body_ids,
                     )
                     report["trajectory_execution"]["route_executions"].append({
                         "phase": "pot2_curobo_transport",
@@ -1695,7 +2233,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                         bridge,
                         output_dir, "pot2_place", p2_after_q, p2_after_eef,
                         p2_final_obstacles, p2_final_goals,
-                        _object_sphere(p2_scene_live, "moka_pot_2", p2_pose_live),
+                        _object_sphere(
+                            p2_scene_live, "moka_pot_2", p2_pose_live, p2_final_export
+                        ),
                     )
                     report["curobo_plan_count"] += 1
                     report["planning_seconds"] += time.monotonic() - t4
@@ -1708,6 +2248,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                         report["pot2"]["placement_execution"] = _execute_joint_path(
                             bridge, recorder, p2_final_plan, "pot2_curobo_place", hold_gripper_action=0.0,
                             reserve_actions=350,
+                            forbidden_contact_body_ids=bottle_body_ids,
                         )
                         report["trajectory_execution"]["route_executions"].append({
                             "phase": "pot2_curobo_place",
@@ -1752,6 +2293,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                                 report["pot2"]["retreat_execution"] = _execute_joint_path(
                                     bridge, recorder, p2_retreat_plan, "pot2_curobo_retreat", hold_gripper_action=0.0,
                                     reserve_actions=40,
+                                    forbidden_contact_body_ids=bottle_body_ids,
                                 )
                                 report["trajectory_execution"]["route_executions"].append({
                                     "phase": "pot2_curobo_retreat",
@@ -1775,17 +2317,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                                 )
                                 report["pot2"].update({
                                     "settling_actions": p2_settling_actions,
-                                    "native_on_after_release_retreat_settling": p2_on.get("value"),
+                                    "native_on_after_release_retreat_settling": p2_on.get("predicate_value"),
                                     "settling_evidence": p2_stability,
                                     "stable_release_verified": bool(
                                         p2_released
-                                        and p2_on.get("value") is True
-                                        and p1_on.get("value") is True
+                                        and p2_on.get("predicate_value") is True
+                                        and p1_on.get("predicate_value") is True
                                         and p2_stability.get("stable_under_report_policy") is True
                                     ),
                                     "post_release_native_task_status": p2_native,
                                     "post_release_pose": p2_on.get("subject"),
-                                    "pot1_native_on_preserved": p1_on.get("value"),
+                                    "pot1_native_on_preserved": p1_on.get("predicate_value"),
                                 })
                                 report["final_native_task_status"] = p2_native
                             else:
@@ -1830,8 +2372,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 report["terminal_runtime_snapshot"] = recorder.snapshot("terminal")
             recorder.close()
             report["recorded_actions"] = recorder.action_count
-            report["recorded_physics_substeps"] = recorder.action_count * MUJOCO_SUBSTEPS
+            report["expected_physics_substeps"] = recorder.action_count * MUJOCO_SUBSTEPS
+            report["recorded_physics_substeps"] = recorder.recorded_physics_substeps
             report["monitoring_incomplete_actions"] = recorder.monitoring_incomplete_actions
+            report["endpoint_convergence_events"] = recorder.endpoint_convergence_events
             report["snapshot_paths"] = recorder.snapshot_paths
             report["artifacts"] = {
                 "records": str(output_dir / "physical_step_records.jsonl.gz"),
@@ -1847,7 +2391,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     else "not_created_zero_physical_actions"
                 ),
                 "latest_snapshot": report.get("terminal_runtime_snapshot"),
-                "collision_world": str(output_dir / "mujoco_collision_world_t215.json"),
+                "collision_world": str(output_dir / f"mujoco_collision_world_t{source_timestep}.json"),
             }
             if report.get("final_native_task_status") is not None:
                 report["end_timestep"] = report["final_native_task_status"].get("timestep")
@@ -1861,6 +2405,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--port", type=int, default=38747)
+    parser.add_argument(
+        "--resume-snapshot",
+        type=Path,
+        help="Resume from a verified archived t=215, t=235, or t=285 Runtime Snapshot.",
+    )
     args = parser.parse_args()
     result = _run(args)
     print(json.dumps({
