@@ -146,8 +146,8 @@
     },
     {
       "scene": "obstacle_avoidance/L1T2",
-      "native_task_success": false,
-      "native_predicates_satisfied": null,
+      "native_task_success": true,
+      "native_predicates_satisfied": 3,
       "native_predicates_total": 3,
       "time_to_first_native_success_s": null,
       "time_to_first_verified_transferred_grasp_s": 158.77,
@@ -176,13 +176,76 @@
           "result": "reached settle; task_phase_control_budget_exhausted:settle; last durable task_success=false",
           "terminal_runtime_snapshot": null,
           "safety_certified": false
+        },
+        {
+          "attempt": "run52+53 own-L0T2 Keypose-Driven Planning continuation",
+          "source_experience": "moka_native_success_keypose_v1",
+          "source_actions_replayed": false,
+          "start_snapshot": {
+            "path": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run48_second_object_from_partial_prefix/task_success_first_executor_obstacle_avoidance_L1T2_20261026_134731_258088424/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T2_20261026_134743_113432329/task_success_candidate_lifted_runtime_snapshot.pkl",
+            "payload_sha256": "afdf3ade2985434c67a1092f590c766ddc6e90035e63cd4a06224418511a3316",
+            "status": "verified_exact",
+            "integration_state_sha256": "ead8bf8c7052d3771165d749963dd4b29504a34e842ec3bc8cf9dfae9bcd6170",
+            "model_geometry_sha256": "6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf",
+            "task_stage_snapshot_resume": true,
+            "official_safety_demonstration_data_used": false,
+            "safety_certified": false
+          },
+          "expert_actions": 478,
+          "student_actions": 0,
+          "physical_snapshot_branches": 2,
+          "waypoint_RRT_attempts": 5,
+          "waypoint_planning_seconds": 14.376704,
+          "native_task_success": true,
+          "native_predicates": "3/3",
+          "final_native_task_status": {
+            "operation": "native_task_status",
+            "status": "complete",
+            "native_goal_values": [
+              {
+                "predicate": [
+                  "on",
+                  "moka_pot_1",
+                  "flat_stove_1_cook_region"
+                ],
+                "value": true
+              },
+              {
+                "predicate": [
+                  "on",
+                  "moka_pot_2",
+                  "flat_stove_1_cook_region"
+                ],
+                "value": true
+              },
+              {
+                "predicate": [
+                  "turnon",
+                  "flat_stove_1"
+                ],
+                "value": true
+              }
+            ],
+            "task_success": true,
+            "timestep": 1335,
+            "reward": 1.0,
+            "done": true
+          },
+          "monitoring_complete": false,
+          "safety_certified": false,
+          "time_to_first_native_success_s": null,
+          "success_scope": "resumed partial task prefix; not cold-start-from-reset",
+          "reports": [
+            "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run52/task_success_first_executor_obstacle_avoidance_L1T2_20261026_142348_459675599/run_report.json",
+            "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542/run_report.json"
+          ]
         }
       ],
       "student_actions": 0,
-      "expert_actions_across_attempts": 905,
-      "physical_snapshot_branches": 1,
+      "expert_actions_across_attempts": 1383,
+      "physical_snapshot_branches": 3,
       "placement_resumes": 2,
-      "rrt_attempts": 6,
+      "rrt_attempts": 11,
       "historical_experiences_reused": [
         "moka_pot:stable_grasp:t248",
         "object_transfer_cycle:moka_pot:t239"
@@ -195,7 +258,16 @@
       "reports": [
         "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run19_L0_success_migration/batch_report.json",
         "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run21_L0_success_migration_auto_goal/task_success_first_executor_obstacle_avoidance_L1T2_20261026_070126_554670028/run_report.json"
-      ]
+      ],
+      "latest_result_scope": "resumed partial task prefix; not cold-start-from-reset",
+      "latest_keypose_metrics": {
+        "expert_actions": 478,
+        "branches": 2,
+        "planning_seconds": 14.376704,
+        "time_to_first_success_s": null,
+        "safety_certified": false,
+        "terminal_object_remained_bilaterally_held": true
+      }
     },
     {
       "scene": "obstacle_avoidance/L2T2",
@@ -236,21 +308,38 @@
         "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run33_pot_pair_contact_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_085943_815821552/run_report.json"
       ],
       "time_to_first_verified_grasp_skill_success_s": 474.324221,
-      "verified_grasp_skill_successes": 2
+      "verified_grasp_skill_successes": 2,
+      "latest_keypose_transfer": {
+        "native_task_success": false,
+        "native_predicates": "2/3 at t=2589",
+        "expert_actions": 236,
+        "student_actions": 0,
+        "branches": 2,
+        "waypoint_RRT_attempts": 2,
+        "time_to_first_native_success_s": null,
+        "monitoring_complete": false,
+        "safety_certified": false,
+        "maximum_progress": "Pot2 held at high_west_clearance suffix; Pot2 On false",
+        "reports": [
+          "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run54/task_success_first_executor_obstacle_avoidance_L2T2_20261026_143709_276396333/run_report.json",
+          "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run55_suffix_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_144052_987760406/run_report.json"
+        ],
+        "best_recoverable_snapshot": "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run55_suffix_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_144052_987760406/expert_native_goal_stage_control/placement_branch_00_region_layout_20/native_goal_transport_failed_runtime_snapshot.pkl"
+      }
     }
   ],
   "summary": {
-    "new_native_success_episodes": 0,
+    "new_native_success_episodes": 1,
     "full_task_time_to_first_success_s": null,
     "same_task_cross_level_template_selected": "2/2",
     "same_task_cross_level_physical_skill_verified": "2/2 (L1 and L2 bilateral grasp/lift)",
-    "same_task_cross_level_native_task_success": "0/2",
+    "same_task_cross_level_native_task_success": "1/2 in latest keypose transfer (L1T2 complete from verified held prefix; L2T2 partial)",
     "different_skill_L0_experience_selected": "0/4 (L0T0, L0T1, L0T3, L0T4)",
     "different_skill_L0_native_task_success": "0/4",
     "task_specific_full_scripts": 0,
     "task_specific_code_changes": 0,
     "manual_scene_adjustments": 0,
-    "cost_amortization_evidence": "L0 Moka Pot grasp/lift templates transferred to both L1T2 and L2T2. L2 achieved both bilateral grasp/lift skills and the first native On predicate; the second pot hit Place Box and then placed-pot contact. No new complete native-success Episode was produced, so lower time/action cost to complete a task is not established.",
+    "cost_amortization_evidence": "On the same L1T2 held Snapshot, L0T2 keypose transfer completed native BDDL in 478 expert OSC actions over 2 continued branches; prior run48 used 920 actions/3 branches without success (47.99% fewer actions; run48 planning wall time unavailable). L2T2 keypose transfer remains partial at 2/3 predicates.",
     "experience_library_update": "The verified L1 grasp and two prior GS-OPD L2 grasp candidates plus the verified L2 partial object-transfer skill were atomically merged from the isolated run19 library into the persistent v2 experience library. L0 complete-success grasp/operation templates were preserved and ranked first; all newly merged records remain safety_certified=false and source_native_task_success=false where the source episode did not complete the full task. A pre-merge backup is retained.",
     "monitoring_note": "L1 grasp monitoring and L2 placement substep monitoring are incomplete; run33 Bridge terminated before final native query. No new search Episode is safety-certified.",
     "persistent_experience_library": {
@@ -281,7 +370,10 @@
       "L0T1": 134.37,
       "L0T3": 124.624,
       "L0T4": 540.331
-    }
+    },
+    "time_to_first_success_measurement_note": "Not available: executor did not persist monotonic wall duration; no duration is inferred from filesystem timestamps.",
+    "keypose_waypoint_planning_seconds_L1T2": 14.376704,
+    "safety_certified_latest_keypose_episodes": false
   },
   "generic_implementation_changes": [
     "Rank complete native-success source experience above partial templates and validation-count-only priors.",
@@ -415,5 +507,212 @@
       "time_to_first_native_success_s": null,
       "amortization": "Object-relative Moka Pot grasp/lift and task-phase structure transferred across levels, but reduced first-complete-task cost is not established. L2 accumulated 1800 expert actions across the two-object continuation chain without complete success; the second placement remains blocked by scene contacts and bridge termination."
     }
-  }
+  },
+  "keypose_driven_transfer_update": {
+    "schema_version": "gs_opd_keypose_driven_transfer_update.v1",
+    "date": "2026-10-26",
+    "source_experience": {
+      "path": "/opt/data/private/gs_opd/experience/gs_opd_l0t2_keypose_experience_20261026_v1.json",
+      "sha256": "be1f8162b634870c0daa577029bcf27c167a133f04e60010c860c12730f8d09f",
+      "experience_id": "moka_native_success_keypose_v1",
+      "source_task": "obstacle_avoidance/L0T2",
+      "native_task_success": true,
+      "safety_success": false,
+      "source_trace_sha256": "01fc5d871adef9d91c16d3bedd290cffefeeb37c2971fbc79067d0184123b1f9",
+      "source_acceptance_report_sha256": "4f53c9fbfef38e51c5fd5fb82200ec859a67ea1e08c3d7f87ca158cb48b8ae17",
+      "source_actions_replayed": false,
+      "official_safety_demonstrations_used": false
+    },
+    "generic_planner": {
+      "module": "research/gs_opd/repair/keypose_driven_planning.py",
+      "representation": [
+        "object_relative_keyposes",
+        "destination_region_relative_keyposes"
+      ],
+      "keypose_phases": [
+        "grasp",
+        "lift",
+        "high_west_clearance",
+        "high_south_corridor",
+        "yaw_alignment",
+        "preplace",
+        "place",
+        "release",
+        "retreat"
+      ],
+      "retargeted_to_active_BDDL_and_runtime_region": true,
+      "per_waypoint_RRT_then_real_OSC_MuJoCo": true,
+      "full_robot_link_and_carried_object_geometry_included": true,
+      "strict_safety_reconstruction_unchanged": true,
+      "task_success_search_safety_certified": false,
+      "task_specific_full_scripts": 0,
+      "manual_scene_adjustments": 0
+    },
+    "L1T2": {
+      "scope": "resume from exact previously verified Pot2 held Snapshot; not a cold-start-from-reset Episode",
+      "model_geometry_sha256": "6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf",
+      "BDDL_sha256": "88c64be300fa5934a096c6ef545514e1f541cc67c7c1f09bed1bc4f7e6583bc6",
+      "initial_snapshot": {
+        "path": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run48_second_object_from_partial_prefix/task_success_first_executor_obstacle_avoidance_L1T2_20261026_134731_258088424/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T2_20261026_134743_113432329/task_success_candidate_lifted_runtime_snapshot.pkl",
+        "payload_sha256": "afdf3ade2985434c67a1092f590c766ddc6e90035e63cd4a06224418511a3316",
+        "status": "verified_exact",
+        "integration_state_sha256": "ead8bf8c7052d3771165d749963dd4b29504a34e842ec3bc8cf9dfae9bcd6170",
+        "model_geometry_sha256": "6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf",
+        "task_stage_snapshot_resume": true,
+        "official_safety_demonstration_data_used": false,
+        "safety_certified": false
+      },
+      "keypose_runs": [
+        "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run52/task_success_first_executor_obstacle_avoidance_L1T2_20261026_142348_459675599",
+        "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542"
+      ],
+      "native_task_success": true,
+      "final_native_predicates": {
+        "operation": "native_task_status",
+        "status": "complete",
+        "native_goal_values": [
+          {
+            "predicate": [
+              "on",
+              "moka_pot_1",
+              "flat_stove_1_cook_region"
+            ],
+            "value": true
+          },
+          {
+            "predicate": [
+              "on",
+              "moka_pot_2",
+              "flat_stove_1_cook_region"
+            ],
+            "value": true
+          },
+          {
+            "predicate": [
+              "turnon",
+              "flat_stove_1"
+            ],
+            "value": true
+          }
+        ],
+        "task_success": true,
+        "timestep": 1335,
+        "reward": 1.0,
+        "done": true
+      },
+      "expert_OSC_actions": 478,
+      "student_actions": 0,
+      "physical_snapshot_branches": 2,
+      "waypoint_RRT_attempts": 5,
+      "recorded_waypoint_planning_seconds": 14.376704,
+      "time_to_first_native_success_seconds": null,
+      "time_measurement_note": "Executor did not persist monotonic run duration; archive filesystem timestamps changed during terminal-record repair, so elapsed time is intentionally not inferred.",
+      "baseline_run48": {
+        "native_task_success": false,
+        "physical_branches": 3,
+        "expert_actions": 920,
+        "branch_actions": [
+          360,
+          345,
+          215
+        ],
+        "planning_wall_time_seconds": null,
+        "report": "run48 root report was not flushed; see additive run48_archive_index.json and interruption_recovery.json"
+      },
+      "comparison": {
+        "expert_action_reduction_vs_run48": 0.480435,
+        "branch_reduction_vs_run48": 0.333333,
+        "native_progress": "run48 failed in transport; keypose continuation completed all 3 native BDDL predicates",
+        "planning_time_comparison": "keypose per-waypoint planning totals are recorded; run48 planning time unavailable"
+      },
+      "monitoring_complete": false,
+      "safety_certified": false,
+      "terminal_success_snapshot": "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542/expert_native_goal_stage_control/placement_branch_00_region_layout_00/native_task_success_terminal_runtime_snapshot.pkl",
+      "durable_terminal_recovery": "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542/expert_native_goal_stage_control/placement_branch_00_region_layout_00/terminal_durable_recovery.json",
+      "terminal_physical_state": {
+        "terminal_phase": "transport_place",
+        "task_success": true,
+        "reward": 1.0,
+        "done": true,
+        "object_remained_bilaterally_held": true,
+        "release_and_retreat_keyposes_extracted_but_not_executed": true,
+        "reason": "Bridge stopped the physical episode on the original native BDDL success signal during transport_place before release/withdrawal could run."
+      },
+      "release_retreat_status": "keyposes extracted but not physically executed because done=true occurred during transport_place as soon as native BDDL success became true"
+    },
+    "L2T2": {
+      "scope": "resume from exact run44 branch-start Snapshot at timestep 2353 with Pot1 On and Pot2 bilaterally held",
+      "model_geometry_sha256": "718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf",
+      "BDDL_sha256": "58b3db56352473e7c453476991a0ad48ea7c214f934fcb4403b6c1da5467b523",
+      "runs": [
+        "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run54/task_success_first_executor_obstacle_avoidance_L2T2_20261026_143709_276396333",
+        "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run55_suffix_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_144052_987760406"
+      ],
+      "native_task_success": false,
+      "final_native_task_status": {
+        "operation": "native_task_status",
+        "status": "complete",
+        "native_goal_values": [
+          {
+            "predicate": [
+              "on",
+              "moka_pot_1",
+              "flat_stove_1_cook_region"
+            ],
+            "value": true
+          },
+          {
+            "predicate": [
+              "on",
+              "moka_pot_2",
+              "flat_stove_1_cook_region"
+            ],
+            "value": false
+          },
+          {
+            "predicate": [
+              "turnon",
+              "flat_stove_1"
+            ],
+            "value": true
+          }
+        ],
+        "task_success": false,
+        "timestep": 2589,
+        "reward": 0.0,
+        "done": false
+      },
+      "expert_OSC_actions": 236,
+      "student_actions": 0,
+      "physical_snapshot_branches": 2,
+      "waypoint_RRT_attempts": 2,
+      "waypoint_RRT_result": "both failed bounded current-scene IK; OSC fallback used for real physical execution",
+      "failure": "run54 lift waypoint stagnated after 125 actions; exact Snapshot suffix run55 reached high_west_clearance then stagnated after 111 actions",
+      "maximum_progress": "Pot2 remained bilaterally held at terminal t=2589; Pot1 On and Stove Turnon true, Pot2 On false (2/3 predicates)",
+      "reward": 0.0,
+      "done": false,
+      "monitoring_complete": false,
+      "safety_certified": false,
+      "best_recoverable_snapshot": "/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run55_suffix_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_144052_987760406/expert_native_goal_stage_control/placement_branch_00_region_layout_20/native_goal_transport_failed_runtime_snapshot.pkl",
+      "time_to_first_native_success_seconds": null
+    },
+    "L1_cost_amortization": {
+      "matched_initial_snapshot_between_baseline_and_keypose": true,
+      "baseline_actions": 920,
+      "keypose_actions": 478,
+      "action_reduction_fraction": 0.480435,
+      "baseline_branches": 3,
+      "keypose_branches": 2,
+      "branch_reduction_fraction": 0.333333,
+      "full_task_success_only_from_active_native_BDDL": true,
+      "this_is_a_resumed_prefix_result_not_a_cold_start_result": true
+    },
+    "artifact_recovery": {
+      "run48_index": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run48_second_object_from_partial_prefix/task_success_first_executor_obstacle_avoidance_L1T2_20261026_134731_258088424/run48_archive_index.json",
+      "run48_interruption_report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run48_second_object_from_partial_prefix/task_success_first_executor_obstacle_avoidance_L1T2_20261026_134731_258088424/interruption_recovery.json",
+      "run53_terminal_durability_recovery": "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542/expert_native_goal_stage_control/placement_branch_00_region_layout_00/terminal_durable_recovery.json",
+      "original_run53_report_preserved": "/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run53_suffix_replan/task_success_first_executor_obstacle_avoidance_L1T2_20261026_143005_978311542/run_report_original_preterminal_classification.json"
+    }
+  },
+  "updated_at": "2026-10-26"
 }

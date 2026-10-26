@@ -25,6 +25,7 @@ import os
 import pickle
 import socket
 import subprocess
+import sys
 import time
 from collections import Counter
 from multiprocessing.connection import Client
@@ -275,6 +276,15 @@ def generate_geometry_candidates(
 
 
 class BridgeSession:
+    _READ_ONLY_RECONNECT_OPS = frozenset({
+        "observe", "native_task_status", "native_goal_query", "inspect_contacts",
+        "grasp_state", "geometry_inventory", "gripper_geometry_inventory",
+        "task_semantic_geometry_bindings", "repair_context",
+        "task_success_first_context", "task_success_first_articulation_context",
+        "robot_joint_limit_inventory", "compiled_model_fingerprint_details",
+        "trajectory_tracking_capabilities",
+    })
+
     def __init__(self, address: tuple[str, int], log_path: Path, args: argparse.Namespace):
         self.address = address
         self.log_path = log_path
@@ -328,8 +338,35 @@ class BridgeSession:
     def request(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.connection is None:
             raise RuntimeError("Safety Bridge is not connected")
-        self.connection.send(request)
-        result = self.connection.recv()
+        operation = request.get("op")
+        try:
+            self.connection.send(request)
+            result = self.connection.recv()
+        except (EOFError, BrokenPipeError, ConnectionError, OSError):
+            # A read-only reply can be retried safely after reconnecting to
+            # the Bridge listener. Physical actions and Snapshot mutations
+            # are deliberately never replayed on an ambiguous connection.
+            if operation not in self._READ_ONLY_RECONNECT_OPS:
+                raise
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
+            last_error: Exception | None = None
+            for _ in range(20):
+                try:
+                    self.connection = Client(self.address, authkey=BRIDGE_AUTHKEY)
+                    break
+                except (ConnectionRefusedError, OSError) as exc:
+                    last_error = exc
+                    time.sleep(0.05)
+            if self.connection is None:
+                raise EOFError(
+                    f"Safety Bridge read-only reconnect failed for {operation}: {last_error}"
+                ) from last_error
+            self.connection.send(request)
+            result = self.connection.recv()
         if not isinstance(result, dict):
             raise RuntimeError(f"Bridge returned malformed response to {request.get('op')}")
         return result
@@ -366,6 +403,58 @@ def _restore_initial(bridge: BridgeSession, payload: bytes, expected_state: np.n
     if actual.shape != expected_state.shape or not np.array_equal(actual, expected_state):
         raise RuntimeError("initial_snapshot_restore_did_not_reproduce_exact_integration_state")
     return result
+
+
+def _verified_resume_runtime_snapshot(
+    path: Path,
+    *,
+    benchmark: str,
+    level: int,
+    task_id: int,
+    seed: int,
+    init_state: int,
+    model_sha: str,
+    bddl_sha: str,
+    instruction: str,
+) -> dict[str, Any]:
+    """Load an exact partial-task prefix after validating its scene identity."""
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"resume_Runtime_Snapshot_missing:{path}")
+    payload = path.read_bytes()
+    setattr(sys.modules["__main__"], "_PythonObjectState", _PythonObjectState)
+    envelope = pickle.loads(payload)
+    scene = envelope.get("scene_metadata", {})
+    expected = {
+        "benchmark": benchmark,
+        "level": level,
+        "task_id": task_id,
+        "environment_seed": seed,
+        "init_state_index": init_state,
+        "bddl_sha256": bddl_sha,
+        "instruction": instruction,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": scene.get(key)}
+        for key, value in expected.items()
+        if scene.get(key) != value
+    }
+    if (
+        envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1"
+        or envelope.get("model_geometry_sha256") != model_sha
+        or mismatches
+    ):
+        raise ValueError(f"resume_Runtime_Snapshot_identity_mismatch:{mismatches}")
+    mujoco_state = envelope.get("snapshot", {}).get("mujoco_state")
+    state = _snapshot_state_vector({"mujoco_integration_state": mujoco_state})
+    return {
+        "path": path,
+        "payload": payload,
+        "payload_sha256": _sha256_bytes(payload),
+        "snapshot_state": {"mujoco_integration_state": state},
+        "integration_state_sha256": _state_sha(state),
+        "scene_metadata": scene,
+    }
 
 
 def _object_state(snapshot_state: dict[str, Any], body_id: int) -> dict[str, Any]:
@@ -586,6 +675,8 @@ def _record_step(
     monitor,
     records: list[dict[str, Any]],
     frames: list[dict[str, Any]],
+    *,
+    raise_on_done: bool = True,
 ) -> None:
     reply = bridge.request({
         "op": "step_monitored",
@@ -641,7 +732,7 @@ def _record_step(
         "agentview_rgb": _image(reply, "agentview_image"),
         "wrist_rgb": _image(reply, "robot0_eye_in_hand_image"),
     })
-    if reply.get("done"):
+    if reply.get("done") and raise_on_done:
         raise RuntimeError("environment_done_during_grasp_only_branch")
 
 
@@ -662,6 +753,9 @@ def _advance_pose(
     *,
     stop_condition=None,
     step_callback=None,
+    stagnation_window_actions: int = 0,
+    position_tolerance_m: float = 0.004,
+    rotation_tolerance_rad: float = 0.045,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
         quaternion_conjugate,
@@ -672,6 +766,12 @@ def _advance_pose(
 
     target_position = np.asarray(target_position, dtype=np.float64)
     target_quaternion = np.asarray(target_quaternion, dtype=np.float64)
+    if (
+        not np.isfinite([position_tolerance_m, rotation_tolerance_rad]).all()
+        or position_tolerance_m <= 0.0 or rotation_tolerance_rad <= 0.0
+    ):
+        raise ValueError("pose_tracking_tolerances_must_be_positive_and_finite")
+    progress_history: list[tuple[float, float]] = []
     for _ in range(maximum_steps):
         if stop_condition is not None and stop_condition():
             return False
@@ -685,8 +785,25 @@ def _advance_pose(
             quaternion_multiply(target_quaternion, quaternion_conjugate(current_quaternion))
         )
         rotation_norm = float(np.linalg.norm(rotation_error))
-        if distance <= 0.004 and rotation_norm <= 0.045:
+        if _pose_tracking_error_within_tolerance(
+            distance, rotation_norm, position_tolerance_m, rotation_tolerance_rad,
+        ):
             return True
+        if stagnation_window_actions:
+            if (
+                isinstance(stagnation_window_actions, bool)
+                or not isinstance(stagnation_window_actions, int)
+                or stagnation_window_actions < 2
+            ):
+                raise ValueError("pose_tracking_stagnation_window_must_be_zero_or_at_least_two")
+            progress_history.append((distance, rotation_norm))
+            progress_history = progress_history[-(stagnation_window_actions + 1):]
+            if _pose_tracking_window_stagnated(
+                progress_history, window_actions=stagnation_window_actions,
+            ):
+                raise RuntimeError(
+                    f"{phase}_waypoint_stagnated_for_{stagnation_window_actions}_actions"
+                )
         delta_position = position_error * min(1.0, 0.008 / max(distance, 1e-12))
         delta_rotation = rotation_error * min(1.0, 0.10 / max(rotation_norm, 1e-12))
         next_quaternion_xyzw = Rotation.from_rotvec(delta_rotation).as_quat()
@@ -713,10 +830,13 @@ def _advance_pose(
             monitor,
             records,
             frames,
+            raise_on_done=False,
         )
         action_counter[0] += 1
         if step_callback is not None:
             step_callback(records[-1], frames[-1])
+        if records[-1].get("done"):
+            raise RuntimeError("environment_done_during_grasp_only_branch")
         if action_counter[0] > MAX_BRANCH_CONTROL_ACTIONS:
             raise RuntimeError("physical_branch_control_action_budget_exceeded")
         actual = np.asarray(
@@ -727,6 +847,40 @@ def _advance_pose(
         if stop_condition is not None and stop_condition():
             return False
     raise TimeoutError(f"{phase}_did_not_reach_pose_within_{maximum_steps}_actions")
+
+
+def _pose_tracking_window_stagnated(
+    history: list[tuple[float, float]],
+    *,
+    window_actions: int,
+    minimum_position_progress_m: float = 0.006,
+    minimum_rotation_progress_rad: float = 0.06,
+) -> bool:
+    """Detect a blocked OSC waypoint while allowing measured route progress."""
+    if len(history) < window_actions + 1:
+        return False
+    window = history[-(window_actions + 1):]
+    position_progress = max(0.0, window[0][0] - min(row[0] for row in window[1:]))
+    rotation_progress = max(0.0, window[0][1] - min(row[1] for row in window[1:]))
+    return bool(
+        position_progress < minimum_position_progress_m
+        and rotation_progress < minimum_rotation_progress_rad
+    )
+
+
+def _pose_tracking_error_within_tolerance(
+    position_error_m: float,
+    rotation_error_rad: float,
+    position_tolerance_m: float,
+    rotation_tolerance_rad: float,
+) -> bool:
+    return bool(
+        np.isfinite([position_error_m, rotation_error_rad, position_tolerance_m, rotation_tolerance_rad]).all()
+        and position_tolerance_m > 0.0
+        and rotation_tolerance_rad > 0.0
+        and position_error_m <= position_tolerance_m
+        and rotation_error_rad <= rotation_tolerance_rad
+    )
 
 
 def _compress_eef_route(route: Any) -> np.ndarray:
@@ -1245,9 +1399,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     initial_state = _snapshot_state_vector({"mujoco_integration_state": envelope["snapshot"]["mujoco_state"]})
     if _state_sha(initial_state) != source_meta.get("mujoco_integration_state_sha256"):
         raise ValueError("source_t0_integration_state_sha256_mismatch")
+    search_start_payload = payload
+    search_start_state = initial_state
+    resume_descriptor = None
+    if args.resume_from_runtime_snapshot is not None:
+        resume_descriptor = _verified_resume_runtime_snapshot(
+            args.resume_from_runtime_snapshot,
+            benchmark=args.benchmark,
+            level=args.level,
+            task_id=args.task_id,
+            seed=args.seed,
+            init_state=args.init_state,
+            model_sha=model_sha,
+            bddl_sha=str(manifest["scene_metadata"]["bddl_sha256"]),
+            instruction=str(manifest["instruction"]),
+        )
+        search_start_payload = resume_descriptor["payload"]
+        search_start_state = _snapshot_state_vector(resume_descriptor["snapshot_state"])
     (output_dir / "source_initial_runtime_snapshot.pkl").write_bytes(payload)
     (output_dir / "source_task.bddl").write_bytes(bddl_path.read_bytes())
     _write_json(output_dir / "source_snapshot_manifest.json", manifest)
+    if resume_descriptor is not None:
+        (output_dir / "source_resume_runtime_snapshot.pkl").write_bytes(search_start_payload)
 
     address = ("127.0.0.1", args.port)
     bridge = BridgeSession(address, output_dir / "safety_bridge.log", args)
@@ -1264,6 +1437,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "environment_seed": args.seed,
             "source_snapshot": str(snapshot_path),
             "source_snapshot_sha256": _sha256_bytes(payload),
+            "search_start_runtime_snapshot": (
+                str(resume_descriptor["path"]) if resume_descriptor is not None else str(snapshot_path)
+            ),
+            "search_start_runtime_snapshot_sha256": (
+                resume_descriptor["payload_sha256"] if resume_descriptor is not None
+                else _sha256_bytes(payload)
+            ),
             "model_geometry_sha256": model_sha,
             "bddl_sha256": manifest["scene_metadata"]["bddl_sha256"],
         },
@@ -1299,6 +1479,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "physical_branches": [],
         "success": None,
     }
+    if resume_descriptor is not None:
+        report["resumed_from_runtime_snapshot"] = {
+            "path": str(resume_descriptor["path"]),
+            "payload_sha256": resume_descriptor["payload_sha256"],
+            "integration_state_sha256": resume_descriptor["integration_state_sha256"],
+            "status": "scene_and_model_identity_verified",
+            "other_completed_native_predicates_preserved": True,
+            "safety_certified": False,
+        }
     final_snapshot_payload: bytes | None = None
     try:
         bridge.start()
@@ -1307,7 +1496,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("bridge_reset_model_does_not_match_archived_t0_snapshot")
         if reset.get("scene_metadata", {}).get("bddl_sha256") != manifest["scene_metadata"].get("bddl_sha256"):
             raise RuntimeError("bridge_reset_BDDL_does_not_match_archived_t0_snapshot")
-        _restore_initial(bridge, payload, initial_state, model_sha)
+        _restore_initial(bridge, search_start_payload, search_start_state, model_sha)
         initial = bridge.request({"op": "observe", "include_snapshot_state": True})
         instruction = str(manifest["instruction"])
         if initial.get("instruction") != instruction:
@@ -1506,7 +1695,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         candidate_start = int(args.candidate_start_index)
         candidates_to_plan = candidates[candidate_start : candidate_start + args.maximum_rrt_preflights]
-        state_sha = _state_sha(initial_state)
+        state_sha = _state_sha(search_start_state)
         for candidate in candidates_to_plan:
             object_pose = _pose(
                 context["target_root_pose_world"]["position_m"],
@@ -1761,7 +1950,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "generation": generation,
             "preflight": {
                 "reset_model_geometry_sha256": reset.get("scene_metadata", {}).get("model_geometry_sha256"),
-                "restored_initial_state_sha256": state_sha,
+                "restored_search_start_state_sha256": state_sha,
                 "native_task_status": native,
                 "initial_safety_diagnostics": initial_safety,
                 "semantic_geometry_binding_status": semantic.get("status"),
@@ -1787,8 +1976,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     bridge,
                     candidate,
                     rrt,
-                    initial_payload=payload,
-                    initial_state=initial_state,
+                    initial_payload=search_start_payload,
+                    initial_state=search_start_state,
                     model_sha=model_sha,
                     context=context,
                     target_binding=target_binding,
@@ -1964,7 +2153,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "safety_certified": False,
                     }
                 try:
-                    _restore_initial(bridge, payload, initial_state, model_sha)
+                    _restore_initial(bridge, search_start_payload, search_start_state, model_sha)
                     branch["exact_initial_snapshot_restored_after_failure"] = True
                 except Exception as restore_exc:
                     branch["exact_initial_snapshot_restored_after_failure"] = False
@@ -2057,6 +2246,10 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot-root", type=Path, default=DEFAULT_SNAPSHOT_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--resume-from-runtime-snapshot", type=Path, default=None,
+        help="continue grasp search from a model-verified partial-task Runtime Snapshot",
+    )
     parser.add_argument("--benchmark", default="obstacle_avoidance")
     parser.add_argument("--level", type=int, default=0)
     parser.add_argument("--task-id", type=int, default=1)

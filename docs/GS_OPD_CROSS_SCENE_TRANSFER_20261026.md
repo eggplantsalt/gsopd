@@ -1,5 +1,29 @@
 # GS-OPD 跨场景经验迁移与成本摊销报告（2026-10-26）
 
+## 2026-10-26 Keypose-Driven Planning：L1成功，L2部分迁移
+
+### 验证结论
+
+仅用GS-OPD自有L0T2完整成功Episode生成的关键姿态经验（source `moka_native_success_keypose_v1`，真实源动作不回放），实现了物体坐标系与目标Region坐标系关键姿态的提取、重定位，并用现有RRT/OSC/Runtime Snapshot闭环执行。没有使用官方示范、CuRobo或训练；严格Safety Reconstruction保持不变。
+
+L1T2从run48已验证Pot2持抓Snapshot精确恢复，分两段接续运行run52→run53，合计478个真实专家OSC动作、2个物理分支、5个关键姿态RRT规划尝试（累计记录规划时长14.376秒）。最终活动BDDL的Pot1 On、Pot2 On、Stove Turnon均为true；`task_success=true`, reward=1, done=true。它是**从已有部分任务前缀恢复的完整原生成功**，不是从reset冷启动的完整Episode。相同run48持抓起点的旧方法消耗920动作、3个分支但未成功：Keypose路径减少47.99%动作和33.33%分支，首次把此L1前缀完成到原生成功。旧run48规划墙钟时间未保存，无法做规划耗时对照；本次L1完整任务的进程墙钟时间也未有单调计时记录，保持unknown。安全认证为false，子步监测不完整。终止动作发生在`transport_place`：Pot2仍被双指夹持，Bridge因原生`done=true`结束；release与retreat关键姿态已经提取但本次没有执行或验证。
+
+L2T2从同布局、同模型/BDDL身份且Pot2双指抓持、Pot1 On的run44分支Snapshot恢复。run54运行125步，抬升目标RRT因当前场景IK无解，真实OSC fallback后24步停滞；run55从run54终态Snapshot跳过近似完成的lift，再运行111步到高位西侧关键姿态附近，随后24步停滞。两段合计236个专家动作、2个分支、2次有界IK/RRT尝试；末态Pot2仍双指抓持，Pot1 On与Stove Turnon为true、Pot2 On为false，2/3谓词，reward=0、done=false、`task_success=false`。所有阶段仅使用真实MuJoCo动作，安全监测不完整，安全认证为false。
+
+### 基线与复现
+
+| 场景/方法 | 原生任务成功 | 专家动作 | 物理分支 | RRT尝试/规划时间 | 复用经验 | 最大进度 |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| L1T2 run48旧运输 | 否 | 920 | 3 | 规划时间未归档 | L0抓持/阶段经验 | 持抓运输受阻 |
+| L1T2 Keypose run52+53 | **是（恢复前缀）** | 478 | 2 | 5次；14.376秒累计规划时长 | L0T2物体与Region相对关键姿态 | 3/3原生谓词，reward=1/done |
+| L2T2 Keypose run54+55 | 否 | 236 | 2 | 2次；均IK无解，OSC fallback | 同一L0T2关键姿态经验 | Pot2持抓到高位西侧，2/3谓词 |
+
+L1逐步证据：`/opt/data/private/gs_opd/rollouts/keypose_driven_L1T2_20261026_run52/` 与 `.../keypose_driven_L1T2_20261026_run53_suffix_replan/`。run53终端`t=1335`的NPZ、压缩日志及双相机视频都含118步成功动作；另补齐耐久JSONL末步与终端视频帧，并保留修复前run_report副本和恢复sidecar。原终止快照按字节另存为`native_task_success_terminal_runtime_snapshot.pkl`；原失败命名文件未删除。
+
+L2逐步证据：`/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run54/` 与 `.../keypose_driven_L2T2_20261026_run55_suffix_replan/`。run48完整性索引：`/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run48_second_object_from_partial_prefix/task_success_first_executor_obstacle_avoidance_L1T2_20261026_134731_258088424/run48_archive_index.json`；其root报告未写出，interruption report显示3个分支、920动作、最终native查询不可用，第三支缺最终Snapshot/NPZ/视频，均显式标注缺失。
+
+旧Task-Success-First暴力搜索已暂停且当前没有活动物理进程。L0T2自身源轨迹安全成功为false；所有新搜索轨迹`safety_certified=false`。相关机器统计追加在[JSON报告](GS_OPD_CROSS_SCENE_TRANSFER_20261026.json)的`keypose_driven_transfer_update`。
+
 ## 验收结论
 
 本轮从GS-OPD自有 obstacle_avoidance/L0T2 原生成功Episode检索并迁移Moka Pot经验。L1T2、L2T2均命中L0抓取/阶段模板；L1真实验证稳定双指抓持并抬升34.54 mm，L2在4次IK/RRT预检后没有进入物理分支。**本轮新搜索完整原生成功Episode为0条。** L1抓取冷启动实现了子技能迁移，但完整任务搜索成本随经验积累下降尚无证据；L1放置仍耗费较多动作而未稳定满足目标。

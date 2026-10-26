@@ -1,3 +1,15 @@
+## 2026-10-26 更新：从暴力搜索转向Keypose经验迁移
+
+当前研究门线是“Task-Success Search → Safety Reconstruction → Validated Episode → Student Training/Data Expansion”。旧Task-Success-First多场景暴力搜索暂停；严格安全认证、阈值和训练代码保持不变。
+
+1. **经验源已建立：** 从GS-OPD自有L0T2完整原生成功轨迹提取抓持、抬升、绕行、对齐、预放置、放置、释放、撤离姿态，分别记录物体坐标与目标Region坐标关系。仅迁移位姿和阶段结构，不回放源动作。该源轨迹本身含风险，`safety_success=false`。
+2. **L1T2迁移已验证到完整原生成功：** run48同一持抓Snapshot旧方法920动作/3支未成功；Keypose run52+53用478动作/2支完成全部BDDL谓词。该结果从既有部分前缀续接，不代表从reset零样本完成。五个Keypose waypoint规划共记录14.376秒；旧基线规划时长缺失。
+3. **L2T2迁移仍有通用运动规划缺口：** run54/55累计236动作、两支真实物理验证，从Pot2 held状态到high-west附近，但未到达BDDL目标。两次有界当前场景IK未解，OSC后续分别在lift与high-west阶段停滞；末态Pot2仍抓持且2/3谓词。没有任务成功或安全成功。
+4. **接下来：** 对Keypose重定位后的workspace/IK失败和阶段接纳做通用归因；增加基于当前真实状态的候选姿态/局部路由而非复用不可达的绝对目标。仅在单次有界验证方案完成后续做L2；L2原生成功前不恢复L0T0或其他暴力搜索。每次保存完整Observation–Action、25子步状态、Snapshot、视频及原生谓词。
+5. **后续阶段：** L2完成后再评估跨level成功成本和同技能经验摊销；然后选择一个不同技能L0场景。只有通过严格Safety Reconstruction与物理验收的数据才进入Validated Episode与Student Training；当前搜索轨迹均`task_success candidate`且`safety_certified=false`。
+
+机器报告与证据索引：[跨场景迁移JSON](GS_OPD_CROSS_SCENE_TRANSFER_20261026.json)、[跨场景人读总结](GS_OPD_CROSS_SCENE_TRANSFER_20261026.md)、[详细进度](GS_OPD_PROGRESS.md)。
+
 ## 最新路线更新：跨层经验迁移已达抓取子技能，完整任务摊销待证（2026-10-26）
 
 - **经验复用已物理验证：** L0T2自有Moka Pot物体相对抓取`t248`和阶段序列`t239`迁移到L1T2/L2T2；两个新布局都真实双指抓起并抬升。L2的第一只Pot又达到原生`On=true`，炉灶原生`Turnon=true`。

@@ -1,3 +1,34 @@
+## 最新进展：Keypose-Driven Planning L1完成原生成功、L2部分迁移（2026-10-26）
+
+### 暂停旧暴力搜索与归档run48
+
+按当前优先级暂停L0T0及其他场景的旧版Task-Success-First暴力搜索；检查时没有遗留Task-Success/Student/Bridge物理进程。run48的根`run_report.json`缺失，新增`run48_archive_index.json`并保留`interruption_recovery.json`与原分支文件：Pot2持抓放置共3支、360/345/215步，总计920步，均没有原生成功；前两支有终态Snapshot、NPZ和视频，第三支只有215条耐久动作与起始Snapshot，缺终态Snapshot/NPZ/视频。子步监测不完整，最终native query不可用，索引对缺件显式记null。
+
+### 自有L0T2关键姿态经验与通用规划
+
+关键姿态来源仅为GS-OPD自有`obstacle_avoidance/L0T2`真实完整原生成功动作记录：1093动作trace SHA `01fc5d871adef9d91c16d3dedd290cffefeeb37c2971fbc79067d0184123b1f9`，验收数据记录原生成功，但安全成功为false。新经验文件为`/opt/data/private/gs_opd/experience/gs_opd_l0t2_keypose_experience_20261026_v1.json`。从物理记录提取grasp、lift、high-west、high-south、yaw-align、preplace、place、release、retreat；抓持/搬运关键姿态以目标物体坐标表达，目标前后姿态以活动BDDL区域坐标表达。迁移只使用姿态结构，不重放源动作。通用实现见`research/gs_opd/repair/keypose_driven_planning.py`；每个姿态使用实时目标与Region重定位、全机器人连杆及携物几何的有界RRT检查，再用真实OSC_POSE/MuJoCo物理执行。搜索阶段记录风险，严格Safety Reconstruction阈值与验收不变。
+
+### L1T2：从run48已验证持抓前缀完成原生任务
+
+run52从run48唯一稳定双指抓持Pot2 Snapshot恢复（Snapshot SHA `afdf3ade2985434c67a1092f590c766ddc6e90035e63cd4a06224418511a3316`；L1模型SHA `6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf`，BDDL SHA `88c64be300fa5934a096c6ef545514e1f541cc67c7c1f09bed1bc4f7e6583bc6`）。run52物理分支360动作，从held start到high-south附近；lift与high-west的RRT分别3.284/2.366 s通过，high-south 4.000 s规划预算耗尽后有界OSC执行224步仍未达到位姿。末态Snapshot SHA `e360e2c0728f12352456290cb666e69ab254b326d1b3cf09ac355a7c5000b522`。
+
+run53从该精确Snapshot恢复，仅续接yaw-align之后的Region相对preplace/place关键姿态，RRT分别1.210/3.517 s，真实OSC动作118步。原生状态`t=1335`的Pot1 On、Pot2 On、Stove Turnon全为true，`task_success=true/reward=1/done=true`。L1新方法从既有持抓前缀到成功共478专家动作、2个物理分支；对照run48相同持抓起点的旧方式920动作、3分支未成功，减少47.99%动作与33.33%分支。五次L1关键姿态规划累计14.376 s；run48规划墙钟时间没有保留，不能比较旧方法时间。L1成功不是reset冷启动任务Episode，而是从先前建立的部分任务前缀接续到完整原生BDDL成功。没有Student动作、场景专用脚本或人工坐标改动。 终止动作发生在`transport_place`阶段，Pot2仍双指夹持；release/retreat关键姿态虽已从源轨迹提取，但因原生`done=true`终止而没有在迁移中执行。该结果满足用户指定的唯一原生任务成功判据，不等同于释放后稳定放置验证。
+
+run53末步原先由于done异常在durable回调前抛错，NPZ/压缩记录/视频已含第118步而逐步耐久JSONL只有117步。现从压缩原始记录补入终止行、从原视频恢复`frame_000117.jpg`；将原始report副本保存在`run_report_original_preterminal_classification.json`，修正run_report中成功段与候选状态，并在`terminal_durable_recovery.json`记录hash和来源。未改写原始失败命名Snapshot；另以相同字节保存`native_task_success_terminal_runtime_snapshot.pkl`作为成功末态名称。
+
+### L2T2：关键姿态迁移达到高位西侧前缀但未成功
+
+run54从L2 seed0/init0、t=2353的run44运输起始Snapshot精确恢复，Pot1 On与炉灶Turnon为true，Pot2双指抓持。活动模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`和BDDL SHA `58b3db56352473e7c453476991a0ad48ea7c214f934fcb4403b6c1da5467b523`匹配。run54真实执行125步，到t=2478时lift关键姿态受限IK无解且OSC在24步窗口内停滞。run55从精确末态Snapshot恢复，跳过已接近完成的lift关键姿态，继续真实执行111步到t=2589的high-west段附近，再因同样有界停滞停止。两段合计236个OSC动作、2个物理分支、2次当前场景有界IK/RRT（均无解）；Pot2仍抓持，Pot2 On为false，原生谓词2/3、reward=0、done=false、完整task_success=false。最佳末态可恢复Snapshot见run55报告。不是任务成功，不标安全。
+
+### 统计与边界
+
+- L1/L2共享同一L0T2对象与Region相对关键姿态经验；源动作未作为跨场景动作重放。L1获得一条从持抓部分前缀恢复后达到完整原生目标的成功轨迹候选；L2迁移只达到高位西侧部分进度。
+- L1完整任务time-to-first-success未被单调时钟计时，且run53的原始report元数据已在耐久修复时更新，故机器报告将墙钟秒数保留为null；不从目录/文件时间推算。新方法RRT各段耗时有记录，旧run48规划时间缺失。
+- 所有搜索数据`safety_certified=false`，L1/L2子步监测不完整。没有官方示范、CuRobo、训练或LeRobot转换；严格安全重构规则未改。
+- 关键姿态/执行路径回归61项通过；相关Python文件编译通过。旧Task-Success-First批量搜索暂停，下一步只分析通用IK失败/关键姿态可达性，不扩展到L0T0或其他场景，除非先解决L2迁移路径的通用阻塞。
+
+跨场景机器统计和每个Snapshot/报告/视频路径见[最新Keypose迁移JSON](GS_OPD_CROSS_SCENE_TRANSFER_20261026.json)和[人读总结](GS_OPD_CROSS_SCENE_TRANSFER_20261026.md)。所有旧记录和run30–33历史保留在下文。
+
 ## 最新进展：L0T2跨层技能迁移与多目标续跑（2026-10-26，run30–33）
 
 本节取代上方此前L1/L2迁移计数。以GS-OPD自有L0T2完整成功Episode中的`moka_pot:stable_grasp:t248`与`object_transfer_cycle:moka_pot:t239`为来源；不读取官方示范动作、不直接回放源动作、不加载LoRA。L1T2和L2T2均真实验证双指抓持与抬升，说明物体相对抓取和阶段结构可以跨层迁移；但全任务成功和成本摊销尚未成立。
