@@ -1,3 +1,13 @@
+## 最新路线状态：Human L0T2精确恢复成功，CuRobo预放置规划无路线（2026-10-26）
+
+- **Snapshot恢复：通过。** 按历史启动和额外reset顺序，t=215、SHA `633b8b…`、331维Integration State和Pot1双指持抓均精确复现；恢复后未reset。
+- **场景与IK：通过。** 当前MuJoCo完整碰撞场景只读导出无状态变化；CuRobo对24个Region等价目标并行IK通过23个。包含当前碰撞启用场景Geom、两个精确合并网格、机器人自碰撞模型和Pot1四球几何拟合。
+- **CuRobo运动规划：阻塞。** MotionPlanner对全部候选在10.373秒后返回`planner_returned_none`。具体阻塞Geom未识别，标为unknown；不猜测为瓶接触或物理失败。
+- **执行与采集：未启动。** 真实动作/子步/物理分支均为0，native `task_success=false`，完整Episode为0；无视频或动作监督标签。本轮不继续相似搜索。
+- **归档：** `/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_235735/`。恢复预检和旧版独立尝试的历史目录均保留。官方数据、训练及安全认证均未使用。
+
+---
+
 ## 最新更新：Human L0T2 t=215持抓Snapshot精确恢复已验证（2026-10-26）
 
 - 根因已定位：仅启动Bridge后立刻恢复缺少历史executor额外`reset`。按`BridgeSession.start → reset → model-SHA gate → restore Snapshot`、seed=0/init-state=0、demo horizon=3600复现后，模型SHA从`3b942cf3…`变为Snapshot所需`633b8b09…`。

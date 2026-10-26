@@ -1,3 +1,15 @@
+## 最新局部目标：Human L0T2 CuRobo运输在完整场景下未找到预放置路线（2026-10-26）
+
+已使用`verify_human_l0t2_t215_snapshot.py`及run3恢复配置复核t=215合法持抓状态；随后运输入口在同一Bridge会话执行历史顺序`start → 额外reset → SHA门禁 → restore`，恢复后没有reset。模型SHA `633b8b…`、331维Integration State精确匹配、Pot1双指抓持通过。
+
+全MuJoCo碰撞场景导出完成（模型SHA匹配且只读状态未变）。CuRobo收到了24个Region等价位置/朝向目标、完整场景编译碰撞几何、Franka自碰撞模型及Pot1碰撞几何的四球拟合。并行自碰撞IK为23/24通过；MotionPlanner在10.37秒后对所有目标返回`planner_returned_none`。物理动作0、子步0，原生任务仍1/3谓词且`task_success=false`。该结果确认阻塞发生在规划阶段；具体阻挡Geom尚不能从无路线结果判定。
+
+当前最佳证据目录：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_235735/`，含全场景几何、规划输入/输出、启动配置和初末Snapshot。没有真实动作Episode，因此没有动作视频，也不应将该归档视为成功轨迹。训练、安全认证与官方示范均未使用。
+
+本轮已结束L0T2 CuRobo运输尝试；后续不继续重复同类物理分支。完整记录见`GS_OPD_PROGRESS.md`最新条目。
+
+---
+
 ## 最新局部目标：已复现Human L0T2 t=215持抓Snapshot的精确Bridge恢复（2026-10-26）
 
 此前模型SHA不匹配的直接原因是启动流程漏掉历史执行器中的额外Bridge `reset`。按成功实验的`BridgeSession`、LIBERO Safety Python、seed=0/init-state=0及demo horizon=3600重跑后，Bridge启动态SHA `3b942cf3…` 在显式`reset`后变为Snapshot要求的 `633b8b09…`。`compiled_model_fingerprint_details`显示唯一变化字段为`body_pos`（33×3）；其余编译模型字段摘要一致。此后Bridge严格接受原t=215 Snapshot。

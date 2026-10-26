@@ -3179,6 +3179,207 @@ def _planning_geometry(carried_binding, obstacle_bindings, expected_instruction)
     return result
 
 
+def _collision_scene_export():
+    """Export active scene collision geometry from scratch data without mutation."""
+    import hashlib
+
+    sim = env.sim
+    model = sim.model._model
+    result = {
+        "operation": "collision_scene_export",
+        "status": "unavailable",
+        "query_complete": False,
+        "physical_state_unchanged": False,
+        "units": "m",
+        "frame": "world",
+        "scene_collision_geometries": [],
+        "robot_collision_geometries": [],
+        "unsupported_geometries": [],
+    }
+    before = signature = cache = None
+    try:
+        before = _mujoco_integration_state(sim)
+        signature = _planning_model_signature(model)
+        cache = _planning_cache_signature(sim.data._data)
+        if before.ndim != 1 or not np.isfinite(before).all():
+            raise ValueError("Current complete integration state is invalid")
+        inventory = _geometry_inventory()
+        if inventory.get("status") != "complete" or inventory.get("robot_classification_status") != "available":
+            raise ValueError("Current full Geometry Inventory is incomplete")
+        scratch = _diagnostic_data_from_integration_state(sim)
+        geom_inventory = {int(row["geom_id"]): row for row in inventory["geometries"]}
+        pair_margin = {}
+        explicit_pair_geoms = set()
+        for index in range(int(model.npair)):
+            geom_a, geom_b = int(model.pair_geom1[index]), int(model.pair_geom2[index])
+            margin = float(model.pair_margin[index])
+            if not (0 <= geom_a < int(model.ngeom) and 0 <= geom_b < int(model.ngeom)) or not np.isfinite(margin) or margin < 0:
+                raise ValueError("Compiled explicit Contact Pair metadata is incomplete")
+            explicit_pair_geoms.update((geom_a, geom_b))
+            for geom_id in (geom_a, geom_b):
+                pair_margin[geom_id] = max(pair_margin.get(geom_id, 0.0), margin)
+        type_names = {
+            int(value): name.removeprefix("mjGEOM_").lower()
+            for name, value in getattr(mujoco.mjtGeom, "__members__", {}).items()
+        }
+        scene_rows, robot_rows, unsupported = [], [], []
+        merged_meshes = {}
+        for geom_id in range(int(model.ngeom)):
+            item = geom_inventory.get(geom_id)
+            if item is None or item.get("errors"):
+                raise ValueError(f"Geom identity inventory is incomplete for {geom_id}")
+            if not item.get("collision_enabled"):
+                continue
+            category = item.get("category")
+            if category not in ("scene", "robot"):
+                raise ValueError(f"Geom {geom_id} lacks a verified robot/scene identity")
+            geom_type = int(model.geom_type[geom_id])
+            type_name = type_names.get(geom_type, f"geom_{geom_type}")
+            base = {
+                "geom_id": geom_id,
+                "geom_name": item.get("geom_name"),
+                "body_id": item.get("body_id"),
+                "body_name": item.get("body_name"),
+                "category": category,
+                "geom_type_id": geom_type,
+                "geom_type": type_name,
+                "contype": int(model.geom_contype[geom_id]),
+                "conaffinity": int(model.geom_conaffinity[geom_id]),
+                "explicit_contact_pair": geom_id in explicit_pair_geoms,
+                "geom_margin_m": float(model.geom_margin[geom_id]),
+                "pair_margin_m": float(pair_margin.get(geom_id, 0.0)),
+                "geom_size_m": np.asarray(model.geom_size[geom_id], dtype=np.float64).tolist(),
+                "geom_rbound_m": float(model.geom_rbound[geom_id]),
+                "position_world_m": np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64).tolist(),
+                "rotation_world": np.asarray(scratch.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3).tolist(),
+            }
+            if category == "robot":
+                robot_rows.append(base)
+                continue
+            margin = max(float(model.geom_margin[geom_id]), pair_margin.get(geom_id, 0.0))
+            local_center = np.zeros(3, dtype=np.float64)
+            if type_name == "plane":
+                # CuRobo's finite obstacle API has no infinite plane primitive.
+                # The active tabletop scene lies inside this broad bounded floor patch.
+                half = np.asarray([2.5, 2.5, 0.01], dtype=np.float64)
+                local_center = np.asarray([0.0, 0.0, -0.01], dtype=np.float64)
+                shape = "cuboid"
+                base["source"] = "bounded_5m_workspace_enclosure_of_active_MuJoCo_infinite_plane"
+            elif type_name == "mesh":
+                mesh_id = int(model.geom_dataid[geom_id])
+                if not 0 <= mesh_id < int(model.nmesh):
+                    raise ValueError(f"Geom {geom_id} has invalid compiled mesh association")
+                address, count = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
+                vertices = np.asarray(model.mesh_vert[address : address + count], dtype=np.float64)
+                if count <= 0 or vertices.shape != (count, 3) or not np.isfinite(vertices).all():
+                    raise ValueError(f"Geom {geom_id} compiled mesh vertices are incomplete")
+                face_address, face_count = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
+                faces = np.asarray(model.mesh_face[face_address : face_address + face_count], dtype=np.int64)
+                if face_count <= 0 or faces.shape != (face_count, 3) or np.any(faces < 0) or np.any(faces >= count):
+                    raise ValueError(f"Geom {geom_id} compiled mesh faces are incomplete")
+                rotation = np.asarray(scratch.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+                position = np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64)
+                vertices_world = vertices @ rotation.T + position[None, :]
+                body_id = int(item["body_id"])
+                merged = merged_meshes.setdefault(body_id, {
+                    "body_id": body_id,
+                    "body_name": item.get("body_name"),
+                    "geom_ids": [],
+                    "geom_names": [],
+                    "vertices_world_m": [],
+                    "faces": [],
+                    "source": "exact_triangles_from_compiled_MuJoCo_collision_meshes",
+                })
+                vertex_offset = len(merged["vertices_world_m"])
+                merged["geom_ids"].append(geom_id)
+                merged["geom_names"].append(item.get("geom_name"))
+                merged["vertices_world_m"].extend(vertices_world.tolist())
+                merged["faces"].extend((faces + vertex_offset).reshape(-1).tolist())
+                continue
+            elif type_name == "box":
+                half = np.asarray(model.geom_size[geom_id], dtype=np.float64)
+                shape = "cuboid"
+                base["source"] = "compiled_MuJoCo_box"
+            elif type_name == "sphere":
+                radius = float(model.geom_size[geom_id, 0])
+                shape = "sphere"
+                base["source"] = "compiled_MuJoCo_sphere"
+            else:
+                sphere = _planning_component_sphere(model, scratch, geom_id, pair_margin)
+                scene_rows.append({
+                    **base,
+                    "shape": "sphere",
+                    "center_world_m": sphere["center_world_m"],
+                    "radius_m": sphere["radius_m"],
+                    "source": sphere["source"],
+                })
+                continue
+            rotation = np.asarray(scratch.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+            center = np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64) + rotation @ local_center
+            if shape == "cuboid":
+                if half.shape != (3,) or not np.isfinite(half).all() or np.any(half <= 0):
+                    raise ValueError(f"Geom {geom_id} has invalid finite box dimensions")
+                scene_rows.append({
+                    **base,
+                    "shape": shape,
+                    "center_world_m": center.tolist(),
+                    "rotation_world": rotation.tolist(),
+                    "half_extents_world_axes_m": (half + margin).tolist(),
+                    "source": base.get("source", "compiled_MuJoCo_box"),
+                })
+            else:
+                if not np.isfinite(radius) or radius <= 0 or not np.isfinite(margin):
+                    raise ValueError(f"Geom {geom_id} has invalid sphere dimensions")
+                scene_rows.append({
+                    **base,
+                    "shape": shape,
+                    "center_world_m": center.tolist(),
+                    "radius_m": float(radius + margin),
+                    "source": base.get("source", "compiled_MuJoCo_sphere"),
+                })
+        for body_id, merged in sorted(merged_meshes.items()):
+            if not merged["vertices_world_m"] or not merged["faces"]:
+                raise ValueError(f"Body {body_id} merged compiled collision mesh is empty")
+            scene_rows.append({
+                **merged,
+                "name": f"mujoco_body_{body_id}_compiled_mesh",
+                "shape": "mesh",
+            })
+        result.update({
+            "model_geometry_sha256": signature,
+            "state_id": hashlib.sha256(signature.encode() + before.tobytes()).hexdigest(),
+            "mujoco_integration_state": before.tolist(),
+            "geometry_inventory": inventory,
+            "scene_collision_geometries": scene_rows,
+            "robot_collision_geometries": robot_rows,
+            "unsupported_geometries": unsupported,
+            "scratch_forward_used": True,
+            "status": "complete" if not unsupported else "partial",
+            "query_complete": not unsupported,
+        })
+    except Exception as exc:
+        result["error"] = f"Collision scene export failed: {type(exc).__name__}: {exc}"
+    finally:
+        try:
+            after = _mujoco_integration_state(sim)
+            checks = {
+                "integration_state_equal": before is not None and np.array_equal(before, after),
+                "model_geometry_equal": signature is not None and signature == _planning_model_signature(model),
+                "live_kinematics_cache_equal": cache is not None and cache == _planning_cache_signature(sim.data._data),
+            }
+            result["state_consistency"] = checks
+            result["physical_state_unchanged"] = all(checks.values())
+        except Exception as exc:
+            result["state_consistency_error"] = f"{type(exc).__name__}: {exc}"
+        if not result["physical_state_unchanged"]:
+            result.update({
+                "status": "unavailable",
+                "query_complete": False,
+                "error": "Collision scene export could not prove state/model/caches unchanged",
+            })
+    return result
+
+
 def _validated_geom_id_list(raw_ids, label, geom_count):
     if not isinstance(raw_ids, list) or not raw_ids:
         return None, f"{label} must be a non-empty array of Geom IDs"
@@ -5098,6 +5299,144 @@ def _run_env_step_with_contact_monitor(action, action_index, monitor):
         )
 
 
+def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monitor):
+    """Execute one bounded 7-DoF torque-controlled MuJoCo trajectory sample."""
+    global obs, last_reward, last_done
+
+    sim = env.sim
+    task_env = env.env
+    if len(env.robots) != 1:
+        raise ValueError("joint_trajectory_control_requires_one_robot")
+    robot = env.robots[0]
+    model, data = sim.model._model, sim.data._data
+    q_target = np.asarray(request.get("joint_target_qpos_rad"), dtype=np.float64)
+    if q_target.shape != (7,) or not np.isfinite(q_target).all():
+        raise ValueError("joint_target_qpos_rad_must_be_finite_7D")
+    qidx = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
+    didx = np.asarray(robot._ref_joint_vel_indexes, dtype=np.int64)
+    actuator_ids = np.asarray(robot._ref_joint_actuator_indexes, dtype=np.int64)
+    if qidx.shape != (7,) or didx.shape != (7,) or actuator_ids.shape != (7,):
+        raise ValueError("active_robot_arm_joint_or_actuator_mapping_is_not_7D")
+    q_start = np.asarray(data.qpos[qidx], dtype=np.float64).copy()
+    q_delta = q_target - q_start
+    control_dt = float(task_env.control_timestep)
+    model_dt = float(task_env.model_timestep)
+    substeps = int(round(control_dt / model_dt))
+    if substeps != 25 or not math.isclose(control_dt, substeps * model_dt, abs_tol=1e-10):
+        raise ValueError("joint_trajectory_control_requires_25_MuJoCo_substeps")
+    lower = np.asarray(model.jnt_range[[
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name))
+        for name in robot.robot_model.joints
+    ], 0], dtype=np.float64)
+    upper = np.asarray(model.jnt_range[[
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name))
+        for name in robot.robot_model.joints
+    ], 1], dtype=np.float64)
+    if np.any(q_target < lower) or np.any(q_target > upper):
+        raise ValueError("joint_target_exceeds_compiled_MuJoCo_position_limits")
+    gripper_action = request.get("gripper_action")
+    if gripper_action is not None:
+        if isinstance(gripper_action, bool) or not isinstance(gripper_action, (int, float)):
+            raise ValueError("gripper_action_must_be_a_finite_scalar")
+        if not np.isfinite(float(gripper_action)) or not -1.0 <= float(gripper_action) <= 1.0:
+            raise ValueError("gripper_action_must_be_within_normalized_range")
+        robot.grip_action(robot.gripper, np.asarray([gripper_action], dtype=np.float64))
+
+    model_mass = np.empty((model.nv, model.nv), dtype=np.float64)
+    torque_bounds = np.asarray(model.actuator_ctrlrange[actuator_ids], dtype=np.float64)
+    desired_velocity = q_delta / control_dt
+    kp = float(request.get("joint_position_kp", 50.0))
+    if not np.isfinite(kp) or not 5.0 <= kp <= 100.0:
+        raise ValueError("joint_position_kp_must_be_between_5_and_100")
+    control_step = {
+        "control_step_index": int(action_index),
+        "status": "incomplete",
+        "expected_physics_substeps": substeps,
+        "captured_physics_substeps": 0,
+        "contact_samples": {"contact": 0, "no_contact": 0, "unavailable": 0},
+        "capture_error": None,
+    }
+    candidate_substep_start = monitor["captured_physics_substeps"]
+    substep_contacts = []
+    applied_joint_torques = []
+    prior_step = sim.__dict__.get("step", None)
+    had_instance_step = "step" in sim.__dict__
+    original_step = sim.step
+    step_index = 0
+
+    def monitored_step(*args, **kwargs):
+        nonlocal step_index
+        result = original_step(*args, **kwargs)
+        contacts = _collect_contacts()
+        sample_status = _record_substep_contacts(
+            monitor,
+            action_index,
+            step_index,
+            candidate_substep_start + step_index,
+            contacts,
+        )
+        geometry = _substep_safety_geometry(monitor, contacts)
+        if geometry is not None and geometry.get("status") != "complete":
+            control_step["capture_error"] = "substep_geometry_monitoring_incomplete"
+        control_step["contact_samples"][sample_status] += 1
+        control_step["captured_physics_substeps"] += 1
+        monitor["captured_physics_substeps"] += 1
+        substep_contacts.append(contacts)
+        step_index += 1
+        return result
+
+    task_env._set_mocap_motion()
+    task_env.timestep += 1
+    try:
+        sim.step = monitored_step
+        for substep in range(substeps):
+            sim.forward()
+            alpha = (substep + 1) / substeps
+            q_reference = q_start + alpha * q_delta
+            q_velocity = np.asarray(data.qvel[didx], dtype=np.float64)
+            q_acceleration = kp * (q_reference - data.qpos[qidx]) + (
+                2.0 * math.sqrt(kp) * (desired_velocity - q_velocity)
+            )
+            mujoco.mj_fullM(model, model_mass, data.qM)
+            torque = (
+                model_mass[np.ix_(didx, didx)] @ q_acceleration
+                + np.asarray(data.qfrc_bias[didx], dtype=np.float64)
+            )
+            if not np.isfinite(torque).all():
+                raise FloatingPointError("joint_torque_command_is_nonfinite")
+            # Keep motor saturation at the compiled actuator bounds.
+            data.ctrl[actuator_ids] = np.clip(
+                torque, torque_bounds[:, 0], torque_bounds[:, 1]
+            )
+            applied_joint_torques.append(np.asarray(data.ctrl[actuator_ids], dtype=np.float64).tolist())
+            sim.step()
+            task_env._update_observables()
+            if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+                raise FloatingPointError("MuJoCo_state_became_nonfinite_during_joint_control")
+            if np.any(data.qpos[qidx] < lower - 1e-7) or np.any(data.qpos[qidx] > upper + 1e-7):
+                raise RuntimeError("MuJoCo_arm_joint_crossed_compiled_position_limit")
+        task_env.cur_time += control_dt
+        reward, done, info = task_env._post_action(None)
+        done = bool(task_env._check_success())
+        info["cost"] = task_env._check_constraint(done)
+        last_reward, last_done = reward, done
+        obs = task_env._get_observations()
+    finally:
+        if had_instance_step:
+            sim.step = prior_step
+        else:
+            sim.__dict__.pop("step", None)
+        control_step["status"] = (
+            "complete"
+            if control_step["captured_physics_substeps"] == substeps
+            else "incomplete"
+        )
+        monitor["_last_control_step"] = _finish_contact_control_step(monitor, control_step)
+
+    info["applied_joint_torques_nm_per_substep"] = applied_joint_torques
+    return obs, reward, done, info, substep_contacts
+
+
 def _contact_monitor_result(monitor):
     control_steps = monitor["control_steps"]
     expected_counts = [
@@ -5792,6 +6131,33 @@ try:
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
                     result["safety_geometry"] = monitor["geometry_substeps"][-1] if monitor.get("geometry_substeps") else None
+                elif request["op"] == "joint_trajectory_step":
+                    monitor = _new_contact_monitor()
+                    try:
+                        obs, reward, done, info, substep_contacts = (
+                            _run_joint_trajectory_step_with_contact_monitor(
+                                request, int(request.get("action_index", 0)), monitor
+                            )
+                        )
+                        result = pack(obs, reward, done, include_snapshot_state=True)
+                        result["control_mode"] = "joint_space_mass_matrix_PD_torque"
+                        result["control_action_space"] = "7D_joint_target_qpos_rad"
+                        result["pi05_native_action_compatible"] = False
+                        result["contact_monitoring"] = _contact_monitor_result(monitor)
+                        result["substep_contacts"] = substep_contacts
+                        result["applied_joint_torques_nm_per_substep"] = info.get("applied_joint_torques_nm_per_substep")
+                        result["contacts"] = _collect_contacts()
+                        result["task_cost"] = info.get("cost")
+                    except Exception as exc:
+                        result = {
+                            "operation": "joint_trajectory_step",
+                            "status": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "control_mode": "joint_space_mass_matrix_PD_torque",
+                            "control_action_space": "7D_joint_target_qpos_rad",
+                            "pi05_native_action_compatible": False,
+                            "contact_monitoring": _contact_monitor_result(monitor),
+                        }
                 elif request["op"] == "snapshot":
                     try:
                         snapshot_id = f"snapshot-{next_snapshot_id:06d}"
@@ -5995,6 +6361,20 @@ try:
                         result = {"operation": "planning_geometry", "status": "unavailable",
                                   "query_complete": False, "physical_state_unchanged": False,
                                   "error": f"Planning geometry failed: {type(exc).__name__}: {exc}"}
+                elif request["op"] == "collision_scene_export":
+                    try:
+                        result = _collision_scene_export()
+                    except Exception as exc:
+                        result = {
+                            "operation": "collision_scene_export",
+                            "status": "unavailable",
+                            "query_complete": False,
+                            "physical_state_unchanged": False,
+                            "scene_collision_geometries": [],
+                            "robot_collision_geometries": [],
+                            "unsupported_geometries": [],
+                            "error": f"Collision scene export failed: {type(exc).__name__}: {exc}",
+                        }
                 elif request["op"] == "rrt_connect":
                     try:
                         import hashlib

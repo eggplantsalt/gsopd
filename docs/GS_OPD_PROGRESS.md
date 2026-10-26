@@ -3906,3 +3906,22 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 可复现入口：`research/gs_opd/repair/verify_human_l0t2_t215_snapshot.py`，命令/配置见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_t215_bridge_recovery_20261026_run3/reproduce.sh`和`launch_config.json`。完整字段指纹、Snapshot副本与恢复证据见同目录`recovery_report.json`和`recovery_report.md`。入口严格拒绝模型SHA不符，恢复后验证状态并退出，不发送任何动作。
 
 **结论：已恢复合法Pot1持抓前缀，初始模型SHA差异由缺失的显式Reset造成，且仅body_pos分字段随该Reset变化。下一轮可在同一启动序列后恢复t=215再接CuRobo；本轮不运行规划或运输，Pot1尚未放置，L0T2 task_success仍为false。**
+
+
+## Human L0T2 CuRobo真实运输尝试：规划阶段未返回路线（2026-10-26）
+
+### 恢复与场景建模
+
+先运行`research/gs_opd/repair/verify_human_l0t2_t215_snapshot.py`复核指定来源。结果为模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`，Integration State shape `[331]`、SHA `853f54dfb585cbc54d3d720d93b19eecf97d399619162b1a66c32d51f282a6b9`逐元素匹配；Pot1双指抓持通过，动作/子步0。实际执行入口读取run3归档`launch_config.json`，维持`BridgeSession.start → 额外reset → compiled model SHA gate → restore t=215`，Snapshot恢复后没有再次reset。
+
+新增只读Bridge `collision_scene_export`从活动编译模型导出碰撞使能的场景/机器人Geom、实际world pose及形状，并验证Integration State、模型签名和live kinematic cache均未变化。CuRobo规划世界包括38个有界cuboid、2个按Body合并的MuJoCo编译三角网格（33,178与13,332面）、地面有界工作区表示；另清点活动模型15个机器人collision Geom并启用CuRobo Franka自碰撞。被抓Pot1的全部15个已绑定碰撞Geom先生成组件包络，再用CuRobo MORPHIT四球拟合附着模型。障碍与Pot1目标支撑仅在最终放置阶段按目标语义排除，场景安全阈值、BDDL和物理模型未改。
+
+### 规划与结果
+
+依据活动BDDL `On(moka_pot_1, flat_stove_1_cook_region)`的Region相对几何生成24个位置/朝向等价的预放置目标。CuRobo并行Franka自碰撞IK为23/24可达；完整场景MotionPlanner运行10.373秒后对所有目标返回`planner_returned_none`，没有输出7D路线。**确定阻塞在CuRobo运动规划阶段；其内部具体碰撞对/无解原因unknown**，不把它推断成MuJoCo物理碰撞或执行器失配。
+
+运行归档：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_235735/`。包含模型/BDDL/状态身份、全几何导出、24目标与IK结果、CuRobo输入/输出和初始/终止Runtime Snapshot。最终状态与t=215恢复状态相同；Pot1 On=false、Pot2 On=false、Stove Turnon=true、原生`task_success=false`。物理动作0、MuJoCo子步0、物理分支0；未运输、放置、释放或Settling，因此没有Episode视频、真实接触记录或可训练动作。Joint-space控制入口标记与π₀.₅原生动作空间不兼容，但本轮未执行，不产生错误监督标签。
+
+恢复验证单独归档于`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_preflight/`。早期运行时接口错误及第一版粗糙网格包围盒无路尝试均各自保留其独立归档，未覆盖数据。没有使用官方安全示范、没有训练、没有Safety Certification。代码`py_compile`与`git diff --check`通过；未运行Rollout模型或训练。
+
+**结论：没有新增完整Task-Success Episode。t=215抓持Snapshot和当前模型可精确复现，但CuRobo未生成可执行运输路线；本轮在规划阻塞处结束，不追加相似物理搜索。**
