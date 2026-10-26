@@ -43,6 +43,7 @@ class JointSpacePlannerConfig:
     edge_max_geom_center_step_m: float = 0.004
     edge_max_geom_midpoint_curvature_m: float = 0.0005
     minimum_clearance_m: float = 0.01
+    require_safe_configurations: bool = True
     seed: int = 20261023
 
     def validate(self) -> None:
@@ -72,6 +73,8 @@ class JointSpacePlannerConfig:
             raise ValueError("goal_bias must lie in (0, 1)")
         if not math.isfinite(float(self.minimum_clearance_m)) or self.minimum_clearance_m < 0.0:
             raise ValueError("planner clearance must be finite and non-negative")
+        if not isinstance(self.require_safe_configurations, bool):
+            raise ValueError("require_safe_configurations must be a bool")
 
 
 @dataclass
@@ -202,6 +205,11 @@ class JointSpaceRRTConnect:
         self._configuration_cache[key] = result
         return result
 
+    def _configuration_admissible(self, result: ConfigurationCheck) -> bool:
+        return not self.config.require_safe_configurations or bool(
+            result.diagnostics.get("configuration_safe", False)
+        )
+
     def _kinematics(self, qpos: np.ndarray) -> KinematicSample:
         key = self._key(qpos)
         if key not in self._kinematic_cache:
@@ -274,7 +282,7 @@ class JointSpaceRRTConnect:
             return False
         for qpos in samples:
             result = self._check(qpos)
-            if not result.diagnostics.get("configuration_safe", False):
+            if not self._configuration_admissible(result):
                 return False
         return True
 
@@ -307,15 +315,21 @@ class JointSpaceRRTConnect:
         min_clearance = math.inf
         by_object: dict[str, float] = {}
         samples = 0
+        unsafe_samples = 0
+        forbidden_contact_samples = 0
+        self_contact_samples = 0
         for start, end in zip(path[:-1], path[1:]):
             dense = self._dense_edge(start, end)
             if dense is None:
                 raise RuntimeError("final_path_adaptive_collision_sampling_incomplete")
             for qpos in dense:
                 check = self._check(qpos)
-                if not check.diagnostics.get("configuration_safe", False):
+                if not self._configuration_admissible(check):
                     raise RuntimeError("final_path_failed_full_geometry_recheck")
                 samples += 1
+                unsafe_samples += int(not check.diagnostics.get("configuration_safe", False))
+                forbidden_contact_samples += int(bool(check.forbidden_contacts))
+                self_contact_samples += int(bool(check.self_contacts))
                 min_clearance = min(min_clearance, float(check.minimum_forbidden_clearance_m))
                 for name, value in check.clearances_by_object_m.items():
                     by_object[name] = min(by_object.get(name, math.inf), float(value))
@@ -323,6 +337,9 @@ class JointSpaceRRTConnect:
             "minimum_clearance_m": min_clearance,
             "clearances_by_object_m": by_object,
             "dense_samples": samples,
+            "unsafe_configuration_samples": unsafe_samples,
+            "forbidden_contact_samples": forbidden_contact_samples,
+            "self_contact_samples": self_contact_samples,
             "joint_length_rad": self._length(path),
         }
 
@@ -340,7 +357,7 @@ class JointSpaceRRTConnect:
                 if np.any(endpoint < self.lower) or np.any(endpoint > self.upper):
                     raise ValueError(f"{endpoint_name}_outside_joint_limits")
                 check = self._check(endpoint)
-                if not check.diagnostics.get("configuration_safe", False):
+                if not self._configuration_admissible(check):
                     raise ValueError(f"{endpoint_name}_configuration_is_unsafe")
             rng = np.random.default_rng(self.config.seed)
             start_tree, goal_tree = _Tree(start, "start"), _Tree(goal, "goal")
@@ -457,7 +474,7 @@ class JointSpaceRRTConnect:
             iterations=iteration + 1 if "iteration" in locals() else 0,
             selected_route_index=0,
             candidates=[
-                {key: value for key, value in item.items() if key != "path"}
+                dict(item)
                 for item in candidates
             ],
         )

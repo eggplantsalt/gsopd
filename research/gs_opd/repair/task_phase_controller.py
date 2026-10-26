@@ -42,6 +42,7 @@ class PhaseEvidence:
     trusted_fixture_activation_available: bool
     task_success: bool | None
     count_phase_control: bool = True
+    finger_contacts_clear: bool = True
     eef_position_error_m: float | None = None
     eef_orientation_error_rad: float | None = None
 
@@ -194,6 +195,38 @@ class TaskPhaseController:
         self._phase_steps = 0
         self._last_timestep = -1
 
+    def adopt_native_goal_contact_for_release(
+        self,
+        object_id: str,
+        *,
+        native_goal_satisfied: bool,
+        satisfied_object_ids: tuple[str, ...],
+        held_object: str | None,
+        grasp_confirmed: bool,
+    ) -> None:
+        """Resume at release when a live held object already satisfies BDDL."""
+        if native_goal_satisfied is not True:
+            raise ValueError("release_resume_requires_satisfied_native_object_goal")
+        if held_object != object_id or grasp_confirmed is not True:
+            raise ValueError("release_resume_requires_verified_live_object_grasp")
+        indices = [i for i, item in enumerate(self.objects) if item["object_id"] == object_id]
+        if len(indices) != 1:
+            raise ValueError(f"held_object_is_not_in_task_program:{object_id}")
+        index = indices[0]
+        satisfied = set(str(name) for name in satisfied_object_ids)
+        preceding = {str(item["object_id"]) for item in self.objects[: index + 1]}
+        if not preceding.issubset(satisfied):
+            raise ValueError("release_resume_requires_ordered_native_predicate_evidence")
+        if self.phase != "pregrasp" or self._expert_handoff:
+            raise RuntimeError(f"native_goal_release_cannot_adopt_from:{self.phase}")
+        self.object_index = index
+        self.phase = "release"
+        self._expert_handoff = True
+        self._phase_steps = 0
+        self._last_timestep = -1
+        self._settle_samples.clear()
+        self._settle_last_timestep = -1
+
     def adopt_released_object_withdrawal(
         self,
         object_id: str,
@@ -315,12 +348,20 @@ class TaskPhaseController:
         elif self.phase in {"transport", "second_object_recovery"} and eef_goal_reached:
             next_phase = "precise_placement" if self.phase == "transport" else "approach"
             self._transition(next_phase)
-        elif self.phase == "precise_placement" and eef_goal_reached:
-            if evidence.held_object != target or not evidence.grasp_confirmed:
-                raise RuntimeError("held_object_lost_before_precise_placement")
+        elif self.phase == "precise_placement" and (eef_goal_reached or evidence.task_goal_satisfied):
+            # Reaching the placement pose is an observed control milestone, not
+            # proof that the object is still grasped.  A real MuJoCo branch can
+            # lose the object during transport or precise placement; let the
+            # bounded release/settle checks establish whether the native BDDL
+            # goal was physically achieved instead of aborting before those
+            # checks run.
             self._transition("release")
         elif self.phase == "release":
-            if evidence.held_object is None and evidence.task_goal_satisfied:
+            if (
+                evidence.held_object is None
+                and evidence.task_goal_satisfied
+                and evidence.finger_contacts_clear
+            ):
                 self._settle_samples.clear()
                 self._settle_last_timestep = -1
                 self._transition("withdrawal")

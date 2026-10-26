@@ -3459,6 +3459,304 @@ def _gripper_geometry_inventory():
     return result
 
 
+def _task_success_first_grasp_context(request):
+    """Resolve an active BDDL target and its collision/pad geometry read-only."""
+    if request.get("expected_instruction") != task.language:
+        raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+    model = env.sim.model._model
+    data = env.sim.data._data
+    bindings = _task_semantic_geometry_bindings()["bindings"]
+    problem = getattr(env.env, "parsed_problem", {})
+    goals = problem.get("goal_state") if isinstance(problem, dict) else None
+    if not isinstance(goals, (list, tuple)):
+        raise ValueError("active_BDDL_goal_state_is_unavailable")
+    candidates = [
+        list(predicate)
+        for predicate in goals
+        if isinstance(predicate, (list, tuple))
+        and (
+            len(predicate) == 3
+            and str(predicate[0]).lower() in ("in", "on")
+            and predicate[1] in bindings
+            or len(predicate) == 2
+            and str(predicate[0]).lower() in ("close", "open")
+            and predicate[1] in bindings
+        )
+    ]
+    requested = request.get("target_predicate")
+    if requested is not None:
+        requested = list(requested) if isinstance(requested, (list, tuple)) else None
+        if requested is None or requested not in candidates:
+            raise ValueError("requested_target_predicate_is_not_an_active_BDDL_object_goal")
+        predicate = requested
+    elif len(candidates) == 1:
+        predicate = candidates[0]
+    else:
+        raise ValueError("active_BDDL_has_ambiguous_object_goals; pass_an_exact_active_target_predicate")
+
+    target_id = str(predicate[1])
+    binding = bindings[target_id]
+    root_id = int(binding["root_body_id"])
+    if root_id <= 0 or root_id >= int(model.nbody):
+        raise ValueError("active_BDDL_target_root_body_is_invalid")
+    root_position = np.asarray(data.xpos[root_id], dtype=np.float64)
+    root_rotation = np.asarray(data.xmat[root_id], dtype=np.float64).reshape(3, 3)
+    geom_rows = []
+    for geom_id in sorted(int(value) for value in binding["geom_ids"]):
+        geom_position = np.asarray(data.geom_xpos[geom_id], dtype=np.float64)
+        geom_rotation = np.asarray(data.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+        geom_type = int(model.geom_type[geom_id])
+        geom_type_name = next(
+            (
+                name.removeprefix("mjGEOM_").lower()
+                for name, value in getattr(mujoco.mjtGeom, "__members__", {}).items()
+                if int(value) == geom_type
+            ),
+            f"geom_{geom_type}",
+        )
+        size = np.asarray(model.geom_size[geom_id], dtype=np.float64).copy()
+        center_offset_geom = np.zeros(3, dtype=np.float64)
+        geometry_source = "compiled_geom_size"
+        mesh_vertex_count = None
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+            mesh_id = int(model.geom_dataid[geom_id])
+            vertex_start = int(model.mesh_vertadr[mesh_id])
+            vertex_count = int(model.mesh_vertnum[mesh_id])
+            vertices = np.asarray(model.mesh_vert[vertex_start : vertex_start + vertex_count], dtype=np.float64)
+            if vertices.ndim == 2 and vertices.shape[1] == 3 and len(vertices):
+                lower, upper = vertices.min(axis=0), vertices.max(axis=0)
+                center_offset_geom = (lower + upper) * 0.5
+                size = (upper - lower) * 0.5
+                geometry_source = "compiled_MuJoCo_mesh_vertex_bounds"
+                mesh_vertex_count = int(vertex_count)
+            else:
+                raise ValueError(f"active_mesh_collision_geometry_has_no_vertices:{geom_id}")
+        center_root = root_rotation.T @ (geom_position - root_position)
+        rotation_root = root_rotation.T @ geom_rotation
+        center_root += rotation_root @ center_offset_geom
+        geom_rows.append({
+            "geom_id": geom_id,
+            "geom_name": str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)),
+            "body_id": int(model.geom_bodyid[geom_id]),
+            "geom_type": int(model.geom_type[geom_id]),
+            "geom_type_name": geom_type_name,
+            "size_m": size.tolist(),
+            "center_root_m": center_root.tolist(),
+            "rotation_root": rotation_root.tolist(),
+            "center_world_m": geom_position.tolist(),
+            "rotation_world": geom_rotation.tolist(),
+            "geometry_source": geometry_source,
+            "mesh_vertex_count": mesh_vertex_count,
+        })
+
+    robot = env.robots[0]
+    eef_site_id = int(robot.eef_site_id)
+    eef_position = np.asarray(data.site_xpos[eef_site_id], dtype=np.float64)
+    eef_rotation = np.asarray(data.site_xmat[eef_site_id], dtype=np.float64).reshape(3, 3)
+    inventory = _gripper_geometry_inventory()
+    if inventory.get("status") != "complete" or not inventory.get("grippers"):
+        raise ValueError("active_gripper_geometry_inventory_is_incomplete")
+    geometries = inventory["grippers"][0].get("geometries", [])
+    pads = {"left": [], "right": []}
+    for item in geometries:
+        name = str(item["geom_name"]).lower()
+        if "pad" not in name:
+            continue
+        if "finger1" in name or "leftfinger" in name or "left_finger" in name:
+            side = "left"
+        elif "finger2" in name or "rightfinger" in name or "right_finger" in name:
+            side = "right"
+        else:
+            continue
+        geom_id = int(item["geom_id"])
+        pads[side].append({
+            "geom_id": geom_id,
+            "geom_name": str(item["geom_name"]),
+            "center_eef_m": (
+                eef_rotation.T @ (np.asarray(data.geom_xpos[geom_id], dtype=np.float64) - eef_position)
+            ).tolist(),
+        })
+    if len(pads["left"]) != 1 or len(pads["right"]) != 1:
+        raise ValueError("active_Panda_model_must_expose_one_pad_collision_geom_per_finger_side")
+    left_center = np.asarray(pads["left"][0]["center_eef_m"], dtype=np.float64)
+    right_center = np.asarray(pads["right"][0]["center_eef_m"], dtype=np.float64)
+    arm_ids = np.asarray(robot._ref_joint_indexes, dtype=np.int64)
+    arm_qpos = np.asarray(data.qpos[model.jnt_qposadr[arm_ids]], dtype=np.float64)
+    gripper_qpos = np.asarray(data.qpos[robot._ref_gripper_joint_pos_indexes], dtype=np.float64)
+    gripper_joint_ids = np.asarray(
+        [env.sim.model.joint_name2id(name) for name in robot.gripper_joints], dtype=np.int64
+    )
+    gripper_joint_ranges = np.asarray(model.jnt_range[gripper_joint_ids], dtype=np.float64)
+    if gripper_joint_ranges.shape != (len(gripper_qpos), 2):
+        raise ValueError("active_gripper_joint_ranges_do_not_match_gripper_qpos")
+    integration = np.zeros(
+        mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_INTEGRATION), dtype=np.float64
+    )
+    mujoco.mj_getState(model, data, integration, mujoco.mjtState.mjSTATE_INTEGRATION)
+    scratch = mujoco.MjData(model)
+    max_pad_separation = 0.0
+    for corner in (
+        [gripper_joint_ranges[0, side0], gripper_joint_ranges[1, side1]]
+        for side0 in (0, 1)
+        for side1 in (0, 1)
+    ):
+        mujoco.mj_setState(model, scratch, integration, mujoco.mjtState.mjSTATE_INTEGRATION)
+        scratch.qpos[robot._ref_gripper_joint_pos_indexes] = np.asarray(corner, dtype=np.float64)
+        mujoco.mj_forward(model, scratch)
+        positions = []
+        for side in ("left", "right"):
+            geom_id = int(pads[side][0]["geom_id"])
+            positions.append(np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64))
+        max_pad_separation = max(max_pad_separation, float(np.linalg.norm(positions[0] - positions[1])))
+    return {
+        "operation": "task_success_first_grasp_context",
+        "status": "complete",
+        "read_only": True,
+        "instruction": str(task.language),
+        "native_goal_predicate": predicate,
+        "native_goal_value": bool(env.env._eval_predicate(predicate)),
+        "target_object_id": target_id,
+        "target_binding": binding,
+        "target_root_pose_world": {
+            "position_m": root_position.tolist(),
+            "rotation": root_rotation.tolist(),
+        },
+        "target_collision_geometries": geom_rows,
+        "eef_pose_world": {
+            "position_m": eef_position.tolist(),
+            "rotation": eef_rotation.tolist(),
+        },
+        "fingertip_pad_geometries": pads,
+        "symmetric_pad_center_eef_m": ((left_center + right_center) * 0.5).tolist(),
+        "gripper_pad_separation_m": float(np.linalg.norm(left_center - right_center)),
+        "active_open_gripper_qpos": gripper_qpos.tolist(),
+        "gripper_joint_ranges": gripper_joint_ranges.tolist(),
+        "maximum_pad_separation_m": max_pad_separation,
+        "arm_qpos": arm_qpos.tolist(),
+        "model_geometry_sha256": _planning_model_signature(model),
+        "bddl_sha256": scene_metadata.get("bddl_sha256"),
+    }
+
+
+def _task_success_first_articulation_context(request):
+    """Resolve a real hinged/slide fixture path using scratch MuJoCo state."""
+    if request.get("expected_instruction") != task.language:
+        raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+    predicate = request.get("predicate")
+    if not isinstance(predicate, (list, tuple)) or len(predicate) != 2:
+        raise ValueError("articulation_context_requires_a_native_unary_fixture_goal")
+    predicate = [str(item) for item in predicate]
+    if predicate[0].lower() not in {"close", "open"}:
+        raise ValueError("articulation_context_supports_only_native_Close_or_Open_goals")
+    if predicate not in env.env.parsed_problem.get("goal_state", []):
+        raise ValueError("requested_fixture_predicate_is_not_an_active_BDDL_goal")
+    fixture_id = predicate[1]
+    fixture = getattr(env.env, "fixtures_dict", {}).get(fixture_id)
+    if fixture is None:
+        raise ValueError(f"active_BDDL_fixture_binding_is_missing:{fixture_id}")
+    model, live = env.sim.model._model, env.sim.data._data
+    root = int(env.sim.model.body_name2id(fixture.root_body))
+    descendants = _planning_body_subtree(model, root)
+    joint_rows = []
+    for joint_id, body_id in enumerate(model.jnt_bodyid):
+        body_id = int(body_id)
+        if body_id not in descendants or not bool(model.jnt_limited[joint_id]):
+            continue
+        joint_type = int(model.jnt_type[joint_id])
+        if joint_type not in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
+            continue
+        qadr = int(model.jnt_qposadr[joint_id])
+        dofadr = int(model.jnt_dofadr[joint_id])
+        current = float(live.qpos[qadr])
+        lower, upper = (float(x) for x in model.jnt_range[joint_id])
+        joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        joint_rows.append({
+            "joint_id": int(joint_id), "joint_name": str(joint_name or f"joint_{joint_id}"),
+            "body_id": body_id, "body_name": str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)),
+            "joint_type": "hinge" if joint_type == int(mujoco.mjtJoint.mjJNT_HINGE) else "slide",
+            "qpos_address": qadr, "dof_address": dofadr, "position": current,
+            "range": [lower, upper],
+        })
+    if not joint_rows:
+        raise ValueError("active_fixture_has_no_limited_hinge_or_slide_joint")
+
+    articulation = getattr(fixture, "object_properties", {}).get("articulation", {})
+    close_ranges = articulation.get(f"default_{predicate[0].lower()}_ranges", [])
+    target_ranges = []
+    if isinstance(close_ranges, (list, tuple)) and len(close_ranges) == 2:
+        target_ranges = [float(close_ranges[0]), float(close_ranges[1])]
+    if predicate[0].lower() == "close" and not target_ranges:
+        target_ranges = [0.0, 0.0]
+    if predicate[0].lower() == "open" and not target_ranges:
+        target_ranges = [joint_rows[0]["range"][0], joint_rows[0]["range"][0]]
+
+    selected = None
+    target_position = None
+    best_distance = -1.0
+    for row in joint_rows:
+        lo, hi = row["range"]
+        clipped = [float(np.clip(value, lo, hi)) for value in target_ranges]
+        candidate_target = float(np.mean(clipped))
+        current = row["position"]
+        distance = abs(current - candidate_target) / max(hi - lo, 1e-9)
+        if distance > best_distance:
+            selected, target_position, best_distance = row, candidate_target, distance
+    assert selected is not None and target_position is not None
+
+    joint_body = int(selected["body_id"])
+    moving_bodies = _planning_body_subtree(model, joint_body)
+    geom_ids = [
+        geom_id for geom_id, body_id in enumerate(model.geom_bodyid)
+        if int(body_id) in moving_bodies
+        and (int(model.geom_contype[geom_id]) or int(model.geom_conaffinity[geom_id]))
+    ]
+    if not geom_ids:
+        raise ValueError("active_articulated_link_has_no_collision_geometry")
+    integration = _mujoco_integration_state(env.sim)
+    scratch = mujoco.MjData(model)
+    qadr, dofadr = int(selected["qpos_address"]), int(selected["dof_address"])
+    samples = np.linspace(float(selected["position"]), target_position, 9)
+    path_by_geom = {int(geom_id): [] for geom_id in geom_ids}
+    hinge_origin = np.asarray(live.xpos[joint_body], dtype=np.float64)
+    radial_scores = {}
+    for angle in samples:
+        mujoco.mj_setState(model, scratch, integration, mujoco.mjtState.mjSTATE_INTEGRATION)
+        scratch.qpos[qadr] = float(angle)
+        scratch.qvel[dofadr] = 0.0
+        mujoco.mj_forward(model, scratch)
+        hinge_origin = np.asarray(scratch.xpos[joint_body], dtype=np.float64)
+        for geom_id in geom_ids:
+            center = np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64)
+            path_by_geom[int(geom_id)].append(center.tolist())
+            if len(path_by_geom[int(geom_id)]) == 1:
+                radial_scores[int(geom_id)] = float(np.linalg.norm(center - hinge_origin))
+    handle_geom = max(geom_ids, key=lambda geom_id: radial_scores[int(geom_id)])
+    centers = np.asarray(path_by_geom[int(handle_geom)], dtype=np.float64)
+    axis_local = np.asarray(model.jnt_axis[int(selected["joint_id"])], dtype=np.float64)
+    axis_world = np.asarray(live.xmat[joint_body], dtype=np.float64).reshape(3, 3) @ axis_local
+    axis_world /= max(float(np.linalg.norm(axis_world)), 1e-12)
+    radial = centers[0] - np.asarray(live.xpos[joint_body], dtype=np.float64)
+    radial -= axis_world * float(np.dot(radial, axis_world))
+    radial /= max(float(np.linalg.norm(radial)), 1e-12)
+    geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(handle_geom))
+    return {
+        "operation": "task_success_first_articulation_context",
+        "status": "complete", "read_only": True,
+        "fixture_id_from_active_BDDL": fixture_id,
+        "fixture_root_body_id": root,
+        "fixture_root_body_name": str(fixture.root_body),
+        "native_goal_predicate": predicate,
+        "native_goal_value": bool(env.env._eval_predicate(predicate)),
+        "joint": {**selected, "target_position": target_position, "close_open_range": target_ranges},
+        "articulated_contact_geom_id": int(handle_geom),
+        "articulated_contact_geom_name": str(geom_name or f"geom_{handle_geom}"),
+        "contact_point_path_world_m": centers.tolist(),
+        "outward_direction_world": radial.tolist(),
+        "model_geometry_sha256": _planning_model_signature(model),
+        "bddl_sha256": scene_metadata.get("bddl_sha256"),
+    }
+
+
 def _validated_render_resolution(resolution):
     """Validate an explicit native square render size without coercion."""
     if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0:
@@ -5734,6 +6032,75 @@ try:
                         result = {
                             "operation": "rrt_connect",
                             "status": "unavailable",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": None,
+                        }
+                elif request["op"] == "task_success_first_context":
+                    try:
+                        result = _task_success_first_grasp_context(request)
+                    except Exception as exc:
+                        result = {
+                            "operation": "task_success_first_grasp_context",
+                            "status": "unavailable",
+                            "read_only": True,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "task_success_first_articulation_context":
+                    try:
+                        result = _task_success_first_articulation_context(request)
+                    except Exception as exc:
+                        result = {
+                            "operation": "task_success_first_articulation_context",
+                            "status": "unavailable",
+                            "read_only": True,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "task_success_first_rrt":
+                    try:
+                        import hashlib
+                        from research.gs_opd.repair.mujoco_jointspace_planning import plan_current_scene
+
+                        expected_instruction = request.get("expected_instruction")
+                        if expected_instruction != task.language:
+                            raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+                        expected_model = request.get("model_geometry_sha256")
+                        actual_model = _planning_model_signature(env.sim.model._model)
+                        if expected_model != actual_model:
+                            raise ValueError("compiled_model_geometry_signature_changed")
+                        current_state = _mujoco_integration_state(env.sim)
+                        current_state_hash = hashlib.sha256(current_state.tobytes()).hexdigest()
+                        if request.get("start_state_sha256") != current_state_hash:
+                            raise ValueError("active_7d_qpos_start_state_changed_before_planning")
+                        planner_config = request.get("planner_config")
+                        if not isinstance(planner_config, dict) or planner_config.get(
+                            "require_safe_configurations"
+                        ) is not False:
+                            raise ValueError("task_success_first_RRT_requires_explicit_record_only_mode")
+                        policy = _normalize_safety_geometry_policy(
+                            request.get("safety_geometry_policy")
+                        )
+                        result = plan_current_scene(
+                            env,
+                            request.get("goal_pose_world"),
+                            policy,
+                            start_state_sha256=current_state_hash,
+                            expected_instruction=expected_instruction,
+                            actual_instruction=task.language,
+                            ik_seed_qpos=request.get("ik_seed_qpos"),
+                            planner_config=planner_config,
+                        )
+                        result["operation"] = "task_success_first_rrt"
+                        result["planning_mode"] = "kinematic_route_with_record_only_safety_diagnostics"
+                        result["safety_certified"] = False
+                        result["start_state_sha256"] = current_state_hash
+                        result["model_geometry_sha256"] = actual_model
+                        result["safety_policy_source"] = request.get("safety_geometry_policy", {}).get("source")
+                    except Exception as exc:
+                        result = {
+                            "operation": "task_success_first_rrt",
+                            "status": "unavailable",
+                            "planning_mode": "kinematic_route_with_record_only_safety_diagnostics",
+                            "safety_certified": False,
                             "failure_reason": f"{type(exc).__name__}: {exc}",
                             "live_state_unchanged": None,
                         }

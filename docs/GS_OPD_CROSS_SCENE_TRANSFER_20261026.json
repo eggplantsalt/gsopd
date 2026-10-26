@@ -1,0 +1,419 @@
+{
+  "schema_version": "gs_opd_cross_scene_transfer_acceptance.v1",
+  "date": "2026-10-26",
+  "branch": "gs-opd-overfit-recovery-08a0198",
+  "policy": {
+    "official_safety_demonstration_data_used": false,
+    "student_checkpoint": "raw_pi05_student_no_lora",
+    "training_started": false,
+    "state_written_or_teleported": false,
+    "full_task_success_authority": "active native BDDL task_success=true",
+    "strict_safety_reconstruction_changed": false,
+    "search_episodes_safety_certified": false
+  },
+  "source_experience": {
+    "scene": "obstacle_avoidance/L0T2",
+    "provenance": "GS-OPD-owned accepted physical episode; no official demonstrations",
+    "acceptance_report": "/opt/data/private/gs_opd/rollouts/round0_l0t2_complete_episode_readonly_acceptance_20261025/round0_complete_episode_acceptance.json",
+    "physical_actions": 1460,
+    "first_native_task_success_timestep": 1459,
+    "terminal_reward": 1.0,
+    "terminal_done": true,
+    "grasp_templates": [
+      "moka_pot:stable_grasp:t248",
+      "moka_pot:stable_grasp:t1053"
+    ],
+    "operation_templates": [
+      "object_transfer_cycle:moka_pot:t239",
+      "object_transfer_cycle:moka_pot:t1043"
+    ],
+    "reused_information": [
+      "object-frame grasp transform and approach waypoints",
+      "task phase sequence and historical phase budgets",
+      "live BDDL target/region lookup pattern"
+    ],
+    "historical_action_replay_as_search_prior": false
+  },
+  "scenes": [
+    {
+      "scene": "obstacle_avoidance/L0T0",
+      "native_task_success": false,
+      "native_predicates": "0/1",
+      "time_to_first_native_success_s": null,
+      "search_wall_time_s": 144.531,
+      "total_task_wall_time_s": 160.335,
+      "student_actions": 8,
+      "expert_actions": 0,
+      "snapshot_branches": 0,
+      "rrt_preflights": 4,
+      "historical_experiences_reused": [],
+      "maximum_progress": "target_not_reached",
+      "failure_reasons": {
+        "planning_time_budget_exhausted": 4
+      },
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "monitoring_complete": false,
+      "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_skill_L0T0_L0T1_20261026_run18/batch_report.json"
+    },
+    {
+      "scene": "obstacle_avoidance/L0T1",
+      "native_task_success": false,
+      "native_predicates": "0/1",
+      "time_to_first_native_success_s": null,
+      "search_wall_time_s": 119.323,
+      "total_task_wall_time_s": 134.37,
+      "student_actions": 8,
+      "expert_actions": 0,
+      "snapshot_branches": 0,
+      "rrt_preflights": 4,
+      "historical_experiences_reused": [],
+      "maximum_progress": "target_not_reached",
+      "failure_reasons": {
+        "planning_time_budget_exhausted": 3,
+        "bounded_current_scene_IK_no_solution": 1
+      },
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "monitoring_complete": true,
+      "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_skill_L0T0_L0T1_20261026_run18/batch_report.json"
+    },
+    {
+      "scene": "obstacle_avoidance/L0T3",
+      "attempt": "run23 cross-skill batch",
+      "native_task_success": false,
+      "native_predicates": "0/2",
+      "time_to_first_native_success_s": null,
+      "search_wall_time_s": 112.71,
+      "total_task_wall_time_s": 124.624,
+      "student_actions": 8,
+      "expert_actions": 0,
+      "snapshot_branches": 0,
+      "rrt_preflights": 4,
+      "historical_experiences_reused": [],
+      "maximum_progress": "target_not_reached",
+      "failure_reasons": {
+        "planning_time_budget_exhausted": 3,
+        "bounded_current_scene_IK_no_solution": 1
+      },
+      "collision_events_recorded": 192,
+      "physics_substeps_recorded": 200,
+      "incomplete_monitor_actions": 0,
+      "monitoring_complete": true,
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "safety_certified": false,
+      "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_skill_L0T3_L0T4_20261026_run23/batch_report.json"
+    },
+    {
+      "scene": "obstacle_avoidance/L0T4",
+      "attempt": "run23 cross-skill batch",
+      "native_task_success": false,
+      "native_predicates": "0/2",
+      "time_to_first_native_success_s": null,
+      "time_to_first_verified_grasp_skill_success_s": null,
+      "search_wall_time_s": 522.734,
+      "total_task_wall_time_s": 540.331,
+      "student_actions": 8,
+      "expert_actions": 440,
+      "physical_actions": 448,
+      "snapshot_branches": 1,
+      "rrt_preflights": 4,
+      "historical_experiences_reused": [],
+      "maximum_progress": "one RRT route reached physical pregrasp/approach execution; no stable grasp or lift",
+      "phase_action_counts": {
+        "RRT_OSC_pregrasp_route": 179,
+        "surface_approach": 60,
+        "local_replan_surface_approach": 201
+      },
+      "failure_reasons": {
+        "local_replan_surface_approach_budget_exhausted": 1
+      },
+      "collision_events_recorded": 12271,
+      "physics_substeps_recorded": 11200,
+      "incomplete_monitor_actions": 343,
+      "monitoring_complete": false,
+      "best_recoverable_snapshot": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_skill_L0T3_L0T4_20261026_run23/obstacle_avoidance_L0T4/stage_00/task_success_first_executor_obstacle_avoidance_L0T4_20261026_071715_026268505/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T4_20261026_071840_546345522/geom102_jaw1_approach2_-1_flip-1__rrt0_local_replan_1_runtime_snapshot.pkl",
+      "microwave_close_predicate_attempted": false,
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "safety_certified": false,
+      "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_skill_L0T3_L0T4_20261026_run23/batch_report.json"
+    },
+    {
+      "scene": "obstacle_avoidance/L1T2",
+      "native_task_success": false,
+      "native_predicates_satisfied": null,
+      "native_predicates_total": 3,
+      "time_to_first_native_success_s": null,
+      "time_to_first_verified_transferred_grasp_s": 158.77,
+      "verified_grasp_lift_m": 0.034544,
+      "attempts": [
+        {
+          "attempt": "run19 L0-success-source migration",
+          "template": "moka_pot:stable_grasp:t248",
+          "operation_skill": "object_transfer_cycle:moka_pot:t239",
+          "grasp_expert_actions": 182,
+          "grasp_snapshot_branches": 1,
+          "grasp_rrt_preflights": 4,
+          "placement_expert_actions_from_durable_log": 318,
+          "placement_rrt_requests": 1,
+          "total_task_wall_time_s": 436.385,
+          "result": "stable bilateral grasp and 34.54 mm lift; placement exited on held_object_lost_before_precise_placement",
+          "safety_certified": false
+        },
+        {
+          "attempt": "run21 exact grasp-snapshot placement resume",
+          "source_grasp_snapshot_exactly_verified": true,
+          "placement_expert_actions": 405,
+          "placement_rrt_requests": 1,
+          "elapsed_s": null,
+          "archive_elapsed_s_from_run_directory_to_report_flush": 975,
+          "result": "reached settle; task_phase_control_budget_exhausted:settle; last durable task_success=false",
+          "terminal_runtime_snapshot": null,
+          "safety_certified": false
+        }
+      ],
+      "student_actions": 0,
+      "expert_actions_across_attempts": 905,
+      "physical_snapshot_branches": 1,
+      "placement_resumes": 2,
+      "rrt_attempts": 6,
+      "historical_experiences_reused": [
+        "moka_pot:stable_grasp:t248",
+        "object_transfer_cycle:moka_pot:t239"
+      ],
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "monitoring_complete": false,
+      "best_recoverable_snapshot": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run19_L0_success_migration/obstacle_avoidance_L1T2/stage_00/task_success_first_executor_obstacle_avoidance_L1T2_20261026_065056_331307395/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T2_20261026_065110_007137754/task_success_candidate_lifted_runtime_snapshot.pkl",
+      "reports": [
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run19_L0_success_migration/batch_report.json",
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run21_L0_success_migration_auto_goal/task_success_first_executor_obstacle_avoidance_L1T2_20261026_070126_554670028/run_report.json"
+      ]
+    },
+    {
+      "scene": "obstacle_avoidance/L2T2",
+      "native_task_success": false,
+      "native_predicates": "2/3 last verified after run32; run33 native query unavailable after Bridge termination",
+      "time_to_first_native_success_s": null,
+      "search_wall_time_s": 41.705,
+      "total_task_wall_time_s": 54.702,
+      "target_predicate": [
+        "on",
+        "moka_pot_1",
+        "flat_stove_1_cook_region"
+      ],
+      "historical_experiences_reused": [
+        "moka_pot:stable_grasp:t248",
+        "object_transfer_cycle:moka_pot:t239"
+      ],
+      "student_actions": 0,
+      "expert_actions": 1800,
+      "snapshot_branches": 2,
+      "rrt_preflights": 18,
+      "failure_reasons": {
+        "run30": "release-stage controller budget exhausted after pot1 native On became true",
+        "run31": "pot2 transport blocked by white_place_box_1 contact",
+        "run32": "contact-normal escape cleared Place Box but route contacted placed moka_pot_1",
+        "run33": "Bridge terminated after 88 durable physical actions; last archived task_success=false"
+      },
+      "task_specific_full_scripts": 0,
+      "task_specific_code_changes": 0,
+      "manual_adjustments": 0,
+      "monitoring_complete": false,
+      "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run22_L0_success_migration/batch_report.json",
+      "maximum_progress": "two verified bilateral grasp/lift skills; pot1 native On=true and stove Turnon=true; pot2 On remains false at last native query",
+      "latest_continuation_reports": [
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run30_ranked_osc_transfer/task_success_first_executor_obstacle_avoidance_L2T2_20261026_080412_743536307/run_report.json",
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run31_second_pot_after_release_fix/task_success_first_executor_obstacle_avoidance_L2T2_20261026_082256_779504502/run_report.json",
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run32_contact_normal_transport_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_084803_297374260/run_report.json",
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run33_pot_pair_contact_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_085943_815821552/run_report.json"
+      ],
+      "time_to_first_verified_grasp_skill_success_s": 474.324221,
+      "verified_grasp_skill_successes": 2
+    }
+  ],
+  "summary": {
+    "new_native_success_episodes": 0,
+    "full_task_time_to_first_success_s": null,
+    "same_task_cross_level_template_selected": "2/2",
+    "same_task_cross_level_physical_skill_verified": "2/2 (L1 and L2 bilateral grasp/lift)",
+    "same_task_cross_level_native_task_success": "0/2",
+    "different_skill_L0_experience_selected": "0/4 (L0T0, L0T1, L0T3, L0T4)",
+    "different_skill_L0_native_task_success": "0/4",
+    "task_specific_full_scripts": 0,
+    "task_specific_code_changes": 0,
+    "manual_scene_adjustments": 0,
+    "cost_amortization_evidence": "L0 Moka Pot grasp/lift templates transferred to both L1T2 and L2T2. L2 achieved both bilateral grasp/lift skills and the first native On predicate; the second pot hit Place Box and then placed-pot contact. No new complete native-success Episode was produced, so lower time/action cost to complete a task is not established.",
+    "experience_library_update": "The verified L1 grasp and two prior GS-OPD L2 grasp candidates plus the verified L2 partial object-transfer skill were atomically merged from the isolated run19 library into the persistent v2 experience library. L0 complete-success grasp/operation templates were preserved and ranked first; all newly merged records remain safety_certified=false and source_native_task_success=false where the source episode did not complete the full task. A pre-merge backup is retained.",
+    "monitoring_note": "L1 grasp monitoring and L2 placement substep monitoring are incomplete; run33 Bridge terminated before final native query. No new search Episode is safety-certified.",
+    "persistent_experience_library": {
+      "path": "/opt/data/private/gs_opd/experience/gs_opd_task_skill_experience_library_20261026_v2.json",
+      "backup": "/opt/data/private/gs_opd/experience/gs_opd_task_skill_experience_library_20261026_v2_pretransfer_merge_20261026.json",
+      "new_grasp_templates": [
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_a673c973a9",
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_c257660c0d",
+        "moka_pot:stable_grasp:obstacle_avoidance_L1T2_seed0_init0_fd7a06e252",
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_a4424722bb",
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_68ed31b2f5"
+      ],
+      "new_operation_skill": "object_transfer_cycle:moka_pot:fe4448eaae",
+      "official_safety_demonstration_data_used": false,
+      "safety_certified": false,
+      "auto_added_l2_verified_grasps": [
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_a4424722bb",
+        "moka_pot:stable_grasp:obstacle_avoidance_L2T2_seed0_init0_68ed31b2f5"
+      ],
+      "auto_added_source_native_task_success": false,
+      "auto_added_safety_certified": false
+    },
+    "different_skill_L0_native_success": "0/4",
+    "cross_skill_L0_physical_branches": 1,
+    "cross_skill_L0_expert_actions": 440,
+    "cross_skill_L0_attempt_wall_times_s": {
+      "L0T0": 160.335,
+      "L0T1": 134.37,
+      "L0T3": 124.624,
+      "L0T4": 540.331
+    }
+  },
+  "generic_implementation_changes": [
+    "Rank complete native-success source experience above partial templates and validation-count-only priors.",
+    "Select first pending object predicate in native BDDL order for direct multi-object Snapshot resume.",
+    "After grip loss at precise placement, continue to real release/native predicate checks; pose alone cannot imply success.",
+    "Archive release/settle controller-budget failures with terminal native status and Runtime Snapshot.",
+    "Add regression tests for experience ranking, BDDL target selection, grip loss, routing, and phase gates.",
+    "Atomically merge evidence-verified new grasp and native object-goal skills from isolated run libraries into the persistent v2 experience library while preserving prior records.",
+    "Resolve target collision geometry, real finger-pad geometry and articulation contact paths from active BDDL/runtime model bindings through read-only Safety Bridge context operations.",
+    "Permit Task-Success-First RRT to return record-only routes while retaining joint/action limits and actual MuJoCo execution for every committed action.",
+    "Use physical contact-normal diagnostics to propose bounded elevated OSC escape waypoints and preserve the blocker/route evidence for subsequent failure memory."
+  ],
+  "current_gaps": [
+    "L1 transferred grasp/lift is verified, but placement continuations did not verify stable native task success.",
+    "L2 first pot native On is true and both pot grasp/lift skills transfer; second pot transport is blocked successively by Place Box and the already placed pot. The run33 Bridge terminated after 88 durable actions.",
+    "Native release/settle stage evidence and precise placement behavior still need a robust continuation from held-object snapshots.",
+    "Failure memory is local to a search process; cross-run route/contact memory is not yet persisted as an automatic strategy selector.",
+    "L0T0/L0T1/L0T3/L0T4 produced no native success and selected no historical skill; different-skill skill acquisition remains open.",
+    "Some per-substep monitoring is incomplete; all search outputs remain non-certified and require the separate strict Safety Reconstruction path."
+  ],
+  "execution_updates": {
+    "scope": "L1T2/L2T2 L0-success experience transfer followed by generic cross-skill L0T0/L0T1/L0T3/L0T4 probes; L2T2 reports below include continued execution from verified physical snapshots, not separate reset episodes.",
+    "l1t2_latest": {
+      "native_task_success": false,
+      "time_to_first_native_success_s": null,
+      "time_to_first_transferred_grasp_and_lift_s": 158.77,
+      "verified_lift_m": 0.034544,
+      "grasp_search_branches": 1,
+      "expert_actions_across_attempts": 905,
+      "student_actions": 0,
+      "reused": [
+        "moka_pot:stable_grasp:t248",
+        "object_transfer_cycle:moka_pot:t239"
+      ],
+      "result": "The transferred grasp/lift was physically verified; two placement continuations did not verify stable native placement/task success.",
+      "reports": [
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run19_L0_success_migration",
+        "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run21_L0_success_migration_auto_goal"
+      ]
+    },
+    "l2t2_continuation_chain": {
+      "native_task_success": false,
+      "time_to_first_native_success_s": null,
+      "last_verified_native_predicates": {
+        "on_moka_pot_1": true,
+        "on_moka_pot_2": false,
+        "turnon_flat_stove_1": true,
+        "count": "2/3"
+      },
+      "run33_final_native_status": "unavailable_bridge_terminated; 88th action archived task_success=false, reward=0, done=false; no final native predicate query or terminal snapshot was available.",
+      "student_actions": 0,
+      "reused": [
+        "moka_pot:stable_grasp:t248",
+        "object_transfer_cycle:moka_pot:t239"
+      ],
+      "verified_grasp_skill_successes": [
+        {
+          "run": "run30",
+          "elapsed_s": 474.324221,
+          "expert_grasp_actions": 213,
+          "snapshot_branches": 1,
+          "verified_lift_m": 0.034488,
+          "template": "moka_pot:stable_grasp:t248"
+        },
+        {
+          "run": "run31",
+          "elapsed_s": 614.191,
+          "expert_grasp_actions": 317,
+          "snapshot_branches": 1,
+          "verified_lift_m": 0.036473,
+          "template": "moka_pot:stable_grasp:t248"
+        }
+      ],
+      "continuations": [
+        {
+          "run": "run30",
+          "expert_grasp_actions": 213,
+          "expert_placement_actions": 302,
+          "rrt_preflights": 8,
+          "native_predicates_after": "2/3; pot1 On=true, pot2 On=false, stove Turnon=true",
+          "result": "Release-stage budget exhausted after pot1 native On became true.",
+          "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run30_ranked_osc_transfer/task_success_first_executor_obstacle_avoidance_L2T2_20261026_080412_743536307/run_report.json",
+          "terminal_snapshot": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run30_ranked_osc_transfer/task_success_first_executor_obstacle_avoidance_L2T2_20261026_080412_743536307/expert_native_placement/native_goal_release_failed_runtime_snapshot.pkl"
+        },
+        {
+          "run": "run31",
+          "expert_grasp_actions": 317,
+          "expert_placement_actions": 440,
+          "rrt_preflights": 8,
+          "native_predicates_after": "2/3; pot2 remained false",
+          "result": "Second pot grasp/lift verified; transport hit Place Box and did not reach target.",
+          "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run31_second_pot_after_release_fix/task_success_first_executor_obstacle_avoidance_L2T2_20261026_082256_779504502/run_report.json",
+          "terminal_snapshot": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run31_second_pot_after_release_fix/task_success_first_executor_obstacle_avoidance_L2T2_20261026_082256_779504502/expert_native_placement/native_goal_transport_failed_runtime_snapshot.pkl"
+        },
+        {
+          "run": "run32",
+          "expert_placement_actions": 440,
+          "rrt_preflights": 1,
+          "native_predicates_after": "2/3; pot2 remained false",
+          "result": "Contact-normal escape moved the pot clear of Place Box; route then contacted already placed pot1.",
+          "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run32_contact_normal_transport_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_084803_297374260/run_report.json",
+          "terminal_snapshot": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run32_contact_normal_transport_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_084803_297374260/expert_native_goal_stage_control/native_goal_transport_failed_runtime_snapshot.pkl"
+        },
+        {
+          "run": "run33",
+          "expert_placement_actions": 88,
+          "rrt_preflights": 1,
+          "native_predicates_after": "unavailable after Bridge termination",
+          "result": "Continued elevated contact-normal route; Bridge pipe closed before completion. Last durable action record has task_success=false, reward=0, done=false.",
+          "report": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run33_pot_pair_contact_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_085943_815821552/run_report.json",
+          "durable_steps": "/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run33_pot_pair_contact_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_085943_815821552/expert_native_goal_stage_control/durable_physical_step_records.jsonl"
+        }
+      ],
+      "aggregate_across_continuation_chain": {
+        "expert_actions": 1800,
+        "grasp_search_branches": 2,
+        "placement_continuation_segments": 4,
+        "rrt_preflights": 18,
+        "complete_native_success_episodes": 0,
+        "safety_certified": false
+      }
+    },
+    "cross_scene_cost_verdict": {
+      "cross_level_template_selected": "2/2",
+      "cross_level_verified_grasp_lift_skill": "2/2",
+      "cross_level_native_complete_task_success": "0/2",
+      "different_skill_L0_template_selected": "0/4",
+      "different_skill_L0_native_complete_task_success": "0/4",
+      "task_specific_full_scripts": 0,
+      "task_specific_manual_scene_adjustments": 0,
+      "time_to_first_native_success_s": null,
+      "amortization": "Object-relative Moka Pot grasp/lift and task-phase structure transferred across levels, but reduced first-complete-task cost is not established. L2 accumulated 1800 expert actions across the two-object continuation chain without complete success; the second placement remains blocked by scene contacts and bridge termination."
+    }
+  }
+}

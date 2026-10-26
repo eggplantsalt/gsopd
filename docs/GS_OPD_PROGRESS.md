@@ -1,4 +1,82 @@
+## 最新进展：L0T2跨层技能迁移与多目标续跑（2026-10-26，run30–33）
+
+本节取代上方此前L1/L2迁移计数。以GS-OPD自有L0T2完整成功Episode中的`moka_pot:stable_grasp:t248`与`object_transfer_cycle:moka_pot:t239`为来源；不读取官方示范动作、不直接回放源动作、不加载LoRA。L1T2和L2T2均真实验证双指抓持与抬升，说明物体相对抓取和阶段结构可以跨层迁移；但全任务成功和成本摊销尚未成立。
+
+| 场景 | 原生完整成功 | 首次完整成功用时 | 经验/成本 | 物理结果 |
+| --- | --- | ---: | --- | --- |
+| L1T2 | 否 | 无 | t248抓取、t239阶段序列；905专家动作，1个抓取分支，Student 0 | 首次稳定抓取/34.54 mm抬升158.77 s；两次放置续跑均未确认任务成功；Monitoring incomplete。 |
+| L2T2连续多目标链 | 否 | 无 | t248模板两次；t239阶段序列；1800专家动作、2个抓取分支、18次RRT预检、Student 0 | 第一次抓取/34.49 mm抬升474.32 s；第二次抓取/36.47 mm抬升614.19 s。Pot1 `On=true`，炉灶`Turnon=true`；Pot2最后一次可用原生查询仍`On=false`。第二个壶依次受Place Box、已放置Pot1阻挡，run33在88个耐久动作后Bridge断管。 |
+| L0T0/T1/T3/T4 | 均否（0/4） | 无 | 经验命中0/4；任务专用完整脚本0、人工场景调整0 | L0T4实际物理分支未达抓持；其它场景在有限预检/搜索中未获完整原生成功。 |
+
+L2T2 run30从seed0/init0开始，首次复用L0 t248模板后以213个抓取专家动作获得稳定抓持，实际抬升34.488 mm；首个Pot又经302个真实动作到达炉面，原生目标成为2/3。release阶段预算耗尽后保留Runtime Snapshot。run31从该物理前缀继续，复用同一历史模板，以317个抓取动作抬升第二个Pot 36.473 mm，再尝试440个运输动作，发生Pot–Place Box接触。run32从失败Snapshot恢复，基于真实接触法线生成高位绕行，消除Place Box阻挡，但转而与已放置Pot1接触。run33继续新的接触法线局部路线，Durable JSONL保存88个动作；Bridge随后BrokenPipe，终态原生谓词不可查询。最后归档动作仍为`task_success=false/reward=0/done=false`，不得当成成功或安全失败（安全认证仍未执行）。
+
+首次抓取技能用时为L1 158.77 s、L2 474.324 s；L2第二次技能用时614.191 s。**没有任何新完整原生成功Episode，首次完整成功耗时均为空。** 因为缺乏同任务冷启动与迁移后的完整成功对照，不能声称摊销降低了首次任务成功成本。此次证明的是两个跨层抓取/抬升技能迁移，以及L2第一对象原生子目标达成。L2累计链包含1800个专家动作、2个抓取搜索分支和4段放置/运输续跑；这些是同一任务Snapshot链上的不同阶段，不计为多条成功Episode。
+
+机器报告和逐次归档索引见[跨场景迁移机器报告](GS_OPD_CROSS_SCENE_TRANSFER_20261026.json)；run30–33原始目录分别位于`/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L2T2_20261026_run30_ranked_osc_transfer/`至`run33_pot_pair_contact_replan/`。所有新搜索轨迹保持`task_success`原始结果与`safety_certified=false`分离。没有训练、LeRobot转换或官方安全示范使用。
+
+通用代码已加入模板排序、失败路线去重、Bridge故障与任务阶段恢复、接触法线逃逸局部重规划及对应回归；未新增任务专用完整脚本或手工坐标。完整回归57项通过，Python编译、机器报告JSON解析和`git diff --check`通过。当前建议优先解决多目标放置时已完成对象的碰撞阻挡与release/settle恢复，然后再跨到不同技能物体；不要为提高成功率绕过MuJoCo接触或原生BDDL判据。
+
 # GS-OPD / π₀.₅ × LIBERO-Safety 进度
+
+## 最新进展：L0T2成功经验迁移与首成功成本（2026-10-26，续）
+
+本节更新并取代同文件此前Task-Success-First跨层计数：本轮新证据含L1T2 run19/run21及L2T2 run22。L0T2来源仍是GS-OPD自有的1460动作完整成功Episode，原生task_success在t=1459成立；只重用对象坐标抓取/接近结构与阶段序列，不把源动作直接当跨场景轨迹。
+
+| 场景 | 原生完整成功 | 首次成功用时 | 物理分支/专家动作 | 经验复用与结论 |
+| --- | --- | --- | --- | --- |
+| L0T0 | 否，0/1谓词 | 无 | 0 / 0（Student 8步） | 无经验；4次RRT均超时 |
+| L0T1 | 否，0/1谓词 | 无 | 0 / 0（Student 8步） | 无经验；3次RRT超时、1次有界IK无解 |
+| L1T2 | 否，3个谓词未获完整成功确认 | 完整任务无；迁移抓取158.77秒 | 1个抓取分支 / 905专家动作 | 复用L0 t248抓取、t239操作阶段；双指稳定抓持并抬升34.54 mm；两次放置续跑未确认稳定原生目标 |
+| L2T2 | 否，1/3谓词 | 无 | 0 / 0 | 命中同一L0抓取/阶段经验；4次预检有2次规划超时、2次有界IK无解，未做物理尝试 |
+
+L1 905个动作由run19抓取182步、该run耐久放置JSONL中的318步、run21精确Snapshot续跑405步组成；旧batch summary漏计318步，以上以逐动作耐久记录纠正。run21到达settle但因阶段预算异常退出，末条记录task_success=false且没有终态Snapshot；此后已补通用异常快照/原生状态归档，尚未对该路线上再次消耗物理预算。run19抓取子步监测不完整，所有搜索数据仍safety_certified=false。
+
+经验库排序已改为完整原生成功来源优先。L1抓取模板及两条已验证L2抓取技能、L2部分转移技能已从隔离run库原子并入持久v2经验库；L1源未完成原生任务，仍标记source_native_task_success=false且全部新数据safety_certified=false。完整L0成功t248/t1053抓取和t239/t1043阶段模板保留并排在匹配首位。合并前备份位于 /opt/data/private/gs_opd/experience/gs_opd_task_skill_experience_library_20261026_v2_pretransfer_merge_20261026.json。单任务Executor现在按活动BDDL待办顺序选首个对象目标，不需人工传目标谓词。stage控制器在精确放置时不再因已失抓就提前中断，而会继续经过物理释放与原生谓词复查。
+
+迁移模板选择率为2/2，真实验证子技能为1/2，完整原生任务成功为0/2；L0不同技能L0T0/L0T1没有命中经验，成功为0/2。本轮没有新完整成功Episode，time-to-first-native-success均为空，不能声称完整搜索成本随经验累积而下降。任务专用完整脚本/代码调整/人工场景位姿调整均为0。详细逐场景成本、失败分类与路径见 [跨场景迁移机器报告](GS_OPD_CROSS_SCENE_TRANSFER_20261026.json) 和 [人读总结](GS_OPD_CROSS_SCENE_TRANSFER_20261026.md)。相关回归46项、py_compile及git diff --check均通过；没有训练、LeRobot转换或官方示范使用。
+
+
+## Task-Success-First：L0T2 自有经验跨层迁移（2026-10-26）
+
+### 经验库与通用迁移改进
+
+以已验收的 GS-OPD 自有 `obstacle_avoidance/L0T2` 原生成功Episode构建对象相对经验库：来源为 1460 个真实动作、25 个物理连续段、18 个任务阶段跨度，终态原生 `task_success=true/reward=1/done=true`。从同一个Moka Pot物体族中提取两条抓持模板（`moka_pot:stable_grasp:t248`、`:t1053`），记录物体坐标系下抓取—接近变换和历史OSC参考点；另生成两个 `pick_transport_place_release` 阶段模板，保留approach→stable grasp→lift→transport→precise placement→release→withdrawal/settle的操作顺序及历史阶段动作预算。目标放置每次仍从新场景活动BDDL目标谓词与实时Region查询，不将源场景动作作为跨场景监督标签；Student动作、OSC调用与MuJoCo动力学均未被历史标签替代。新场景的技能不自动获得安全认证。
+
+源数据归档 `/opt/data/private/gs_opd/datasets/lerobot_l0t2_round0_operational_success_v21_20261025/`；机器经验库 `/opt/data/private/gs_opd/experience/gs_opd_task_skill_experience_library_20261026_v2.json`。官方安全示范数据未下载、读取或使用；未启动训练或LeRobot转换。
+
+修复了历史模板 `target_geom_id=-1` 生成负RRT种子、物理候选调度使用未定义BDDL谓词导致搜索在动作前异常退出的问题。命中可迁移技能时延迟加载Student模型，避免仅为跳过Student而加载3.35B模型。RRT没有可行路线但历史候选有IK且Scratch运行状态未变化时，追加通用高位OSC接近路线；OSC动作仍在真实MuJoCo执行，失败可恢复。按实测控制速度实现路线长度自适应动作预算，并针对路由停滞加入保存失败段Runtime Snapshot、从当前状态做单次有界RRT/OSC局部重规划的逻辑。固定上限为每个抓取物理分支440动作、预抓取路由最多320步、表面接近最多60步，最多2个Snapshot分支；这不是安全余量调整。
+
+### 跨层结果
+
+所有迁移从目标场景seed=0、init-state=0实际Reset，分别校验运行时目标和模型/BDDL指纹；表中“经验使用”表示匹配并尝试了自有历史模板，未达到稳定抓持的尝试不能计为成功技能复用。
+
+| 场景 / 最近试次 | 原生完整成功 | 用时 | 物理分支 / 专家动作 | 自有经验尝试 | 结果 |
+| --- | --- | ---: | ---: | --- | --- |
+| L1T2 run1 | 否 | 131.1 s | 0 / 0 | `moka_pot:stable_grasp:t248` | 历史候选IK可达；负RRT种子与失败记忆变量错误，未执行动作 |
+| L1T2 run2 | 否 | 192.3 s | 2 / 148 | 同上1次 | 两分支各74步OSC后超时，EEF距预抓取仍远；无Beer/Place Box机器人接触 |
+| L1T2 run3 | 否 | 354.0 s | 2 / 376 | 同上1次 | 历史候选207步后尚差约90 mm；另一几何候选到达预抓取，24步表面接近预算耗尽；无稳定抓持/抬升 |
+| L2T2 run1 | 否 | 85.5 s | 0 / 0 | `moka_pot:stable_grasp:t248` | 6次RRT预演均无路线（4次预算耗尽、2次IK无解）；没有伪报物理尝试 |
+| L2T2 run2 | 否 | 619.2 s | 1 / 320 | 同上1次 | RRT未产路后转真实高位OSC路线；到距预抓取约70.6 mm处路由预算耗尽。无机器人场景接触，但子步监测204/320步不完整，不作安全证明 |
+
+L1T2、L2T2都成功命中了同一Moka Pot族的历史技能候选，故当前**经验检索命中率2/2**；稳定抓持后的技能复用率为0/2，完整跨场景原生成功Episode为0。两个场景都没有取得第一条成功轨迹，因此本轮 `time_to_first_success=null`，不能声称搜索成本已随经验积累下降。L2T2最新一次以较小预检预算验证局部失败Snapshot重规划仍在进行，结果和成本单独追加。以上试次均为0个任务专用完整脚本、0项任务专用人工坐标/位姿调整；通用候选预算和路线控制逻辑的代码改动不计作场景特化。
+
+归档根目录分别为 `/opt/data/private/gs_opd/rollouts/task_success_first_cross_level_L1T2_20261026_run1..run3/` 与 `task_success_first_cross_level_L2T2_20261026_run1..run2/`。每次均保留JSON报告、物理动作/状态/接触记录、视频（有实际动作时）及Snapshot；有实际动作的搜索轨迹均标记 `safety_certified=false`。
+
+回归验证：25项联合测试通过，覆盖7D RRT候选路径、任务进度/失败记忆、非负历史候选RRT种子、按路由长度给界预算、高位OSC路线、经验库来源/对象重定位/阶段模板匹配、批次恢复和阶段控制器。`py_compile`、`git diff --check`通过。剩余关键缺口为：MuJoCo OSC闭环在新布局下的实际跟踪速度/姿态响应、局部重规划分支物理验证，以及L1/L2首次稳定抓持；当前 `SearchFailureMemory` 仍为单次搜索内存，跨独立运行的失败记忆持久化尚未接入。
+
+## L0T1 Task-Success-First闭环首轮验证（2026-10-26）
+
+新增通用入口 `research/gs_opd/repair/task_success_first_executor.py`：按活动BDDL绑定目标对象和原生谓词，Student先执行有限真实动作；未达原生成功则恢复同一t=0 Runtime Snapshot并调用几何抓取候选、IK、record-only 7D RRT-Connect、真实OSC_POSE Snapshot分支。若专家抓取/抬升成功，入口会恢复并逐元素核验该成功Snapshot，再给原始Student一次有限接续；仍未完成时使用 `TaskPhaseController`、活动BDDL目标区域查询、record-only RRT与真实OSC执行运输、精确放置、松爪、退出和settle。完整成功仅由Safety Bridge `native_task_status.task_success=true`认定。搜索记录标为task-success candidate；严格Safety Reconstruction和训练代码保持原样，搜索轨迹不标记为安全训练数据。
+
+L0T1入口校验了活动场景 `obstacle_avoidance/L0T1`、seed/init-state 0、模型SHA `9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e`、BDDL目标 `In(black_book_1, desk_caddy_1_back_contain_region)`。原始 π₀.₅ Student（3.35B基础权重，无LoRA）运行32个真实动作：EEF移动54.562 mm，书本仅移动0.000059 mm，无抓取/指尖接触；原生谓词和task_success仍false，reward=0、done=false；动作监测800/800个MuJoCo子步完整。随即自动恢复t=0 Snapshot。首个专家预算为最多16个几何候选、8个RRT预检、每候选20秒、3个物理Snapshot分支；仅1条路线进入物理执行，74个OSC动作后未到预抓取，观测到Hand–Beer真实碰撞，失败Snapshot精确恢复。
+
+后续增加RRT路线多样性与候选分段搜索：每个候选最多3条record-only路线，RRT预算上限1200次迭代/12000次配置检查/60秒。候选0–2的3个物理分支均在预抓取前停滞；候选4–7的4种反向接近方向均IK不可达；长轴候选8–11的4个预检均有路由、合计生成6条RRT路线，其中3个分支进入真实物理执行但仍未到达预抓取。跨分支均没有稳定双指抓持、30 mm抬升或BDDL成功；每个失败分支恢复了其源Snapshot。部分旧Safety Bridge逐子步几何监测返回不完整（分支记录如实标明，不能用作安全证明），但实际碰撞/状态和OSC动作已归档。
+
+完整Student→专家闭环归档为 `/opt/data/private/gs_opd/rollouts/task_success_first_executor_obstacle_avoidance_L0T1_20261026_023908_341269761/`；更广RRT搜索分别在 `task_success_first_executor_additional_rrt_routes/`、`task_success_first_executor_rrt_budget_expansion/`、`task_success_first_executor_opposite_approaches/`、`task_success_first_executor_long_axis/`。含机器报告、双相机视频、逐动作Observation/7D动作/接触/机器人物体状态、起始及分支Snapshot和模型/BDDL指纹。一次更早试运行在动作后因缺少分段目录而未能写出记录，该错误报告保留但不作为Episode；公共写入器已修复后重跑。复现入口：`PYTHONPATH=. /workspace/zy_workspace/RLinf/.venv/bin/python -m research.gs_opd.repair.task_success_first_executor --port <port> --expert-port <port> ...`；Bridge和抓取搜索按各自原有LIBERO-Safety环境启动。
+
+本轮完成的是有界Student失败触发、Snapshot回滚和真实专家分支闭环；**没有完成任务成功轨迹**。当前物理瓶颈是RRT—OSC接近轨迹持续与Beer附近几何发生真实阻挡，部分候选无IK；下一步应改善抓取候选/路线搜索的物理可达多样性，再验证Student阶段交接与BDDL区域放置。未使用官方安全示范数据，未训练、未转换LeRobot。
+
+通用接口当前以Bridge可解析的单个活动`in/on`对象目标为入口；多对象有序目标链还需接入`TaskPhaseController.objects`配置，不能据L0T1结果宣称30个任务均可直接执行。
 
 ## L0T1 书本抓取候选：开爪接近与闭爪双指几何筛选（2026-10-26）
 

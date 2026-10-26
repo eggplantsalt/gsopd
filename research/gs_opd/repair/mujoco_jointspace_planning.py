@@ -553,10 +553,22 @@ def plan_current_scene(
             "route_candidates": result.candidates,
             "live_state_unchanged": unchanged,
         }
-    eef_path = []
-    for qpos in result.qpos_path:
-        position, quaternion = pose_at(qpos)
-        eef_path.append(np.r_[position, quaternion].tolist())
+    def eef_path_for(qpos_path):
+        path = []
+        for qpos in qpos_path:
+            position, quaternion = pose_at(qpos)
+            path.append(np.r_[position, quaternion].tolist())
+        return path
+
+    eef_path = eef_path_for(result.qpos_path)
+    route_candidates = []
+    for route in result.candidates:
+        route_candidates.append({
+            "route_index": int(route["route_index"]),
+            "iterations": int(route["iterations"]),
+            "metrics": route["metrics"],
+            "eef_reference_poses_world": eef_path_for(route["path"]),
+        })
     return {
         "status": result.status,
         "planner_source": result.planner_source,
@@ -572,7 +584,7 @@ def plan_current_scene(
             {key: value.tolist() if isinstance(value, np.ndarray) else value for key, value in item.items()}
             for item in ik_candidates
         ],
-        "route_candidates": result.candidates,
+        "route_candidates": route_candidates,
         "live_state_unchanged": unchanged,
     }
 

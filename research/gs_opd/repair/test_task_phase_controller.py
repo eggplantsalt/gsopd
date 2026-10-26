@@ -46,6 +46,7 @@ def _evidence(
     fixture_predicate_satisfied=True,
     task_success=False,
     count_phase_control=True,
+    finger_contacts_clear=True,
     eef_position_error_m=None,
     eef_orientation_error_rad=None,
 ):
@@ -65,6 +66,7 @@ def _evidence(
         trusted_fixture_activation_available=False,
         task_success=task_success,
         count_phase_control=count_phase_control,
+        finger_contacts_clear=finger_contacts_clear,
         eef_position_error_m=eef_position_error_m,
         eef_orientation_error_rad=eef_orientation_error_rad,
     )
@@ -181,6 +183,79 @@ class TaskPhaseControllerTests(unittest.TestCase):
             ))
         self.assertEqual(controller.phase, "second_object_recovery")
         self.assertEqual(controller.current_object["object_id"], "object_b")
+
+    def test_release_waits_for_both_finger_contacts_to_clear_before_withdrawal(self):
+        controller = TaskPhaseController(_config(("object_a",)))
+        controller.adopt_held_object("object_a")
+        controller.update(_evidence(
+            1, eef_goal_reached=True, held_object="object_a", grasp_confirmed=True,
+        ))
+        controller.update(_evidence(
+            2, eef_goal_reached=True, held_object="object_a", grasp_confirmed=True,
+        ))
+        self.assertEqual(controller.phase, "release")
+
+        controller.update(_evidence(
+            3, task_goal_satisfied=True, finger_contacts_clear=False,
+        ))
+        self.assertEqual(controller.phase, "release")
+        controller.update(_evidence(
+            4, task_goal_satisfied=True, finger_contacts_clear=False,
+        ))
+        self.assertEqual(controller.phase, "release")
+        controller.update(_evidence(
+            5, task_goal_satisfied=True, finger_contacts_clear=True,
+        ))
+        self.assertEqual(controller.phase, "withdrawal")
+
+    def test_native_goal_contact_snapshot_can_resume_at_release_only_with_evidence(self):
+        controller = TaskPhaseController(_config())
+        controller.adopt_native_goal_contact_for_release(
+            "object_a", native_goal_satisfied=True,
+            satisfied_object_ids=("object_a",), held_object="object_a",
+            grasp_confirmed=True,
+        )
+        self.assertEqual(controller.phase, "release")
+        self.assertEqual(controller.current_object["object_id"], "object_a")
+
+        with self.assertRaisesRegex(ValueError, "satisfied_native_object_goal"):
+            TaskPhaseController(_config()).adopt_native_goal_contact_for_release(
+                "object_a", native_goal_satisfied=False,
+                satisfied_object_ids=(), held_object="object_a", grasp_confirmed=True,
+            )
+        with self.assertRaisesRegex(ValueError, "verified_live_object_grasp"):
+            TaskPhaseController(_config()).adopt_native_goal_contact_for_release(
+                "object_a", native_goal_satisfied=True,
+                satisfied_object_ids=("object_a",), held_object=None,
+                grasp_confirmed=False,
+            )
+
+    def test_native_placement_predicate_transitions_to_release_before_pose_tolerance(self):
+        controller = TaskPhaseController(_config(("object_a",)))
+        controller.adopt_held_object("object_a")
+        controller.update(_evidence(1, eef_goal_reached=True,
+                                    held_object="object_a", grasp_confirmed=True))
+        self.assertEqual(controller.phase, "precise_placement")
+        controller.update(_evidence(2, task_goal_satisfied=True,
+                                    held_object="object_a", grasp_confirmed=True))
+        self.assertEqual(controller.phase, "release")
+
+    def test_precise_placement_reaching_pose_after_grip_loss_rechecks_native_goal(self):
+        controller = TaskPhaseController(_config(("object_a",)))
+        controller.adopt_held_object("object_a")
+        controller.update(_evidence(1, eef_goal_reached=True,
+                                    held_object="object_a", grasp_confirmed=True))
+        self.assertEqual(controller.phase, "precise_placement")
+
+        # A physical placement branch may lose the object before the EEF
+        # reaches its target.  This must continue through real release and
+        # native-goal verification, never claim success from pose alone.
+        controller.update(_evidence(2, eef_goal_reached=True))
+        self.assertEqual(controller.phase, "release")
+        self.assertFalse(controller.complete)
+        controller.update(_evidence(3, task_goal_satisfied=False))
+        self.assertEqual(controller.phase, "release")
+        self.assertFalse(controller.complete)
 
     def test_unknown_native_success_and_unconfigured_fixture_fail_closed(self):
         controller = TaskPhaseController(_config(("object_a",)))
