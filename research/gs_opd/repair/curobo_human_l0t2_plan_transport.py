@@ -59,12 +59,22 @@ def _tensor_summary(value):
     return summary
 
 
+def _tensor_values(value):
+    """Return a compact numeric tensor payload for the chosen trajectory."""
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return None
+    return value.detach().float().cpu().numpy().tolist()
+
+
 def _raw_planner_result(result):
     if result is None:
         return {"returned_none": True, "result_type": None, "attributes": {}}
     names = (
         "success", "status", "solve_time", "total_time", "position_error",
         "orientation_error", "goalset_index", "interpolated_last_tstep",
+        "minimum_trajectory_dt", "maximum_trajectory_dt",
     )
     return {
         "returned_none": False,
@@ -623,6 +633,8 @@ def _run(source: dict, diagnostic_only: bool = False) -> dict:
     q_path = None
     planner_joint_path = None
     eef_path = None
+    trajectory_profile = None
+    optimized_trajectory_profile = None
     if success:
         selection = getattr(result, "goalset_index", None)
         if selection is not None and selection.numel():
@@ -638,6 +650,92 @@ def _run(source: dict, diagnostic_only: bool = False) -> dict:
                 "CuRobo reported_success_with_invalid_joint_path_shape:"
                 f"{tuple(q_tensor_path.shape)}"
             )
+        last_tstep_tensor = getattr(result, "interpolated_last_tstep", None)
+        if last_tstep_tensor is None or not last_tstep_tensor.numel():
+            raise RuntimeError("CuRobo_success_missing_interpolated_last_tstep")
+        # CuRobo's get_batch_interpolated_trajectory returns this as a point
+        # count: the interpolation kernel fills [0:last_tstep) and pads from
+        # last_tstep onward with the final configuration.
+        valid_point_count = int(last_tstep_tensor.detach().reshape(-1)[0].item())
+        if valid_point_count < 2 or valid_point_count > len(q_tensor_path):
+            raise RuntimeError(
+                "CuRobo_interpolated_valid_point_count_out_of_range:"
+                f"{valid_point_count}/{len(q_tensor_path)}"
+            )
+        trajectory_dt_tensor = getattr(trajectory, "dt", None)
+        trajectory_dt_values = (
+            trajectory_dt_tensor.detach().float().cpu().reshape(-1).tolist()
+            if isinstance(trajectory_dt_tensor, torch.Tensor) else []
+        )
+        effective_dt = (
+            float(trajectory_dt_values[0])
+            if trajectory_dt_values and np.isfinite(trajectory_dt_values[0])
+            else float(source.get("interpolation_dt_s", 0.05))
+        )
+        if effective_dt <= 0.0 or not np.isfinite(effective_dt):
+            raise RuntimeError(f"CuRobo_interpolated_dt_invalid:{effective_dt}")
+
+        def _trajectory_component(name):
+            component = getattr(trajectory, name, None)
+            if not isinstance(component, torch.Tensor):
+                return None
+            array = component.detach().float().cpu().numpy().reshape(
+                -1, component.shape[-1]
+            )
+            if array.shape != q_tensor_path.shape:
+                raise RuntimeError(
+                    f"CuRobo_interpolated_{name}_shape_mismatch:"
+                    f"{array.shape}/{q_tensor_path.shape}"
+                )
+            return array
+
+        valid_velocity = _trajectory_component("velocity")
+        valid_acceleration = _trajectory_component("acceleration")
+        valid_jerk = _trajectory_component("jerk")
+        transition = planner.trajopt_solver.transition_model
+        velocity_limits = transition.max_velocity.detach().float().cpu().reshape(-1).tolist()
+        acceleration_limits = transition.max_acceleration.detach().float().cpu().reshape(-1).tolist()
+        valid_position = q_tensor_path[:valid_point_count]
+        trajectory_profile = {
+            "source": "CuRobo TrajOptSolverResult.interpolated_trajectory",
+            "interpolated_last_tstep_semantics": "valid_point_count; zero-based last valid index is count-1",
+            "buffer_point_count": int(len(q_tensor_path)),
+            "effective_valid_point_count": valid_point_count,
+            "effective_last_valid_point_index": valid_point_count - 1,
+            "padding_point_count": int(len(q_tensor_path) - valid_point_count),
+            "interpolation_dt_s": effective_dt,
+            "configured_interpolation_dt_s": float(source.get("interpolation_dt_s", 0.05)),
+            "valid_motion_duration_s": float((valid_point_count - 1) * effective_dt),
+            "time_s": (np.arange(valid_point_count, dtype=np.float64) * effective_dt).tolist(),
+            "position_rad": valid_position.tolist(),
+            "velocity_rad_s": valid_velocity[:valid_point_count].tolist() if valid_velocity is not None else None,
+            "acceleration_rad_s2": valid_acceleration[:valid_point_count].tolist() if valid_acceleration is not None else None,
+            "jerk_rad_s3": valid_jerk[:valid_point_count].tolist() if valid_jerk is not None else None,
+            "joint_velocity_limits_rad_s": velocity_limits,
+            "joint_acceleration_limits_rad_s2": acceleration_limits,
+            "max_abs_interpolated_velocity_rad_s": (
+                np.max(np.abs(valid_velocity[:valid_point_count]), axis=0).tolist()
+                if valid_velocity is not None else None
+            ),
+            "max_abs_interpolated_acceleration_rad_s2": (
+                np.max(np.abs(valid_acceleration[:valid_point_count]), axis=0).tolist()
+                if valid_acceleration is not None else None
+            ),
+            "derivative_arrays_are_from_planner_result": bool(
+                valid_velocity is not None and valid_acceleration is not None
+            ),
+        }
+
+        optimized = getattr(result, "js_solution", None)
+        if optimized is not None:
+            optimized_trajectory_profile = {
+                "source": "CuRobo TrajOptSolverResult.js_solution",
+                "position_rad": _tensor_values(getattr(optimized, "position", None)),
+                "velocity_rad_s": _tensor_values(getattr(optimized, "velocity", None)),
+                "acceleration_rad_s2": _tensor_values(getattr(optimized, "acceleration", None)),
+                "jerk_rad_s3": _tensor_values(getattr(optimized, "jerk", None)),
+                "dt_s": _tensor_values(getattr(optimized, "dt", None)),
+            }
         planner_joint_path = q_tensor_path.tolist()
         q_path = q_tensor_path[:, :7].tolist()
         eef_path = []
@@ -710,6 +808,8 @@ def _run(source: dict, diagnostic_only: bool = False) -> dict:
         "configuration_collision_audit_complete_curobo_world": configuration_collision_audit,
         "planner_execution_gate": planner_gate,
         "raw_motion_planner_result": raw_motion_result,
+        "trajectory_profile": trajectory_profile,
+        "optimized_trajectory_profile": optimized_trajectory_profile,
         "raw_full_scene_ik_attempts": raw_full_scene_ik_attempts,
         "planner_joint_path_rad_full": planner_joint_path,
         "planner_trajectory_joint_count": (

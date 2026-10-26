@@ -10,6 +10,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import math
 import os
 import pickle
 import subprocess
@@ -58,6 +59,14 @@ RECOVERY_CONFIG = Path(
 INSTRUCTION = "put both moka pots on the stove"
 MAX_DEMO_ACTIONS = 3600
 MUJOCO_SUBSTEPS = 25
+CONTROL_TIMESTEP_S = 0.05
+REUSABLE_POT1_PREPLACE_ARCHIVE = Path(
+    "/opt/data/private/gs_opd/rollouts/"
+    "gs_opd_human_l0t2_curobo_transport_20261027_physical_attempt"
+)
+POT1_PREPLACE_FUTURE_RESERVE_ACTIONS = 1800 + 210 + 100 + 40 + 500
+POT1_PLACEMENT_FUTURE_RESERVE_ACTIONS = 210 + 100 + 40 + 500
+POT1_RETREAT_FUTURE_RESERVE_ACTIONS = 40 + 500
 
 
 def _sha(data: bytes) -> str:
@@ -345,6 +354,257 @@ def _save_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _compare_cache_value(expected: Any, actual: Any, path: str, mismatches: list[str]) -> None:
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if expected.keys() != actual.keys():
+            mismatches.append(f"{path}:keys_differ")
+            return
+        for key in expected:
+            _compare_cache_value(expected[key], actual[key], f"{path}.{key}", mismatches)
+        return
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            mismatches.append(f"{path}:length_{len(expected)}_vs_{len(actual)}")
+            return
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            _compare_cache_value(left, right, f"{path}[{index}]", mismatches)
+        return
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        if expected is not actual:
+            mismatches.append(f"{path}:boolean_diff")
+        return
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        if not math.isclose(float(expected), float(actual), rel_tol=1e-9, abs_tol=1e-9):
+            mismatches.append(f"{path}:numeric_diff_{expected}_{actual}")
+        return
+    if expected != actual:
+        mismatches.append(f"{path}:value_diff")
+
+
+def _plan_identity_mismatches(cached: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    identity_fields = (
+        "task",
+        "current_arm_qpos_rad",
+        "live_eef_position_world_m",
+        "live_eef_quaternion_world_wxyz",
+        "robot_base_pose_world_m",
+        "robot_base_quaternion_world_wxyz",
+        "live_planner_tool_pose_world_m",
+        "live_planner_tool_quaternion_world_wxyz",
+        "eef_to_planner_tool_transform",
+        "obstacle_geometries_world",
+        "goal_poses_world",
+        "attached_payload",
+        "random_seed",
+        "interpolation_dt_s",
+        "interpolation_buffer_size",
+    )
+    mismatches: list[str] = []
+    for key in identity_fields:
+        if key not in cached or key not in current:
+            mismatches.append(f"{key}:missing")
+            continue
+        _compare_cache_value(cached[key], current[key], key, mismatches)
+    return mismatches
+
+
+def _cached_plan_if_identity_matches(
+    output_path: Path,
+    input_data: dict[str, Any],
+    archive_dir: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    cached_input_path = archive_dir / "pot1_preplace_curobo_input.json"
+    cached_plan_path = archive_dir / "pot1_preplace_curobo_plan.json"
+    if not cached_input_path.is_file() or not cached_plan_path.is_file():
+        return None, {
+            "status": "cache_unavailable",
+            "archive": str(archive_dir),
+            "missing": [str(path) for path in (cached_input_path, cached_plan_path) if not path.is_file()],
+        }
+    cached_input = json.loads(cached_input_path.read_text(encoding="utf-8"))
+    mismatches = _plan_identity_mismatches(cached_input, input_data)
+    cached_plan = json.loads(cached_plan_path.read_text(encoding="utf-8"))
+    if cached_plan.get("status") != "planned" or not cached_plan.get("joint_path_rad"):
+        mismatches.append("cached_plan:not_a_usable_planned_route")
+    if cached_plan.get("curobo_version") != "0.0.post1.dev1":
+        mismatches.append("cached_plan:curobo_version_mismatch")
+    if mismatches:
+        return None, {
+            "status": "cache_rejected_identity_mismatch",
+            "archive": str(archive_dir),
+            "mismatch_count": len(mismatches),
+            "mismatches": mismatches[:30],
+        }
+    cache_note = {
+        "status": "reused_exact_identity_route",
+        "archive": str(archive_dir),
+        "input_identity_fields_compared": 15,
+        "numeric_tolerance_abs_rel": 1e-9,
+        "cached_plan_sha256": _sha(cached_plan_path.read_bytes()),
+    }
+    cached_plan["route_reuse"] = cache_note
+    cached_plan["process"] = {
+        "returncode": 0,
+        "reused": True,
+        "input": str(output_path.with_name("pot1_preplace_curobo_input.json")),
+        "report": str(output_path),
+        "source_plan": str(cached_plan_path),
+    }
+    _save_json(output_path, cached_plan)
+    return cached_plan, cache_note
+
+
+def _trajectory_last_tstep_count(plan: dict[str, Any]) -> int:
+    profile = plan.get("trajectory_profile")
+    if isinstance(profile, dict) and profile.get("effective_valid_point_count") is not None:
+        return int(profile["effective_valid_point_count"])
+    values = (
+        plan.get("raw_motion_planner_result", {})
+        .get("attributes", {})
+        .get("interpolated_last_tstep", {})
+        .get("values")
+    )
+    if values is None:
+        raise ValueError("CuRobo_route_missing_interpolated_last_tstep")
+    scalar = np.asarray(values, dtype=np.float64).reshape(-1)
+    if scalar.size != 1 or not np.isfinite(scalar[0]) or scalar[0] != int(scalar[0]):
+        raise ValueError("CuRobo_interpolated_last_tstep_not_single_integer")
+    return int(scalar[0])
+
+
+def _prepare_time_parameterized_path(
+    plan: dict[str, Any], control_dt_s: float = CONTROL_TIMESTEP_S
+) -> dict[str, Any]:
+    capacity_path = np.asarray(plan["joint_path_rad"], dtype=np.float64)
+    if capacity_path.ndim != 2 or capacity_path.shape[1] != 7 or not np.isfinite(capacity_path).all():
+        raise ValueError("invalid_CuRobo_7D_joint_path")
+    valid_count = _trajectory_last_tstep_count(plan)
+    if valid_count < 2 or valid_count > len(capacity_path):
+        raise ValueError(f"CuRobo_valid_point_count_out_of_range:{valid_count}/{len(capacity_path)}")
+    profile = plan.get("trajectory_profile") or {}
+    planner_dt = float(profile.get("interpolation_dt_s", plan.get("interpolation_dt_s", 0.0)))
+    if not np.isfinite(planner_dt) or planner_dt <= 0.0:
+        raise ValueError(f"CuRobo_route_invalid_interpolation_dt:{planner_dt}")
+    positions = capacity_path[:valid_count].copy()
+    if profile.get("position_rad") is not None:
+        saved_position = np.asarray(profile["position_rad"], dtype=np.float64)
+        if saved_position.shape[0] != valid_count or not np.allclose(
+            saved_position[:, :7], positions, rtol=0.0, atol=1e-7
+        ):
+            raise ValueError("CuRobo_valid_position_profile_does_not_match_execution_path")
+
+    resampled = False
+    resample_scale = 1.0
+    velocity = None
+    acceleration = None
+    velocity_limits = profile.get("joint_velocity_limits_rad_s")
+    acceleration_limits = profile.get("joint_acceleration_limits_rad_s2")
+    if profile.get("velocity_rad_s") is not None:
+        velocity = np.asarray(profile["velocity_rad_s"], dtype=np.float64)[:valid_count, :7]
+    if profile.get("acceleration_rad_s2") is not None:
+        acceleration = np.asarray(profile["acceleration_rad_s2"], dtype=np.float64)[:valid_count, :7]
+
+    need_time_resampling = not math.isclose(planner_dt, control_dt_s, rel_tol=0.0, abs_tol=1e-9)
+    velocity_limits_arr = None
+    acceleration_limits_arr = None
+    if velocity_limits is not None and acceleration_limits is not None:
+        velocity_limits_arr = np.asarray(velocity_limits, dtype=np.float64)[:7]
+        acceleration_limits_arr = np.asarray(acceleration_limits, dtype=np.float64)[:7]
+        if velocity_limits_arr.shape != (7,) or acceleration_limits_arr.shape != (7,):
+            raise ValueError("CuRobo_joint_dynamic_limits_not_7D")
+        qdot = np.diff(positions, axis=0) / planner_dt
+        qddot = np.diff(qdot, axis=0) / planner_dt if len(qdot) > 1 else np.zeros((0, 7))
+        max_v_ratio = float(np.max(np.abs(qdot) / velocity_limits_arr[None, :])) if len(qdot) else 0.0
+        max_a_ratio = float(np.max(np.abs(qddot) / acceleration_limits_arr[None, :])) if len(qddot) else 0.0
+        if velocity is not None:
+            max_v_ratio = max(
+                max_v_ratio,
+                float(np.max(np.abs(velocity) / velocity_limits_arr[None, :])),
+            )
+        if acceleration is not None:
+            max_a_ratio = max(
+                max_a_ratio,
+                float(np.max(np.abs(acceleration) / acceleration_limits_arr[None, :])),
+            )
+        need_time_resampling = need_time_resampling or max_v_ratio > 1.0 + 1e-6 or max_a_ratio > 1.0 + 1e-6
+
+    # When planner and Bridge periods match and the valid path satisfies the
+    # planner limits, consume samples one-to-one. Otherwise use a time-aware
+    # Hermite resampling and expand time until sampled velocity and acceleration
+    # remain within the limits; never thin points to save actions.
+    if need_time_resampling:
+        if velocity is None or acceleration is None or velocity_limits is None or acceleration_limits is None:
+            raise ValueError(
+                "time_resampling_requires_saved_CuRobo_position_velocity_acceleration_and_limits"
+            )
+        from scipy.interpolate import BPoly
+
+        assert velocity_limits_arr is not None and acceleration_limits_arr is not None
+        source_times = np.arange(valid_count, dtype=np.float64) * planner_dt
+        for _ in range(8):
+            scaled_times = source_times * resample_scale
+            scaled_velocities = velocity / resample_scale
+            scaled_accelerations = acceleration / (resample_scale * resample_scale)
+            spline = BPoly.from_derivatives(
+                scaled_times,
+                [
+                    [positions[index], scaled_velocities[index], scaled_accelerations[index]]
+                    for index in range(valid_count)
+                ],
+            )
+            control_steps = int(math.ceil(float(scaled_times[-1]) / control_dt_s))
+            target_times = np.arange(control_steps + 1, dtype=np.float64) * control_dt_s
+            sample_times = np.minimum(target_times, scaled_times[-1])
+            candidate = np.asarray(spline(sample_times), dtype=np.float64)
+            if len(candidate) < 2 or not np.isfinite(candidate).all():
+                raise ValueError("CuRobo_time_resampling_produced_invalid_path")
+            v_fd = np.diff(candidate, axis=0) / control_dt_s
+            a_fd = np.diff(v_fd, axis=0) / control_dt_s if len(v_fd) > 1 else np.zeros((0, 7))
+            velocity_ratio = float(np.max(np.abs(v_fd) / velocity_limits_arr[None, :])) if len(v_fd) else 0.0
+            acceleration_ratio = float(np.max(np.abs(a_fd) / acceleration_limits_arr[None, :])) if len(a_fd) else 0.0
+            if velocity_ratio <= 1.0 + 1e-6 and acceleration_ratio <= 1.0 + 1e-6:
+                positions = candidate
+                resampled = True
+                break
+            resample_scale *= max(velocity_ratio, math.sqrt(acceleration_ratio), 1.01) * 1.01
+        else:
+            raise ValueError("CuRobo_velocity_acceleration_constrained_resampling_did_not_converge")
+
+    if len(positions) > 1:
+        derived_velocity = np.diff(positions, axis=0) / control_dt_s
+        derived_acceleration = (
+            np.diff(derived_velocity, axis=0) / control_dt_s
+            if len(derived_velocity) > 1 else np.zeros((0, 7), dtype=np.float64)
+        )
+    else:
+        derived_velocity = np.zeros((0, 7), dtype=np.float64)
+        derived_acceleration = np.zeros((0, 7), dtype=np.float64)
+    return {
+        "joint_path_rad": positions,
+        "buffer_point_count": int(len(capacity_path)),
+        "effective_valid_point_count": int(valid_count),
+        "effective_last_valid_point_index": int(valid_count - 1),
+        "padded_point_count": int(len(capacity_path) - valid_count),
+        "planner_sample_dt_s": planner_dt,
+        "control_sample_dt_s": control_dt_s,
+        "valid_trajectory_duration_s": float((valid_count - 1) * planner_dt),
+        "executed_sample_count": int(len(positions)),
+        "time_resampled": resampled,
+        "resample_time_scale": float(resample_scale),
+        "resampling_velocity_acceleration_limits_available": bool(
+            velocity_limits is not None and acceleration_limits is not None
+        ),
+        "planner_velocity_array_available": velocity is not None,
+        "planner_acceleration_array_available": acceleration is not None,
+        "finite_difference_max_abs_velocity_rad_s": (
+            np.max(np.abs(derived_velocity), axis=0).tolist() if len(derived_velocity) else [0.0] * 7
+        ),
+        "finite_difference_max_abs_acceleration_rad_s2": (
+            np.max(np.abs(derived_acceleration), axis=0).tolist() if len(derived_acceleration) else [0.0] * 7
+        ),
+    }
+
+
 def _plan(
     bridge: BridgeSession,
     output_dir: Path,
@@ -354,6 +614,7 @@ def _plan(
     obstacle_spheres: list[dict[str, Any]],
     goals: list[dict[str, Any]],
     attached_payload: dict[str, Any] | None,
+    reusable_archive: Path | None = None,
 ) -> dict[str, Any]:
     input_path = output_dir / f"{stage}_curobo_input.json"
     output_path = output_dir / f"{stage}_curobo_plan.json"
@@ -406,6 +667,13 @@ def _plan(
         "interpolation_buffer_size": 1800,
     }
     _save_json(input_path, input_data)
+    cache_decision = None
+    if reusable_archive is not None:
+        cached, cache_decision = _cached_plan_if_identity_matches(
+            output_path, input_data, reusable_archive
+        )
+        if cached is not None:
+            return cached
     if not CUROBO_PYTHON.is_file() or not CUROBO_HELPER.is_file():
         raise FileNotFoundError("existing_isolated_CuRobo_environment_or_helper_missing")
     completed = subprocess.run(
@@ -428,6 +696,8 @@ def _plan(
         "input": str(input_path),
         "report": str(output_path),
     }
+    if cache_decision is not None:
+        result["route_reuse"] = cache_decision
     _save_json(output_path, result)
     return result
 
@@ -646,22 +916,115 @@ def _execute_joint_path(
     plan: dict[str, Any],
     phase: str,
     hold_gripper_action: float | None = 0.0,
+    reserve_actions: int = 0,
 ) -> dict[str, Any]:
     if plan.get("status") != "planned" or not plan.get("joint_path_rad"):
         raise RuntimeError(f"CuRobo route unavailable for {phase}:{plan.get('status')}:{plan.get('error')}")
-    path = np.asarray(plan["joint_path_rad"], dtype=np.float64)
-    if path.ndim != 2 or path.shape[1] != 7 or not np.isfinite(path).all():
-        raise ValueError(f"invalid_CuRobo_7D_joint_path:{phase}")
+    prepared = _prepare_time_parameterized_path(plan)
+    path = prepared["joint_path_rad"]
+    before_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
+    before_q = _arm_q_from_snapshot(before_state)
+    if not np.allclose(path[0], before_q, rtol=0.0, atol=5e-4):
+        raise ValueError(
+            f"CuRobo_path_start_state_mismatch:{phase}:"
+            f"max_abs_error={float(np.max(np.abs(path[0] - before_q))):.9g}"
+        )
     start = recorder.action_count
+    required_actions = max(0, len(path) - 1)
+    available_actions = MAX_DEMO_ACTIONS - recorder.action_count - int(reserve_actions)
+    if required_actions > available_actions:
+        raise RuntimeError(
+            f"time_parameterized_route_does_not_fit_reserved_demo_budget:{phase}:"
+            f"required={required_actions}:available={max(0, available_actions)}:"
+            f"reserved={reserve_actions}"
+        )
     for row in path[1:]:
         reply = _joint_step(bridge, recorder, row, phase, gripper_action=hold_gripper_action)
         if reply.get("task_success") is True:
             break
     recorder.snapshot(f"{phase}_end")
+    after_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
+    actual_q = _arm_q_from_snapshot(after_state)
+    actual_eef = _eef_from_snapshot(after_state)
+    valid_count = int(prepared["effective_valid_point_count"])
+    target_eef = None
+    if plan.get("goal_candidates"):
+        selected = int(plan.get("selected_goal_index", 0))
+        if 0 <= selected < len(plan["goal_candidates"]):
+            target_eef = plan["goal_candidates"][selected]
+    endpoint_error = None
+    if isinstance(target_eef, dict):
+        target_position = np.asarray(target_eef.get("position_world_m", target_eef.get("eef_position_world_m")), dtype=np.float64)
+        target_quaternion = target_eef.get("quaternion_world_wxyz", target_eef.get("eef_quaternion_world_wxyz"))
+        if target_position.shape == (3,) and target_quaternion is not None:
+            target_pose = _pose_matrix(target_position, target_quaternion)
+            rotation_delta = Rotation.from_matrix(target_pose[:3, :3].T @ actual_eef[:3, :3])
+            endpoint_error = {
+                "position_error_m": float(np.linalg.norm(actual_eef[:3, 3] - target_pose[:3, 3])),
+                "rotation_error_rad": float(rotation_delta.magnitude()),
+                "planned_eef_position_world_m": target_pose[:3, 3].tolist(),
+                "actual_eef_position_world_m": actual_eef[:3, 3].tolist(),
+            }
     return {
-        "requested_path_points": int(len(path)),
+        "requested_path_points": int(prepared["buffer_point_count"]),
+        "effective_valid_point_count": valid_count,
+        "effective_last_valid_point_index": int(prepared["effective_last_valid_point_index"]),
+        "padded_points_not_executed": int(prepared["padded_point_count"]),
+        "valid_trajectory_duration_s": prepared["valid_trajectory_duration_s"],
+        "planner_sample_dt_s": prepared["planner_sample_dt_s"],
+        "control_sample_dt_s": prepared["control_sample_dt_s"],
+        "execution_resampling": {key: value for key, value in prepared.items() if key not in {"joint_path_rad"}},
         "executed_control_actions": recorder.action_count - start,
+        "reserved_future_actions": int(reserve_actions),
+        "post_execution_joint_error_rad": (actual_q - path[-1]).tolist(),
+        "post_execution_joint_error_norm_rad": float(np.linalg.norm(actual_q - path[-1])),
+        "post_execution_eef_endpoint_error": endpoint_error,
         "final_native_task_success": bool(reply.get("task_success")) if len(path) > 1 else None,
+    }
+
+
+def _release_gripper(
+    bridge: BridgeSession,
+    recorder: EpisodeRecorder,
+    release_q: np.ndarray,
+    binding: dict[str, Any],
+    phase: str,
+    *,
+    reserve_actions: int,
+) -> dict[str, Any]:
+    available = max(0, MAX_DEMO_ACTIONS - recorder.action_count - int(reserve_actions))
+    action_budget = min(210, available)
+    actions = 0
+    separated = False
+    last_check = None
+    while actions < action_budget:
+        _joint_step(bridge, recorder, release_q, phase, gripper_action=-1.0)
+        actions += 1
+        if actions % 10 == 0 or actions == action_budget:
+            last_check = bridge.request({
+                "op": "grasp_state",
+                "carried_binding": _binding(binding),
+                "expected_instruction": INSTRUCTION,
+            })
+            closure = last_check.get("gripper_closure", {})
+            if last_check.get("grasp_confirmed") is False and closure.get("closed") is False:
+                separated = True
+                break
+    if separated:
+        reason = None
+    elif action_budget < 210:
+        reason = "release_not_confirmed_before_reserved_demo_budget"
+    else:
+        reason = "release_not_confirmed_within_210_actions"
+    return {
+        "actions": actions,
+        "action_budget": action_budget,
+        "reserved_future_actions": int(reserve_actions),
+        "contact_separated": separated,
+        "last_grasp_state_check": last_check,
+        "failure_reason": reason,
+        "check_interval_actions": 10,
+        "final_check_performed_when_budget_below_10": bool(action_budget < 10 and last_check is not None),
     }
 
 
@@ -721,6 +1084,16 @@ def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
         "",
         "Dangerous contacts are retained as task-success search evidence; this experiment does not certify safety.",
     ]
+    for route in report.get("trajectory_execution", {}).get("route_executions", []):
+        endpoint = route.get("post_execution_eef_endpoint_error") or {}
+        rows.append(
+            f"- Route `{route.get('phase')}`: valid points `{route.get('effective_valid_point_count')}`/"
+            f"`{route.get('requested_path_points')}`, executed actions `"
+            f"{route.get('executed_control_actions')}`, padded points skipped `"
+            f"{route.get('padded_points_not_executed')}`, EEF position error `"
+            f"{endpoint.get('position_error_m')}` m, rotation error `"
+            f"{endpoint.get('rotation_error_rad')}` rad."
+        )
     (output_dir / "run_report.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -783,6 +1156,18 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "obstacles": "all collision-enabled non-robot MuJoCo Geoms except the carried object and native target support during final docking; cuboids/meshes enclosed by oriented boxes, other finite shapes by exact spheres or verified broadphase spheres",
             "floor": "bounded 5 m workspace cuboid representing the active infinite MuJoCo floor plane",
             "robot": "CuRobo packaged Franka collision model with self_collision_check=true; current MuJoCo robot Geom inventory saved for identity audit",
+            "route_cache": str(REUSABLE_POT1_PREPLACE_ARCHIVE),
+            "route_cache_policy": "reuse Pot1 preplace only when task, 7D start, tool/base transforms, full obstacle geometry, goals, attached payload, random seed, and interpolation settings match within 1e-9",
+        },
+        "trajectory_execution": {
+            "control_timestep_s": CONTROL_TIMESTEP_S,
+            "demo_action_budget": MAX_DEMO_ACTIONS,
+            "future_action_reserves": {
+                "pot1_preplace": POT1_PREPLACE_FUTURE_RESERVE_ACTIONS,
+                "pot1_place": POT1_PLACEMENT_FUTURE_RESERVE_ACTIONS,
+                "pot1_retreat": POT1_RETREAT_FUTURE_RESERVE_ACTIONS,
+            },
+            "execution_rule": "consume only CuRobo valid point count; preserve time samples; resample only with saved velocity/acceleration and limits",
         },
         "controller": {
             "mode": "joint_space_mass_matrix_PD_torque",
@@ -810,6 +1195,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "monitoring_incomplete_actions": 0,
         "pot1": {"stable_release_verified": False},
         "pot2": {"attempted": False, "stable_release_verified": False},
+        "trajectory_execution": {
+            "control_timestep_s": CONTROL_TIMESTEP_S,
+            "demo_action_budget": MAX_DEMO_ACTIONS,
+            "route_executions": [],
+            "route_cache_archive": str(REUSABLE_POT1_PREPLACE_ARCHIVE),
+        },
         "artifacts": {},
     }
     bridge = BridgeSession(
@@ -944,7 +1335,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         })
 
         t0 = time.monotonic()
-        preplan = _plan(bridge, output_dir, "pot1_preplace", initial_q, initial_eef, obstacle_spheres, preplace_goals, payload_sphere)
+        preplan = _plan(
+            bridge, output_dir, "pot1_preplace", initial_q, initial_eef,
+            obstacle_spheres, preplace_goals, payload_sphere,
+            reusable_archive=REUSABLE_POT1_PREPLACE_ARCHIVE,
+        )
         report["curobo_plan_count"] += 1
         report["planning_seconds"] += time.monotonic() - t0
         report["pot1"]["preplace_plan"] = preplan
@@ -955,8 +1350,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             return report
         recorder.snapshot("before_pot1_transport")
         report["pot1"]["preplace_execution"] = _execute_joint_path(
-            bridge, recorder, preplan, "pot1_curobo_transport", hold_gripper_action=0.0
+            bridge, recorder, preplan, "pot1_curobo_transport", hold_gripper_action=0.0,
+            reserve_actions=POT1_PREPLACE_FUTURE_RESERVE_ACTIONS,
         )
+        report["trajectory_execution"]["route_executions"].append({
+            "phase": "pot1_curobo_transport",
+            **report["pot1"]["preplace_execution"],
+        })
         live = bridge.request({"op": "observe", "include_snapshot_state": True})
         live_state = live["snapshot_state"]
         live_eef = _eef_from_snapshot(live_state)
@@ -1012,29 +1412,31 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             return report
         report["pot1"]["selected_candidate_id"] = final_plan["goal_candidates"][final_plan["selected_goal_index"]]["candidate_id"]
         report["pot1"]["placement_execution"] = _execute_joint_path(
-            bridge, recorder, final_plan, "pot1_curobo_place", hold_gripper_action=0.0
+            bridge, recorder, final_plan, "pot1_curobo_place", hold_gripper_action=0.0,
+            reserve_actions=POT1_PLACEMENT_FUTURE_RESERVE_ACTIONS,
         )
+        report["trajectory_execution"]["route_executions"].append({
+            "phase": "pot1_curobo_place",
+            **report["pot1"]["placement_execution"],
+        })
 
         release_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
         release_q = _arm_q_from_snapshot(release_state)
-        release_confirmed = False
-        release_actions = 0
-        while release_actions < 210 and recorder.action_count < MAX_DEMO_ACTIONS:
-            reply = _joint_step(
-                bridge, recorder, release_q, "pot1_gripper_release", gripper_action=-1.0
-            )
-            release_actions += 1
-            if release_actions % 10 == 0:
-                state = bridge.request({"op": "grasp_state", "carried_binding": _binding(bindings["moka_pot_1"]), "expected_instruction": INSTRUCTION})
-                closure = state.get("gripper_closure", {})
-                if state.get("grasp_confirmed") is False and closure.get("closed") is False:
-                    release_confirmed = True
-                    break
+        release_result = _release_gripper(
+            bridge, recorder, release_q, bindings["moka_pot_1"],
+            "pot1_gripper_release", reserve_actions=140 + 500,
+        )
+        release_actions = int(release_result["actions"])
+        release_confirmed = bool(release_result["contact_separated"])
+        report["pot1"]["release"] = release_result
         report["pot1"]["release_actions"] = release_actions
         report["pot1"]["release_contact_separated"] = release_confirmed
         recorder.snapshot("pot1_released")
         if not release_confirmed:
-            raise RuntimeError("Pot1_gripper_did_not_fully_release_within_210_actions")
+            raise RuntimeError(
+                "Pot1_" + str(release_result.get("failure_reason"))
+                + f":actions={release_actions}:budget={release_result.get('action_budget')}"
+            )
 
         after_release = bridge.request({"op": "observe", "include_snapshot_state": True})
         pot1_after = bridge.request({
@@ -1076,8 +1478,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["pot1"]["retreat_plan"] = retreat_plan
         if retreat_plan.get("status") == "planned":
             report["pot1"]["retreat_execution"] = _execute_joint_path(
-                bridge, recorder, retreat_plan, "pot1_curobo_retreat", hold_gripper_action=0.0
+                bridge, recorder, retreat_plan, "pot1_curobo_retreat", hold_gripper_action=0.0,
+                reserve_actions=POT1_RETREAT_FUTURE_RESERVE_ACTIONS,
             )
+            report["trajectory_execution"]["route_executions"].append({
+                "phase": "pot1_curobo_retreat",
+                **report["pot1"]["retreat_execution"],
+            })
         else:
             report["pot1"]["retreat_execution"] = {"status": "not_executed", "reason": retreat_plan.get("error") or retreat_plan.get("planner_status")}
             raise RuntimeError("CuRobo_could_not_plan_post_release_retreat")
@@ -1145,8 +1552,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             report["pot2"]["pregrasp_plan"] = pot2_preplan
             if pot2_preplan.get("status") == "planned":
                 report["pot2"]["pregrasp_execution"] = _execute_joint_path(
-                    bridge, recorder, pot2_preplan, "pot2_curobo_pregrasp", hold_gripper_action=-1.0
+                    bridge, recorder, pot2_preplan, "pot2_curobo_pregrasp", hold_gripper_action=-1.0,
+                    reserve_actions=1000,
                 )
+                report["trajectory_execution"]["route_executions"].append({
+                    "phase": "pot2_curobo_pregrasp",
+                    **report["pot2"]["pregrasp_execution"],
+                })
                 # A bounded final approach uses CuRobo with the target Pot2 omitted from its own world.
                 approach_export = bridge.request({"op": "collision_scene_export"})
                 if approach_export.get("status") != "complete" or approach_export.get("physical_state_unchanged") is not True:
@@ -1167,14 +1579,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 report["pot2"]["grasp_plan"] = approach_plan
                 if approach_plan.get("status") == "planned":
                     report["pot2"]["grasp_execution"] = _execute_joint_path(
-                        bridge, recorder, approach_plan, "pot2_curobo_grasp_approach", hold_gripper_action=-1.0
+                        bridge, recorder, approach_plan, "pot2_curobo_grasp_approach", hold_gripper_action=-1.0,
+                        reserve_actions=800,
                     )
+                    report["trajectory_execution"]["route_executions"].append({
+                        "phase": "pot2_curobo_grasp_approach",
+                        **report["pot2"]["grasp_execution"],
+                    })
                     hold_q = _arm_q_from_snapshot(bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"])
                     pot2_grasp_confirmed = False
-                    close_budget = min(210, max(0, MAX_DEMO_ACTIONS - recorder.action_count))
+                    close_budget = min(210, max(0, MAX_DEMO_ACTIONS - recorder.action_count - 500))
+                    close_start = recorder.action_count
+                    close_last_check = None
                     for _ in range(close_budget):
                         _joint_step(bridge, recorder, hold_q, "pot2_gripper_close", gripper_action=1.0)
-                        if (recorder.action_count % 5) == 0:
+                        if (recorder.action_count % 5) == 0 or _ + 1 == close_budget:
                             pot2_grasp = bridge.request({
                                 "op": "grasp_state", "carried_binding": _binding(bindings["moka_pot_2"]),
                                 "expected_instruction": INSTRUCTION,
@@ -1183,6 +1602,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                                 report["pot2"]["grasp_state"] = pot2_grasp
                                 pot2_grasp_confirmed = True
                                 break
+                            close_last_check = pot2_grasp
+                    report["pot2"]["gripper_close"] = {
+                        "actions": recorder.action_count - close_start,
+                        "action_budget": close_budget,
+                        "reserved_future_actions": 500,
+                        "last_grasp_state_check": close_last_check,
+                    }
                     if not pot2_grasp_confirmed:
                         report["pot2"]["grasp_state"] = {"grasp_confirmed": False, "reason": "gripper_close_budget_exhausted"}
                 else:
@@ -1232,8 +1658,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     report["pot2"]["blocking_reason"] = pot2_transport_plan.get("error") or pot2_transport_plan.get("planner_status")
                 else:
                     report["pot2"]["preplace_execution"] = _execute_joint_path(
-                        bridge, recorder, pot2_transport_plan, "pot2_curobo_transport", hold_gripper_action=0.0
+                        bridge, recorder, pot2_transport_plan, "pot2_curobo_transport", hold_gripper_action=0.0,
+                        reserve_actions=500,
                     )
+                    report["trajectory_execution"]["route_executions"].append({
+                        "phase": "pot2_curobo_transport",
+                        **report["pot2"]["preplace_execution"],
+                    })
                     p2_after_transport = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
                     p2_after_eef, p2_after_q = _eef_from_snapshot(p2_after_transport), _arm_q_from_snapshot(p2_after_transport)
                     p2_grasp_check = bridge.request({"op": "grasp_state", "carried_binding": _binding(bindings["moka_pot_2"]), "expected_instruction": INSTRUCTION})
@@ -1275,20 +1706,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     else:
                         report["pot2"]["selected_candidate_id"] = p2_final_plan["goal_candidates"][p2_final_plan["selected_goal_index"]]["candidate_id"]
                         report["pot2"]["placement_execution"] = _execute_joint_path(
-                            bridge, recorder, p2_final_plan, "pot2_curobo_place", hold_gripper_action=0.0
+                            bridge, recorder, p2_final_plan, "pot2_curobo_place", hold_gripper_action=0.0,
+                            reserve_actions=350,
                         )
+                        report["trajectory_execution"]["route_executions"].append({
+                            "phase": "pot2_curobo_place",
+                            **report["pot2"]["placement_execution"],
+                        })
                         p2_release_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
                         p2_release_q = _arm_q_from_snapshot(p2_release_state)
-                        p2_released = False
-                        p2_release_actions = 0
-                        while p2_release_actions < 210 and recorder.action_count < MAX_DEMO_ACTIONS:
-                            _joint_step(bridge, recorder, p2_release_q, "pot2_gripper_release", gripper_action=-1.0)
-                            p2_release_actions += 1
-                            if p2_release_actions % 10 == 0:
-                                release_check = bridge.request({"op": "grasp_state", "carried_binding": _binding(bindings["moka_pot_2"]), "expected_instruction": INSTRUCTION})
-                                if release_check.get("grasp_confirmed") is False and release_check.get("gripper_closure", {}).get("closed") is False:
-                                    p2_released = True
-                                    break
+                        p2_release_result = _release_gripper(
+                            bridge, recorder, p2_release_q, bindings["moka_pot_2"],
+                            "pot2_gripper_release", reserve_actions=140,
+                        )
+                        p2_released = bool(p2_release_result["contact_separated"])
+                        p2_release_actions = int(p2_release_result["actions"])
+                        report["pot2"]["release"] = p2_release_result
                         report["pot2"]["release_actions"] = p2_release_actions
                         report["pot2"]["release_contact_separated"] = p2_released
                         recorder.snapshot("pot2_released")
@@ -1317,8 +1750,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                             report["pot2"]["retreat_plan"] = p2_retreat_plan
                             if p2_retreat_plan.get("status") == "planned":
                                 report["pot2"]["retreat_execution"] = _execute_joint_path(
-                                    bridge, recorder, p2_retreat_plan, "pot2_curobo_retreat", hold_gripper_action=0.0
+                                    bridge, recorder, p2_retreat_plan, "pot2_curobo_retreat", hold_gripper_action=0.0,
+                                    reserve_actions=40,
                                 )
+                                report["trajectory_execution"]["route_executions"].append({
+                                    "phase": "pot2_curobo_retreat",
+                                    **report["pot2"]["retreat_execution"],
+                                })
                                 p2_settle_q = _arm_q_from_snapshot(bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"])
                                 p2_settling_actions = 0
                                 for _ in range(40):

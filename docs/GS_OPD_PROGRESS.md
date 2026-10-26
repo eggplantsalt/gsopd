@@ -3947,3 +3947,31 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 综合诊断：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_physical_attempt/model_diagnostic_report.json`及`.md`。动作、视频、90k子步接触记录、计划输入/输出、起终Snapshot、FK比较和子步完整性报告均在同目录。正确的后续状态只应描述为Pot1到达On区域但未完成释放；本轮完整成功Episode新增0。未使用官方示范、未训练、未改BDDL或Safety Reconstruction标准。
 
 定向代码检查：四个修改模块`py_compile`通过，`git diff --check`通过；未运行独立测试套件。
+
+
+## Human L0T2 CuRobo有效轨迹长度与预算修复：单次接续被放置规划门禁阻断（2026-10-27）
+
+### CuRobo有效长度证据与执行修复
+
+检查CuRobo隔离环境当前版本`0.0.post1.dev1`的`get_batch_interpolated_trajectory`、`calculate_traj_steps`与Warp插值核：`interpolated_last_tstep`是有效点数，索引`[0:last_tstep)`为有效轨迹，缓冲区从`last_tstep`起重复末端关节配置。run前归档的Pot1预放置与放置路径均为1800点容量、`last_tstep=21`，即21个有效点（末端索引20）、1779个填充点、50 ms采样、1.0 s有效时长。两条轨迹末端状态之后均为重复填充；此前执行器将每个缓存的1799条路径行都发送给物理控制器，恰好每条多执行1779步。
+
+修复`run_human_l0t2_curobo_transport.py`，只执行有效点前缀并保留原采样时间，不抽点；当前CuRobo路径时间间隔与Safety Bridge 50 ms动作周期匹配，因此有效样本逐点执行即可。新生成的计划额外归档有效位置、速度、加速度、jerk、采样时间和CuRobo关节动态限制；周期不匹配时用包含位置/速度/加速度边界的五次Hermite时间重采样，只允许延长时间并检验速度、加速度上限。历史缓存未保存原始速度/加速度，本次未重采样，基于有效位置计算并记录有限差分速度/加速度。
+
+释放阶段改为每10步检查并在预算终点额外检查一次，因此不足10步的释放预算不会被错误描述成“已执行210步仍未松开”。运输、放置、松爪、退爪、Settling和Pot2阶段通过逐段预留全任务动作预算，保留3600步demo-only horizon；不更改CuRobo规划器、碰撞几何、低层控制、MuJoCo模型或BDDL。
+
+### 单次真实物理接续
+
+从原合法t=215持抓Snapshot恢复成功：模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`、BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`、331维Integration State精确一致。对旧预放置输入的15项任务/状态/基座工具变换/全障碍/目标/附着物/规划设置逐项比较，数值容差`1e-9`全部匹配，因而复用该缓存路线。21个有效点执行20个动作；Pot1仍被抓持。到达末端时EEF位置误差18.83 mm、角误差0.00756 rad，当前t=235 Pot1 `On=false`。
+
+只对实际到达的t=235状态重新规划放置段。CuRobo预规划门禁报告起点在其完整场景代理世界中不清晰：Pot1 attached-object sphere 62与番茄酱瓶主体`bottle_of_tomato_paste_2_with_hand_1_main`的mesh包络`mujoco_body_25_compiled_mesh`重叠6.735 mm，故MotionPlanner未启动、没有产生第二条有效路线。24个候选终态中17个全世界无碰撞，4个代理碰撞（主要同一瓶体mesh，最深14.556 mm），3个没有IK解。已保存的500个MuJoCo子步中没有记录到body 25/26与机器人或Pot1的实际接触；这只表示本短段接触记录未观察到对应接触，不能证明CuRobo代理冲突是误报或构成安全认证。
+
+因此本次20步后停止：3600步预算未耗尽，Pot1松爪/稳定性未测试，Pot2未开始，最终Pot1 `On=false`、Pot2 `On=false`、Stove `Turnon=true`、原生`task_success=false`。物理控制为关节目标扭矩执行，与π₀.₅原生动作标签不兼容；没有完整成功Episode，`safety_certified=false`。Contact sample共500条，但20/20动作几何监测标为incomplete。
+
+### 证据与验证
+
+- 单次运行归档：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_020247/`。
+- 主要诊断：同目录`trajectory_length_budget_diagnostic.json`与`.md`；包含两条旧1800点路径的有效点数、旧/新执行动作数、末端误差、t=235规划门禁、碰撞代理证据与最终原生谓词。
+- 完整物理证据：`physical_step_records.jsonl.gz`、双相机视频、初始/终态Snapshot、当前MuJoCo碰撞世界以及CuRobo原始输入/输出。
+- 验证：两个修改Python模块`py_compile`通过；有效路径切片检查得到21有效点/1779填充点/20动作；50 ms时间重采样的合成边界检查通过；`git diff --check`通过。未训练、未使用官方示范、未修改主线RLinf工作树。
+
+**结论：**固定容量误执行和释放短预算漏检已修复并经一次真实物理接续验证。Pot1路线只执行20步，说明3600步不再被两条填充缓冲区耗尽；完整任务仍未成功，实际阻塞是t=235 CuRobo规划起点与番茄酱瓶mesh代理发生6.735 mm重叠。按本轮边界停止，不追加物理分支或碰撞参数补丁。

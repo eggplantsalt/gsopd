@@ -699,3 +699,12 @@ Round60的41步/1025子步归档已完成离线对照；Round60/61/62不因本�
 机器摘要已按两个分支的耐久动作记录离线纠正：185个真实动作、4625个子步、6387条控制边界接触记录、185步的子步完整性标记均为incomplete；不构成安全认证。两分支各自的Observation/Action NPZ、双相机MP4、25子步接触记录和失败Runtime Snapshot均完整保留。综合报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/batch_report.json`、`batch_report.md`；任务级证据：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/obstacle_avoidance_human_L0T2/task_report.json`。最佳目标Region进展Snapshot在直接路线t=322终态；侧向路线t=293终态也单独保存。
 
 **结论：任务失败并在2条分支后停止。首个实现修复确实消除了18步预算截断，但真实番茄酱瓶接触减缓了Pot1运输，12步停滞判断仍过早结束低速目标进展；24步门槛修正尚未物理验证。没有启动Pot2、没有完整成功Episode、没有安全认证或训练。**
+
+
+## 当前局部目标更新（2026-10-27）：修复CuRobo路径有效长度后完成一次接续，放置规划门禁阻断
+
+旧CuRobo预放置、放置轨迹各有1800点容量，但CuRobo `interpolated_last_tstep=21`表示有效21点、1779填充点。此前每条各误执行1799步。现在只执行有效前缀，并把速度/加速度与时间参数纳入新计划归档及必要的时间重采样；释放阶段在少于10步的预算终点也会检查。3600步分阶段预留仍保留。
+
+从原模型/BDDL精确的t=215 Snapshot恢复；15项路线身份比对通过，复用旧预放置路径。真实执行20步后EEF位置误差18.83 mm、角误差0.00756 rad，Pot1仍抓持、`On=false`。t=235重新规划放置路线时，CuRobo预检因Pot1代理球与番茄酱瓶主体mesh包络重叠6.735 mm拒绝起点；17/24目标配置可行，但MotionPlanner未启动。500个已保存子步未观察到body25/26实际接触。松爪未到达，Pot2未启动，原生task_success=false；完整成功Episode仍为0。
+
+报告与视频、动作/状态、Snapshot见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_020247/`。本轮只做一次物理接续，已停止；不继续增加该场景物理分支或调整碰撞表示。本地代码验证：`py_compile`、有效长度检查、时间重采样边界检查、`git diff --check`通过。动作标签与π₀.₅原生OSC不兼容，安全认证未通过/未尝试。
