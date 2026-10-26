@@ -75,6 +75,23 @@ def pose_record(matrix: Any) -> dict[str, list[float]]:
     }
 
 
+def update_pose_record(
+    pose: dict[str, Any],
+    *,
+    position_m: Any | None = None,
+    quaternion_wxyz: Any | None = None,
+) -> dict[str, list[float]]:
+    """Update pose fields as one rigid transform, never leaving a stale matrix."""
+    if not isinstance(pose, dict):
+        raise ValueError("keypose_pose_record_must_be_a_mapping")
+    position = pose.get("position_m") if position_m is None else position_m
+    quaternion = pose.get("quaternion_wxyz") if quaternion_wxyz is None else quaternion_wxyz
+    synchronized = pose_record(pose_matrix(position, quaternion))
+    pose.clear()
+    pose.update(synchronized)
+    return pose
+
+
 def _load_row_state(row: dict[str, Any], prefix: str) -> tuple[dict[str, Any], dict[str, Any]]:
     reference = row.get("physical_state_ref") or {}
     archive = reference.get("archive") or reference.get("npz")

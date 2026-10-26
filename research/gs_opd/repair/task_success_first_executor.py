@@ -1231,6 +1231,7 @@ def _native_place_single(
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _advance_pose,
         _compress_eef_route,
+        _compress_eef_route_with_indices,
         _record_step,
         _snapshot_state_vector,
         _state_sha,
@@ -1243,6 +1244,7 @@ def _native_place_single(
     from research.gs_opd.repair.keypose_driven_planning import (
         retarget_keypose_sequence,
         select_keypose_suffix,
+        update_pose_record,
     )
 
     native_goal = bridge.request({"op": "native_goal_query", "predicate": predicate})
@@ -1325,7 +1327,9 @@ def _native_place_single(
                 )
                 preplace_position += entry_direction * _native_region_entry_offset_m(predicate)
                 preplace_position[2] = float(goal_eef[2, 3] + approach_height_m)
-                row["eef_pose_world"]["position_m"] = preplace_position.tolist()
+                update_pose_record(
+                    row["eef_pose_world"], position_m=preplace_position,
+                )
     entry_eef = goal_eef.copy()
     entry_eef[:3, 3] += entry_direction * _native_region_entry_offset_m(predicate)
     high_eef = entry_eef.copy()
@@ -1681,7 +1685,66 @@ def _native_place_single(
                     "live_state_verification": plan_state_check,
                 })
                 if keypose_plan.get("status") == "offline_feasible" and keypose_plan.get("live_state_unchanged") is True:
-                    subroute = _compress_eef_route(keypose_plan.get("eef_reference_poses_world"))
+                    raw_eef_route = np.asarray(
+                        keypose_plan.get("eef_reference_poses_world"), dtype=np.float64,
+                    )
+                    qpos_path = np.asarray(keypose_plan.get("qpos_path"), dtype=np.float64)
+                    if (
+                        raw_eef_route.ndim != 2 or raw_eef_route.shape[1:] != (7,)
+                        or qpos_path.ndim != 2 or qpos_path.shape[1:] != (7,)
+                        or len(raw_eef_route) != len(qpos_path)
+                        or not np.isfinite(raw_eef_route).all()
+                        or not np.isfinite(qpos_path).all()
+                    ):
+                        raise RuntimeError(
+                            f"keypose_RRT_joint_and_EEF_path_alignment_invalid:{keypose['name']}"
+                        )
+                    subroute, compressed_source_indices = _compress_eef_route_with_indices(raw_eef_route)
+                    route_archive = {
+                        "schema_version": "gs_opd_rrt_osc_route_archive.v1",
+                        "keypose": keypose["name"],
+                        "model_geometry_sha256": model_sha,
+                        "start_state_sha256": live_state_sha,
+                        "goal_eef_pose_world": waypoint.tolist(),
+                        "planner_status": keypose_plan.get("status"),
+                        "planner_seed": keypose_planner_seed,
+                        "planning_seconds": keypose_plan.get("planning_seconds"),
+                        "qpos_path_rad": qpos_path.tolist(),
+                        "raw_eef_reference_poses_world": raw_eef_route.tolist(),
+                        "compressed_waypoints": [
+                            {
+                                "compressed_index": index,
+                                "source_path_index": source_index,
+                                "eef_pose_world": subroute[index].tolist(),
+                                "rrt_reference_qpos_rad": qpos_path[source_index].tolist(),
+                            }
+                            for index, source_index in enumerate(compressed_source_indices)
+                        ],
+                        "compression": {
+                            "translation_threshold_m": 0.020,
+                            "rotation_threshold_rad": 0.10,
+                            "compressed_source_path_indices": compressed_source_indices,
+                        },
+                        "execution_policy": "OSC_POSE feedback toward each compressed EEF waypoint",
+                        "safety_certified": False,
+                    }
+                    route_bytes = json.dumps(
+                        route_archive, ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")
+                    route_path = output_dir / (
+                        f"rrt_osc_route_{len(keypose_rrt_runs) - 1:02d}_{keypose['name']}.json"
+                    )
+                    route_path.write_bytes(route_bytes)
+                    keypose_rrt_runs[-1]["route_archive"] = {
+                        "path": str(route_path),
+                        "sha256": hashlib.sha256(route_bytes).hexdigest(),
+                        "qpos_path_rows": int(len(qpos_path)),
+                        "raw_eef_path_rows": int(len(raw_eef_route)),
+                        "compressed_waypoint_count": int(len(subroute)),
+                        "compressed_source_path_indices": compressed_source_indices,
+                    }
+                    keypose_rrt_runs[-1]["selected_qpos_path_saved"] = True
+                    keypose_rrt_runs[-1]["raw_eef_path_saved"] = True
                 else:
                     keypose_rrt_runs[-1]["execution_fallback"] = None
                     raise RuntimeError(
@@ -1691,7 +1754,19 @@ def _native_place_single(
             else:
                 keypose = {"name": "native_goal_transport_waypoint"}
                 subroute = np.asarray([waypoint], dtype=np.float64)
-            for subgoal in subroute:
+            for subgoal_index, subgoal in enumerate(subroute):
+                tracking_context = None
+                if keypose_sequence is not None:
+                    source_path_index = compressed_source_indices[subgoal_index]
+                    tracking_context = {
+                        "rrt_archive_path": keypose_rrt_runs[-1]["route_archive"]["path"],
+                        "rrt_route_sha256": keypose_rrt_runs[-1]["route_archive"]["sha256"],
+                        "keypose": keypose["name"],
+                        "compressed_waypoint_index": subgoal_index,
+                        "rrt_source_path_index": source_path_index,
+                        "rrt_reference_eef_pose_world": raw_eef_route[source_path_index].tolist(),
+                        "rrt_reference_qpos_rad": qpos_path[source_path_index].tolist(),
+                    }
                 _advance_pose(
                     bridge, subgoal[:3], subgoal[3:],
                     f"transport_{keypose['name']}", "native_goal_transport", counter,
@@ -1701,6 +1776,7 @@ def _native_place_single(
                     stagnation_window_actions=24,
                     position_tolerance_m=0.010,
                     rotation_tolerance_rad=0.10,
+                    planning_tracking=tracking_context,
                 )
                 if counter[0] > transport_action_budget:
                     raise RuntimeError("native_goal_transport_action_budget_exhausted")
@@ -2236,7 +2312,9 @@ def _screen_native_keypose_candidates(
             entry /= entry_norm
         preplace_position += entry * _native_region_entry_offset_m(predicate)
         preplace_position[2] = float(goal_eef[2, 3] + approach_height_m)
-        preplace["eef_pose_world"]["position_m"] = preplace_position.tolist()
+        update_pose_record(
+            preplace["eef_pose_world"], position_m=preplace_position,
+        )
         preplace_pose = np.eye(4, dtype=np.float64)
         preplace_pose[:3, :3] = Rotation.from_quat(
             np.asarray(preplace["eef_pose_world"]["quaternion_wxyz"], dtype=np.float64)[[1, 2, 3, 0]]

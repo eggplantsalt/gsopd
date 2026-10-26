@@ -3775,3 +3775,17 @@ t=1335首次出现原生task success；`On(moka_pot_1, flat_stove_1_cook_region)
 机器逐步报告：`/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/round60_stagnation_diagnostic.json`（SHA-256 `22fc96c134d86fb7d39f0a20668a6be46320eee44e6b8634700a4eba8b0397d9`）；可读摘要同目录`round60_stagnation_diagnostic.md`。报告分别列出已证实问题、推测根因和缺失字段。最小建议是后续获准执行时持久化所选RRT关节路径、完整EEF参考、压缩后Waypoint及逐动作局部目标误差，保留或验证7D参考跟踪；继续把Hand–Pot接触保留为真实物理约束，并同步修正keypose `position_m`与matrix的序列化一致性。本轮没有实施修复，也没有运行测试或Rollout。
 
 Round60/61/62未成功的轮次保持归档，本轮不增加候选或物理搜索；L1T2完整稳定Episode与其历史记录未改。
+
+## Round60 RRT→OSC接口修复与t=2607短段验证（2026-10-26）
+
+先修复Keypose刚体字段同步：更新EEF `position_m` 时现在原子重建同一Pose Record的四元数与4×4 `matrix`；关键姿态候选与实际放置入口共用该函数。新增测试覆盖非平凡旋转下平移更新及所有重定位姿态的矩阵一致性。确认旧Round60 `preplace` 的position与matrix平移差186.841 mm；但其执行代码消费`position_m`，本次修复后短段重放与归档动作、EEF位置逐步完全一致，因此该序列化错误不是t=2607失配的直接原因。
+
+执行器现在对每个Keypose RRT分别保存完整7D `qpos_path`、原始EEF参考、压缩后Waypoint及其源路径索引，并写入带SHA的`rrt_osc_route_*.json`。每个OSC动作耐久记录当前压缩子目标、对应RRT源索引/7D参考、真实OSC局部命令目标、动作前后实际qpos和规划关节误差。压缩兼容原有pose-only调用；新增映射和动作记录回归。
+
+从Round60原t=2589 Runtime Snapshot恢复，模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`、BDDL SHA `58b3db56352473e7c4534769911a0ad48ea7c214f934fcb4403b6c1da5467b523`、指令及Integration State hash核验一致。由于Round60原始选中`qpos_path`未归档，本次从精确t=2589状态按同一seed/规划配置重新生成单条RRT路线，不能声称逐元素恢复了原始RRT数组。规划耗时10.859 s、161项配置检查；65个7D关节/EEF参考点压缩为7个Waypoint（索引0/15/29/41/51/59/64）。随后只执行18个真实OSC动作和450/450个MuJoCo子步至t=2607，没有重放剩余失败路线。新旧18步动作最大差为0、EEF位置最大差为0 mm。归档为`/opt/data/private/gs_opd/diagnostics/round60_rrt_osc_interface_20261026_185951_481254/`；最佳Snapshot位于`best_progress_runtime_snapshot.pkl`（t=2607），另存起点/终点Snapshot、双相机视频、动作/子步记录和完整RRT路径JSON。
+
+真实7D qpos在最近路径投影上的误差从0.010增至0.191 rad，EEF最近路径距离从1.4 mm增至16.1 mm；这是对RRT几何路径的最近点投影，非时间对齐的关节跟踪误差。t=2607局部请求`[-1.35,-2.45,-7.50] mm`，实际位移`[+2.52,+0.73,-0.81] mm`，三维方向余弦0.040：X轴分量已经反向，但总平移尚非反向，故t=2607之后24步的失速/反向根因仍unknown。所有本段动作在归一化范围内，子步关节限位违规0。
+
+Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 24在450/450子步持续接触；穿透为0.157–0.179 mm，接触坐标系法向力分量1.851–2.154 N。接触从起始Snapshot存在，到t=2607没有恶化；是否对后续运动构成因果阻挡仍unknown。没有降低安全阈值、改变BDDL或Safety Reconstruction标准，没有写入qpos、引入新控制器、启动新任务或训练。
+
+下一步建议先对局部OSC参考跟踪做针对性改进：沿稠密EEF参考进行单调路径投影并监控qpos偏差；若该跟踪仍持续离开RRT走廊，再单独评估基于真实动力学的关节路径执行。当前证据不足以直接新增关节控制器。回归：`test_keypose_driven_planning`与`test_task_success_first_executor`共31项通过。

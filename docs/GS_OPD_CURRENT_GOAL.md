@@ -574,6 +574,16 @@ t=20 Snapshot 恢复通过，模型几何指纹为 `1a0c219c…f7a9f752`。运�
 最终`t=1412`原生Pot1 On、Pot2 On、Stove Turnon均真，reward=1、done=true。77步后缀跨越t=1335的原生done：使用demo-only horizon=1600，同一环境继续执行真实动作，未改BDDL/成功判据、未写入物体状态；因此它不是标准1000步Benchmark协议。Settling 500个物理子步谓词全真、Pot2零位姿跨度，末态和整个Settling均无手爪–Pot2接触。后成功阶段仍记录到678个手爪–Pot2接触子步（t=1336–1364与1366–1367），不做安全认证。
 
 完整数据及hash清单位于 `/opt/data/private/gs_opd/rollouts/l1t2_success_episode_reconstruction_20261026_attempt2/`。可用于后续LeRobot转换的Action/Observation素材已保存，本轮没有转换或训练。当前局部任务完成；下一步如继续GS-OPD，应先对该数据执行独立Safety Reconstruction/接触分层审计，再由用户安排LeRobot转换或其它场景任务，不把task-success样本自动并入安全训练集。
+
+## 当前局部目标更新（2026-10-26）：Round60 RRT→OSC短段诊断完成
+
+上节的只读阶段性结论由一次18步短段验证补充：从Round60 t=2589精确Snapshot开始，唯一真实MuJoCo验证执行到t=2607，共450/450子步，模型、BDDL、指令和初始Integration State均匹配。由于Round60原始选中`qpos_path`未归档，本次以相同起始状态、seed和规划配置重新生成一条RRT路线：65个7D qpos/EEF参考点，压缩索引为0/15/29/41/51/59/64；完整重生成路径、每步OSC局部目标和真实qpos均已归档。新旧前18步动作及EEF状态逐步完全一致，但原始RRT数组无法逐元素比对。
+
+t=2607命令位移`[-1.35,-2.45,-7.50] mm`与实位移`[+2.52,+0.73,-0.81] mm`几乎正交（余弦0.040），只有X轴分量方向相反，尚不能称整体位移反向。RRT最近点qpos偏差为0.010–0.191 rad，EEF路径偏差1.4–16.1 mm；这些最近点距离不是时间同步误差。持续Geom74 Hand–Geom117 Pot2接触有450条子步证据，深度0.157–0.179 mm、法向力1.851–2.154 N，t=2589已存在且到t=2607未加重。其后续阻挡因果和t=2607后的完整反向原因unknown。
+
+位姿`position_m`更新现在会同步4×4矩阵，并已有刚体回归。执行器会持久化RRT完整7D参考、原始EEF路径、压缩映射及逐步实际OSC目标/关节状态。当前推荐下一步是局部增强OSC稠密路径跟踪与路径进度投影，暂不引入新关节控制器；如果改进后仍偏离规划走廊，再评估动力学感知的关节路径执行。
+
+机器与可读报告：`/opt/data/private/gs_opd/diagnostics/round60_rrt_osc_interface_20261026_185951_481254/diagnostic_report.json`、`round60_rrt_osc_interface_diagnostic.md`；最佳物理Snapshot为`t=2607`的`best_progress_runtime_snapshot.pkl`。相关31项回归通过。本轮未扩展到其他任务、未训练、未放宽安全规则。
 ## 当前局部目标更新（2026-10-26）：Round60停滞只读诊断完成，暂停新搜索
 
 Round60的41步/1025子步归档已完成离线对照；Round60/61/62不因本次报告而增加新的RRT候选或物理搜索。首个可观察到的OSC命令与实际EEF运动失配发生在t=2607，后24步平均EEF位移0.742 mm，23/24步实际平移方向与命令相反。目标RRT局部Waypoint和选中7D `qpos_path`未归档，所以精确局部误差及实际关节轨迹相对RRT轨迹均为unknown。

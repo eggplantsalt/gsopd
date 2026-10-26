@@ -677,6 +677,7 @@ def _record_step(
     frames: list[dict[str, Any]],
     *,
     raise_on_done: bool = True,
+    planning_tracking: dict[str, Any] | None = None,
 ) -> None:
     reply = bridge.request({
         "op": "step_monitored",
@@ -705,7 +706,7 @@ def _record_step(
         or any(item.get("status") != "complete" for item in substeps)
     )
     snapshot_state = reply.get("snapshot_state", {})
-    records.append({
+    record = {
         "candidate_id": candidate_id,
         "step_index": len(records),
         "phase": phase,
@@ -724,7 +725,20 @@ def _record_step(
         "done": reply.get("done", False),
         "task_success": reply.get("task_success"),
         "timestep": reply.get("timestep"),
-    })
+    }
+    if planning_tracking is not None:
+        tracking = dict(planning_tracking)
+        actual_joint_qpos = snapshot_state.get("robot_states", [{}])[0].get("joint_qpos")
+        reference_joint_qpos = tracking.get("rrt_reference_qpos_rad")
+        if actual_joint_qpos is not None:
+            tracking["actual_joint_qpos_after_rad"] = actual_joint_qpos
+        if actual_joint_qpos is not None and reference_joint_qpos is not None:
+            actual_q = np.asarray(actual_joint_qpos, dtype=np.float64)
+            reference_q = np.asarray(reference_joint_qpos, dtype=np.float64)
+            if actual_q.shape == reference_q.shape == (7,):
+                tracking["rrt_reference_joint_error_rad"] = float(np.linalg.norm(actual_q - reference_q))
+        record["planning_tracking"] = tracking
+    records.append(record)
     frames.append({
         "candidate_id": candidate_id,
         "step_index": len(records) - 1,
@@ -756,6 +770,7 @@ def _advance_pose(
     stagnation_window_actions: int = 0,
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
+    planning_tracking: dict[str, Any] | None = None,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
         quaternion_conjugate,
@@ -818,6 +833,21 @@ def _advance_pose(
             _advance_pose.controller_fields,
             gripper_action=0.0,
         )
+        step_tracking = None
+        if planning_tracking is not None:
+            step_tracking = {
+                **planning_tracking,
+                "osc_command_target_eef_pose_world": np.r_[
+                    current_position + delta_position, next_quaternion,
+                ].tolist(),
+                "active_subgoal_eef_pose_world": np.r_[target_position, target_quaternion].tolist(),
+                "observed_eef_pose_before_action_world": np.r_[
+                    current_position, current_quaternion,
+                ].tolist(),
+                "actual_joint_qpos_before_rad": robot.get("joint_qpos"),
+                "requested_translation_delta_world_m": delta_position.tolist(),
+                "requested_rotation_delta_world_rad": delta_rotation.tolist(),
+            }
         _record_step(
             bridge,
             action,
@@ -831,6 +861,7 @@ def _advance_pose(
             records,
             frames,
             raise_on_done=False,
+            planning_tracking=step_tracking,
         )
         action_counter[0] += 1
         if step_callback is not None:
@@ -883,7 +914,7 @@ def _pose_tracking_error_within_tolerance(
     )
 
 
-def _compress_eef_route(route: Any) -> np.ndarray:
+def _compress_eef_route_with_indices(route: Any) -> tuple[np.ndarray, list[int]]:
     poses = np.asarray(route, dtype=np.float64)
     if poses.ndim != 2 or poses.shape[1] != 7 or len(poses) < 2 or not np.isfinite(poses).all():
         raise ValueError("RRT_EEF_route_is_not_a_finite_N_by_7_pose_array")
@@ -897,7 +928,12 @@ def _compress_eef_route(route: Any) -> np.ndarray:
             last = index
     if len(keep) > MAX_PREFIX_CONTROL_ACTIONS:
         keep = sorted(set(np.linspace(0, len(poses) - 1, MAX_PREFIX_CONTROL_ACTIONS).round().astype(int).tolist()))
-    return poses[keep]
+    return poses[keep], keep
+
+
+def _compress_eef_route(route: Any) -> np.ndarray:
+    """Compatibility wrapper retaining the original pose-only return value."""
+    return _compress_eef_route_with_indices(route)[0]
 
 
 def _run_physical_branch(

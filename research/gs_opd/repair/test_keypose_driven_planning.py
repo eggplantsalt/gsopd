@@ -10,6 +10,7 @@ from research.gs_opd.repair.keypose_driven_planning import (
     pose_matrix,
     retarget_keypose_sequence,
     select_keypose_suffix,
+    update_pose_record,
 )
 
 
@@ -152,6 +153,52 @@ class KeyposeDrivenPlanningTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in resumed], ["preplace", "place"])
         with self.assertRaisesRegex(ValueError, "not_in_relocated_sequence"):
             select_keypose_suffix(sequence, "unknown")
+
+    def test_updating_keypose_position_keeps_all_rigid_pose_fields_synchronized(self):
+        original = pose_matrix(
+            [0.12, -0.24, 1.3],
+            [0.9238795325, 0.0, 0.3826834324, 0.0],
+        )
+        pose = {
+            "position_m": original[:3, 3].tolist(),
+            "quaternion_wxyz": [0.9238795325, 0.0, 0.3826834324, 0.0],
+            "matrix": original.tolist(),
+        }
+        new_position = np.asarray([0.06, -0.19, 1.43])
+        update_pose_record(pose, position_m=new_position)
+        matrix = np.asarray(pose["matrix"], dtype=np.float64)
+        np.testing.assert_allclose(pose["position_m"], new_position, atol=1e-12)
+        np.testing.assert_allclose(matrix[:3, 3], pose["position_m"], atol=1e-12)
+        np.testing.assert_allclose(matrix[:3, :3], original[:3, :3], atol=1e-12)
+        np.testing.assert_allclose(
+            matrix, pose_matrix(pose["position_m"], pose["quaternion_wxyz"]), atol=1e-12,
+        )
+        self.assertEqual(matrix.shape, (4, 4))
+        np.testing.assert_allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-12)
+
+    def test_retargeted_keypose_records_are_rigid_transform_consistent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace, acceptance = self._fixture(Path(temporary))
+            experience = extract_keypose_experience(
+                trace, acceptance, object_id="moka_pot_1",
+                predicate=["on", "moka_pot_1", "flat_stove_1_cook_region"],
+                source_region_world=pose_matrix([0.0, 0.0, 0.3], [1.0, 0.0, 0.0, 0.0]),
+            )
+        relocated = retarget_keypose_sequence(
+            experience,
+            held_object_world=pose_matrix([0.4, -0.2, 0.7], [1.0, 0.0, 0.0, 0.0]),
+            current_eef_world=pose_matrix([0.4, -0.2, 0.8], [1.0, 0.0, 0.0, 0.0]),
+            destination_region_world=pose_matrix([-0.3, 0.15, 0.35], [1.0, 0.0, 0.0, 0.0]),
+            destination_object_world=pose_matrix([-0.27, 0.14, 0.46], [1.0, 0.0, 0.0, 0.0]),
+        )
+        for row in relocated:
+            for field in ("object_pose_world", "eef_pose_world"):
+                pose = row[field]
+                np.testing.assert_allclose(
+                    pose["matrix"],
+                    pose_matrix(pose["position_m"], pose["quaternion_wxyz"]),
+                    atol=1e-12,
+                )
 
 
 if __name__ == "__main__":

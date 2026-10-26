@@ -39,6 +39,7 @@ from research.gs_opd.repair.task_success_first_executor import (
 from research.gs_opd.repair.task_success_first_grasp_search import BridgeSession
 from research.gs_opd.repair.task_success_first_grasp_search import (
     _record_step,
+    _compress_eef_route_with_indices,
     _verified_resume_runtime_snapshot,
     _pose_tracking_error_within_tolerance,
     _pose_tracking_window_stagnated,
@@ -46,6 +47,14 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_eef_route_compression_preserves_source_index_mapping(self):
+        poses = np.zeros((5, 7), dtype=np.float64)
+        poses[:, 0] = [0.0, 0.004, 0.021, 0.024, 0.050]
+        poses[:, 3] = 1.0
+        compressed, source_indices = _compress_eef_route_with_indices(poses)
+        self.assertEqual(source_indices, [0, 2, 4])
+        np.testing.assert_allclose(compressed, poses[source_indices])
+
     def test_keypose_rrt_call_count_ignores_budget_placeholders(self):
         candidates = [
             {
@@ -78,6 +87,7 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
                 if request["op"] == "step_monitored":
                     return {
                         "done": True, "task_success": True, "reward": 1.0,
+                        "snapshot_state": {"robot_states": [{"joint_qpos": [0.1] * 7}]},
                         "images": {
                             "agentview_image": {"data": bytes([1, 2, 3]), "shape": [1, 1, 3]},
                             "robot0_eye_in_hand_image": {"data": bytes([4, 5, 6]), "shape": [1, 1, 3]},
@@ -94,10 +104,18 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             bridge, np.zeros(7, dtype=np.float32), "release", "candidate", 0,
             {"body_id": 1}, "instruction", {}, Monitor(), [], [],
         )
-        _record_step(*args, raise_on_done=False)
+        _record_step(
+            *args,
+            raise_on_done=False,
+            planning_tracking={
+                "rrt_reference_qpos_rad": [0.0] * 7,
+                "osc_command_target_eef_pose_world": [0.0] * 7,
+            },
+        )
         self.assertEqual(len(args[-2]), 1)
         self.assertTrue(args[-2][0]["done"])
         self.assertTrue(args[-2][0]["task_success"])
+        self.assertEqual(args[-2][0]["planning_tracking"]["rrt_reference_joint_error_rad"], np.sqrt(0.07))
         with self.assertRaisesRegex(RuntimeError, "environment_done"):
             _record_step(
                 bridge, np.zeros(7, dtype=np.float32), "release", "candidate", 1,
