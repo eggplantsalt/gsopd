@@ -1,0 +1,325 @@
+{
+  "schema": "gs_opd_libero_safety_stage_b_summary.v1",
+  "scope": {
+    "benchmark": "obstacle_avoidance",
+    "level": 0,
+    "task_id": 0,
+    "task": "pick up the akita black bowl on the stove and place it on the plate",
+    "init_state": 0,
+    "seed": 0,
+    "standard_horizon": 1000
+  },
+  "status": "blocked_no_complete_route",
+  "scene_probe": {
+    "status": "pass",
+    "model_geometry_sha256": "40fd3ac3f0efd60a4a3de827b45e7228f4e67c6238c86d7957586dc8edd408d2",
+    "bddl_sha256": "b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12",
+    "robot_collision_geom_count": 15,
+    "scene_collision_geom_count": 180,
+    "target_collision_geom_count": 40,
+    "initial_robot_contact_count": 0,
+    "report": "/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt04/scene_probe_report.json",
+    "report_sha256": "6484488c5a14eee2be0c6315746ce845a01fa3a302d1615249bd6857ce9a2917"
+  },
+  "curobo": {
+    "full_scene": true,
+    "base_tool_registration_passed": true,
+    "position_error_m": 0.0004999893270639759,
+    "orientation_error_rad": 0.0004926443596941757,
+    "valid_trajectory_length_source": "interpolated_last_tstep",
+    "buffer_size": 1800
+  },
+  "attempted_bundle_count": 2,
+  "route_bundles": [
+    {
+      "seed": 20261027,
+      "status": "blocked",
+      "selected_variant_ids": {
+        "pre_grasp": 1,
+        "grasp": 0,
+        "lift": 4,
+        "pre_place": 0,
+        "place": 2,
+        "release": 4,
+        "retreat": 4
+      },
+      "attempted_stages": [
+        {
+          "stage": "pre_grasp",
+          "selected_variant_id": 1,
+          "ik_any_solution": true,
+          "curobo_success": true,
+          "valid_trajectory_point_count": 21,
+          "mujoco_path_audit": {
+            "status": "complete",
+            "physical_state_unchanged": true,
+            "state_count": 21,
+            "illegal_contact_count": 0
+          },
+          "closed_gripper_check": null,
+          "rejection_reason": null
+        },
+        {
+          "stage": "grasp",
+          "selected_variant_id": 0,
+          "ik_any_solution": true,
+          "curobo_success": true,
+          "valid_trajectory_point_count": 21,
+          "mujoco_path_audit": {
+            "status": "complete",
+            "physical_state_unchanged": true,
+            "state_count": 21,
+            "illegal_contact_count": 0
+          },
+          "closed_gripper_check": {
+            "status": "complete",
+            "illegal_contact_count": 13,
+            "verified_pad_target_contact_count": 21,
+            "unique_illegal_pairs": [
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g28",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -1.60989520196489e-05
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g29",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0010901331007597706
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g29",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.00199815962146977
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g30",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0018395790591018647
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g30",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0020260900086481884
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g31",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0018395790591018647
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g31",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0020260900086481884
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_collision",
+                  "gripper0_finger2_pad_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0006235347617474001
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_pad_collision",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0006235347617473947
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_pad_collision",
+                  "gripper0_finger2_pad_collision"
+                ],
+                "contact_count": 4,
+                "minimum_distance_m": -0.0004999999999999978
+              }
+            ]
+          },
+          "rejection_reason": "closed_gripper_exact_contact_check_failed"
+        }
+      ],
+      "bundle_rejection_reason": "grasp: closed_gripper_exact_contact_check_failed"
+    },
+    {
+      "seed": 20261028,
+      "status": "blocked",
+      "selected_variant_ids": {
+        "pre_grasp": 3,
+        "grasp": 3,
+        "lift": 0,
+        "pre_place": 0,
+        "place": 0,
+        "release": 2,
+        "retreat": 2
+      },
+      "attempted_stages": [
+        {
+          "stage": "pre_grasp",
+          "selected_variant_id": 3,
+          "ik_any_solution": true,
+          "curobo_success": true,
+          "valid_trajectory_point_count": 21,
+          "mujoco_path_audit": {
+            "status": "complete",
+            "physical_state_unchanged": true,
+            "state_count": 21,
+            "illegal_contact_count": 0
+          },
+          "closed_gripper_check": null,
+          "rejection_reason": null
+        },
+        {
+          "stage": "grasp",
+          "selected_variant_id": 3,
+          "ik_any_solution": true,
+          "curobo_success": true,
+          "valid_trajectory_point_count": 21,
+          "mujoco_path_audit": {
+            "status": "complete",
+            "physical_state_unchanged": true,
+            "state_count": 21,
+            "illegal_contact_count": 0
+          },
+          "closed_gripper_check": {
+            "status": "complete",
+            "illegal_contact_count": 14,
+            "verified_pad_target_contact_count": 19,
+            "unique_illegal_pairs": [
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g28",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0015162884826449266
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g28",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.001507957339599159
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g29",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0016392792497723892
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g29",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0014262255796029732
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g30",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0016180998775395966
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g30",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0014930469699566042
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g31",
+                  "gripper0_finger1_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0016180998775395966
+              },
+              {
+                "geom_names": [
+                  "akita_black_bowl_1_g31",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0014930469699566042
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_collision",
+                  "gripper0_finger2_pad_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0006235347617473667
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_pad_collision",
+                  "gripper0_finger2_collision"
+                ],
+                "contact_count": 1,
+                "minimum_distance_m": -0.0006235347617473944
+              },
+              {
+                "geom_names": [
+                  "gripper0_finger1_pad_collision",
+                  "gripper0_finger2_pad_collision"
+                ],
+                "contact_count": 4,
+                "minimum_distance_m": -0.0004999999999999963
+              }
+            ]
+          },
+          "rejection_reason": "closed_gripper_exact_contact_check_failed"
+        }
+      ],
+      "bundle_rejection_reason": "grasp: closed_gripper_exact_contact_check_failed"
+    }
+  ],
+  "complete_valid_route": false,
+  "stage_c_started": false,
+  "physical_episode": {
+    "actions": 0,
+    "timestep": 0,
+    "task_success": false,
+    "stable_release": "not_attempted",
+    "illegal_contact_in_scratch_closed_grasp_check": true,
+    "safety_monitoring_complete": false,
+    "safety_certification": "unknown_not_certified",
+    "new_trainable_episodes": 0
+  },
+  "no_training": true,
+  "no_official_actions_replayed": true,
+  "no_live_state_or_object_pose_writes": true,
+  "route_report": "/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt07/stage_b_route_report.json",
+  "route_report_sha256": "317b320678be9d0103de584ec9e6fd554e420d15c5284e385cf3bf5f67e590d0",
+  "only_blocker": "Both grasp bundles contact the target bowl with non-pad finger Geom 73 and have gripper self-contact; find a grasp Keypose whose closed state has only verified left/right pad-to-target contacts, without weakening the collision gate."
+}

@@ -1,3 +1,13 @@
+## 当前局部目标：LIBERO-Safety OA/L0T0示范生成器最小复现（2026-10-27）
+
+当前唯一试点为`obstacle_avoidance/L0T0`：将炉灶上的Akita黑碗放到盘子。Human L0T2与此前自研Task-Success-First RRT、Region-Progress及CuRobo局部修补路线暂停。论文式Keypose、五变体和坐标转换已实现并通过17项真实数值测试；代码与原论文/官方接口边界见[复现规格](GS_OPD_LIBERO_SAFETY_DATA_REPRO_SPEC.md)。
+
+阶段A通过：对象/目标Region局部SE(3)、米制、WXYZ四元数、工具帧和确定性变体均有测试。阶段B使用活动MuJoCo完整场景和CuRobo成功规划了两组的Pre-Grasp/Grasp路径，但两组闭爪scratch审计都发现非指垫—碗接触及夹爪自碰撞，故没有完整分阶段路线。阶段C按门槛未执行；Bridge保持0动作/0 timestep，原生任务仍false，释放未验证，安全监测为unknown，安全认证未通过，新增可训练Episode为0。
+
+**唯一阻塞：**需要一组闭爪时仅左右真实指垫接触目标碗、且无夹爪自碰撞的抓持Keypose。下一次只验证一个可量测功能：闭爪抓持终点的真实Geom对筛选；筛选通过后再重新评估阶段B，不直接启动物理Episode。
+
+---
+
 ## 本轮结果：CuRobo模型审计通过，Pot1释放受3600步预算阻断（2026-10-27）
 
 Human L0T2 t=215来源状态与模型/BDDL指纹精确匹配。已修复有证据的`robot0_base`/`panda_hand`校准错误、Pot1附着球漏包/假碰撞，以及9维CuRobo路径后处理误送给7自由度FK的问题。5姿态FK对照通过；完整碰撞世界下起点与21个有IK解的目标均无碰撞，3个目标IK不可达。

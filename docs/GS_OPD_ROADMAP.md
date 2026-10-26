@@ -1,3 +1,13 @@
+## 当前路线：LIBERO-Safety OA/L0T0 Keypose复现（2026-10-27）
+
+单场景最小复现优先，试点为`obstacle_avoidance/L0T0`。已完成对象/Region局部SE(3)与每阶段五个固定种子变体（阶段A通过，17项测试）。真实完整MuJoCo障碍场景接入CuRobo后，两组Keypose Bundle均仅完成Pre-Grasp/Grasp规划；闭爪scratch审计发现非指垫Finger Geom与碗相交以及夹爪自碰撞，路线严格拒绝。
+
+**目前阶段门：B未通过，C保持关闭。** 不做物理执行、不把关节轨迹标成π₀.₅ OSC标签、不把scratch接触结果称为Episode安全认证。双Bundle报告与只读初态证据链接见[进度记录](GS_OPD_PROGRESS.md)顶部。后续唯一工作是验证新的稀疏抓持Keypose能否满足“左右真实指垫—目标物接触、无非指垫碰撞、无夹爪自碰撞”；该门通过后再计划完整的分阶段CuRobo路线，完整路线通过后才考虑最多一次标准1000步物理Episode。
+
+旧Human L0T2与此前RRT/Region-Progress/CuRobo局部修补路线在此目标下暂停；文档后续内容保留为历史记录，不改变当前试点。
+
+---
+
 ## 2026-10-27：Human L0T2 CuRobo规划问题定位，物理执行止于松爪预算
 
 - 修复并验证了MuJoCo实际base↔CuRobo FK、EEF-site↔hand工具变换和15个Pot1源Geom附着球表示；旧四球拟合对两个候选制造了与瓶体的假碰撞。全场景起点及21个IK可达目标通过碰撞检查。

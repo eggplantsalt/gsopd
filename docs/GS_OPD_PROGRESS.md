@@ -1,3 +1,17 @@
+## 2026-10-27：LIBERO-Safety OA/L0T0 Keypose最小端到端复现停在阶段B
+
+本轮只处理`obstacle_avoidance/L0T0`（炉灶上的碗放到盘子），读取并恢复了已提交的[LIBERO-Safety复现规格](GS_OPD_LIBERO_SAFETY_DATA_REPRO_SPEC.md)。阶段A的独立对象/Region局部Keypose、严格SE(3)变换和固定种子五变体实现通过17项数值测试；JUnit报告为`reports/libero_safety_repro/stage_a_junit.xml`。工程扰动、初始抬升、预抓取/预放置与撤离距离均单独标为复现选择，未声称来自论文。
+
+阶段B实际启动OA/L0T0 seed=0/init-state=0的LIBERO-Safety Bridge，核对标准1000步场景、完整180个场景碰撞几何、15个机器人碰撞几何、40个碗碰撞几何和当前MuJoCo/CuRobo基座/工具校准。真实MuJoCo闭爪审计运行在scratch `MjData`，状态未变。CuRobo沿真实完整障碍场景分别测试两个确定性Keypose Bundle；每个Bundle的Pre-Grasp与Grasp均返回CuRobo规划成功及21个有效插值点（按`interpolated_last_tstep`截取，不使用1800点填充尾部）。
+
+**阶段B未通过。** 两组在闭爪抓持精确审计处均拒绝：合法候选指垫Geom 74/77虽接触碗Geom，但非指垫`gripper0_finger1_collision` Geom 73也与碗Geom 111–114相交；同时夹爪自碰撞Geom对也出现。Bundle 20261027有13个违规接触、最深穿透约2.026 mm；Bundle 20261028有14个违规接触、最深约1.639 mm。不能将这些接触改标为抓持许可；未生成任何完整的Lift—运输—Place—Release—Retreat路线。此结果也不证明此前的GS-OPD抓持示范无效，它只拒绝本轮这两组新Keypose/闭爪几何。
+
+阶段C没有启动：Bridge最终action_count=0、timestep=0；没有物理动作、释放、Settling或episode视频。原生`task_success=false`（保持在合法初态），稳定释放未验证；发生违规接触的是scratch闭爪检查，物理episode安全监测为`unknown`/不完整，故安全认证未通过。新增可训练Episode为0；没有训练或动作标签重标注。
+
+复现代码位于`research/gs_opd/libero_safety_repro/`，唯一既有接口适配是在`research/gs_opd/smoke/safety_bridge.py`增加只读scratch路径接触审计。提交内的结构化汇总为`reports/libero_safety_repro/stage_b_summary.json`。只读场景报告：`/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt04/scene_probe_report.json`；双Bundle/CuRobo/接触报告：`/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt07/stage_b_route_report.json`。唯一后续阻塞是找到并通过严格指垫专属闭爪接触审计的可行Keypose抓持姿态；通过完整阶段B之前不进入真实执行。
+
+---
+
 ## 2026-10-26：缓存完整RRT路径并转human/L0T2尝试，尚无新完整Episode
 
 本轮实现并实测预筛规划结果复用：缓存完整7D关节路径和EEF参考，按模型几何、活动BDDL、精确起始状态、目标位姿、安全几何策略、规划器配置及路径内容哈希验证；只有对应输入变化时才重新规划。L2T2从Round60精确持抓Snapshot启动（payload SHA `70b9bfa20d8caf0eb3a71309ad58eed471100b8293f6e35b61fbb42c70a9326d`，Integration State SHA `836981a4fd3507c6a384db7e0e3088d78c8ad64a2519fab4b07a7030bae4d208`）。L1T2来源路线65组7D/EEF状态全部精确匹配并直接复用，没有执行重复RRT；真实OSC执行42步、记录1050条预期子步接触采样后，在预放置阶段停滞。末端位移约58.3 mm，原生谓词仍2/3，`task_success=false`；完整失败Snapshot、双相机视频、动作和状态归档均保留。

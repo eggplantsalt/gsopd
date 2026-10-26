@@ -3495,6 +3495,243 @@ def _scratch_robot_fk_audit(raw_joint_positions):
     return result
 
 
+def _scratch_robot_path_contact_audit(
+    raw_arm_joint_states,
+    object_id,
+    raw_gripper_joint_states=None,
+    raw_eef_to_object_transform=None,
+    raw_world_object_transform=None,
+    fingertip_contact_scope="none",
+):
+    """Audit exact MuJoCo contacts along hypothetical arm states on scratch data.
+
+    The only optional contact exception is the active task's verified left/right
+    fingertip pads against the requested target object's compiled collision
+    Geoms, and only at the final supplied state. An optional object transform
+    is expressed as T_eef_object in meters and is used to carry the target in
+    scratch data; the live integration state is never modified or stepped.
+    """
+    sim = env.sim
+    model = sim.model._model
+    q_values = np.asarray(raw_arm_joint_states, dtype=np.float64)
+    gripper_values = None if raw_gripper_joint_states is None else np.asarray(
+        raw_gripper_joint_states, dtype=np.float64
+    )
+    transform_eef_object = None if raw_eef_to_object_transform is None else np.asarray(
+        raw_eef_to_object_transform, dtype=np.float64
+    )
+    result = {
+        "operation": "scratch_robot_path_contact_audit",
+        "status": "unavailable",
+        "physical_state_unchanged": False,
+        "object_id": object_id,
+        "states": [],
+    }
+    if (
+        not isinstance(object_id, str)
+        or q_values.ndim != 2
+        or q_values.shape[1:] != (7,)
+        or not len(q_values)
+        or not np.isfinite(q_values).all()
+    ):
+        result["error"] = "object_id_and_finite_N_by_7_arm_joint_states_required"
+        return result
+    if gripper_values is not None and (
+        gripper_values.shape != (len(q_values), 2)
+        or not np.isfinite(gripper_values).all()
+    ):
+        result["error"] = "gripper_joint_states_must_be_finite_N_by_2"
+        return result
+    if transform_eef_object is not None and (
+        transform_eef_object.shape != (4, 4)
+        or not np.isfinite(transform_eef_object).all()
+        or not np.allclose(transform_eef_object[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)
+        or not np.allclose(
+            transform_eef_object[:3, :3].T @ transform_eef_object[:3, :3],
+            np.eye(3), atol=1e-6,
+        )
+        or not np.isclose(np.linalg.det(transform_eef_object[:3, :3]), 1.0, atol=1e-6)
+    ):
+        result["error"] = "T_eef_object_must_be_a_finite_SE3_transform_in_meters"
+        return result
+    world_object_transform = None if raw_world_object_transform is None else np.asarray(
+        raw_world_object_transform, dtype=np.float64
+    )
+    if world_object_transform is not None and (
+        world_object_transform.shape != (4, 4)
+        or not np.isfinite(world_object_transform).all()
+        or not np.allclose(world_object_transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)
+        or not np.allclose(
+            world_object_transform[:3, :3].T @ world_object_transform[:3, :3],
+            np.eye(3), atol=1e-6,
+        )
+        or not np.isclose(np.linalg.det(world_object_transform[:3, :3]), 1.0, atol=1e-6)
+    ):
+        result["error"] = "T_world_object_must_be_a_finite_SE3_transform_in_meters"
+        return result
+    if transform_eef_object is not None and world_object_transform is not None:
+        result["error"] = "carried_and_fixed_world_object_transforms_are_mutually_exclusive"
+        return result
+    if fingertip_contact_scope not in ("none", "final_state", "all_states"):
+        result["error"] = "fingertip_contact_scope_must_be_none_final_state_or_all_states"
+        return result
+
+    bindings_result = _task_semantic_geometry_bindings()
+    binding = bindings_result.get("bindings", {}).get(object_id)
+    if bindings_result.get("status") != "complete" or not isinstance(binding, dict):
+        result["error"] = "active_BDDL_target_geometry_binding_unavailable"
+        return result
+    problem = getattr(env.env, "parsed_problem", {})
+    goals = problem.get("goal_state") if isinstance(problem, dict) else None
+    target_predicate = next((
+        list(predicate)
+        for predicate in goals or []
+        if isinstance(predicate, (list, tuple))
+        and len(predicate) == 3
+        and predicate[1] == object_id
+    ), None)
+    if target_predicate is None:
+        result["error"] = "active_BDDL_target_predicate_is_unavailable"
+        return result
+    context = _task_success_first_grasp_context({
+        "expected_instruction": task.language,
+        "target_predicate": target_predicate,
+    })
+    if context.get("status") != "complete" or context.get("read_only") is not True:
+        result["error"] = "verified_fingertip_geometry_context_unavailable"
+        return result
+    target_geom_ids = {int(value) for value in binding.get("root_geom_ids", [])}
+    pad_ids = {
+        int(row["geom_id"])
+        for side in ("left", "right")
+        for row in context.get("fingertip_pad_geometries", {}).get(side, [])
+    }
+    if not target_geom_ids or not pad_ids or len(pad_ids) != 2:
+        result["error"] = "verified_two_sided_fingertip_or_target_geom_ids_unavailable"
+        return result
+    allowed_pairs = {
+        tuple(sorted((pad_id, target_geom_id)))
+        for pad_id in pad_ids
+        for target_geom_id in target_geom_ids
+    }
+
+    robot = env.robots[0]
+    arm_qpos = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
+    gripper_qpos = np.asarray(robot._ref_gripper_joint_pos_indexes, dtype=np.int64)
+    if len(arm_qpos) != 7 or len(gripper_qpos) != 2:
+        result["error"] = "active_robot_arm_or_gripper_qpos_layout_is_not_7_plus_2"
+        return result
+    live_before = _mujoco_integration_state(sim)
+    model_before = _planning_model_signature(model)
+    cache_before = _planning_cache_signature(sim.data._data)
+    scratch = _diagnostic_data_from_integration_state(sim)
+    robot_body_ids = {
+        int(row["body_id"])
+        for row in _geometry_inventory().get("geometries", [])
+        if row.get("category") == "robot" and row.get("collision_enabled") is True
+    }
+    target_body_id = int(binding["root_body_id"])
+    free_joint_id = int(model.body_jntadr[target_body_id])
+    if transform_eef_object is not None and (
+        int(model.body_jntnum[target_body_id]) != 1
+        or int(model.jnt_type[free_joint_id]) != int(mujoco.mjtJoint.mjJNT_FREE)
+    ):
+        result["error"] = "carried_target_root_is_not_a_single_free_joint"
+        return result
+    object_qpos = int(model.jnt_qposadr[free_joint_id])
+    eef_site_id = int(robot.eef_site_id)
+    states = []
+    for state_index, arm_q in enumerate(q_values):
+        scratch.qpos[arm_qpos] = arm_q
+        if gripper_values is not None:
+            scratch.qpos[gripper_qpos] = gripper_values[state_index]
+        mujoco.mj_forward(model, scratch)
+        if transform_eef_object is not None:
+            eef_pose = np.eye(4, dtype=np.float64)
+            eef_pose[:3, :3] = np.asarray(scratch.site_xmat[eef_site_id]).reshape(3, 3)
+            eef_pose[:3, 3] = np.asarray(scratch.site_xpos[eef_site_id], dtype=np.float64)
+            object_pose = eef_pose @ transform_eef_object
+            object_quat = np.empty(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(object_quat, object_pose[:3, :3].reshape(9))
+            scratch.qpos[object_qpos:object_qpos + 7] = np.r_[object_pose[:3, 3], object_quat]
+            mujoco.mj_forward(model, scratch)
+        elif world_object_transform is not None:
+            object_quat = np.empty(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(object_quat, world_object_transform[:3, :3].reshape(9))
+            scratch.qpos[object_qpos:object_qpos + 7] = np.r_[
+                world_object_transform[:3, 3], object_quat
+            ]
+            mujoco.mj_forward(model, scratch)
+        contacts = []
+        illegal_contacts = []
+        for contact_index in range(int(scratch.ncon)):
+            contact = scratch.contact[contact_index]
+            geom_a, geom_b = int(contact.geom1), int(contact.geom2)
+            body_a, body_b = int(model.geom_bodyid[geom_a]), int(model.geom_bodyid[geom_b])
+            if body_a not in robot_body_ids and body_b not in robot_body_ids:
+                continue
+            pair = tuple(sorted((geom_a, geom_b)))
+            target_fingertip_pair = pair in allowed_pairs
+            allowed = bool(
+                target_fingertip_pair
+                and fingertip_contact_scope != "none"
+                and (
+                    fingertip_contact_scope == "all_states"
+                    or state_index == len(q_values) - 1
+                )
+            )
+            row = {
+                "geom_ids": [geom_a, geom_b],
+                "geom_names": [
+                    sim.model.geom_id2name(geom_a), sim.model.geom_id2name(geom_b)
+                ],
+                "body_ids": [body_a, body_b],
+                "distance_m": float(contact.dist),
+                "is_verified_fingertip_target_pair": target_fingertip_pair,
+                "allowed": allowed,
+            }
+            contacts.append(row)
+            if not allowed:
+                illegal_contacts.append(row)
+        states.append({
+            "state_index": state_index,
+            "arm_joint_positions_rad": arm_q.tolist(),
+            "gripper_joint_positions_rad": (
+                gripper_values[state_index].tolist() if gripper_values is not None else None
+            ),
+            "contact_count": len(contacts),
+            "illegal_contact_count": len(illegal_contacts),
+            "contacts": contacts,
+            "illegal_contacts": illegal_contacts,
+        })
+    live_after = _mujoco_integration_state(sim)
+    cache_after = _planning_cache_signature(sim.data._data)
+    unchanged = bool(
+        np.array_equal(live_before, live_after)
+        and model_before == _planning_model_signature(model)
+        and cache_before == cache_after
+    )
+    illegal_count = sum(row["illegal_contact_count"] for row in states)
+    result.update({
+        "status": "complete" if unchanged else "incomplete",
+        "physical_state_unchanged": unchanged,
+        "active_model_and_cache_unchanged": bool(
+            model_before == _planning_model_signature(model)
+            and cache_before == cache_after
+        ),
+        "target_geom_ids": sorted(target_geom_ids),
+        "verified_fingertip_pad_geom_ids": sorted(pad_ids),
+        "allowed_contact_policy": (
+            f"only verified left/right fingertip-pad to target-object geom pairs ({fingertip_contact_scope})"
+            if fingertip_contact_scope != "none" else "no robot-scene contact exception"
+        ),
+        "state_count": len(states),
+        "illegal_contact_count": illegal_count,
+        "states": states,
+    })
+    return result
+
+
 def _scratch_carried_geom_distance_audit(raw_joint_states, object_id):
     """Measure exact compiled Geom distances in hypothetical grasp-preserving scratch states."""
     sim = env.sim
@@ -6730,6 +6967,24 @@ try:
                     except Exception as exc:
                         result = {
                             "operation": "scratch_carried_geom_distance_audit",
+                            "status": "unavailable",
+                            "physical_state_unchanged": False,
+                            "states": [],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "scratch_robot_path_contact_audit":
+                    try:
+                        result = _scratch_robot_path_contact_audit(
+                            request.get("arm_joint_states_rad"),
+                            request.get("object_id"),
+                            request.get("gripper_joint_states_rad"),
+                            request.get("T_eef_object_m"),
+                            request.get("T_world_object_m"),
+                            request.get("fingertip_contact_scope", "none"),
+                        )
+                    except Exception as exc:
+                        result = {
+                            "operation": "scratch_robot_path_contact_audit",
                             "status": "unavailable",
                             "physical_state_unchanged": False,
                             "states": [],
