@@ -1,3 +1,12 @@
+## 2026-10-27：Human L0T2 CuRobo规划问题定位，物理执行止于松爪预算
+
+- 修复并验证了MuJoCo实际base↔CuRobo FK、EEF-site↔hand工具变换和15个Pot1源Geom附着球表示；旧四球拟合对两个候选制造了与瓶体的假碰撞。全场景起点及21个IK可达目标通过碰撞检查。
+- CuRobo MotionPlanner真实返回两条路线，分别到预放置与放置目标；两段均由MuJoCo执行。Pot1终态原生On=true，但3600动作中仅余2步开夹爪控制，未通过释放；Pot2 On=false，完整task_success=false。没有任务成功Episode。
+- 所有动作、双相机Observation/视频、25子步接触、快照、规划原始结果及FK/几何审计已归档于`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_physical_attempt/`。接触子步采样完整，clearance监测不可用，安全认证false；7D arm targets不是π₀.₅原生动作标签。
+- 下一次若继续该任务，先从归档终态评估可恢复性并按放置路径长度预留完整松爪/退爪/settling预算；不要重新抓取、删除番茄酱瓶或重复规划相同全路径。跨场景成功采集主线不应把本次Pot1持抓放置段误记为完整Episode。
+
+---
+
 ## 最新路线状态：Human L0T2精确恢复成功，CuRobo预放置规划无路线（2026-10-26）
 
 - **Snapshot恢复：通过。** 按历史启动和额外reset顺序，t=215、SHA `633b8b…`、331维Integration State和Pot1双指持抓均精确复现；恢复后未reset。

@@ -346,6 +346,7 @@ def _save_json(path: Path, value: Any) -> None:
 
 
 def _plan(
+    bridge: BridgeSession,
     output_dir: Path,
     stage: str,
     current_q: np.ndarray,
@@ -357,11 +358,46 @@ def _plan(
     input_path = output_dir / f"{stage}_curobo_input.json"
     output_path = output_dir / f"{stage}_curobo_plan.json"
     eef_position, eef_quaternion = _matrix_pose(eef_pose)
+    frame_audit = bridge.request({
+        "op": "scratch_robot_fk_audit",
+        "arm_joint_positions_rad": [current_q.tolist()],
+    })
+    if (
+        frame_audit.get("status") != "complete"
+        or frame_audit.get("physical_state_unchanged") is not True
+        or len(frame_audit.get("poses", [])) != 1
+    ):
+        raise RuntimeError(
+            "MuJoCo_base_and_tool_frame_audit_failed:"
+            + str(frame_audit.get("error") or frame_audit.get("status"))
+        )
+    pose_audit = frame_audit["poses"][0]
+    root_body_name = str(frame_audit["root_body_name"])
+    root_pose = pose_audit["bodies"][root_body_name]
+    hand_pose = pose_audit["bodies"].get("robot0_right_hand")
+    if not isinstance(hand_pose, dict):
+        raise RuntimeError("CuRobo panda_hand to MuJoCo robot0_right_hand binding unavailable")
+    base_world = _pose_matrix(
+        root_pose["position_world_m"], root_pose["quaternion_world_wxyz"]
+    )
+    live_hand_world = _pose_matrix(
+        hand_pose["position_world_m"], hand_pose["quaternion_world_wxyz"]
+    )
+    live_eef_world = _pose_matrix(
+        pose_audit["eef_position_world_m"], pose_audit["eef_quaternion_world_wxyz"]
+    )
+    eef_to_tool = np.linalg.inv(live_eef_world) @ live_hand_world
     input_data = {
         "task": "obstacle_avoidance_human/L0T2",
         "current_arm_qpos_rad": current_q.tolist(),
         "live_eef_position_world_m": eef_position,
         "live_eef_quaternion_world_wxyz": eef_quaternion,
+        "robot_base_pose_world_m": root_pose["position_world_m"],
+        "robot_base_quaternion_world_wxyz": root_pose["quaternion_world_wxyz"],
+        "live_planner_tool_pose_world_m": hand_pose["position_world_m"],
+        "live_planner_tool_quaternion_world_wxyz": hand_pose["quaternion_world_wxyz"],
+        "eef_to_planner_tool_transform": eef_to_tool.tolist(),
+        "mujoco_fk_audit": frame_audit,
         "obstacle_geometries_world": obstacle_spheres,
         "goal_poses_world": goals,
         "attached_payload": attached_payload,
@@ -743,7 +779,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "planner": {
             "existing_environment": str(CUROBO_PYTHON),
             "planner": "CuRobo MotionPlanner goalset with packaged Franka self-collision and complete active MuJoCo scene collision export",
-            "payload": "conservative sphere enclosing all bound Pot1 collision Geoms, attached to panda_hand",
+            "payload": "one attached sphere per bound Pot1 MuJoCo collision-Geom enclosure, preserving all 15 source centers/radii",
             "obstacles": "all collision-enabled non-robot MuJoCo Geoms except the carried object and native target support during final docking; cuboids/meshes enclosed by oriented boxes, other finite shapes by exact spheres or verified broadphase spheres",
             "floor": "bounded 5 m workspace cuboid representing the active infinite MuJoCo floor plane",
             "robot": "CuRobo packaged Franka collision model with self_collision_check=true; current MuJoCo robot Geom inventory saved for identity audit",
@@ -908,7 +944,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         })
 
         t0 = time.monotonic()
-        preplan = _plan(output_dir, "pot1_preplace", initial_q, initial_eef, obstacle_spheres, preplace_goals, payload_sphere)
+        preplan = _plan(bridge, output_dir, "pot1_preplace", initial_q, initial_eef, obstacle_spheres, preplace_goals, payload_sphere)
         report["curobo_plan_count"] += 1
         report["planning_seconds"] += time.monotonic() - t0
         report["pot1"]["preplace_plan"] = preplan
@@ -957,6 +993,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
         t1 = time.monotonic()
         final_plan = _plan(
+            bridge,
             output_dir,
             "pot1_place",
             live_q,
@@ -1024,6 +1061,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         retreat_position, retreat_quaternion = _matrix_pose(retreat_goal_world)
         t2 = time.monotonic()
         retreat_plan = _plan(
+            bridge,
             output_dir,
             "pot1_retreat",
             retreat_q,
@@ -1097,6 +1135,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             p2p, p2q = _matrix_pose(pot2_pregrasp)
             p2_start = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
             pot2_preplan = _plan(
+                bridge,
                 output_dir, "pot2_pregrasp", _arm_q_from_snapshot(p2_start), _eef_from_snapshot(p2_start),
                 pot2_obstacles,
                 [{"candidate_id": "pot2_transferred_pot1_grasp", "eef_position_world_m": p2p, "eef_quaternion_world_wxyz": p2q}],
@@ -1117,6 +1156,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 p2_live = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
                 approach_plan = _plan(
+                    bridge,
                     output_dir, "pot2_grasp", _arm_q_from_snapshot(p2_live), _eef_from_snapshot(p2_live),
                     approach_obstacles,
                     [{"candidate_id": "pot2_transferred_pot1_grasp", "eef_position_world_m": _matrix_pose(pot2_grasp_eef)[0],
@@ -1179,6 +1219,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 t3 = time.monotonic()
                 pot2_transport_plan = _plan(
+                    bridge,
                     output_dir, "pot2_preplace", pot2_q, pot2_eef,
                     pot2_transport_obstacles, pot2_preplace_goals,
                     _object_sphere(pot2_live_scene, "moka_pot_2", pot2_live_pose),
@@ -1220,6 +1261,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     t4 = time.monotonic()
                     p2_final_plan = _plan(
+                        bridge,
                         output_dir, "pot2_place", p2_after_q, p2_after_eef,
                         p2_final_obstacles, p2_final_goals,
                         _object_sphere(p2_scene_live, "moka_pot_2", p2_pose_live),
@@ -1264,6 +1306,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                             )
                             t5 = time.monotonic()
                             p2_retreat_plan = _plan(
+                                bridge,
                                 output_dir, "pot2_retreat", p2_retreat_q, p2_retreat_eef,
                                 p2_retreat_obstacles,
                                 [{"candidate_id": "pot2_release_retreat", "eef_position_world_m": p2r, "eef_quaternion_world_wxyz": p2rq}],

@@ -3380,6 +3380,339 @@ def _collision_scene_export():
     return result
 
 
+def _scratch_robot_fk_audit(raw_joint_positions):
+    """Compare requested arm FK poses on scratch MuJoCo data only."""
+    sim = env.sim
+    model = sim.model._model
+    robot = env.robots[0]
+    qpos_indices = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
+    q_values = np.asarray(raw_joint_positions, dtype=np.float64)
+    result = {
+        "operation": "scratch_robot_fk_audit",
+        "status": "unavailable",
+        "physical_state_unchanged": False,
+        "model_geometry_sha256": _planning_model_signature(model),
+        "joint_qpos_indices": qpos_indices.tolist(),
+        "joint_names": [],
+        "poses": [],
+    }
+    if (
+        q_values.ndim != 2
+        or q_values.shape[1:] != (len(qpos_indices),)
+        or not len(q_values)
+        or not np.isfinite(q_values).all()
+    ):
+        result["error"] = "joint_positions_must_be_finite_N_by_active_arm_dof"
+        return result
+
+    joint_names = []
+    for qpos_index in qpos_indices:
+        matches = [
+            joint_id for joint_id in range(int(model.njnt))
+            if int(model.jnt_qposadr[joint_id]) == int(qpos_index)
+        ]
+        if len(matches) != 1:
+            result["error"] = "active_arm_qpos_index_does_not_map_to_one_joint"
+            return result
+        joint_id = matches[0]
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        joint_names.append(str(name))
+        if bool(model.jnt_limited[joint_id]):
+            lower, upper = (float(value) for value in model.jnt_range[joint_id])
+            if np.any(q_values[:, len(joint_names) - 1] < lower) or np.any(
+                q_values[:, len(joint_names) - 1] > upper
+            ):
+                result["error"] = f"requested_fk_pose_exceeds_physical_limit:{name}"
+                result["joint_names"] = joint_names
+                return result
+
+    live_state_before = _mujoco_integration_state(sim)
+    model_signature_before = _planning_model_signature(model)
+    cache_before = _planning_cache_signature(sim.data._data)
+    scratch = _diagnostic_data_from_integration_state(sim)
+    body_names = [
+        getattr(robot.robot_model, "root_body", "robot0_base"),
+        *[f"robot0_link{index}" for index in range(8)],
+        "robot0_right_hand",
+        "gripper0_right_gripper",
+        "gripper0_eef",
+    ]
+    body_ids = {}
+    for name in body_names:
+        try:
+            body_ids[name] = int(sim.model.body_name2id(name))
+        except Exception:
+            continue
+    poses = []
+    for pose_index, q in enumerate(q_values):
+        scratch.qpos[qpos_indices] = q
+        mujoco.mj_forward(model, scratch)
+        bodies = {}
+        for name, body_id in body_ids.items():
+            quaternion = np.empty(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(quaternion, np.asarray(scratch.xmat[body_id]).reshape(9))
+            bodies[name] = {
+                "body_id": body_id,
+                "position_world_m": np.asarray(scratch.xpos[body_id], dtype=np.float64).tolist(),
+                "quaternion_world_wxyz": (quaternion / np.linalg.norm(quaternion)).tolist(),
+            }
+        eef_id = int(robot.eef_site_id)
+        eef_quaternion = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(
+            eef_quaternion, np.asarray(scratch.site_xmat[eef_id]).reshape(9)
+        )
+        eef_quaternion /= np.linalg.norm(eef_quaternion)
+        poses.append({
+            "pose_index": pose_index,
+            "arm_qpos_rad": q.tolist(),
+            "bodies": bodies,
+            "eef_site_id": eef_id,
+            "eef_position_world_m": np.asarray(
+                scratch.site_xpos[eef_id], dtype=np.float64
+            ).tolist(),
+            "eef_quaternion_world_wxyz": eef_quaternion.tolist(),
+        })
+
+    live_state_after = _mujoco_integration_state(sim)
+    cache_after = _planning_cache_signature(sim.data._data)
+    unchanged = bool(
+        np.array_equal(live_state_before, live_state_after)
+        and model_signature_before == _planning_model_signature(model)
+        and cache_before == cache_after
+    )
+    result.update({
+        "status": "complete" if unchanged else "incomplete",
+        "physical_state_unchanged": unchanged,
+        "model_geometry_sha256": model_signature_before,
+        "joint_names": joint_names,
+        "root_body_name": getattr(robot.robot_model, "root_body", None),
+        "poses": poses,
+        "scratch_forward_used": True,
+        "active_state_equal": bool(np.array_equal(live_state_before, live_state_after)),
+        "active_model_equal": model_signature_before == _planning_model_signature(model),
+        "active_kinematics_cache_equal": cache_before == cache_after,
+    })
+    return result
+
+
+def _scratch_carried_geom_distance_audit(raw_joint_states, object_id):
+    """Measure exact compiled Geom distances in hypothetical grasp-preserving scratch states."""
+    sim = env.sim
+    model = sim.model._model
+    model_wrapper = sim.model
+    q_values = np.asarray(raw_joint_states, dtype=np.float64)
+    result = {
+        "operation": "scratch_carried_geom_distance_audit",
+        "status": "unavailable",
+        "physical_state_unchanged": False,
+        "model_geometry_sha256": _planning_model_signature(model),
+        "object_id": object_id,
+        "states": [],
+    }
+    if (
+        not isinstance(object_id, str)
+        or q_values.ndim != 2
+        or q_values.shape[1:] != (7,)
+        or not len(q_values)
+        or not np.isfinite(q_values).all()
+    ):
+        result["error"] = "object_id_and_finite_N_by_7_joint_states_required"
+        return result
+    bindings_result = _task_semantic_geometry_bindings()
+    binding = bindings_result.get("bindings", {}).get(object_id)
+    if bindings_result.get("status") != "complete" or not isinstance(binding, dict):
+        result["error"] = "active_BDDL_object_geometry_binding_unavailable"
+        return result
+
+    body_id = int(binding["root_body_id"])
+    carried_geom_ids = [int(value) for value in binding["root_geom_ids"]]
+    robot = env.robots[0]
+    arm_qpos = np.asarray(robot._ref_joint_pos_indexes, dtype=np.int64)
+    if len(arm_qpos) != 7:
+        result["error"] = "active_robot_arm_qpos_is_not_7d"
+        return result
+    joint_names = []
+    for qpos_index in arm_qpos:
+        joint_id = next(
+            (jid for jid in range(int(model.njnt)) if int(model.jnt_qposadr[jid]) == int(qpos_index)),
+            None,
+        )
+        if joint_id is None:
+            result["error"] = "active_arm_qpos_index_has_no_model_joint"
+            return result
+        joint_names.append(str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)))
+    joint_name_to_id = {
+        str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)): jid
+        for jid in range(int(model.njnt))
+    }
+    for q_index, q_value in enumerate(q_values):
+        for q_col, joint_name in enumerate(joint_names):
+            joint_id = joint_name_to_id[joint_name]
+            if bool(model.jnt_limited[joint_id]):
+                lower, upper = (float(v) for v in model.jnt_range[joint_id])
+                if q_value[q_col] < lower or q_value[q_col] > upper:
+                    result["error"] = f"scratch_joint_state_exceeds_physical_limit:{joint_name}"
+                    return result
+
+    live_state_before = _mujoco_integration_state(sim)
+    model_signature_before = _planning_model_signature(model)
+    cache_before = _planning_cache_signature(sim.data._data)
+    scratch = _diagnostic_data_from_integration_state(sim)
+    free_joint_id = int(model.body_jntadr[body_id])
+    if (
+        int(model.body_jntnum[body_id]) != 1
+        or int(model.jnt_type[free_joint_id]) != int(mujoco.mjtJoint.mjJNT_FREE)
+    ):
+        result["error"] = "carried_object_root_is_not_one_free_joint"
+        return result
+    object_qpos = int(model.jnt_qposadr[free_joint_id])
+    object_pose_start = np.eye(4, dtype=np.float64)
+    object_pose_start[:3, :3] = np.asarray(scratch.xmat[body_id]).reshape(3, 3)
+    object_pose_start[:3, 3] = np.asarray(scratch.xpos[body_id], dtype=np.float64)
+    eef_site_id = int(robot.eef_site_id)
+    eef_pose_start = np.eye(4, dtype=np.float64)
+    eef_pose_start[:3, :3] = np.asarray(scratch.site_xmat[eef_site_id]).reshape(3, 3)
+    eef_pose_start[:3, 3] = np.asarray(scratch.site_xpos[eef_site_id], dtype=np.float64)
+    eef_to_object = np.linalg.inv(eef_pose_start) @ object_pose_start
+
+    inventory = _geometry_inventory()
+    if inventory.get("status") != "complete":
+        result["error"] = "complete_geometry_inventory_unavailable"
+        return result
+    robot_geom_ids = sorted(
+        int(row["geom_id"])
+        for row in inventory["geometries"]
+        if row.get("category") == "robot" and row.get("collision_enabled") is True
+    )
+    scene_geom_ids = sorted(
+        int(row["geom_id"])
+        for row in inventory["geometries"]
+        if row.get("category") == "scene"
+        and row.get("collision_enabled") is True
+        and int(row["geom_id"]) not in set(carried_geom_ids)
+    )
+    query_geom_ids = sorted(set(scene_geom_ids + robot_geom_ids))
+    distance_fn = getattr(mujoco, "mj_geomDistance", None)
+    if not callable(distance_fn):
+        result["error"] = "MuJoCo_build_has_no_mj_geomDistance"
+        return result
+    geom_names = {
+        geom_id: model_wrapper.geom_id2name(geom_id)
+        for geom_id in set(carried_geom_ids + query_geom_ids)
+    }
+    mesh_type = int(mujoco.mjtGeom.mjGEOM_MESH)
+    requested_pairs = 0
+    attempted_pairs = 0
+    censored_pairs = 0
+    pair_errors = []
+    states = []
+    for state_index, arm_q in enumerate(q_values):
+        scratch.qpos[arm_qpos] = arm_q
+        mujoco.mj_forward(model, scratch)
+        eef_pose = np.eye(4, dtype=np.float64)
+        eef_pose[:3, :3] = np.asarray(scratch.site_xmat[eef_site_id]).reshape(3, 3)
+        eef_pose[:3, 3] = np.asarray(scratch.site_xpos[eef_site_id], dtype=np.float64)
+        object_pose = eef_pose @ eef_to_object
+        quat = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quat, object_pose[:3, :3].reshape(9))
+        scratch.qpos[object_qpos:object_qpos + 7] = np.r_[object_pose[:3, 3], quat]
+        mujoco.mj_forward(model, scratch)
+        per_body = {}
+        nearest = None
+        near_pairs = []
+        for geom_a in carried_geom_ids:
+            for geom_b in query_geom_ids:
+                requested_pairs += 1
+                attempted_pairs += 1
+                fromto = np.zeros(6, dtype=np.float64)
+                try:
+                    distance = float(distance_fn(model, scratch, geom_a, geom_b, 5.0, fromto))
+                    if not np.isfinite(distance):
+                        raise ValueError("non_finite_geom_distance")
+                    if distance >= 5.0:
+                        censored_pairs += 1
+                        continue
+                    body_b = int(model.geom_bodyid[geom_b])
+                    body_name_b = model_wrapper.body_id2name(body_b)
+                    pair = {
+                        "carried_geom_id": int(geom_a),
+                        "carried_geom_name": geom_names.get(geom_a),
+                        "other_geom_id": int(geom_b),
+                        "other_geom_name": geom_names.get(geom_b),
+                        "other_body_id": body_b,
+                        "other_body_name": body_name_b,
+                        "distance_m": distance,
+                        "mesh_approximation": (
+                            int(model.geom_type[geom_a]) == mesh_type
+                            or int(model.geom_type[geom_b]) == mesh_type
+                        ),
+                    }
+                    current = per_body.get(str(body_b))
+                    if current is None or distance < current["minimum_distance_m"]:
+                        per_body[str(body_b)] = {
+                            "other_body_id": body_b,
+                            "other_body_name": body_name_b,
+                            "minimum_distance_m": distance,
+                            "closest_geom_pair": pair,
+                        }
+                    if nearest is None or distance < nearest["distance_m"]:
+                        nearest = pair
+                    if distance <= 0.02:
+                        near_pairs.append(pair)
+                except Exception as exc:
+                    if len(pair_errors) < 25:
+                        pair_errors.append({
+                            "carried_geom_id": int(geom_a),
+                            "other_geom_id": int(geom_b),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+        states.append({
+            "state_index": state_index,
+            "arm_qpos_rad": arm_q.tolist(),
+            "object_pose_world": {
+                "position_m": object_pose[:3, 3].tolist(),
+                "quaternion_wxyz": quat.tolist(),
+            },
+            "nearest_pair": nearest,
+            "minimum_distance_by_other_body": sorted(
+                per_body.values(), key=lambda row: row["minimum_distance_m"]
+            ),
+            "near_pairs_le_20mm": sorted(near_pairs, key=lambda row: row["distance_m"]),
+        })
+    live_state_after = _mujoco_integration_state(sim)
+    cache_after = _planning_cache_signature(sim.data._data)
+    state_unchanged = bool(
+        np.array_equal(live_state_before, live_state_after)
+        and model_signature_before == _planning_model_signature(model)
+        and cache_before == cache_after
+    )
+    result.update({
+        "status": "complete" if state_unchanged and attempted_pairs == requested_pairs and not pair_errors else "incomplete",
+        "physical_state_unchanged": state_unchanged,
+        "active_integration_state_equal": bool(np.array_equal(live_state_before, live_state_after)),
+        "active_model_and_cache_equal": bool(
+            model_signature_before == _planning_model_signature(model)
+            and cache_before == cache_after
+        ),
+        "timestep": int(env.env.timestep),
+        "object_root_body_id": body_id,
+        "object_geom_ids": carried_geom_ids,
+        "robot_comparison_geom_count": len(robot_geom_ids),
+        "scene_comparison_geom_count": len(scene_geom_ids),
+        "requested_pair_count": requested_pairs,
+        "attempted_pair_count": attempted_pairs,
+        "censored_at_5m_pair_count": censored_pairs,
+        "pair_error_count": len(pair_errors),
+        "pair_errors": pair_errors,
+        "source_object_to_eef_transform_world_relative": eef_to_object.tolist(),
+        "distance_sign_convention": "negative=overlap, zero=touching, positive=separation",
+        "distance_method": "mj_geomDistance on independent MjData; carried object rigidly follows the actual t=215 EEF-to-object transform; no mj_step or live qpos write",
+        "mesh_approximation_possible": True,
+        "states": states,
+    })
+    return result
+
+
 def _validated_geom_id_list(raw_ids, label, geom_count):
     if not isinstance(raw_ids, list) or not raw_ids:
         return None, f"{label} must be a non-empty array of Geom IDs"
@@ -6374,6 +6707,33 @@ try:
                             "robot_collision_geometries": [],
                             "unsupported_geometries": [],
                             "error": f"Collision scene export failed: {type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "scratch_robot_fk_audit":
+                    try:
+                        result = _scratch_robot_fk_audit(
+                            request.get("arm_joint_positions_rad")
+                        )
+                    except Exception as exc:
+                        result = {
+                            "operation": "scratch_robot_fk_audit",
+                            "status": "unavailable",
+                            "physical_state_unchanged": False,
+                            "poses": [],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "scratch_carried_geom_distance_audit":
+                    try:
+                        result = _scratch_carried_geom_distance_audit(
+                            request.get("arm_joint_states_rad"),
+                            request.get("object_id"),
+                        )
+                    except Exception as exc:
+                        result = {
+                            "operation": "scratch_carried_geom_distance_audit",
+                            "status": "unavailable",
+                            "physical_state_unchanged": False,
+                            "states": [],
+                            "error": f"{type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "rrt_connect":
                     try:

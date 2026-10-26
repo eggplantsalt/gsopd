@@ -1,3 +1,13 @@
+## 本轮结果：CuRobo模型审计通过，Pot1释放受3600步预算阻断（2026-10-27）
+
+Human L0T2 t=215来源状态与模型/BDDL指纹精确匹配。已修复有证据的`robot0_base`/`panda_hand`校准错误、Pot1附着球漏包/假碰撞，以及9维CuRobo路径后处理误送给7自由度FK的问题。5姿态FK对照通过；完整碰撞世界下起点与21个有IK解的目标均无碰撞，3个目标IK不可达。
+
+唯一一次物理接续规划成功返回preplace与place路线并执行3600个真实动作。Pot1原生`On=true`、炉灶`Turnon=true`，但仅余2步开夹爪动作，未能确认完全分离；Pot2 `On=false`，原生task_success=false，稳定释放与完整Episode均未通过。90,000/90,000 MuJoCo子步接触记录完整；几何余量监测不可用，数据非π₀.₅原生动作标签且未安全认证。
+
+完整机器报告和可恢复失败Snapshot：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_physical_attempt/`。本轮已结束，不追加相似规划/物理搜索；旧版“planner_returned_none”结论由本次模型审计与成功路线结果更新，相关历史原文仍保留在进度文档。
+
+---
+
 ## 最新局部目标：Human L0T2 CuRobo运输在完整场景下未找到预放置路线（2026-10-26）
 
 已使用`verify_human_l0t2_t215_snapshot.py`及run3恢复配置复核t=215合法持抓状态；随后运输入口在同一Bridge会话执行历史顺序`start → 额外reset → SHA门禁 → restore`，恢复后没有reset。模型SHA `633b8b…`、331维Integration State精确匹配、Pot1双指抓持通过。

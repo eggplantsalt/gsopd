@@ -3925,3 +3925,25 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 恢复验证单独归档于`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_preflight/`。早期运行时接口错误及第一版粗糙网格包围盒无路尝试均各自保留其独立归档，未覆盖数据。没有使用官方安全示范、没有训练、没有Safety Certification。代码`py_compile`与`git diff --check`通过；未运行Rollout模型或训练。
 
 **结论：没有新增完整Task-Success Episode。t=215抓持Snapshot和当前模型可精确复现，但CuRobo未生成可执行运输路线；本轮在规划阻塞处结束，不追加相似物理搜索。**
+
+## Human L0T2 CuRobo坐标/附着几何审计与单次物理接续（2026-10-27）
+
+本轮按历史`BridgeSession.start → 额外reset → compiled-model SHA门禁 → restore`精确恢复t=215 Pot1持抓Snapshot：payload SHA `b348a065ccb7259a69fd0dc042b42264d257e9f3aba4adb271ff23956729801e`、模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`、BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`。331维Integration State与来源逐元素一致；恢复后未再次reset，未写入qpos/物体状态。
+
+### 有证据的坐标与碰撞表示修正
+
+- 使用5组真实姿态比较CuRobo FK和MuJoCo scratch FK。MuJoCo `robot0_base`与CuRobo `panda_link0`一致；`robot0_link0..7`相对CuRobo `panda_link0..7`最大位置误差`6.07e-8 m`、最大角误差`1.42e-5°`。CuRobo `panda_hand`与MuJoCo `robot0_right_hand`最大误差`0.501 mm / 0.0283°`。旧单姿态用EEF site对齐`panda_hand`会令推算基座错约`755.97 mm / 90.03°`；现改用实际MuJoCo基座，并显式保留EEF-site→hand刚体变换（沿hand局部z约−97 mm，转角约90°）。
+- 原CuRobo MORPHIT四球拟合只完整包住15个Pot1源Geom中的3个，512点/源Geom采样覆盖率`86.59%`。它将放置候选2/8错误报告为与番茄酱瓶编译网格穿透`0.536/0.896 mm`。独立MuJoCo精确Geom距离显示两候选对瓶体主Body实际间隙分别`36.596/46.149 mm`，对玻璃Body间隙`103.229/87.274 mm`；这些是代理球造成的假碰撞。改为每个绑定源Geom包围球一个CuRobo附着球，15/15源球保持完整，采样覆盖率100%，世界变换最大中心误差`4.23e-8 m`，未移除任何障碍或改变MuJoCo几何。
+- 修复路径输出后处理：MotionPlanner返回的轨迹为9维，与franka配置的7个arm joints + 2个finger joints一致；此前把9维状态送进7自由度FK才产生`q should have dof=7, got 9`，并非MotionPlanner没有路线。现在完整9维计划路径保留在报告，7维arm路径独立送入关节执行及FK。
+
+修正后完整世界含38个CuRobo cuboid、2个场景mesh、Franka自身碰撞与15球Pot1。起始状态无碰撞；24个目标中21个IK状态在完整世界检查无碰撞，3个目标没有IK解（其世界碰撞状态unknown）。这证明存在通过模型检查的目标，并不单独证明整条路径可执行。
+
+### 一次真实物理执行结果
+
+只执行一次完整接续入口，CuRobo分别为preplace候选2与末端place候选7返回路线；每条1800点，规划时间分别9.38秒和9.72秒。真实MuJoCo执行了1799步运输、1799步放置。Pot1终态原生`On=true`，炉灶`Turnon=true`，但3600步demo-only动作预算仅剩2步用于开夹爪，少于每10步确认一次完全松爪所需的预算。故`release_contact_separated=false`、稳定释放未验证、Pot2 `On=false`、原生`task_success=false`，最终阻塞为`Pot1_gripper_did_not_fully_release_within_210_actions`。这是动作预算在两条1800点路径之间的分配不足；没有进行第三次规划或物理搜索。
+
+逐步记录完整保存3600个实际关节控制动作、双相机Observation/视频、每步25个MuJoCo子步，共90,000个接触样本，19种实际Geom对；离线完整性扫描未发现缺失子步。几何clearance子步监测3600/3600不可用，因此不作穿透/安全认证结论。关节目标动作标记为与π₀.₅原生动作标签不兼容，`safety_certified=false`。
+
+综合诊断：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261027_physical_attempt/model_diagnostic_report.json`及`.md`。动作、视频、90k子步接触记录、计划输入/输出、起终Snapshot、FK比较和子步完整性报告均在同目录。正确的后续状态只应描述为Pot1到达On区域但未完成释放；本轮完整成功Episode新增0。未使用官方示范、未训练、未改BDDL或Safety Reconstruction标准。
+
+定向代码检查：四个修改模块`py_compile`通过，`git diff --check`通过；未运行独立测试套件。

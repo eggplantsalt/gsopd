@@ -282,7 +282,8 @@ class BridgeSession:
         "task_semantic_geometry_bindings", "repair_context",
         "task_success_first_context", "task_success_first_articulation_context",
         "robot_joint_limit_inventory", "compiled_model_fingerprint_details",
-        "trajectory_tracking_capabilities",
+        "trajectory_tracking_capabilities", "scratch_robot_fk_audit",
+        "scratch_carried_geom_distance_audit",
     })
 
     def __init__(self, address: tuple[str, int], log_path: Path, args: argparse.Namespace):
