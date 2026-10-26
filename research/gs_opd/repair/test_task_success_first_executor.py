@@ -21,6 +21,10 @@ import numpy as np
 from research.gs_opd.repair.task_success_first_executor import (
     _make_precomputed_rrt_route_cache,
     _validate_precomputed_rrt_route,
+    _joint_limit_diagnostics,
+    _live_joint_limit_specification,
+    _transport_grasp_loss_reason,
+    _native_transport_action_budget,
     _phase_evidence,
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
@@ -51,6 +55,62 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_joint_limit_diagnostic_reports_the_measured_small_overage(self):
+        ranges = np.asarray([[-2.9, 2.9]] * 6 + [[-2.8973, 2.8973]], dtype=np.float64)
+        qpos = np.asarray([0.0] * 6 + [2.897506367677], dtype=np.float64)
+        result = _joint_limit_diagnostics(qpos, [f"robot0_joint{i + 1}" for i in range(7)], ranges)
+        self.assertFalse(result["within_limits"])
+        self.assertAlmostEqual(result["maximum_excess_rad"], 0.000206367677, places=11)
+        self.assertEqual(result["violating_joint_count"], 1)
+        self.assertEqual(result["joints"][-1]["joint_name"], "robot0_joint7")
+
+    def test_joint_limit_specification_accepts_bridge_available_status(self):
+        names, ranges = _live_joint_limit_specification({
+            "status": "available",
+            "robots": [{
+                "status": "available",
+                "joint_names": ["robot0_joint1", "robot0_joint7"],
+                "joint_ranges": [[-2.9, 2.9], [-2.8973, 2.8973]],
+            }],
+        })
+        self.assertEqual(names, ["robot0_joint1", "robot0_joint7"])
+        self.assertEqual(np.asarray(ranges).shape, (2, 2))
+
+    def test_transport_loss_stops_before_false_grasp_can_be_misread_as_release(self):
+        loss = {"phase": "transport_preplace", "grasp_state": {"grasp_confirmed": False}}
+        release = {"phase": "release", "grasp_state": {"grasp_confirmed": False}}
+        self.assertEqual(
+            _transport_grasp_loss_reason(loss),
+            "bilateral_grasp_lost_during_native_goal_transport",
+        )
+        self.assertIsNone(_transport_grasp_loss_reason(release))
+
+    def test_transport_budget_scales_past_legacy_360_cap_and_reserves_next_object(self):
+        route = np.asarray([
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ])
+        native = {
+            "status": "complete",
+            "timestep": 500,
+            "native_goal_values": [
+                {"predicate": ["on", "moka_pot_1", "stove"], "value": False},
+                {"predicate": ["on", "moka_pot_2", "stove"], "value": False},
+            ],
+        }
+        result = _native_transport_action_budget(
+            route, native, predicate=["on", "moka_pot_1", "stove"],
+            demonstration_horizon=3000,
+        )
+        self.assertGreater(result["actions"], 360)
+        self.assertEqual(result["future_pending_object_goal_count"], 1)
+        self.assertEqual(
+            result["available_after_reserves"],
+            3000 - 500 - result["current_goal_completion_reserve"]
+            - result["future_goal_reserve_each"],
+        )
+        self.assertLessEqual(result["actions"], result["available_after_reserves"])
+
     def test_task_success_search_can_physically_try_valid_ik_after_rrt_timeout(self):
         row = {
             "admitted_to_physical_search": False,

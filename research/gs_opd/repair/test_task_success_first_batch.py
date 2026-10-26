@@ -119,6 +119,45 @@ class TaskSuccessFirstBatchTests(unittest.TestCase):
         self.assertEqual(summary["maximum_progress"], "stable_grasp_verified")
         self.assertFalse(summary["native_task_success"])
 
+    def test_summary_does_not_call_joint_recovery_actions_transport_or_native_progress(self):
+        native = {
+            "status": "complete",
+            "task_success": False,
+            "native_goal_values": [
+                {"predicate": ["on", "moka_pot_1", "stove"], "value": False},
+                {"predicate": ["on", "moka_pot_2", "stove"], "value": False},
+                {"predicate": ["turnon", "stove"], "value": True},
+            ],
+        }
+        stages = [{
+            "status": "native_goal_route_preflight_failed",
+            "final_native_task_status": native,
+            "segments": [
+                {
+                    "type": "verified_live_grasp_snapshot_resume",
+                    "native_task_status": native,
+                    "grasp_stability": {"stable": True},
+                },
+                {
+                    "type": "expert_native_goal_stage_control",
+                    "recorded_actions": 8,
+                    "transport_actions": 0,
+                    "joint_limit_recovery_actions": 8,
+                },
+            ],
+        }]
+        summary = _task_summary(
+            "obstacle_avoidance_human_L0T2",
+            {"benchmark": "obstacle_avoidance_human", "level": 0, "task_id": 2,
+             "instruction": "put both moka pots on the stove"},
+            stages,
+        )
+        self.assertEqual(summary["physical_actions"], 8)
+        self.assertTrue(summary["stable_grasp_verified"])
+        self.assertFalse(summary["transport_phase_executed"])
+        self.assertEqual(summary["maximum_progress"], "stable_grasp_verified")
+        self.assertFalse(summary["native_task_success"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -554,3 +554,9 @@ L2T2 Round60的41步真实动作与1025个子步接触已完成只读诊断。Ro
 优先级调整为先补齐“规划路线—物理执行”证据链：Round60代码路径会把RRT `qpos_path`转成压缩EEF waypoint并交给独立OSC跟踪，分支归档只保留规划摘要，没有保存选中关节路径或逐动作局部目标。关节限位违规为0；Hand Geom 74—Pot2 Geom 117非指垫接触从起始Snapshot持续存在，且停滞时穿透/法向负载未增加，不能据此判定它为直接根因。后续应先持久化关节与EEF参考、Waypoint映射和局部误差，再针对性验证路线跟踪；不放宽安全约束，不用重复增加同类搜索轮次替代诊断。
 
 Round60诊断机器报告和逐步指标见归档`evidence/round60_stagnation_diagnostic.json`及`evidence/round60_stagnation_diagnostic.md`。准确局部Waypoint误差、实际qpos相对RRT路径偏差和Hand–Pot接触的因果影响仍标为unknown。L1T2完整稳定Episode继续保留为已验收的GS-OPD经验来源，且不视为Safety-Certified数据。
+
+## Human L0T2执行状态更新（2026-10-26）
+
+固定360步运输截断已由路线长度与剩余demo horizon/后续对象预算取代，并增加限位OSC恢复与合法Snapshot回退。单次Human L0T2续接未完成任务：失败t=575 Snapshot的joint7越限0.000206368 rad；8个真实OSC动作仍剩0.000127443 rad越限，随后准确回退至同场景合法Pot1持抓Snapshot。RRT接续规划12秒超时，没有物理运输动作；Pot1仍未放置，Pot2阶段未运行，原生任务完整成功为false。启动参数请求8秒但未传入主运输RRT，运行值为12秒；接口传播已修复，未为此重跑。未追加搜索。
+
+后续实现应优先改进任务等价目标区域的RRT候选与失败分类/预算，避免将规划超时变成物理动作空转；关节状态必须始终来自真实合法状态，继续使用MuJoCo反馈与BDDL完成判据。保留本轮8步动作、200子步样本、接触日志、双相机视频和t=215最佳Snapshot作失败前缀。子步几何门禁标记incomplete，严格安全认证仍独立执行。定向测试37 passed及6 subtests；详见`GS_OPD_PROGRESS.md`及归档`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_transport_budget_recovery_20261026_retry2/`。

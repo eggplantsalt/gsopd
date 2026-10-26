@@ -43,11 +43,12 @@ DEFAULT_CHECKPOINT = Path(
 )
 LIBERO_PYTHON = Path("/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python")
 BRIDGE_AUTHKEY = b"gs-opd-local"
-MAX_NATIVE_TRANSPORT_ACTIONS = 360
 MAX_NATIVE_PLACEMENT_ACTIONS = 96
 MAX_NATIVE_RELEASE_ACTIONS = 32
 MAX_NATIVE_WITHDRAWAL_ACTIONS = 64
 MAX_NATIVE_SETTLE_ACTIONS = 144
+FUTURE_OBJECT_GOAL_ACTION_RESERVE = 1200
+MAX_JOINT_LIMIT_RECOVERY_ACTIONS = 8
 NATIVE_PLACEMENT_RRT_BUDGET_S = 12.0
 NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS = 8000
 NATIVE_PLACEMENT_RRT_MAX_ITERATIONS = 2000
@@ -418,6 +419,346 @@ def _task_values(native: dict[str, Any]) -> tuple[dict[tuple[str, ...], bool], b
     if native.get("status") != "complete" or native.get("task_success") is None or not values:
         raise ValueError("native_BDDL_goal_status_is_incomplete")
     return values, bool(native["task_success"])
+
+
+def _joint_limit_diagnostics(
+    joint_qpos: Any,
+    joint_names: list[str],
+    joint_ranges: Any,
+    *,
+    tolerance_rad: float = 1e-8,
+) -> dict[str, Any]:
+    qpos = np.asarray(joint_qpos, dtype=np.float64)
+    ranges = np.asarray(joint_ranges, dtype=np.float64)
+    if (
+        qpos.ndim != 1 or ranges.shape != (len(qpos), 2)
+        or len(joint_names) != len(qpos) or not np.isfinite(qpos).all()
+        or not np.isfinite(ranges).all() or not np.isfinite(tolerance_rad)
+        or tolerance_rad < 0.0
+    ):
+        raise ValueError("joint_limit_diagnostics_require_aligned_finite_state_and_ranges")
+    violations = []
+    for name, value, (lower, upper) in zip(joint_names, qpos, ranges):
+        lower_excess = max(0.0, float(lower - value))
+        upper_excess = max(0.0, float(value - upper))
+        excess = max(lower_excess, upper_excess)
+        violations.append({
+            "joint_name": str(name),
+            "position_rad": float(value),
+            "lower_rad": float(lower),
+            "upper_rad": float(upper),
+            "lower_excess_rad": lower_excess,
+            "upper_excess_rad": upper_excess,
+            "excess_rad": excess,
+            "within_limits": excess <= tolerance_rad,
+        })
+    maximum_excess = max((row["excess_rad"] for row in violations), default=0.0)
+    return {
+        "within_limits": maximum_excess <= tolerance_rad,
+        "maximum_excess_rad": maximum_excess,
+        "violating_joint_count": sum(not row["within_limits"] for row in violations),
+        "joints": violations,
+    }
+
+
+def _live_joint_limit_specification(repair_context: dict[str, Any]) -> tuple[list[str], Any]:
+    """Read finite Panda joint identity/ranges from the active Bridge controller context."""
+    robots = repair_context.get("robots") if isinstance(repair_context, dict) else None
+    if (
+        not isinstance(repair_context, dict)
+        or repair_context.get("status") != "available"
+        or not isinstance(robots, list) or len(robots) != 1
+        or not isinstance(robots[0], dict)
+        or robots[0].get("status") != "available"
+    ):
+        raise RuntimeError("joint_limit_recovery_requires_live_controller_joint_ranges")
+    names = robots[0].get("joint_names")
+    ranges = robots[0].get("joint_ranges")
+    if not isinstance(names, list) or not names or ranges is None:
+        raise RuntimeError("joint_limit_recovery_requires_live_controller_joint_ranges")
+    return [str(name) for name in names], ranges
+
+
+def _transport_grasp_loss_reason(record: dict[str, Any]) -> str | None:
+    phase = str(record.get("phase", "")) if isinstance(record, dict) else ""
+    if not (phase.startswith("transport_") or phase == "precise_placement"):
+        return None
+    grasp = record.get("grasp_state")
+    if isinstance(grasp, dict) and grasp.get("grasp_confirmed") is False:
+        return "bilateral_grasp_lost_during_native_goal_transport"
+    return None
+
+
+def _native_transport_action_budget(
+    route: Any,
+    native_task_status: dict[str, Any],
+    *,
+    predicate: list[str],
+    demonstration_horizon: int,
+    observed_speed_m_s: float = 0.012,
+) -> dict[str, Any]:
+    """Allocate transport actions from route length and the remaining demo horizon."""
+    from research.gs_opd.repair.task_success_first_search import route_control_action_budget
+
+    timestep = native_task_status.get("timestep")
+    if (
+        isinstance(timestep, bool) or not isinstance(timestep, int) or timestep < 0
+        or isinstance(demonstration_horizon, bool)
+        or not isinstance(demonstration_horizon, int)
+        or demonstration_horizon <= timestep
+    ):
+        raise ValueError("native_transport_action_budget_requires_remaining_demo_horizon")
+    pending = pending_object_goals(native_task_status)
+    future_goals = [row for row in pending if list(row) != list(predicate)]
+    completion_reserve = (
+        MAX_NATIVE_PLACEMENT_ACTIONS
+        + MAX_NATIVE_RELEASE_ACTIONS
+        + MAX_NATIVE_WITHDRAWAL_ACTIONS
+        + MAX_NATIVE_SETTLE_ACTIONS
+    )
+    future_reserve = len(future_goals) * FUTURE_OBJECT_GOAL_ACTION_RESERVE
+    available = max(0, demonstration_horizon - timestep - completion_reserve - future_reserve)
+    if available == 0:
+        raise RuntimeError("native_transport_action_budget_reserved_for_completion_and_pending_goals")
+    estimated_actions = route_control_action_budget(
+        route,
+        observed_speed_m_s=observed_speed_m_s,
+        minimum_actions=74,
+        maximum_actions=10_000_000,
+    )
+    return {
+        "actions": min(estimated_actions, available),
+        "route_length_m": float(np.linalg.norm(
+            np.diff(np.asarray(route, dtype=np.float64)[:, :3], axis=0), axis=1,
+        ).sum()),
+        "estimated_actions_for_route": estimated_actions,
+        "available_after_reserves": available,
+        "current_goal_completion_reserve": completion_reserve,
+        "future_pending_object_goal_count": len(future_goals),
+        "future_goal_reserve_each": FUTURE_OBJECT_GOAL_ACTION_RESERVE,
+        "timestep_at_budget_start": timestep,
+        "demonstration_horizon": demonstration_horizon,
+        "observed_speed_assumption_m_s": observed_speed_m_s,
+        "termination_policy": "route_or_remaining_horizon_budget; no fixed per-transport action cap",
+    }
+
+
+def _recover_joint_limits_with_osc(
+    bridge,
+    *,
+    target_binding: dict[str, Any],
+    instruction: str,
+    safety_policy: dict[str, Any],
+    controller_fields: dict[str, Any],
+    output_dir: Path,
+    fallback_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Try a short physical OSC retreat from a near-limit state, then restore a verified hold."""
+    from research.gs_opd.repair.task_success_first_grasp_search import (
+        _record_step,
+        _snapshot_state_vector,
+        _write_recording,
+    )
+    from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
+    from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+    robot = observed["snapshot_state"]["robot_states"][0]
+    repair = bridge.request({"op": "repair_context"})
+    joint_names, joint_ranges = _live_joint_limit_specification(repair)
+    initial_limits = _joint_limit_diagnostics(
+        robot.get("joint_qpos"), joint_names, joint_ranges,
+    )
+    if initial_limits["within_limits"]:
+        return {
+            "status": "not_needed",
+            "initial_joint_limits": initial_limits,
+            "actions": 0,
+            "safety_certified": False,
+        }
+
+    start_snapshot = bridge.request({"op": "export_runtime_snapshot"})
+    if start_snapshot.get("status") != "complete" or not isinstance(start_snapshot.get("payload"), bytes):
+        raise RuntimeError("out_of_limit_recovery_start_snapshot_export_failed")
+    start_path = output_dir / "limit_recovery_start_runtime_snapshot.pkl"
+    start_path.write_bytes(start_snapshot["payload"])
+    monitor = GraspStabilityMonitor(required_samples=3)
+    records: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    durable_records = output_dir / "durable_physical_step_records.jsonl"
+    durable_frames = output_dir / "durable_dual_camera_frames"
+    durable_frames.mkdir(parents=True, exist_ok=True)
+    max_excess = float(initial_limits["maximum_excess_rad"])
+    reason = None
+    try:
+        grasp = bridge.request({
+            "op": "grasp_state",
+            "carried_binding": target_binding,
+            "expected_instruction": instruction,
+        })
+        if (
+            grasp.get("grasp_confirmed") is not True
+            or grasp.get("finger_contacts", {}).get("left") is not True
+            or grasp.get("finger_contacts", {}).get("right") is not True
+        ):
+            reason = "out_of_limit_snapshot_does_not_have_verified_bilateral_grasp"
+        elif max_excess > 0.02:
+            reason = "joint_limit_excess_exceeds_bounded_OSC_recovery_range"
+        else:
+            for action_index in range(MAX_JOINT_LIMIT_RECOVERY_ACTIONS):
+                current = bridge.request({"op": "observe", "include_snapshot_state": True})
+                current_robot = current["snapshot_state"]["robot_states"][0]
+                current_pos = np.asarray(current_robot["eef_pos"], dtype=np.float64)
+                current_quat = np.asarray(current_robot["eef_quat"], dtype=np.float64)
+                target_pos = current_pos + np.asarray([0.0, 0.0, 0.002], dtype=np.float64)
+                action = world_pose_tracking_action(
+                    current_pos, current_quat, target_pos, current_quat,
+                    controller_fields, gripper_action=0.0,
+                ).astype(np.float32)
+                before = _joint_limit_diagnostics(
+                    current_robot.get("joint_qpos"), joint_names, joint_ranges,
+                )
+                _record_step(
+                    bridge, action, "joint_limit_OSC_recovery", "native_goal_recovery",
+                    action_index, target_binding, instruction, safety_policy, monitor,
+                    records, frames, raise_on_done=False,
+                    planning_tracking={
+                        "tracking_mode": "bounded_native_OSC_pose_recovery_from_joint_limit_violation",
+                        "target_eef_pose_world": np.r_[target_pos, current_quat].tolist(),
+                        "joint_limits_before": before,
+                        "safety_certified": False,
+                    },
+                )
+                record = records[-1]
+                after_robot = record.get("snapshot_state", {}).get("robot_states", [{}])[0]
+                after = _joint_limit_diagnostics(
+                    after_robot.get("joint_qpos"), joint_names, joint_ranges,
+                )
+                if record.get("done"):
+                    reason = "environment_done_during_joint_limit_OSC_recovery"
+                    break
+                if record.get("grasp_state", {}).get("grasp_confirmed") is not True:
+                    reason = "bilateral_grasp_lost_during_joint_limit_OSC_recovery"
+                    break
+                with durable_records.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(
+                        record, ensure_ascii=False, separators=(",", ":"),
+                        default=lambda item: item.tolist() if isinstance(item, np.ndarray) else str(item),
+                    ))
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                frame = frames[-1]
+                combined = np.concatenate((frame["agentview_rgb"], frame["wrist_rgb"]), axis=1)
+                if not cv2.imwrite(
+                    str(durable_frames / f"frame_{action_index:04d}.jpg"),
+                    cv2.cvtColor(combined, cv2.COLOR_RGB2BGR),
+                ):
+                    raise RuntimeError("joint_limit_recovery_dual_camera_frame_write_failed")
+                if after["within_limits"]:
+                    break
+                if after["maximum_excess_rad"] >= max_excess - 1e-6:
+                    reason = "OSC_recovery_did_not_reduce_joint_limit_excess"
+                    break
+                max_excess = float(after["maximum_excess_rad"])
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+
+    if records:
+        _write_recording(output_dir, records, frames)
+    current = bridge.request({"op": "observe", "include_snapshot_state": True})
+    current_robot = current["snapshot_state"]["robot_states"][0]
+    current_limits = _joint_limit_diagnostics(
+        current_robot.get("joint_qpos"), joint_names, joint_ranges,
+    )
+    current_grasp = bridge.request({
+        "op": "grasp_state",
+        "carried_binding": target_binding,
+        "expected_instruction": instruction,
+    })
+    if current_limits["within_limits"] and current_grasp.get("grasp_confirmed") is True:
+        recovered_snapshot = bridge.request({"op": "export_runtime_snapshot"})
+        recovered_path = output_dir / "OSC_recovered_runtime_snapshot.pkl"
+        if recovered_snapshot.get("status") == "complete" and isinstance(recovered_snapshot.get("payload"), bytes):
+            recovered_path.write_bytes(recovered_snapshot["payload"])
+        return {
+            "status": "recovered_by_real_OSC",
+            "initial_joint_limits": initial_limits,
+            "final_joint_limits": current_limits,
+            "physical_actions": len(records),
+            "bilateral_grasp_retained": True,
+            "start_snapshot": str(start_path),
+            "recovered_snapshot": str(recovered_path) if recovered_path.is_file() else None,
+            "reason": reason,
+            "safety_certified": False,
+            "artifacts": {
+                "records": str(output_dir / "physical_step_records.jsonl.gz"),
+                "actions_states": str(output_dir / "task_success_first_actions_states.npz"),
+                "video": str(output_dir / "dual_camera_agentview_wrist_20fps.mp4"),
+                "durable_records": str(durable_records),
+                "durable_frames": str(durable_frames),
+            },
+        }
+
+    if fallback_snapshot is not None:
+        restored = bridge.request({
+            "op": "restore_runtime_snapshot", "payload": fallback_snapshot["payload"],
+        })
+        actual = _snapshot_state_vector(restored.get("snapshot_state", {}))
+        expected = _snapshot_state_vector(fallback_snapshot["snapshot_state"])
+        if (
+            restored.get("status") != "restored"
+            or restored.get("model_geometry_sha256") != fallback_snapshot.get("model_geometry_sha256")
+            or actual.shape != expected.shape or not np.array_equal(actual, expected)
+        ):
+            raise RuntimeError("verified_joint_limit_fallback_snapshot_exact_restore_failed")
+        native = bridge.request({"op": "native_task_status"})
+        values, success = _task_values(native)
+        if success:
+            raise RuntimeError("joint_limit_fallback_snapshot_unexpectedly_has_task_success")
+        fallback_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
+        fallback_robot = fallback_observation["snapshot_state"]["robot_states"][0]
+        fallback_limits = _joint_limit_diagnostics(
+            fallback_robot.get("joint_qpos"), joint_names, joint_ranges,
+        )
+        fallback_grasp = bridge.request({
+            "op": "grasp_state",
+            "carried_binding": target_binding,
+            "expected_instruction": instruction,
+        })
+        if not fallback_limits["within_limits"] or fallback_grasp.get("grasp_confirmed") is not True:
+            raise RuntimeError("fallback_runtime_snapshot_is_not_a_valid_held_object_start")
+        return {
+            "status": "restored_verified_legal_runtime_snapshot",
+            "initial_joint_limits": initial_limits,
+            "failed_OSC_joint_limits": current_limits,
+            "fallback_joint_limits": fallback_limits,
+            "physical_recovery_actions": len(records),
+            "bilateral_grasp_retained": True,
+            "recovery_failure_reason": reason,
+            "fallback_snapshot": fallback_snapshot["path"],
+            "fallback_snapshot_sha256": fallback_snapshot["payload_sha256"],
+            "fallback_integration_state_sha256": _state_digest(actual),
+            "fallback_native_goal_values": native.get("native_goal_values"),
+            "safety_certified": False,
+            "artifacts": {
+                "records": str(output_dir / "physical_step_records.jsonl.gz"),
+                "actions_states": str(output_dir / "task_success_first_actions_states.npz"),
+                "video": str(output_dir / "dual_camera_agentview_wrist_20fps.mp4"),
+                "durable_records": str(durable_records),
+                "durable_frames": str(durable_frames),
+            },
+        }
+    return {
+        "status": "joint_limit_recovery_failed_without_legal_fallback",
+        "initial_joint_limits": initial_limits,
+        "final_joint_limits": current_limits,
+        "physical_actions": len(records),
+        "bilateral_grasp_retained": current_grasp.get("grasp_confirmed") is True,
+        "reason": reason,
+        "safety_certified": False,
+    }
 
 
 def _select_active_target_predicate(
@@ -1409,6 +1750,8 @@ def _native_place_single(
     output_dir: Path,
     placement_candidate: dict[str, Any] | None = None,
     keypose_experience: dict[str, Any] | None = None,
+    demonstration_horizon: int = 1000,
+    rrt_time_budget_s: float = NATIVE_PLACEMENT_RRT_BUDGET_S,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     from scipy.spatial.transform import Rotation
@@ -1574,7 +1917,7 @@ def _native_place_single(
                 "max_iterations": NATIVE_PLACEMENT_RRT_MAX_ITERATIONS,
                 "max_config_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
                 "max_candidate_routes": 2,
-                "search_time_budget_s": NATIVE_PLACEMENT_RRT_BUDGET_S,
+                "search_time_budget_s": rrt_time_budget_s,
                 "shortcut_attempts": 24, "minimum_clearance_m": 0.0,
                 "require_safe_configurations": False, "seed": 74103,
             },
@@ -1623,6 +1966,9 @@ def _native_place_single(
         frame_path = durable_frames_dir / f"frame_{int(frame['step_index']):06d}.jpg"
         if not cv2.imwrite(str(frame_path), cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)):
             raise RuntimeError("durable_dual_camera_frame_write_failed")
+        grasp_failure = _transport_grasp_loss_reason(record)
+        if grasp_failure is not None:
+            raise RuntimeError(grasp_failure)
 
     def persist_latest_step() -> None:
         if records and frames:
@@ -1659,7 +2005,7 @@ def _native_place_single(
             "transport_route_RRT": {
                 "status": planned.get("status"),
                 "failure_reason": planned.get("failure_reason"),
-                "time_budget_s": NATIVE_PLACEMENT_RRT_BUDGET_S,
+                "time_budget_s": rrt_time_budget_s,
                 "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
                 "safety_certified": False,
                 "live_state_verification": planner_state_verification,
@@ -1789,10 +2135,16 @@ def _native_place_single(
             np.r_[target_high[:3, 3], _wxyz(target_high[:3, :3])],
             np.r_[goal_eef[:3, 3], _wxyz(goal_eef[:3, :3])],
         )))
-    transport_action_budget = 0 if resume_at_release else route_control_action_budget(
-        route, observed_speed_m_s=0.012, minimum_actions=74,
-        maximum_actions=MAX_NATIVE_TRANSPORT_ACTIONS,
+    transport_budget_details = (
+        {"actions": 0, "termination_policy": "resume_at_release"}
+        if resume_at_release else _native_transport_action_budget(
+            route,
+            bridge.request({"op": "native_task_status"}),
+            predicate=predicate,
+            demonstration_horizon=demonstration_horizon,
+        )
     )
+    transport_action_budget = int(transport_budget_details["actions"])
 
     try:
         for waypoint_index, waypoint in enumerate(route[1:]):
@@ -1803,9 +2155,10 @@ def _native_place_single(
                 keypose_planner_budget_s = float(
                     placement_candidate.get(
                         "preplace_rrt_search_time_budget_s",
-                        min(8.0, NATIVE_PLACEMENT_RRT_BUDGET_S),
-                    ) if placement_candidate is not None else min(8.0, NATIVE_PLACEMENT_RRT_BUDGET_S)
+                        min(8.0, rrt_time_budget_s),
+                    ) if placement_candidate is not None else min(8.0, rrt_time_budget_s)
                 )
+                keypose_planner_budget_s = min(keypose_planner_budget_s, rrt_time_budget_s)
                 keypose_planner_iterations = int(
                     placement_candidate.get("preplace_rrt_max_iterations", 750)
                     if placement_candidate is not None else 750
@@ -2060,7 +2413,7 @@ def _native_place_single(
                         f"transport_{keypose['name']}_dense_RRT_path",
                         "native_goal_transport",
                         counter,
-                        max(1, transport_action_budget - counter[0]),
+                        max(0, transport_action_budget - counter[0]),
                         target_binding,
                         instruction,
                         safety_policy,
@@ -2101,7 +2454,7 @@ def _native_place_single(
                     _advance_pose(
                         bridge, subgoal[:3], subgoal[3:],
                         f"transport_{keypose['name']}", "native_goal_transport", counter,
-                        max(1, transport_action_budget - counter[0]), target_binding,
+                        max(0, transport_action_budget - counter[0]), target_binding,
                         instruction, safety_policy, monitor, records, frames,
                         step_callback=persist_step,
                         stagnation_window_actions=24,
@@ -2141,7 +2494,7 @@ def _native_place_single(
             "transport_route_RRT": {
                 "status": planned.get("status"),
                 "failure_reason": planned.get("failure_reason"),
-                "time_budget_s": NATIVE_PLACEMENT_RRT_BUDGET_S,
+                "time_budget_s": rrt_time_budget_s,
                 "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
                 "safety_certified": False,
                 "live_state_verification": planner_state_verification,
@@ -2157,6 +2510,8 @@ def _native_place_single(
                 "safety_certified": False,
             },
             "transport_actions": len(records),
+            "transport_action_budget": transport_action_budget,
+            "transport_action_budget_details": transport_budget_details,
             "physics_substeps": int(sum(
                 item.get("contact_monitoring", {}).get("captured_physics_substeps", 0)
                 for item in records
@@ -2361,7 +2716,7 @@ def _native_place_single(
         "transport_route_RRT": {
             "status": planned.get("status"),
             "failure_reason": planned.get("failure_reason"),
-            "time_budget_s": NATIVE_PLACEMENT_RRT_BUDGET_S,
+            "time_budget_s": rrt_time_budget_s,
             "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
             "ik_seed_count": len(_placement_ik_seed_portfolio(robot)),
             "goal_role": rrt_goal_role,
@@ -2374,6 +2729,7 @@ def _native_place_single(
         },
         "keypose_RRT_waypoints": keypose_rrt_runs,
         "transport_action_budget": transport_action_budget,
+        "transport_action_budget_details": transport_budget_details,
         "stage_action_limit": stage_action_limit,
         "recorded_actions": len(records),
         "recorded_physics_substeps": int(sum(
@@ -2420,6 +2776,7 @@ def _screen_native_keypose_candidates(
     geometry_candidates: list[dict[str, Any]],
     experiences: list[dict[str, Any]],
     maximum_rrt_preflights: int,
+    maximum_rrt_time_budget_s: float,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Compare own-success keyposes on one frozen held-object state.
 
@@ -2518,7 +2875,7 @@ def _screen_native_keypose_candidates(
             raise RuntimeError("keypose_candidate_screen_start_snapshot_drifted")
         planner_config = _keypose_rrt_planner_config(
             seed=seed,
-            search_time_budget_s=search_time_budget_s,
+            search_time_budget_s=min(search_time_budget_s, maximum_rrt_time_budget_s),
             maximum_iterations=maximum_iterations,
             maximum_config_checks=maximum_config_checks,
         )
@@ -2797,6 +3154,9 @@ def _native_place(
     keypose_preflight_report: dict[str, Any] | None = None,
     expected_start_snapshot_sha256: str | None = None,
     expected_bddl_sha256: str | None = None,
+    demonstration_horizon: int = 1000,
+    rrt_time_budget_s: float = NATIVE_PLACEMENT_RRT_BUDGET_S,
+    recovery_fallback_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Search distinct native-region layouts from one exact held-object Snapshot."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2810,15 +3170,57 @@ def _native_place(
             "recorded_actions": 0,
             "safety_certified": False,
         }
+    limit_recovery = {"status": "not_needed", "physical_actions": 0, "safety_certified": False}
+    if controller.phase != "release" and not values.get(tuple(predicate), False):
+        limit_recovery = _recover_joint_limits_with_osc(
+            bridge,
+            target_binding=target_binding,
+            instruction=instruction,
+            safety_policy=safety_policy,
+            controller_fields=controller_fields,
+            output_dir=output_dir / "joint_limit_recovery",
+            fallback_snapshot=recovery_fallback_snapshot,
+        )
+        if limit_recovery.get("status") == "joint_limit_recovery_failed_without_legal_fallback":
+            final_status = bridge.request({"op": "native_task_status"})
+            return {
+                "status": "joint_limit_recovery_failed",
+                "failure_reason": limit_recovery.get("reason"),
+                "joint_limit_recovery": limit_recovery,
+                "final_native_task_status": final_status,
+                "native_task_success": final_status.get("task_success"),
+                "recorded_actions": int(limit_recovery.get("physical_actions", 0)),
+                "safety_certified": False,
+            }
+        native_start = bridge.request({"op": "native_task_status"})
+        values, task_success = _task_values(native_start)
+        if task_success:
+            return {
+                "status": "complete_task_success",
+                "final_native_task_status": native_start,
+                "native_task_success": True,
+                "joint_limit_recovery": limit_recovery,
+                "recorded_actions": int(limit_recovery.get("physical_actions", 0)),
+                "safety_certified": False,
+            }
     experience_portfolio = list(keypose_experiences or [])
     if controller.phase == "release" or values.get(tuple(predicate), False):
-        return _native_place_single(
+        result = _native_place_single(
             bridge, target_id=target_id, target_binding=target_binding,
             predicate=predicate, instruction=instruction, model_sha=model_sha,
             safety_policy=safety_policy, controller_fields=controller_fields,
             controller=controller, output_dir=output_dir,
             keypose_experience=experience_portfolio[0] if experience_portfolio else None,
+            demonstration_horizon=demonstration_horizon,
+            rrt_time_budget_s=rrt_time_budget_s,
         )
+        result["joint_limit_recovery"] = limit_recovery
+        recovery_actions = int(
+            limit_recovery.get("physical_actions", limit_recovery.get("physical_recovery_actions", 0)) or 0
+        )
+        result["joint_limit_recovery_actions"] = recovery_actions
+        result["recorded_actions"] = int(result.get("recorded_actions", 0) or 0) + recovery_actions
+        return result
 
     base = bridge.request({"op": "export_runtime_snapshot"})
     if base.get("status") != "complete" or not isinstance(base.get("payload"), bytes):
@@ -3001,6 +3403,7 @@ def _native_place(
             geometry_candidates=candidates,
             experiences=experience_portfolio,
             maximum_rrt_preflights=maximum_rrt_preflights,
+            maximum_rrt_time_budget_s=rrt_time_budget_s,
         )
         route_cache_dir = output_dir / "preflight_route_cache"
         for row in keypose_preflight:
@@ -3112,6 +3515,8 @@ def _native_place(
                 controller=controller, output_dir=branch_dir,
                 placement_candidate=candidate,
                 keypose_experience=candidate_experiences.get(candidate["candidate_id"]),
+                demonstration_horizon=demonstration_horizon,
+                rrt_time_budget_s=rrt_time_budget_s,
             )
         except Exception as exc:
             result = {
@@ -3181,6 +3586,14 @@ def _native_place(
         "direct_object_or_robot_state_write": False,
         "safety_certified": False,
     }
+    last_result["joint_limit_recovery"] = limit_recovery
+    recovery_actions = int(
+        limit_recovery.get("physical_actions", limit_recovery.get("physical_recovery_actions", 0)) or 0
+    )
+    last_result["joint_limit_recovery_actions"] = recovery_actions
+    last_result["recorded_actions"] = int(
+        last_result.get("recorded_actions", last_result.get("transport_actions", 0)) or 0
+    ) + recovery_actions
     return last_result
 
 
@@ -3265,6 +3678,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "student_actions_after_verified_expert_stage": args.student_handoff_action_budget,
             "grasp_geometry_candidates": args.maximum_candidates,
             "RRT_preflights": args.maximum_rrt_preflights,
+            "RRT_time_budget_s": args.rrt_time_budget_s,
             "physical_grasp_branches": args.maximum_physical_branches,
             "expected_MuJoCo_substeps_per_action": 25,
             "demonstration_horizon": args.demonstration_horizon,
@@ -3425,6 +3839,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "geom_ids": sorted(int(x) for x in binding["root_geom_ids"]),
             "geom_names": list(binding["root_geom_names"]),
         }
+        recovery_fallback_snapshot = None
+        if args.recovery_fallback_runtime_snapshot is not None:
+            recovery_fallback_snapshot = _verified_runtime_snapshot_descriptor(
+                args.recovery_fallback_runtime_snapshot,
+                benchmark=args.benchmark,
+                level=args.level,
+                task_id=args.task_id,
+                seed=args.seed,
+                init_state=args.init_state,
+                model_sha=model_sha,
+                bddl_sha=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
+                instruction=str(observed.get("instruction")),
+            )
+            report["joint_limit_recovery_fallback"] = {
+                "path": str(recovery_fallback_snapshot["path"]),
+                "payload_sha256": recovery_fallback_snapshot["payload_sha256"],
+                "model_geometry_sha256": model_sha,
+                "bddl_sha256": observed.get("scene_metadata", {}).get("bddl_sha256"),
+                "identity_validation": "passed",
+                "bilateral_grasp_validation": "checked_after_exact_restore",
+                "robot_or_object_state_written_directly": False,
+                "safety_certified": False,
+            }
         live_grasp_state = bridge.request({
             "op": "grasp_state", "carried_binding": target_binding,
             "expected_instruction": observed["instruction"],
@@ -3539,6 +3976,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 maximum_physical_branches=args.maximum_physical_branches,
                 maximum_rrt_preflights=args.maximum_rrt_preflights,
                 keypose_preflight_report=keypose_preflight_report,
+                demonstration_horizon=args.demonstration_horizon,
+                rrt_time_budget_s=args.rrt_time_budget_s,
+                recovery_fallback_snapshot=recovery_fallback_snapshot,
                 expected_start_snapshot_sha256=(
                     direct_resume.get("payload_sha256") if direct_resume
                     else _sha(resume["path"].read_bytes())
@@ -3644,6 +4084,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 maximum_physical_branches=args.maximum_physical_branches,
                 maximum_rrt_preflights=args.maximum_rrt_preflights,
                 keypose_preflight_report=keypose_preflight_report,
+                demonstration_horizon=args.demonstration_horizon,
+                rrt_time_budget_s=args.rrt_time_budget_s,
+                recovery_fallback_snapshot=recovery_fallback_snapshot,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
@@ -3734,6 +4177,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 maximum_physical_branches=args.maximum_physical_branches,
                 maximum_rrt_preflights=args.maximum_rrt_preflights,
                 keypose_preflight_report=keypose_preflight_report,
+                demonstration_horizon=args.demonstration_horizon,
+                rrt_time_budget_s=args.rrt_time_budget_s,
+                recovery_fallback_snapshot=recovery_fallback_snapshot,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
@@ -3931,6 +4377,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         maximum_physical_branches=args.maximum_physical_branches,
                         maximum_rrt_preflights=args.maximum_rrt_preflights,
                         keypose_preflight_report=keypose_preflight_report,
+                        demonstration_horizon=args.demonstration_horizon,
+                        rrt_time_budget_s=args.rrt_time_budget_s,
+                        recovery_fallback_snapshot=recovery_fallback_snapshot,
                         expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                         expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
                     )
@@ -3973,6 +4422,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from-grasp-report", type=Path, default=None)
     parser.add_argument("--resume-from-placement-report", type=Path, default=None)
     parser.add_argument("--resume-from-runtime-snapshot", type=Path, default=None)
+    parser.add_argument("--recovery-fallback-runtime-snapshot", type=Path, default=None,
+                        help="identity-checked legal Runtime Snapshot used only if OSC joint-limit recovery fails")
     parser.add_argument("--resume-from-keypose-preflight-report", type=Path, default=None)
     parser.add_argument("--previous-search-report", type=Path, action="append", default=[])
     parser.add_argument("--init-state", type=int, default=0)

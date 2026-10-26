@@ -57,6 +57,7 @@ def _snapshot_root_from_payload(
     root: Path,
     *,
     task_bddl: Path | None = None,
+    source: str = "current_seed_init_state_or_verified_prior_task_stage_snapshot",
 ) -> Path:
     from research.gs_opd.repair.task_success_first_grasp_search import _PythonObjectState
 
@@ -90,7 +91,7 @@ def _snapshot_root_from_payload(
                 "mujoco_integration_state_sha256": hashlib.sha256(state_bytes).hexdigest(),
             }
         },
-        "source": "current_seed_init_state_or_verified_prior_task_stage_snapshot",
+        "source": source,
     }
     _write_json(snapshots / "runtime_snapshot_manifest.json", manifest)
     _write_json(root / "snapshot_source.json", {
@@ -126,12 +127,69 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
         benchmark=args.suite, level=args.level, task_id=task_id,
         init_state=args.init_state, seed=args.seed,
         camera_resolution=args.camera_resolution,
+        demonstration_horizon=args.demonstration_horizon,
     )
     port = args.base_port + task_id * 8
     bridge = BridgeSession(("127.0.0.1", port), task_dir / "preflight_bridge.log", bridge_args)
     try:
         bridge.start()
         reset = bridge.request({"op": "reset"})
+        reset_metadata = reset.get("scene_metadata", {})
+        resume_source = None
+        initial_snapshot_payload = None
+        if args.resume_from_runtime_snapshot is not None:
+            from research.gs_opd.repair.task_success_first_grasp_search import _PythonObjectState
+
+            setattr(sys.modules["__main__"], "_PythonObjectState", _PythonObjectState)
+            resume_source = Path(args.resume_from_runtime_snapshot).resolve()
+            if not resume_source.is_file():
+                raise FileNotFoundError(f"resume_Runtime_Snapshot_missing:{resume_source}")
+            resume_payload = resume_source.read_bytes()
+            envelope = pickle.loads(resume_payload)
+            scene = envelope.get("scene_metadata", {})
+            expected_scope = {
+                "benchmark": args.suite,
+                "level": args.level,
+                "task_id": task_id,
+                "environment_seed": args.seed,
+                "init_state_index": args.init_state,
+            }
+            if envelope.get("schema_version") != "gs_opd_runtime_snapshot.v1":
+                raise ValueError("resume_Runtime_Snapshot_schema_mismatch")
+            for key, value in expected_scope.items():
+                if scene.get(key) != value:
+                    raise ValueError(f"resume_Runtime_Snapshot_{key}_mismatch")
+            expected_bddl = args.expected_bddl_hashes.get(str(task_id))
+            if expected_bddl and scene.get("bddl_sha256") != expected_bddl:
+                raise ValueError("resume_Runtime_Snapshot_BDDL_fingerprint_mismatch")
+            if scene.get("instruction") != reset_metadata.get("instruction"):
+                raise ValueError("resume_Runtime_Snapshot_instruction_mismatch")
+            if scene.get("bddl_sha256") != reset_metadata.get("bddl_sha256"):
+                raise ValueError("resume_Runtime_Snapshot_live_BDDL_mismatch")
+            baseline = bridge.request({"op": "export_runtime_snapshot"})
+            if (
+                baseline.get("status") != "complete"
+                or baseline.get("model_geometry_sha256") != envelope.get("model_geometry_sha256")
+            ):
+                raise ValueError("resume_Runtime_Snapshot_model_fingerprint_mismatch")
+            integration = np.asarray(
+                envelope.get("snapshot", {}).get("mujoco_state"), dtype=np.float64,
+            )
+            if integration.ndim != 1 or not len(integration) or not np.isfinite(integration).all():
+                raise ValueError("resume_Runtime_Snapshot_integration_state_invalid")
+            restored = bridge.request({"op": "restore_runtime_snapshot", "payload": resume_payload})
+            restored_state = np.asarray(
+                restored.get("snapshot_state", {}).get("mujoco_integration_state", []),
+                dtype=np.float64,
+            )
+            if (
+                restored.get("status") != "restored"
+                or restored.get("model_geometry_sha256") != envelope.get("model_geometry_sha256")
+                or restored_state.shape != integration.shape
+                or not np.array_equal(restored_state, integration)
+            ):
+                raise RuntimeError("resume_Runtime_Snapshot_exact_restore_verification_failed")
+            initial_snapshot_payload = resume_payload
         observed = bridge.request({"op": "observe", "include_snapshot_state": True})
         native = bridge.request({"op": "native_task_status"})
         object_goals = pending_object_goals(native)
@@ -161,10 +219,25 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
             raise RuntimeError("preflight_init_state_was_not_the_requested_snapshot")
         if exported.get("status") != "complete" or not isinstance(exported.get("payload"), bytes):
             raise RuntimeError("preflight_Runtime_Snapshot_export_failed")
-        if source_root.exists():
-            _verify_existing_t0_snapshot(source_root, exported["payload"])
+        if initial_snapshot_payload is None:
+            initial_snapshot_payload = exported["payload"]
         else:
-            _snapshot_root_from_payload(exported["payload"], source_root)
+            restored_state = np.asarray(
+                exported.get("snapshot_state", {}).get("mujoco_integration_state", []),
+                dtype=np.float64,
+            )
+            source_envelope = pickle.loads(initial_snapshot_payload)
+            source_state = np.asarray(source_envelope["snapshot"]["mujoco_state"], dtype=np.float64)
+            if restored_state.shape != source_state.shape or not np.array_equal(restored_state, source_state):
+                raise RuntimeError("resume_Runtime_Snapshot_changed_during_read_only_preflight")
+        if source_root.exists():
+            _verify_existing_t0_snapshot(source_root, initial_snapshot_payload)
+        else:
+            _snapshot_root_from_payload(
+                initial_snapshot_payload, source_root,
+                source=("verified_failed_stage_Runtime_Snapshot_resume" if resume_source else None)
+                or "current_seed_init_state_or_verified_prior_task_stage_snapshot",
+            )
         expected = args.expected_bddl_hashes.get(str(task_id))
         actual = reset.get("scene_metadata", {}).get("bddl_sha256")
         if expected and actual != expected:
@@ -225,7 +298,7 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
                         raise RuntimeError("historical_L0T2_snapshot_regression_did_not_restore_exact_t0")
             else:
                 historical_regression["restore_status"] = "historical_snapshot_not_found"
-        return source_root, {
+        preflight = {
             "scene_metadata": reset.get("scene_metadata"),
             "instruction": observed.get("instruction"),
             "initial_native_task_status": native,
@@ -249,6 +322,20 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
                 for name, value in observed.get("snapshot_state", {}).get("object_states", {}).items()
             },
         }
+        if resume_source is not None:
+            preflight["resumed_from_runtime_snapshot"] = {
+                "path": str(resume_source),
+                "payload_sha256": _sha(initial_snapshot_payload),
+                "integration_state_sha256": hashlib.sha256(
+                    np.ascontiguousarray(source_state, dtype=np.float64).tobytes()
+                ).hexdigest(),
+                "model_geometry_sha256": exported.get("model_geometry_sha256"),
+                "bddl_sha256": reset_metadata.get("bddl_sha256"),
+                "exact_restore_verified": True,
+                "no_robot_or_object_state_write": True,
+                "safety_certified": False,
+            }
+        return source_root, preflight
     finally:
         bridge.close()
 
@@ -416,6 +503,9 @@ def _artifacts_for_stage(stage: dict[str, Any]) -> list[dict[str, Any]]:
     for segment in stage.get("segments", []):
         if isinstance(segment.get("artifacts"), dict):
             artifacts.append(segment["artifacts"])
+        recovery = segment.get("joint_limit_recovery")
+        if isinstance(recovery, dict) and isinstance(recovery.get("artifacts"), dict):
+            artifacts.append(recovery["artifacts"])
         nested = segment.get("report")
         if nested and Path(nested).is_file():
             expert = json.loads(Path(nested).read_text(encoding="utf-8"))
@@ -490,6 +580,11 @@ def _run_stage(
         "--target-predicate", *[str(token) for token in predicate],
         "--experience-library", str(args.experience_library),
     ]
+    if stage_index == 0 and args.recovery_fallback_runtime_snapshot is not None:
+        command.extend([
+            "--recovery-fallback-runtime-snapshot",
+            str(args.recovery_fallback_runtime_snapshot.resolve()),
+        ])
     log_path = stage_root / "executor.log"
     started = time.monotonic()
     with log_path.open("wb") as log:
@@ -562,6 +657,14 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
         int(segment.get("candidate_count", 0) or 0)
         for stage in stages for segment in stage.get("segments", [])
     )
+    rrt_attempts += sum(
+        int(segment.get("placement_search", {}).get("RRT_preflight_count", 0) or 0)
+        + int(
+            isinstance(segment.get("transport_route_RRT"), dict)
+            and segment.get("transport_route_RRT", {}).get("status") not in {None, "not_run"}
+        )
+        for stage in stages for segment in stage.get("segments", [])
+    )
     candidate_reports = []
     experience_templates = []
     experience_skills = []
@@ -585,6 +688,9 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
         for report in candidate_reports for candidate in report.get("candidates", [])
     )
     stable_grasp = any(
+        segment.get("grasp_stability", {}).get("stable") is True
+        for stage in stages for segment in stage.get("segments", [])
+    ) or any(
         (report.get("success") or {}).get("stable_bilateral_grasp", {}).get(
             "stable", (report.get("success") or {}).get("stable_bilateral_grasp", {}).get(
                 "stable_grasp_observed"
@@ -600,11 +706,23 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
     )
     transported = any(
         segment.get("type") == "expert_native_goal_stage_control"
-        and int(segment.get("recorded_actions", 0) or 0) > 0
+        and int(segment.get("transport_actions", 0) or 0) > 0
         for stage in stages for segment in stage.get("segments", [])
     )
     initial_satisfied = 0
+    for stage in stages:
+        found_initial = False
+        for segment in stage.get("segments", []):
+            initial_status = segment.get("native_task_status")
+            if isinstance(initial_status, dict) and initial_status.get("status") == "complete":
+                _, initial_satisfied = native_goal_counts(initial_status)
+                found_initial = True
+                break
+        if found_initial:
+            break
     for report in candidate_reports:
+        if initial_satisfied:
+            break
         initial_status = (report.get("preflight") or {}).get("native_task_status")
         if isinstance(initial_status, dict) and initial_status.get("status") == "complete":
             _, initial_satisfied = native_goal_counts(initial_status)
@@ -720,6 +838,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             task_rows[(row["suite"], int(level_index), int(suffix))] = row
     # Benchmark level task ids match the manifest's within-level order.
     chosen = args.task_ids or list(TASK_ORDER)
+    if args.resume_from_runtime_snapshot is not None and len(chosen) != 1:
+        raise ValueError("resume_from_runtime_snapshot_requires_exactly_one_selected_task")
     results: list[dict[str, Any]] = []
     global_actions = 0
     for task_id in chosen:
@@ -970,6 +1090,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", action="store_true",
                         help="resume an existing batch archive without rerunning archived task stages")
+    parser.add_argument("--resume-from-runtime-snapshot", type=Path, default=None,
+                        help="start one task from an identity-checked prior physical Runtime Snapshot")
+    parser.add_argument("--recovery-fallback-runtime-snapshot", type=Path, default=None,
+                        help="legal identity-matched hold Snapshot used only after failed OSC limit recovery")
     parser.add_argument("--base-port", type=int, default=39100)
     parser.add_argument("--camera-resolution", type=int, default=256)
     parser.add_argument("--student-actions", type=int, default=16)
@@ -997,8 +1121,18 @@ def _parse_args() -> argparse.Namespace:
         parser.error("physical branch or stage budget is outside its bounded range")
     if args.global_action_budget < 1 or args.per_task_action_budget < 1 or not 0.5 <= args.rrt_time_budget_s <= 60:
         parser.error("global action or RRT time budget is invalid")
-    if not 1000 <= args.demonstration_horizon <= 1800:
-        parser.error("--demonstration-horizon must be in 1000..1800")
+    if not 1000 <= args.demonstration_horizon <= 3600:
+        parser.error("--demonstration-horizon must be in 1000..3600")
+    if args.resume_from_runtime_snapshot is not None:
+        if args.task_ids is None or len(args.task_ids) != 1:
+            parser.error("--resume-from-runtime-snapshot requires exactly one explicit --task-ids value")
+        if not args.resume_from_runtime_snapshot.is_file():
+            parser.error("--resume-from-runtime-snapshot must reference an existing Snapshot")
+    if (
+        args.recovery_fallback_runtime_snapshot is not None
+        and not args.recovery_fallback_runtime_snapshot.is_file()
+    ):
+        parser.error("--recovery-fallback-runtime-snapshot must reference an existing Snapshot")
     if args.task_ids is not None and any(item < 0 or item > 4 for item in args.task_ids):
         parser.error("L0 task ids must be in 0..4")
     args.manifest = args.manifest.resolve()

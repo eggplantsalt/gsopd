@@ -609,3 +609,9 @@ Round60的41步/1025子步归档已完成离线对照；Round60/61/62不因本�
 代码审计发现执行器将RRT输出降为压缩EEF路径后以OSC重新跟踪，未保留关节构型参考；这是优先排查项，不是已经证明的唯一失败原因。Geom 74 Hand–Pot2 Geom 117接触从t=2589起始Snapshot持续贯穿1025子步，最大穿透0.179 mm；停滞期间穿透与法向力没有恶化。接触可能限制运动，因果仍unknown；安全策略保持原样。
 
 诊断JSON与Markdown保存在Round60归档`evidence/round60_stagnation_diagnostic.{json,md}`。后续如继续，先在不执行物理分支的工作中补齐RRT qpos/EEF参考、压缩Waypoint索引和逐步局部目标记录，并修复keypose位姿matrix同步；得到可复核实现后，再由用户安排下一次物理验证。保留L1T2完整稳定Episode为只读经验源；不启动训练。
+
+## 当前局部目标更新（2026-10-26）：Human L0T2运输预算已修复，单次续接止于RRT规划失败
+
+运输执行不再受固定360步截断：预算按完整路线长度、任务尚未完成的后续对象和demo horizon余量计算。Human L0T2的t=575失败Snapshot已精确恢复；Pot1关节7初始越限0.000206368 rad。8个真实OSC抬升动作把越限降至0.000127443 rad，仍未恢复合法，因此按策略恢复到SHA `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`的合法双指持Pot1 Snapshot；终态与该Snapshot Integration State相同，关节均在限位内。恢复动作中的双指抓持持续有效。
+
+在该合法Snapshot上只进行了一次放置/运输规划，实际RRT在12秒后超时；尽管本次CLI请求8秒，执行器未将该上限传入主运输RRT，现已修复传播。未开始真实运输、Pot1放置/释放或Pot2阶段，原生task_success为false，完整Episode新增数为0。没有追加相似搜索。8步真实动作、200个子步样本、接触记录和双相机视频在`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_transport_budget_recovery_20261026_retry2/`。每步25子步已采样，但全几何监测状态为incomplete，故不宣称该段安全认证。最可能的当前物理阻塞是从合法持抓姿态到目标区域的RRT规划超时；单独限位OSC恢复不足，但合法Snapshot回退有效。后续可复用预算逻辑、限位诊断和t=215持抓前缀，不能把这次搜索称为运输或任务成功。

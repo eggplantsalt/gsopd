@@ -3818,3 +3818,13 @@ Round60/61/62未成功的轮次保持归档，本轮不增加候选或物理搜�
 Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 24在450/450子步持续接触；穿透为0.157–0.179 mm，接触坐标系法向力分量1.851–2.154 N。接触从起始Snapshot存在，到t=2607没有恶化；是否对后续运动构成因果阻挡仍unknown。没有降低安全阈值、改变BDDL或Safety Reconstruction标准，没有写入qpos、引入新控制器、启动新任务或训练。
 
 下一步建议先对局部OSC参考跟踪做针对性改进：沿稠密EEF参考进行单调路径投影并监控qpos偏差；若该跟踪仍持续离开RRT走廊，再单独评估基于真实动力学的关节路径执行。当前证据不足以直接新增关节控制器。回归：`test_keypose_driven_planning`与`test_task_success_first_executor`共31项通过。
+
+## Human L0T2运输预算修复与单次接续（2026-10-26）
+
+修正通用Task-Success运输预算：移除固定360控制步上限，按当前完整EEF路线长度、实际任务的剩余BDDL目标预留和demo horizon余量分配预算；预算不足时不跨越预留的放置/释放/Settling或后续对象动作。新增Runtime Snapshot回退参数。对当前持抓Snapshot的Panda真实关节限位做逐关节诊断；若小幅越限则只发真实OSC抬升动作尝试恢复，未恢复时精确恢复同场景、同模型、同BDDL的合法双指抓持Snapshot，不修改qpos或放宽物理限位。批处理入口支持对单个任务从已验证Runtime Snapshot续接及demo-only horizon 3600。
+
+从Human L0T2上一轮t=575运输失败Snapshot恢复，模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`、BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`、seed/init-state/instruction完全核对。`robot0_joint7`越上限`0.000206367677 rad`。真实OSC抬升8步后仍越限`0.000127442799 rad`，期间Pot1双指抓持持续为真；随后自动回退到既有合法Pot1抓持/抬升Snapshot（SHA `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`），终态Integration State与该Snapshot逐元素一致，七关节均在模型范围内。没有直接设置机器人或物体状态。
+
+从合法回退Snapshot开始的一次有界运输规划因RRT `planning_time_budget_exhausted`停止（实际规划预算12秒，未进入OSC运输）。本次启动命令请求8秒，但原执行器主运输规划仍读取12秒模块默认值；此配置传播缺陷已在代码中修复为统一使用CLI RRT时间预算，不为修复而重跑物理分支。所以Pot1尚未放置/释放，Pot2未开始抓取，原生`task_success=false`，本轮新增完整成功Episode为0；真实物理动作共8步，均为限位恢复尝试，未产生运输动作。最佳可恢复Snapshot仍是t=215双指持Pot1状态，与源合法Snapshot Integration State逐元素一致。8步共记录200个子步接触样本；每步记录25个子步，但几何监测器报告`incomplete`（真实接触及严格几何检查失败仍保留，不代表完整安全监测或安全认证）。动作/状态、接触JSONL、双相机帧和视频保存在`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_transport_budget_recovery_20261026_retry2/`；综合机器报告为`human_l0t2_transport_recovery_attempt_report.json`，并保留`batch_report.json`、Human L0T2 `task_report.json`与stage `run_report.json`。
+
+最初两次启动错误均在物理动作前退出（导入路径与Bridge状态名检查问题），零动作归档保留在相邻的`...transport_budget_recovery_20261026/`与`..._retry1/`；唯一实际物理恢复尝试在`..._retry2/`，没有继续追加搜索。动态预算单元回归覆盖超过360步的路线预算；恢复和失抓终止回归核对了真实Bridge `status=available`限位字段及运输段失抓。定向测试`test_task_success_first_executor.py`及`test_task_success_first_batch.py`：37 passed、6 subtests passed。报告统计已离线纠正为已验证持抓、未执行运输、1次RRT尝试；监测不完整如实保留。
