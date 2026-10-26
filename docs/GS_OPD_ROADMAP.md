@@ -1,3 +1,13 @@
+## 最新更新：Human L0T2 t=215持抓Snapshot精确恢复已验证（2026-10-26）
+
+- 根因已定位：仅启动Bridge后立刻恢复缺少历史executor额外`reset`。按`BridgeSession.start → reset → model-SHA gate → restore Snapshot`、seed=0/init-state=0、demo horizon=3600复现后，模型SHA从`3b942cf3…`变为Snapshot所需`633b8b09…`。
+- `compiled_model_fingerprint_details`显示Reset前后唯一不同字段为`body_pos`（33×3），其余字段摘要相同；同BDDL、模型SHA门禁不绕过。
+- 原t=215 Runtime Snapshot恢复后Integration State逐元素精确一致；左右指垫接触Pot1、夹爪闭合、状态只读验证不变。动作和物理子步均为0。
+- 可复现入口`research/gs_opd/repair/verify_human_l0t2_t215_snapshot.py`及配置/报告在`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_t215_bridge_recovery_20261026_run3/`。
+- 下次可从同一恢复序列直接接CuRobo。当前仅验证抓持前缀，未规划、未运输、未获得任务成功Episode。
+
+---
+
 ## 最新更新：Human L0T2 CuRobo尝试因Snapshot模型指纹不匹配而停止（2026-10-26）
 
 - CuRobo既有环境可用，版本`0.0.post1.dev1`/源码commit `78fd485`；没有重装或升级。

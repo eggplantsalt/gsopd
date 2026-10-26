@@ -1,3 +1,13 @@
+## 最新局部目标：已复现Human L0T2 t=215持抓Snapshot的精确Bridge恢复（2026-10-26）
+
+此前模型SHA不匹配的直接原因是启动流程漏掉历史执行器中的额外Bridge `reset`。按成功实验的`BridgeSession`、LIBERO Safety Python、seed=0/init-state=0及demo horizon=3600重跑后，Bridge启动态SHA `3b942cf3…` 在显式`reset`后变为Snapshot要求的 `633b8b09…`。`compiled_model_fingerprint_details`显示唯一变化字段为`body_pos`（33×3）；其余编译模型字段摘要一致。此后Bridge严格接受原t=215 Snapshot。
+
+恢复Integration State shape=[331]并与Snapshot逐元素完全相等，native timestep=215、task_success=false；活动语义绑定及只读`grasp_state`确认Pot1双指接触、夹爪闭合，检查期间状态未变化。动作0、MuJoCo子步0。没有重抓、规划或CuRobo运输。
+
+可重复只读入口：`research/gs_opd/repair/verify_human_l0t2_t215_snapshot.py`；当前验证归档：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_t215_bridge_recovery_20261026_run3/`，含Snapshot副本、运行时指纹、环境配置、JSON/Markdown证据和`reproduce.sh`。下一轮CuRobo可使用此验证序列恢复相同Snapshot；仍需在同一Bridge会话中接入规划。此结果只验证Snapshot和持抓，不代表Pot1已放置或任务成功。
+
+---
+
 ## 最新局部目标：Human L0T2 CuRobo迁移被t=215 Snapshot模型指纹门禁阻断（2026-10-26）
 
 本轮未运行旧MuJoCo 7D RRT、Region-Progress路线或OSC停滞阈值调试。CuRobo隔离环境已可用（`nvidia-curobo 0.0.post1.dev1`，源码commit `78fd485`），未安装或升级。只读启动Human L0T2 seed=0/init-state=0 Bridge时得到完整723 Geom清单和Pot1/Pot2/番茄酱瓶/炉灶语义绑定；但该信息来自t=0，不能替代抓持状态模型证明。

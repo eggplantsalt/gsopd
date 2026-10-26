@@ -3885,3 +3885,24 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 未用旧MuJoCo RRT、未用Region-Progress、未调整OSC阈值、未回退旧路线；BDDL和物理状态均未改。报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_curobo_transport_20261026_run1/run_report.json`及同目录Markdown。探测日志位于`..._probe/safety_bridge.log`和`..._probe2/safety_bridge.log`。
 
 **结论：**实际任务尝试在Snapshot身份校验阶段阻塞，不能报告为规划失败或OSC执行失败。下次继续前必须先取得模型指纹匹配的合法Pot1持抓Snapshot，或恢复其精确原模型环境；在此之前不运行规划与物理分支。
+
+
+## Human L0T2 t=215 Snapshot模型指纹复现与精确恢复（2026-10-26）
+
+### 根因与启动流程
+
+上一轮的失败探测在Bridge刚启动后直接恢复Snapshot，并用`BridgeProcess`探测入口的horizon=1800；它没有复用之前成功实验的`BridgeSession`额外Reset顺序。历史成功实验使用同一任务、BDDL和seed，demo horizon=3600；`task_success_first_executor.py`已有固定流程`BridgeSession.start() -> Bridge reset -> 模型SHA核验 -> Snapshot restore`。Bridge初始启动本身执行`env.seed(0) -> env.reset() -> env.set_init_state(states[0])`，executor在此基础上又显式Reset一次。
+
+复现使用`/workspace/zy_workspace/LIBERO-Safety/.venv/bin/python`，benchmark=`obstacle_avoidance_human`、L0T2、seed=0、init-state=0、256相机、horizon=3600。当前运行时版本为Python 3.10.21、MuJoCo 3.3.2、robosuite 1.4.0、LIBERO 0.1.0、NumPy 1.26.4、Gym 0.25.2。历史Bridge日志未持久化包版本，因此历史版本单独标为unknown；但Bridge源码在历史成功运行时与当前相同，`safety_bridge.py`最近修改commit为`8a5e6c85`，额外Reset门禁在commit `9a614391`中已有，直接恢复分支在`e4e28e63`中已有。
+
+`compiled_model_fingerprint_details`对照显示：启动后模型SHA为`3b942cf306a7decd7dcf576e7970d7a4dcb5af3c663db26da508dd5dd0a56fc8`；额外Reset后模型SHA精确变为`633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`，与合法t=215 Snapshot一致。仅`body_pos`字段改变（shape `[33,3]`，Reset前digest `6f3b7855…`、Reset后`1351af5d…`）；其它分字段摘要均相同。相同BDDL SHA为`2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`。
+
+### Snapshot恢复验收
+
+原t=215持抓Snapshot payload SHA为`b348a065ccb7259a69fd0dc042b42264d257e9f3aba4adb271ff23956729801e`。Bridge以精确模型SHA恢复成功，331维Integration State与来源逐元素完全一致（`np.array_equal=true`；SHA `853f54dfb585cbc54d3d720d93b19eecf97d399619162b1a66c32d51f282a6b9`）。只读导出及语义绑定/抓持检查后状态仍完全一致。native timestep=215，Pot1 On=false、Pot2 On=false、Stove Turnon=true、task_success=false；`grasp_state` pass，左右指垫均接触Pot1且夹爪闭合。动作0、物理子步0；没有修改qpos或物体状态。
+
+首次corrected run2的Snapshot恢复和Integration State比对已通过，但当时抓持查询误传了`task_success_first_context`绑定结构，Bridge返回binding malformed；只读无变化。run3使用活动语义绑定中的root body和碰撞Geom重试后通过双指抓持验证。此为验证器输入格式修正，不是场景或抓持失败。
+
+可复现入口：`research/gs_opd/repair/verify_human_l0t2_t215_snapshot.py`，命令/配置见`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_t215_bridge_recovery_20261026_run3/reproduce.sh`和`launch_config.json`。完整字段指纹、Snapshot副本与恢复证据见同目录`recovery_report.json`和`recovery_report.md`。入口严格拒绝模型SHA不符，恢复后验证状态并退出，不发送任何动作。
+
+**结论：已恢复合法Pot1持抓前缀，初始模型SHA差异由缺失的显式Reset造成，且仅body_pos分字段随该Reset变化。下一轮可在同一启动序列后恢复t=215再接CuRobo；本轮不运行规划或运输，Pot1尚未放置，L0T2 task_success仍为false。**
