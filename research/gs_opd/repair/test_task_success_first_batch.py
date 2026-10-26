@@ -7,15 +7,21 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
+from research.gs_opd.repair import task_success_first_batch
 from research.gs_opd.repair.task_success_first_batch import (
+    _artifacts_for_stage,
     _existing_stage_reports,
     _find_terminal_snapshot,
     _next_distinct_goal,
+    _run_stage,
     _stage_action_count,
     _stage_physical_branch_count,
     _task_summary,
@@ -23,6 +29,73 @@ from research.gs_opd.repair.task_success_first_batch import (
 
 
 class TaskSuccessFirstBatchTests(unittest.TestCase):
+    def test_stage_action_count_includes_each_attempted_placement_branch(self):
+        report = {
+            "segments": [{
+                "recorded_actions": 78,
+                "placement_search": {
+                    "candidate_attempts": [
+                        {"recorded_actions": 107},
+                        {"recorded_actions": 78},
+                    ],
+                },
+            }],
+        }
+        self.assertEqual(_stage_action_count(report), 185)
+
+    def test_stage_artifact_index_includes_every_placement_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            branch = Path(directory) / "branch"
+            branch.mkdir()
+            record = branch / "physical_step_records.jsonl.gz"
+            with gzip.open(record, "wt", encoding="utf-8") as handle:
+                handle.write(json.dumps({"contacts": [], "contact_monitoring": {}}) + "\n")
+            video = branch / "dual_camera_agentview_wrist_20fps.mp4"
+            video.write_bytes(b"video")
+            artifacts = _artifacts_for_stage({
+                "segments": [{"placement_search": {
+                    "candidate_attempts": [{"branch_archive": str(branch)}],
+                }}],
+            })
+        self.assertEqual(artifacts, [{"records": str(record), "video": str(video)}])
+
+    def test_first_resumed_stage_passes_exact_runtime_snapshot_to_executor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "held.pkl"
+            snapshot.write_bytes(b"runtime-snapshot")
+            task_dir = root / "task"
+            task_dir.mkdir()
+            captured = {}
+
+            def fake_run(command, **kwargs):
+                captured["command"] = command
+                stage_root = Path(command[command.index("--output-root") + 1])
+                report_path = stage_root / "task_success_first_executor_test" / "run_report.json"
+                report_path.parent.mkdir(parents=True)
+                report_path.write_text(json.dumps({"final_native_task_status": {"task_success": False}}))
+                return Namespace(returncode=0)
+
+            args = Namespace(
+                suite="obstacle_avoidance_human", level=0, init_state=0, seed=0,
+                camera_resolution=64, base_port=39900, student_actions=1,
+                student_handoff_actions=1, maximum_candidates=1, rrt_preflights=1,
+                physical_branches=2, rrt_time_budget_s=8.0,
+                demonstration_horizon=3600, checkpoint=root / "checkpoint",
+                device="cuda:0", experience_library=root / "library.json",
+                transport_strategy="native_region_progress_osc", keypose_experience=[],
+                resume_from_runtime_snapshot=snapshot,
+                recovery_fallback_runtime_snapshot=None,
+            )
+            with patch.object(task_success_first_batch.subprocess, "run", side_effect=fake_run):
+                _run_stage(
+                    args, task_id=2, stage_index=0, predicate=["on", "moka_pot_1", "stove"],
+                    snapshot_root=root / "snapshot_root", task_dir=task_dir,
+                )
+            command = captured["command"]
+            flag = command.index("--resume-from-runtime-snapshot")
+            self.assertEqual(command[flag + 1], str(snapshot.resolve()))
+
     def test_task_branch_budget_counts_physical_region_branches_across_goals(self):
         report = {
             "segments": [

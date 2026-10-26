@@ -2402,7 +2402,7 @@ def _native_place_single(
                     counter, segment_steps, target_binding, instruction,
                     safety_policy, monitor, records, frames,
                     step_callback=persist_step,
-                    stagnation_window_actions=12,
+                    stagnation_window_actions=24,
                     position_tolerance_m=0.015,
                     rotation_tolerance_rad=0.12,
                     planning_tracking=progress_context,

@@ -362,7 +362,7 @@ def _stage_action_count(report: dict[str, Any]) -> int:
     total = 0
     for segment in report.get("segments", []):
         total += int(segment.get("actions_executed", 0) or 0)
-        total += int(segment.get("recorded_actions", 0) or 0)
+        total += _segment_recorded_action_count(segment)
         expert_report_path = segment.get("report")
         if expert_report_path and Path(expert_report_path).is_file():
             expert = json.loads(Path(expert_report_path).read_text(encoding="utf-8"))
@@ -376,6 +376,14 @@ def _stage_action_count(report: dict[str, Any]) -> int:
                     "attempted_control_actions_archived", branch.get("branch_control_actions", 0)
                 ) or 0)
     return total
+
+
+def _segment_recorded_action_count(segment: dict[str, Any]) -> int:
+    placement = segment.get("placement_search")
+    attempts = placement.get("candidate_attempts") if isinstance(placement, dict) else None
+    if isinstance(attempts, list) and attempts:
+        return sum(int(row.get("recorded_actions", 0) or 0) for row in attempts)
+    return int(segment.get("recorded_actions", 0) or 0)
 
 
 def _stage_physical_branch_count(report: dict[str, Any]) -> int:
@@ -520,6 +528,16 @@ def _artifacts_for_stage(stage: dict[str, Any]) -> list[dict[str, Any]]:
     for segment in stage.get("segments", []):
         if isinstance(segment.get("artifacts"), dict):
             artifacts.append(segment["artifacts"])
+        placement = segment.get("placement_search")
+        attempts = placement.get("candidate_attempts", []) if isinstance(placement, dict) else []
+        for attempt in attempts:
+            branch_archive = attempt.get("branch_archive")
+            if branch_archive:
+                branch_root = Path(branch_archive)
+                artifacts.append({
+                    "records": str(branch_root / "physical_step_records.jsonl.gz"),
+                    "video": str(branch_root / "dual_camera_agentview_wrist_20fps.mp4"),
+                })
         recovery = segment.get("joint_limit_recovery")
         if isinstance(recovery, dict) and isinstance(recovery.get("artifacts"), dict):
             artifacts.append(recovery["artifacts"])
@@ -600,6 +618,11 @@ def _run_stage(
     ]
     for keypose_path in args.keypose_experience:
         command.extend(["--keypose-experience", str(Path(keypose_path).resolve())])
+    if stage_index == 0 and args.resume_from_runtime_snapshot is not None:
+        command.extend([
+            "--resume-from-runtime-snapshot",
+            str(args.resume_from_runtime_snapshot.resolve()),
+        ])
     if stage_index == 0 and args.recovery_fallback_runtime_snapshot is not None:
         command.extend([
             "--recovery-fallback-runtime-snapshot",
@@ -650,7 +673,7 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
         for stage in stages for segment in stage.get("segments", [])
     )
     expert_actions = sum(
-        int(segment.get("recorded_actions", 0) or 0)
+        _segment_recorded_action_count(segment)
         for stage in stages for segment in stage.get("segments", [])
     )
     expert_actions += sum(

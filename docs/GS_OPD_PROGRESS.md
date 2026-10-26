@@ -3843,3 +3843,18 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 完整JSON及可读摘要：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.json`、`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_osc_20261026_run1/human_l0t2_region_progress_attempt_report.md`。分支视频、动作/状态NPZ、逐步接触记录和终态Runtime Snapshot均按JSON清单保存。定向验证：39 passed、6 subtests passed，三模块py_compile通过。
 
 **结论：本轮运输策略的物理尝试失败，主要已证实阻塞是过短的局部Waypoint动作分配；修正后的预算和侧向路线尚未在物理上验证。保留t=233可恢复Snapshot与失败证据，不启动Pot2，不训练。**
+
+
+## Human L0T2 Region-Progress OSC端到端验证（2026-10-26）
+
+从已验证合法的Pot1双指持抓Runtime Snapshot精确恢复：t=215，Snapshot SHA-256 `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`（原始归档SHA为 `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`），模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`，BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`。启动参数使用seed=0、init-state=0、demo-only horizon=3600。批处理首阶段增加了精确Snapshot参数传递；运行证据确认以原有持抓状态接续，没有重做抓取、Student动作或RRT预检。
+
+执行了两条实际不同的Snapshot运输路线，均从同一t=215状态分支：直接区域进展路线107个OSC动作至t=322；使用L1T2 Keypose侧向参考、第一Waypoint同时抬升和侧移的路线78个OSC动作至t=293。Pot1双指抓持在两支全程保持，共185个真实OSC动作、4625个MuJoCo子步样本，RRT调用0。两支终态均未满足Pot1 `On`，Pot2 `On`为false，Stove `Turnon`为true，原生谓词1/3、task_success=false。没有真实松爪、稳定释放或Pot2阶段；新增完整Task-Success Episode为0。
+
+真正的物理阻塞是两条路线都进入番茄酱瓶障碍物的Hand接触：Geom 74 `gripper0_hand_collision`与`bottle_of_tomato_paste_2_with_hand_1`拆分几何发生碰撞。直接路线首次在t=307记录接触、持续到t=322，最深穿透约0.203 mm、接触力范数最高约7.30 N；侧向路线在t=282首次接触、持续到t=293，最深穿透约0.302 mm、力范数最高约3.70 N。接触后OSC移动减慢；各自停滞窗口末段Pot1到目标Region中心仍缩短约5.0 mm和3.2 mm，之后原12步EEF进展检测结束分支。接触因果与停止同时出现，不能据此证明唯一因果，但两支都存在明确真实障碍接触，不能把该结果描述为纯粹IK/RRT或任意跟踪误差失败。
+
+结束后只做了最小执行门槛修正：Region-Progress OSC的现有停滞检测窗口从12步延长到24步，累计6 mm判断及其余限位、MuJoCo物理响应、动作预算和失稳保护保持不变。该代码修正未在本轮物理重跑；本轮两条分支预算已用尽，按要求停止。回归检查：批处理与执行器测试42 passed、6 subtests passed；两个修改模块py_compile通过。
+
+机器摘要已按两个分支的耐久动作记录离线纠正：185个真实动作、4625个子步、6387条控制边界接触记录、185步的子步完整性标记均为incomplete；不构成安全认证。两分支各自的Observation/Action NPZ、双相机MP4、25子步接触记录和失败Runtime Snapshot均完整保留。综合报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/batch_report.json`、`batch_report.md`；任务级证据：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/obstacle_avoidance_human_L0T2/task_report.json`。最佳目标Region进展Snapshot在直接路线t=322终态；侧向路线t=293终态也单独保存。
+
+**结论：任务失败并在2条分支后停止。首个实现修复确实消除了18步预算截断，但真实番茄酱瓶接触减缓了Pot1运输，12步停滞判断仍过早结束低速目标进展；24步门槛修正尚未物理验证。没有启动Pot2、没有完整成功Episode、没有安全认证或训练。**
