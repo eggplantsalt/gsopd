@@ -177,8 +177,8 @@ def _parse_scene_args():
 scene_args = _parse_scene_args()
 if scene_args.camera_resolution <= 0:
     raise ValueError("--camera-resolution must be positive")
-if not 1 <= scene_args.demonstration_horizon <= 2600:
-    raise ValueError("--demonstration-horizon must be in 1..2600")
+if not 1 <= scene_args.demonstration_horizon <= 3600:
+    raise ValueError("--demonstration-horizon must be in 1..3600; values over 1000 are demonstration-only")
 suite = get_benchmark(scene_args.benchmark)()
 task = suite.get_task_by_level_id(scene_args.level, scene_args.task_id)
 if task is None:

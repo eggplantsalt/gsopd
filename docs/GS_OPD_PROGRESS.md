@@ -1,3 +1,35 @@
+## L2T2 跨Level Keypose续接尝试（2026-10-26；限额路线失败后停止）
+
+### 起点与迁移来源
+
+本轮目标为从此前Pot1 On=true、Stove Turnon=true、Pot2双指稳定抓持的t=2589状态续接，仅处理`obstacle_avoidance/L2T2`。run55源Snapshot为`/opt/data/private/gs_opd/rollouts/keypose_driven_L2T2_20261026_run55_suffix_replan/task_success_first_executor_obstacle_avoidance_L2T2_20261026_144052_987760406/expert_native_goal_stage_control/placement_branch_00_region_layout_20/native_goal_transport_failed_runtime_snapshot.pkl`，payload SHA-256 `9b0a99429932d650e031a9bd01603a76866b57369d8641bf80b1dc3c86d70e7a`，模型SHA `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`，BDDL SHA `58b3db56352473e7c4534769911a0ad48ea7c214f934fcb4403b6c1da5467b523`，恢复后Integration State SHA `836981a4fd3507c6a384db7e0e3088d78c8ad64a2519fab4b07a7030bae4d208`。状态和原生谓词逐项核对通过；Pot2双指抓持复验通过。
+
+对照GS-OPD自有L0T2成功关键姿态经验（trace SHA `01fc5d871adef9d91c16d3bedd290cffefeeb37c2971fbc79067d0184123b1f9`）与新提取的L1T2稳定成功经验（trace SHA `998b3f69a323f1e2970f6c4298f7c737ce0d79e070e5a91c5f917977a8c2116e`）。只迁移物体相对/目标Region相对关键姿态及阶段结构，不重放源动作。L0T2的`region_layout_20 / yaw+180 / h=0.38 m`路线在首轮候选中唯一通过预放置整机和持物RRT以及末端IK候选筛选；L1来源候选的预放置RRT超出预算。
+
+### 有界物理尝试与结果
+
+Round60只开1个真实物理Snapshot分支。预放置路线物理重规划通过（11.190秒），OSC执行41个7D控制动作后，在`transport_preplace_waypoint_stagnated_for_24_actions`处停止。t=2589→2630，Pot2仍双指稳定抓持，净移动约80.3 mm；Pot1 On、Stove Turnon为true，Pot2 On为false，reward=0、done=false、原生任务成功=false。失败终态Snapshot SHA `e489a1e990b41876ced9432cdcaa94f409474d56b1f4292db89018fa33cfeefb`，Integration State SHA `61a428f06a7112700ae3027f88a27d12d7772f76593b7bea3dd50e53258455b4`。这是本轮最佳可恢复前缀。
+
+动作归档含41×7真实动作、41步双相机帧、机器人/物体状态与Snapshot、每个动作25个物理子步的接触身份记录（1025/1025；无不可用接触样本）。逐子步接触合计52,275条身份记录、19组Geom对。包含双指—Pot2接触，也包含`gripper0_hand_collision`—`moka_pot_2_g14`非指接触（1025个子步均有）；这些危险接触保留为task-success搜索风险，严格安全认证未通过/未执行。
+
+Round61因为入口默认快照根误指向L0T1模型（SHA `9e2f…`）而被模型指纹门禁拒绝，未执行动作。Round62显式使用L2T2 seed0/init0初始清单后，精确恢复Round60 t=2630终态；限定候选数和RRT实际调用，没有任何新的不同路线同时通过预放置RRT和末端IK，故第二物理分支为0并停止。Round61/62均没有新增物理动作。
+
+### 指标、证据及停止结论
+
+| 项目 | 本轮结果 |
+| --- | --- |
+| 新增真实动作 | 41专家OSC；Student 0 |
+| 物理分支 | 1；备用筛查分支0 |
+| RRT预筛 | Round60 8次实际调用、1/4候选获准执行；Round62 4次实际调用，无新增可执行的不同路线 |
+| RRT规划时长 | 预筛累计166.663秒；真实路线重规划11.190秒 |
+| 完整原生任务成功 | 否；当前2/3谓词 |
+| 松爪、撤爪、Settling后稳定性 | 未到达，未验证 |
+| 安全认证 | false；没有修改严格Safety Reconstruction |
+
+[双相机视频](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/expert_native_goal_stage_control/placement_branch_00_route_01_region_layout_20_v1_yaw+180_h380/dual_camera_agentview_wrist_20fps.mp4)、动作NPZ、逐子步记录和失败/起点Snapshot在[Round60分支归档](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/expert_native_goal_stage_control/placement_branch_00_route_01_region_layout_20_v1_yaw+180_h380/)；Round60/62联合指标见[机器报告](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/l2t2_keypose_continuation_summary.json)和[人读报告](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/l2t2_keypose_continuation_summary.md)。无官方示范数据、无训练、无物体状态或qpos写入。当前未取得第三条完整稳定Task-Success轨迹；停止追加相似高位西侧路线，后续应从t=2630最佳持抓Snapshot解决OSC预放置跟踪停滞，并先证明不同路线可达后再决定是否执行。
+
+---
+
 ## run53 稳定释放完成：末端放置修正与真实子步验收（2026-10-26）
 
 ### 对照结论与原因

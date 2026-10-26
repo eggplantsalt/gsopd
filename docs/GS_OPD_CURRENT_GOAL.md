@@ -1,3 +1,15 @@
+## 最新局部目标：L2T2 Keypose续接已取得可恢复持抓前缀，完整成功仍未取得（2026-10-26）
+
+从run55 Pot2双指持抓Snapshot（t=2589）严格恢复，核对模型SHA `718ba2a082c0…`、BDDL SHA `58b3db563524…`、payload SHA `9b0a9942…`、Integration State SHA `836981a4…`及2/3初始原生谓词。只用GS-OPD自有L0T2与L1T2成功关键姿态经验，不回放历史动作。L0来源路线唯一通过首轮整机/持物预放置RRT和末端IK筛选；L1来源候选受RRT预算阻挡。
+
+Round60在一个真实分支执行41个OSC动作（1025个MuJoCo子步）后，真实预放置跟踪停滞。Pot2继续双指抓持并移动约80 mm，Pot1 On和Stove Turnon仍为真、Pot2 On仍为假；reward=0、done=false。失败终态可精确恢复，Snapshot SHA `e489a1e9…`、Integration State SHA `61a428f0…`。Round62从该状态精确恢复，4次RRT调用没有筛出不同的可执行路线，未开启第二个物理分支。Round61错误快照根在模型指纹门禁处停止，0动作。
+
+本轮新增动作41；RRT候选筛选累计166.663秒，物理路线RRT 11.190秒；完整任务成功0，稳定释放未到达。1025/1025子步接触采样齐全；52,275条接触身份记录包含每步重复的Hand–Pot2非指接触，因此只记录为Task-Success候选，安全认证=false。视频、OA动作/状态、Snapshot与机器摘要链接见`GS_OPD_PROGRESS.md`和跨场景报告。
+
+**当前最优状态：**Round60 t=2630失败终态Snapshot。下一次只继续L2T2，优先诊断为何可达RRT路线在真实OSC的预放置Waypoint停滞；不重做抓取，不重复原路线，不转去其他场景或训练。
+
+---
+
 ## 最新局部目标：完成run53最后几厘米的稳定释放（2026-10-26）
 
 L1T2 run53原生成功前缀t=1335的精确Snapshot SHA为`32bdc4296106e794df472092698fece507e697e7169ff4771b1a9bf0c72c9563`。原地完全松爪但不撤离时，Pot2仍于t=1342失去Cook Region的原生`On`，确认Pot2原放置中心靠近区域边缘，释放后存在自身滑移风险。

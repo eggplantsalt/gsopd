@@ -22,6 +22,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _phase_evidence,
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
+    _keypose_rrt_call_count,
     _native_region_entry_offset_m,
     _native_placement_planner_target,
     _object_contact_escape_direction,
@@ -45,6 +46,32 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_keypose_rrt_call_count_ignores_budget_placeholders(self):
+        candidates = [
+            {
+                "preplace_RRT": {
+                    "initial_RRT_attempt": {"status": "no_safe_path", "planning_seconds": 12.0},
+                    "bounded_extended_RRT_attempt": {"status": "offline_feasible", "planning_seconds": 9.5},
+                },
+                "terminal_pose_IK_RRT_diagnostic": {
+                    "status": "budget_exhausted", "planning_seconds": None,
+                },
+            },
+            {
+                "preplace_RRT": {"status": "budget_exhausted", "planning_seconds": None},
+                "terminal_pose_IK_RRT_diagnostic": {
+                    "status": "no_safe_path", "planning_seconds": 4.0,
+                },
+            },
+            {
+                "preplace_RRT": {"status": "offline_feasible", "planning_seconds": 3.0},
+                "terminal_pose_IK_RRT_diagnostic": {
+                    "status": "not_run_after_unreachable_preplace_route", "planning_seconds": None,
+                },
+            },
+        ]
+        self.assertEqual(_keypose_rrt_call_count(candidates), 4)
+
     def test_terminal_physical_step_can_be_recorded_before_done_is_raised(self):
         class DoneBridge:
             def request(self, request):

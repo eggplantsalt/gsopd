@@ -73,6 +73,27 @@ def _state_digest(value: Any) -> str:
     return _sha(np.ascontiguousarray(value, dtype=np.float64).tobytes())
 
 
+def _keypose_rrt_call_count(candidate_rows: list[dict[str, Any]]) -> int:
+    """Count planner calls with recorded runtimes, excluding budget placeholders."""
+    count = 0
+
+    def was_called(result: Any) -> bool:
+        return isinstance(result, dict) and result.get("planning_seconds") is not None
+
+    for row in candidate_rows:
+        preplace = row.get("preplace_RRT")
+        if isinstance(preplace, dict):
+            initial = preplace.get("initial_RRT_attempt")
+            extended = preplace.get("bounded_extended_RRT_attempt")
+            if isinstance(initial, dict) or isinstance(extended, dict):
+                count += int(was_called(initial)) + int(was_called(extended))
+            else:
+                count += int(was_called(preplace))
+        terminal = row.get("terminal_pose_IK_RRT_diagnostic")
+        count += int(was_called(terminal))
+    return count
+
+
 def _verify_planner_live_state(
     planner_result: dict[str, Any],
     observed_state_sha256: str,
@@ -1216,10 +1237,7 @@ def _native_place_single(
         _wxyz,
         _write_recording,
     )
-    from research.gs_opd.repair.task_success_first_search import (
-        high_approach_route,
-        route_control_action_budget,
-    )
+    from research.gs_opd.repair.task_success_first_search import route_control_action_budget
     from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
     from research.gs_opd.repair.keypose_driven_planning import (
@@ -1293,10 +1311,25 @@ def _native_place_single(
     entry_norm = float(np.linalg.norm(entry_direction))
     if entry_norm > 1e-8:
         entry_direction = entry_direction / entry_norm
+    approach_height_m = float(
+        placement_candidate.get("approach_height_m", 0.14)
+        if placement_candidate is not None else 0.14
+    )
+    if not np.isfinite(approach_height_m) or not 0.08 <= approach_height_m <= 0.50:
+        raise ValueError("native_goal_approach_height_must_be_in_0.08_to_0.50")
+    if keypose_sequence is not None:
+        for row in keypose_sequence:
+            if row["name"] == "preplace":
+                preplace_position = np.asarray(
+                    row["eef_pose_world"]["position_m"], dtype=np.float64,
+                )
+                preplace_position += entry_direction * _native_region_entry_offset_m(predicate)
+                preplace_position[2] = float(goal_eef[2, 3] + approach_height_m)
+                row["eef_pose_world"]["position_m"] = preplace_position.tolist()
     entry_eef = goal_eef.copy()
     entry_eef[:3, 3] += entry_direction * _native_region_entry_offset_m(predicate)
     high_eef = entry_eef.copy()
-    high_eef[:3, 3] += np.asarray([0.0, 0.0, 0.14])
+    high_eef[:3, 3] += np.asarray([0.0, 0.0, approach_height_m])
     high_quat = _wxyz(high_eef[:3, :3])
     state_sha = _state_sha(_snapshot_state_vector(state))
     rrt_goal_eef, rrt_goal_role = _native_placement_planner_target(
@@ -1500,7 +1533,7 @@ def _native_place_single(
             for row in keypose_sequence
         ]
         route = [start_pose, *keypose_poses]
-        transport_route_source = "GS_OPD_L0T2_actual_keypose_sequence_object_and_native_region_frames"
+        transport_route_source = "GS_OPD_own_success_object_and_native_region_frame_keypose_sequence"
     elif planned.get("status") == "offline_feasible" and planned.get("live_state_unchanged") is True:
         route = _compress_eef_route(planned.get("eef_reference_poses_world"))
         transport_route_source = "jointspace_RRT"
@@ -1517,10 +1550,15 @@ def _native_place_single(
     else:
         if planned.get("live_state_unchanged") is not True:
             raise RuntimeError("native_goal_transport_RRT_modified_live_state")
-        start_pose = np.r_[robot["eef_pos"], _wxyz(eef_world[:3, :3])]
-        route = _compress_eef_route(high_approach_route(start_pose, np.r_[high_eef[:3, 3], high_quat]))
-        transport_route_source = "high_OSC_waypoints_after_RRT_failure"
-    if not resume_at_release:
+        return archive_failure(
+            "route_preflight",
+            RuntimeError(
+                "native_goal_transport_RRT_not_feasible_before_OSC:"
+                f"{planned.get('failure_reason') or planned.get('status')}"
+            ),
+            "jointspace_RRT_preflight_rejected",
+        )
+    if not resume_at_release and keypose_sequence is None:
         live_contacts = bridge.request({"op": "inspect_contacts"})
         contact_escape = _object_contact_escape_direction(
             live_contacts, target_binding, obj["root_pos"],
@@ -1556,7 +1594,7 @@ def _native_place_single(
     # Move laterally to a high point above the native region before descending
     # to the physical object target pose. This keeps On routes from repeatedly
     # pushing a held object through the same blocked vertical approach.
-    if not resume_at_release:
+    if not resume_at_release and keypose_sequence is None:
         target_high = goal_eef.copy()
         target_high[:3, 3] += np.asarray([0.0, 0.0, 0.14])
         route = _compress_eef_route(np.vstack((
@@ -1574,6 +1612,24 @@ def _native_place_single(
                 keypose = keypose_sequence[waypoint_index]
                 live = bridge.request({"op": "observe", "include_snapshot_state": True})
                 live_state_sha = _state_sha(_snapshot_state_vector(live.get("snapshot_state", {})))
+                keypose_planner_budget_s = float(
+                    placement_candidate.get(
+                        "preplace_rrt_search_time_budget_s",
+                        min(8.0, NATIVE_PLACEMENT_RRT_BUDGET_S),
+                    ) if placement_candidate is not None else min(8.0, NATIVE_PLACEMENT_RRT_BUDGET_S)
+                )
+                keypose_planner_iterations = int(
+                    placement_candidate.get("preplace_rrt_max_iterations", 750)
+                    if placement_candidate is not None else 750
+                )
+                keypose_planner_checks = int(
+                    placement_candidate.get("preplace_rrt_max_config_checks", 3000)
+                    if placement_candidate is not None else 3000
+                )
+                keypose_planner_seed = int(
+                    placement_candidate.get("preplace_rrt_seed", 74103 + waypoint_index)
+                    if placement_candidate is not None else 74103 + waypoint_index
+                )
                 keypose_plan = bridge.request({
                     "op": "task_success_first_rrt",
                     "expected_instruction": instruction,
@@ -1588,14 +1644,14 @@ def _native_place_single(
                         "step_rad": 0.22,
                         "connect_max_steps": 16,
                         "goal_bias": 0.18,
-                        "max_iterations": 750,
-                        "max_config_checks": 3000,
+                        "max_iterations": keypose_planner_iterations,
+                        "max_config_checks": keypose_planner_checks,
                         "max_candidate_routes": 1,
-                        "search_time_budget_s": min(8.0, NATIVE_PLACEMENT_RRT_BUDGET_S),
+                        "search_time_budget_s": keypose_planner_budget_s,
                         "shortcut_attempts": 12,
                         "minimum_clearance_m": 0.0,
                         "require_safe_configurations": False,
-                        "seed": 74103 + waypoint_index,
+                        "seed": keypose_planner_seed,
                     },
                     "ik_seed_qpos": _placement_ik_seed_portfolio(live["snapshot_state"]["robot_states"][0]),
                 })
@@ -1614,6 +1670,10 @@ def _native_place_single(
                     "planning_seconds": keypose_plan.get("planning_seconds"),
                     "configuration_checks": keypose_plan.get("config_checks"),
                     "iterations": keypose_plan.get("iterations"),
+                    "search_time_budget_s": keypose_planner_budget_s,
+                    "maximum_iterations": keypose_planner_iterations,
+                    "maximum_config_checks": keypose_planner_checks,
+                    "seed": keypose_planner_seed,
                     "minimum_forbidden_clearance_m": keypose_plan.get("minimum_forbidden_clearance_m"),
                     "record_only_diagnostics": True,
                     "carried_object_geometry_included": True,
@@ -1623,10 +1683,11 @@ def _native_place_single(
                 if keypose_plan.get("status") == "offline_feasible" and keypose_plan.get("live_state_unchanged") is True:
                     subroute = _compress_eef_route(keypose_plan.get("eef_reference_poses_world"))
                 else:
-                    # Planning failure is evidence, not a collision veto. OSC
-                    # still physically attempts this actual source keypose.
-                    subroute = np.asarray([waypoint], dtype=np.float64)
-                    keypose_rrt_runs[-1]["execution_fallback"] = "single_keypose_OSC_after_bounded_RRT_failure"
+                    keypose_rrt_runs[-1]["execution_fallback"] = None
+                    raise RuntimeError(
+                        "keypose_RRT_not_feasible_before_OSC:"
+                        f"{keypose['name']}:{keypose_plan.get('failure_reason') or keypose_plan.get('status')}"
+                    )
             else:
                 keypose = {"name": "native_goal_transport_waypoint"}
                 subroute = np.asarray([waypoint], dtype=np.float64)
@@ -1936,6 +1997,322 @@ def _native_place_single(
     }
 
 
+def _screen_native_keypose_candidates(
+    bridge,
+    *,
+    target_id: str,
+    target_binding: dict[str, Any],
+    predicate: list[str],
+    instruction: str,
+    model_sha: str,
+    safety_policy: dict[str, Any],
+    start_snapshot_state: dict[str, Any],
+    start_state_sha256: str,
+    region: dict[str, Any],
+    geometry_candidates: list[dict[str, Any]],
+    experiences: list[dict[str, Any]],
+    maximum_rrt_preflights: int,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Compare own-success keyposes on one frozen held-object state.
+
+    Candidate placement locations come from the active BDDL region and current
+    occupancy. Every staging pose is screened with the full held-object and
+    robot geometry RRT. The terminal contact pose must have a valid IK solution;
+    its RRT diagnostics are retained because final support contact may be a
+    task-success search contact and will be physically executed by bounded OSC.
+    """
+    from scipy.spatial.transform import Rotation
+    from research.gs_opd.repair.keypose_driven_planning import (
+        retarget_keypose_sequence,
+        select_keypose_suffix,
+    )
+    from research.gs_opd.repair.task_success_first_grasp_search import (
+        _snapshot_state_vector,
+        _state_sha,
+        _wxyz,
+    )
+
+    if not experiences:
+        raise ValueError("keypose_candidate_screen_requires_verified_GS_OPD_experiences")
+    robot = start_snapshot_state.get("robot_states", [{}])[0]
+    obj = _object_state(start_snapshot_state, int(target_binding["body_id"]))
+    object_world = np.eye(4, dtype=np.float64)
+    object_world[:3, :3] = Rotation.from_quat(
+        np.asarray(obj["root_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+    ).as_matrix()
+    object_world[:3, 3] = np.asarray(obj["root_pos"], dtype=np.float64)
+    eef_world = np.eye(4, dtype=np.float64)
+    eef_world[:3, :3] = Rotation.from_quat(
+        np.asarray(robot["eef_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+    ).as_matrix()
+    eef_world[:3, 3] = np.asarray(robot["eef_pos"], dtype=np.float64)
+    object_to_eef = np.linalg.inv(object_world) @ eef_world
+    region_world = np.eye(4, dtype=np.float64)
+    region_world[:3, :3] = np.asarray(region["site_rotation_world"], dtype=np.float64)
+    region_world[:3, 3] = np.asarray(region["site_position_world_m"], dtype=np.float64)
+
+    combinations: list[tuple[dict[str, Any], dict[str, Any], float, float]] = []
+    if len(geometry_candidates) >= 4 and len(experiences) >= 2:
+        combinations = [
+            (geometry_candidates[0], experiences[1], 0.32, -90.0),
+            (geometry_candidates[0], experiences[0], 0.38, 180.0),
+            (geometry_candidates[3], experiences[1], 0.34, -90.0),
+            (geometry_candidates[3], experiences[0], 0.40, 180.0),
+        ]
+    else:
+        bases = geometry_candidates[:min(2, len(geometry_candidates))]
+        angles = (-90.0, 180.0, -90.0, 180.0)
+        heights = (0.32, 0.38, 0.34, 0.40)
+        for base_index, base_candidate in enumerate(bases):
+            for experience_index, experience in enumerate(experiences[:2]):
+                if len(combinations) >= 4:
+                    break
+                combinations.append((
+                    base_candidate, experience,
+                    heights[len(combinations)], angles[len(combinations)],
+                ))
+        if len(experiences) == 1:
+            for base_candidate in bases:
+                if len(combinations) >= 4:
+                    break
+                combinations.append((
+                    base_candidate, experiences[0],
+                    heights[len(combinations)], angles[len(combinations)],
+                ))
+
+    planning_policy = dict(safety_policy)
+    planning_policy["carried_object"] = {
+        "object_id": target_id,
+        "grasp_binding": target_binding,
+        "allowed_contact_pairs": [],
+        "allowed_support_contact_pairs": [],
+    }
+    preflight_count = 0
+    preflight_rows: list[dict[str, Any]] = []
+    physical_candidates: list[dict[str, Any]] = []
+    experience_by_candidate: dict[str, dict[str, Any]] = {}
+
+    def screen_pose(
+        goal_pose: np.ndarray,
+        seed: int,
+        *,
+        search_time_budget_s: float = 12.0,
+        maximum_iterations: int = 750,
+        maximum_config_checks: int = 3000,
+    ) -> dict[str, Any]:
+        nonlocal preflight_count
+        if preflight_count >= maximum_rrt_preflights:
+            return {"status": "budget_exhausted", "failure_class": "RRT_preflight_budget_exhausted"}
+        live = bridge.request({"op": "observe", "include_snapshot_state": True})
+        live_state_sha = _state_sha(_snapshot_state_vector(live.get("snapshot_state", {})))
+        if live_state_sha != start_state_sha256:
+            raise RuntimeError("keypose_candidate_screen_start_snapshot_drifted")
+        result = bridge.request({
+            "op": "task_success_first_rrt",
+            "expected_instruction": instruction,
+            "model_geometry_sha256": model_sha,
+            "start_state_sha256": live_state_sha,
+            "goal_pose_world": {
+                "position_world_m": goal_pose[:3, 3].tolist(),
+                "quaternion_wxyz": _wxyz(goal_pose[:3, :3]).tolist(),
+            },
+            "safety_geometry_policy": planning_policy,
+            "planner_config": {
+                "step_rad": 0.22,
+                "connect_max_steps": 16,
+                "goal_bias": 0.18,
+                "max_iterations": int(maximum_iterations),
+                "max_config_checks": int(maximum_config_checks),
+                "max_candidate_routes": 1,
+                "search_time_budget_s": float(search_time_budget_s),
+                "shortcut_attempts": 12,
+                "minimum_clearance_m": 0.0,
+                "require_safe_configurations": False,
+                "seed": int(seed),
+            },
+            "ik_seed_qpos": _placement_ik_seed_portfolio(robot),
+        })
+        preflight_count += 1
+        after = bridge.request({"op": "observe", "include_snapshot_state": True})
+        after_sha = _state_sha(_snapshot_state_vector(after.get("snapshot_state", {})))
+        unchanged = after_sha == live_state_sha
+        if not unchanged:
+            raise RuntimeError("keypose_candidate_RRT_screen_modified_live_snapshot")
+        valid_ik_count = sum(
+            1 for row in result.get("ik_candidates", [])
+            if float(row.get("position_error_m", float("inf"))) <= 0.003
+            and float(row.get("orientation_error_rad", float("inf"))) <= 0.03
+        )
+        return {
+            "status": result.get("status"),
+            "failure_reason": result.get("failure_reason"),
+            "failure_class": (
+                "IK_unreachable"
+                if "inverse_kinematics" in str(result.get("failure_reason", ""))
+                else "RRT_or_full_geometry_route_unavailable"
+                if result.get("status") != "offline_feasible"
+                else None
+            ),
+            "planning_seconds": result.get("planning_seconds"),
+            "configuration_checks": result.get("config_checks"),
+            "iterations": result.get("iterations"),
+            "ik_candidate_count": valid_ik_count,
+            "minimum_forbidden_clearance_m": result.get("minimum_forbidden_clearance_m"),
+            "live_state_unchanged": unchanged,
+            "full_robot_link_geometry_included": True,
+            "held_object_geometry_included": True,
+            "safety_certified": False,
+        }
+
+    for variant_index, (base_candidate, experience, approach_height_m, yaw_offset_degrees) in enumerate(combinations):
+        candidate = dict(base_candidate)
+        exp_id = str(experience.get("experience_id", "own_success"))
+        candidate["candidate_id"] = (
+            f"route_{variant_index:02d}_{base_candidate['candidate_id']}_"
+            f"{exp_id.rsplit('_', 1)[-1]}_"
+            f"yaw{int(yaw_offset_degrees):+04d}_h{int(round(approach_height_m * 1000)):03d}"
+        )
+        release = next(
+            (row for row in experience.get("keypose_sequence", []) if row.get("name") == "release"),
+            None,
+        )
+        if release is None:
+            preflight_rows.append({
+                "candidate_id": candidate["candidate_id"],
+                "source_experience_id": exp_id,
+                "status": "rejected",
+                "failure_class": "source_release_keypose_missing",
+            })
+            continue
+        release_local = np.asarray(release["region_to_object"]["matrix"], dtype=np.float64)
+        yaw_variant = Rotation.from_euler("z", yaw_offset_degrees, degrees=True).as_matrix()
+        candidate["rotation_world"] = (
+            region_world[:3, :3] @ yaw_variant @ release_local[:3, :3]
+        ).tolist()
+        candidate["orientation_source"] = f"{exp_id}:region_relative_release_keypose"
+        candidate["orientation_yaw_offset_degrees"] = yaw_offset_degrees
+        candidate["approach_height_m"] = float(approach_height_m)
+        candidate["route_strategy"] = "jointspace_rrt"
+        candidate["source_keypose_experience_id"] = exp_id
+        candidate["source_keypose_task"] = experience.get("source", {}).get("task")
+
+        runtime_experience = dict(experience)
+        runtime_experience["keypose_sequence"] = [
+            row for row in experience.get("keypose_sequence", [])
+            if row.get("name") in {"grasp", "lift", "preplace", "release"}
+        ]
+        runtime_experience["_route_start_after"] = "lift"
+        required = {"grasp", "lift", "preplace", "release"}
+        names = {row.get("name") for row in runtime_experience["keypose_sequence"]}
+        if not required.issubset(names):
+            preflight_rows.append({
+                "candidate_id": candidate["candidate_id"],
+                "source_experience_id": exp_id,
+                "status": "rejected",
+                "failure_class": "source_keypose_sequence_missing_required_phases",
+            })
+            continue
+
+        goal_object = np.eye(4, dtype=np.float64)
+        goal_object[:3, :3] = np.asarray(candidate["rotation_world"], dtype=np.float64)
+        goal_object[:3, 3] = np.asarray(candidate["position_world_m"], dtype=np.float64)
+        goal_eef = goal_object @ object_to_eef
+        relocated = retarget_keypose_sequence(
+            runtime_experience,
+            held_object_world=object_world,
+            current_eef_world=eef_world,
+            destination_region_world=region_world,
+            destination_object_world=goal_object,
+        )
+        sequence = [row for row in relocated if row.get("name") in {"lift", "preplace"}]
+        sequence = select_keypose_suffix(sequence, "lift")
+        if len(sequence) != 1 or sequence[0].get("name") != "preplace":
+            raise RuntimeError("keypose_candidate_preflight_did_not_resolve_one_preplace_pose")
+        preplace = sequence[0]
+        preplace_position = np.asarray(preplace["eef_pose_world"]["position_m"], dtype=np.float64)
+        entry = np.asarray(candidate.get("entry_direction_world", [0.0, 0.0, 0.0]), dtype=np.float64)
+        entry_norm = float(np.linalg.norm(entry))
+        if entry_norm > 1e-8:
+            entry /= entry_norm
+        preplace_position += entry * _native_region_entry_offset_m(predicate)
+        preplace_position[2] = float(goal_eef[2, 3] + approach_height_m)
+        preplace["eef_pose_world"]["position_m"] = preplace_position.tolist()
+        preplace_pose = np.eye(4, dtype=np.float64)
+        preplace_pose[:3, :3] = Rotation.from_quat(
+            np.asarray(preplace["eef_pose_world"]["quaternion_wxyz"], dtype=np.float64)[[1, 2, 3, 0]]
+        ).as_matrix()
+        preplace_pose[:3, 3] = preplace_position
+
+        row: dict[str, Any] = {
+            "candidate_id": candidate["candidate_id"],
+            "source_experience_id": exp_id,
+            "source_task": candidate["source_keypose_task"],
+            "placement_candidate": candidate,
+            "screened_keypose": "preplace",
+            "approach_height_m": approach_height_m,
+        }
+        preplace_plan = screen_pose(preplace_pose, 74201 + variant_index * 2)
+        if (
+            preplace_plan.get("status") == "no_safe_path"
+            and int(preplace_plan.get("ik_candidate_count", 0)) > 0
+            and "planning_time_budget_exhausted" in str(preplace_plan.get("failure_reason", ""))
+            and preflight_count < maximum_rrt_preflights
+        ):
+            # One longer, new-seed route attempt is allowed only when IK has
+            # already established that the pose is reachable and the first
+            # RRT stopped specifically at its time budget.
+            extended = screen_pose(
+                preplace_pose,
+                84201 + variant_index,
+                search_time_budget_s=20.0,
+                maximum_iterations=2000,
+                maximum_config_checks=8000,
+            )
+            first_attempt = preplace_plan
+            preplace_plan = {
+                **extended,
+                "initial_RRT_attempt": first_attempt,
+                "bounded_extended_RRT_attempt": extended,
+            }
+        row["preplace_RRT"] = preplace_plan
+        if preplace_plan.get("status") == "offline_feasible":
+            terminal_plan = screen_pose(goal_eef, 74202 + variant_index * 2)
+            row["terminal_pose_IK_RRT_diagnostic"] = terminal_plan
+            terminal_ik_feasible = bool(
+                terminal_plan.get("status") == "offline_feasible"
+                or int(terminal_plan.get("ik_candidate_count", 0)) > 0
+            )
+        else:
+            row["terminal_pose_IK_RRT_diagnostic"] = {
+                "status": "not_run_after_unreachable_preplace_route",
+                "failure_class": "candidate_stopped_before_unreachable_waypoint",
+                "ik_candidate_count": 0,
+            }
+            terminal_ik_feasible = False
+        row["admitted_to_physical_search"] = bool(
+            preplace_plan.get("status") == "offline_feasible" and terminal_ik_feasible
+        )
+        row["terminal_contact_policy"] = "bounded_OSC_descent_only_after_valid_terminal_IK"
+        preflight_rows.append(row)
+        if row["admitted_to_physical_search"]:
+            physical_candidates.append(candidate)
+            experience_by_candidate[candidate["candidate_id"]] = runtime_experience
+
+    # Preserve a distinct second route for the optional branch, while ranking
+    # the first by target-region occupancy score and the actual RRT planning time.
+    physical_candidates.sort(key=lambda item: (
+        -float(item.get("ranking_score", 0.0)),
+        float(next((row["preplace_RRT"].get("planning_seconds", float("inf"))
+                    for row in preflight_rows if row.get("candidate_id") == item["candidate_id"]), float("inf"))),
+    ))
+    if len(physical_candidates) > 1:
+        alternate = next((item for item in physical_candidates[1:]
+                          if item.get("region_local_xy_m") != physical_candidates[0].get("region_local_xy_m")
+                          or item.get("entry_direction_world") != physical_candidates[0].get("entry_direction_world")), None)
+        physical_candidates = [physical_candidates[0]] + ([alternate] if alternate else [])
+    return physical_candidates, experience_by_candidate, preflight_rows
+
+
 def _native_place(
     bridge,
     *,
@@ -1948,7 +2325,12 @@ def _native_place(
     controller_fields: dict[str, Any],
     controller: TaskPhaseController,
     output_dir: Path,
-    keypose_experience: dict[str, Any] | None = None,
+    keypose_experiences: list[dict[str, Any]] | None = None,
+    maximum_physical_branches: int = 2,
+    maximum_rrt_preflights: int = 8,
+    keypose_preflight_report: dict[str, Any] | None = None,
+    expected_start_snapshot_sha256: str | None = None,
+    expected_bddl_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Search distinct native-region layouts from one exact held-object Snapshot."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1962,13 +2344,14 @@ def _native_place(
             "recorded_actions": 0,
             "safety_certified": False,
         }
+    experience_portfolio = list(keypose_experiences or [])
     if controller.phase == "release" or values.get(tuple(predicate), False):
         return _native_place_single(
             bridge, target_id=target_id, target_binding=target_binding,
             predicate=predicate, instruction=instruction, model_sha=model_sha,
             safety_policy=safety_policy, controller_fields=controller_fields,
             controller=controller, output_dir=output_dir,
-            keypose_experience=keypose_experience,
+            keypose_experience=experience_portfolio[0] if experience_portfolio else None,
         )
 
     base = bridge.request({"op": "export_runtime_snapshot"})
@@ -2012,8 +2395,139 @@ def _native_place(
         occupied_contexts=occupied_contexts,
         maximum_candidates=4,
     )
-    if keypose_experience is not None:
-        candidates = candidates[:1]
+    keypose_preflight: list[dict[str, Any]] = []
+    candidate_experiences: dict[str, dict[str, Any]] = {}
+    preflight_reuse_summary: dict[str, Any] | None = None
+    if keypose_preflight_report is not None:
+        if not experience_portfolio:
+            raise ValueError("precomputed_keypose_route_requires_verified_source_experiences")
+        prior_scope = keypose_preflight_report.get("scope", {})
+        prior_task = keypose_preflight_report.get("task", {})
+        prior_resume = keypose_preflight_report.get("resumed_from_runtime_snapshot", {})
+        if (
+            prior_scope.get("benchmark") != "obstacle_avoidance"
+            or int(prior_scope.get("level", -1)) != 2
+            or int(prior_scope.get("task_id", -1)) != 2
+            or prior_task.get("model_geometry_sha256") != model_sha
+            or expected_bddl_sha256 is None
+            or prior_task.get("BDDL_sha256") != expected_bddl_sha256
+            or expected_start_snapshot_sha256 is None
+            or prior_resume.get("payload_sha256") != expected_start_snapshot_sha256
+        ):
+            raise ValueError("precomputed_keypose_route_scene_or_snapshot_fingerprint_mismatch")
+        prior_segments = keypose_preflight_report.get("segments", [])
+        prior_search = next((
+            row.get("placement_search") for row in reversed(prior_segments)
+            if isinstance(row.get("placement_search"), dict)
+        ), None)
+        if not isinstance(prior_search, dict):
+            raise ValueError("precomputed_keypose_route_report_has_no_candidate_preflight")
+        prior_start_state_sha = prior_search.get("start_snapshot_state_sha256")
+        if prior_start_state_sha != _state_digest(base_state):
+            raise ValueError("precomputed_keypose_route_state_fingerprint_mismatch")
+        prior_native = prior_task.get("initial_native_task_status", {}).get("native_goal_values", [])
+        current_native = native_start.get("native_goal_values", [])
+        prior_pairs = sorted((tuple(row.get("predicate", [])), row.get("value")) for row in prior_native)
+        current_pairs = sorted((tuple(row.get("predicate", [])), row.get("value")) for row in current_native)
+        if prior_pairs != current_pairs:
+            raise ValueError("precomputed_keypose_route_native_predicates_differ_from_restored_snapshot")
+        feasible_rows = [
+            row for row in prior_search.get("keypose_candidate_preflight", [])
+            if row.get("admitted_to_physical_search") is True
+            and row.get("preplace_RRT", {}).get("status") == "offline_feasible"
+            and int(row.get("terminal_pose_IK_RRT_diagnostic", {}).get("ik_candidate_count", 0)) > 0
+        ]
+        if not feasible_rows:
+            raise ValueError("precomputed_keypose_route_report_has_no_admitted_candidate")
+        selected = feasible_rows[0]
+        candidate = dict(selected["placement_candidate"])
+        experience_id = selected.get("source_experience_id")
+        experience = next((row for row in experience_portfolio
+                           if row.get("experience_id") == experience_id), None)
+        if experience is None:
+            raise ValueError("precomputed_keypose_route_source_experience_not_loaded")
+        runtime_experience = dict(experience)
+        runtime_experience["keypose_sequence"] = [
+            row for row in experience.get("keypose_sequence", [])
+            if row.get("name") in {"grasp", "lift", "preplace", "release"}
+        ]
+        runtime_experience["_route_start_after"] = "lift"
+        candidate_id = str(selected.get("candidate_id", ""))
+        try:
+            variant_index = int(candidate_id.split("_")[1])
+        except (IndexError, ValueError):
+            raise ValueError("precomputed_keypose_route_candidate_id_is_malformed")
+        extended = selected.get("preplace_RRT", {}).get("bounded_extended_RRT_attempt", {})
+        if extended.get("status") == "offline_feasible":
+            candidate.update({
+                "preplace_rrt_search_time_budget_s": 20.0,
+                "preplace_rrt_max_iterations": 2000,
+                "preplace_rrt_max_config_checks": 8000,
+                "preplace_rrt_seed": 84201 + variant_index,
+            })
+        else:
+            candidate.update({
+                "preplace_rrt_search_time_budget_s": 12.0,
+                "preplace_rrt_max_iterations": 750,
+                "preplace_rrt_max_config_checks": 3000,
+                "preplace_rrt_seed": 74201 + variant_index * 2,
+            })
+        candidates = [candidate]
+        keypose_preflight = list(prior_search.get("keypose_candidate_preflight", []))
+        candidate_experiences[candidate_id] = runtime_experience
+        preflight_reuse_summary = {
+            "status": "reused_after_exact_snapshot_hash_and_native_predicate_recheck",
+            "candidate_id": candidate_id,
+            "source_experience_id": experience_id,
+            "source_preflight_run_archive": keypose_preflight_report.get("archive"),
+            "resume_snapshot_payload_sha256": expected_start_snapshot_sha256,
+            "start_snapshot_state_sha256": _state_digest(base_state),
+            "physical_waypoint_RRT_replanned_before_execution": True,
+            "safety_certified": False,
+        }
+    elif experience_portfolio:
+        candidates, candidate_experiences, keypose_preflight = _screen_native_keypose_candidates(
+            bridge,
+            target_id=target_id,
+            target_binding=target_binding,
+            predicate=predicate,
+            instruction=instruction,
+            model_sha=model_sha,
+            safety_policy=safety_policy,
+            start_snapshot_state=base.get("snapshot_state", {}),
+            start_state_sha256=_state_digest(base_state),
+            region=target_query["region"],
+            geometry_candidates=candidates,
+            experiences=experience_portfolio,
+            maximum_rrt_preflights=maximum_rrt_preflights,
+        )
+        if not candidates:
+            screen_snapshot_path = output_dir / "keypose_candidate_screen_start_runtime_snapshot.pkl"
+            screen_snapshot_path.write_bytes(base_payload)
+            return {
+                "status": "native_region_candidates_unreachable",
+                "failure_reason": "no_candidate_has_a_full_geometry_RRT_reachable_preplace_and_a_valid_terminal_IK_solution",
+                "native_goal_predicate": predicate,
+                "native_goal_value": False,
+                "native_task_success": False,
+                "final_native_task_status": native_start,
+                "recorded_actions": 0,
+                "recorded_physics_substeps": 0,
+                "keypose_route_preflight": keypose_preflight,
+                "placement_search": {
+                    "mode": "L0_L1_keypose_comparison_and_full_geometry_RRT_preflight",
+                    "candidate_count": len(keypose_preflight),
+                    "RRT_preflight_count": _keypose_rrt_call_count(keypose_preflight),
+                    "physical_branch_count": 0,
+                    "candidate_attempts": keypose_preflight,
+                    "completed_object_occupancy_count": len(occupied_contexts),
+                    "start_snapshot_state_sha256": _state_digest(base_state),
+                    "start_snapshot_path": str(screen_snapshot_path),
+                    "branch_actions_use_real_MuJoCo_OSC": True,
+                    "direct_object_or_robot_state_write": False,
+                    "safety_certified": False,
+                },
+            }
     attempts: list[dict[str, Any]] = []
     last_result: dict[str, Any] | None = None
 
@@ -2054,7 +2568,8 @@ def _native_place(
         ):
             raise RuntimeError("placement_candidate_restore_lost_bilateral_held_object")
 
-    for ordinal, candidate in enumerate(candidates):
+    physical_branch_budget = max(1, min(3, int(maximum_physical_branches)))
+    for ordinal, candidate in enumerate(candidates[:physical_branch_budget]):
         if ordinal:
             try:
                 restore_branch_start()
@@ -2077,7 +2592,7 @@ def _native_place(
                 safety_policy=safety_policy, controller_fields=controller_fields,
                 controller=controller, output_dir=branch_dir,
                 placement_candidate=candidate,
-                keypose_experience=keypose_experience,
+                keypose_experience=candidate_experiences.get(candidate["candidate_id"]),
             )
         except Exception as exc:
             result = {
@@ -2091,6 +2606,7 @@ def _native_place(
         native_final = result.get("final_native_task_status", {})
         candidate_record = {
             "candidate": candidate,
+            "source_keypose_experience_id": candidate.get("source_keypose_experience_id"),
             "status": result.get("status"),
             "failure_reason": result.get("failure_reason"),
             "failure_phase": result.get("failure_phase"),
@@ -2116,11 +2632,26 @@ def _native_place(
         }
     last_result["placement_search"] = {
         "mode": (
-            "keypose_guided_native_region_single_snapshot_branch"
-            if keypose_experience is not None
+            "L0_L1_keypose_guided_native_region_full_geometry_preflight"
+            if experience_portfolio
             else "native_region_multi_candidate_snapshot_branches"
         ),
-        "candidate_count": len(candidates),
+        "candidate_count": len(keypose_preflight) if experience_portfolio else len(candidates),
+        "RRT_preflight_count": _keypose_rrt_call_count(keypose_preflight),
+        "keypose_candidate_preflight": keypose_preflight,
+        "preflight_reuse": preflight_reuse_summary,
+        "verified_source_experiences": [
+            {
+                "experience_id": row.get("experience_id"),
+                "task": row.get("source", {}).get("task"),
+                "trace_sha256": row.get("source", {}).get("trace_sha256"),
+                "acceptance_report_sha256": row.get("source", {}).get("acceptance_report_sha256"),
+                "native_task_success": row.get("source", {}).get("native_task_success"),
+                "official_safety_demonstrations_used": row.get("source", {}).get("official_safety_demonstrations_used"),
+                "source_actions_replayed": False,
+            }
+            for row in experience_portfolio
+        ],
         "physical_branch_count": sum(
             1 for row in attempts if row.get("branch_archive") is not None
         ),
@@ -2296,15 +2827,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         target_id = str(context["target_object_id"])
         predicate = list(context["native_goal_predicate"])
         object_goal = len(predicate) == 3 and predicate[0].lower() in {"in", "on"}
-        keypose_experience = None
-        if args.keypose_experience is not None:
-            keypose_experience = json.loads(
-                args.keypose_experience.read_text(encoding="utf-8")
-            )
+        keypose_experiences: list[dict[str, Any]] = []
+        keypose_transfer_rows: list[dict[str, Any]] = []
+        for keypose_path in args.keypose_experience:
+            keypose_experience = json.loads(keypose_path.read_text(encoding="utf-8"))
             source = keypose_experience.get("source", {})
+            source_task = str(source.get("task", ""))
             if (
                 keypose_experience.get("schema_version") != "gs_opd_keypose_experience.v1"
-                or "obstacle_avoidance/L0T2" not in str(source.get("task", ""))
+                or not any(task in source_task for task in (
+                    "obstacle_avoidance/L0T2", "obstacle_avoidance/L1T2",
+                ))
                 or source.get("native_task_success") is not True
                 or source.get("official_safety_demonstrations_used") is not False
                 or keypose_experience.get("object_family") != target_id.rsplit("_", 1)[0]
@@ -2314,17 +2847,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError("keypose_experience_source_or_active_native_goal_mismatch")
             if args.keypose_start_after is not None:
                 keypose_experience["_route_start_after"] = args.keypose_start_after
-            report["keypose_experience_transfer"] = {
-                "path": str(args.keypose_experience.resolve()),
+            keypose_experiences.append(keypose_experience)
+            keypose_transfer_rows.append({
+                "path": str(keypose_path.resolve()),
                 "experience_id": keypose_experience.get("experience_id"),
                 "source_trace_sha256": source.get("trace_sha256"),
                 "source_acceptance_report_sha256": source.get("acceptance_report_sha256"),
+                "source_task": source_task,
                 "source_native_task_success": source.get("native_task_success"),
                 "source_safety_success": source.get("safety_success"),
                 "target_match": predicate,
                 "actual_source_actions_replayed": False,
                 "safety_certified": False,
-            }
+            })
+        if keypose_transfer_rows:
+            report["keypose_experience_transfers"] = keypose_transfer_rows
+            report["keypose_experience_transfer"] = keypose_transfer_rows[0]
+        keypose_preflight_report = None
+        if args.resume_from_keypose_preflight_report is not None:
+            keypose_preflight_report = json.loads(
+                args.resume_from_keypose_preflight_report.read_text(encoding="utf-8")
+            )
+            report["keypose_preflight_reuse_source"] = str(
+                args.resume_from_keypose_preflight_report.resolve()
+            )
         experience_template = None
         if object_goal and args.experience_library and args.experience_library.is_file():
             from research.gs_opd.repair.task_skill_experience import (
@@ -2470,9 +3016,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 predicate=predicate, instruction=observed["instruction"], model_sha=model_sha,
                 safety_policy=policy, controller_fields=controller_inventory["robots"][0]["fields"],
                 controller=controller, output_dir=output_dir / "expert_native_placement",
-                keypose_experience=keypose_experience,
+                keypose_experiences=keypose_experiences,
+                maximum_physical_branches=args.maximum_physical_branches,
+                maximum_rrt_preflights=args.maximum_rrt_preflights,
+                keypose_preflight_report=keypose_preflight_report,
+                expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
+                expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
             report["segments"].append({"type": "resumed_expert_native_goal_stage_control", **place_result})
+            if not isinstance(place_result.get("final_native_task_status"), dict):
+                place_result["final_native_task_status"] = bridge.request({"op": "native_task_status"})
             report["final_native_task_status"] = place_result["final_native_task_status"]
             report["task_success"] = report["final_native_task_status"].get("task_success") is True
             report["status"] = (
@@ -2565,9 +3118,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 predicate=predicate, instruction=observed["instruction"], model_sha=model_sha,
                 safety_policy=policy, controller_fields=controller_inventory["robots"][0]["fields"],
                 controller=controller, output_dir=output_dir / "expert_native_release_resume",
-                keypose_experience=keypose_experience,
+                keypose_experiences=keypose_experiences,
+                maximum_physical_branches=args.maximum_physical_branches,
+                maximum_rrt_preflights=args.maximum_rrt_preflights,
+                keypose_preflight_report=keypose_preflight_report,
+                expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
+                expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
             report["segments"].append({"type": "resumed_expert_release_withdrawal", **place_result})
+            if not isinstance(place_result.get("final_native_task_status"), dict):
+                place_result["final_native_task_status"] = bridge.request({"op": "native_task_status"})
             report["final_native_task_status"] = place_result["final_native_task_status"]
             report["task_success"] = report["final_native_task_status"].get("task_success") is True
             report["status"] = (
@@ -2648,9 +3208,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 predicate=predicate, instruction=observed["instruction"], model_sha=model_sha,
                 safety_policy=policy, controller_fields=controller_inventory["robots"][0]["fields"],
                 controller=controller, output_dir=output_dir / "expert_native_goal_stage_control",
-                keypose_experience=keypose_experience,
+                keypose_experiences=keypose_experiences,
+                maximum_physical_branches=args.maximum_physical_branches,
+                maximum_rrt_preflights=args.maximum_rrt_preflights,
+                keypose_preflight_report=keypose_preflight_report,
+                expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
+                expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
             )
             report["segments"].append({"type": "expert_native_goal_stage_control", **place_result})
+            if not isinstance(place_result.get("final_native_task_status"), dict):
+                place_result["final_native_task_status"] = bridge.request({"op": "native_task_status"})
             report["final_native_task_status"] = place_result["final_native_task_status"]
             report["task_success"] = place_result["final_native_task_status"].get("task_success") is True
             report["status"] = "complete_task_success" if report["task_success"] else place_result["status"]
@@ -2699,8 +3266,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 command.extend([
                     "--resume-from-runtime-snapshot", str(direct_resume["path"]),
                 ])
+            if args.resume_from_keypose_preflight_report is not None:
+                command.extend([
+                    "--resume-from-keypose-preflight-report",
+                    str(args.resume_from_keypose_preflight_report.resolve()),
+                ])
             if args.experience_library is not None:
                 command.extend(["--experience-library", str(args.experience_library)])
+            for keypose_path in args.keypose_experience:
+                command.extend(["--keypose-experience", str(keypose_path.resolve())])
+            if args.keypose_start_after is not None:
+                command.extend(["--keypose-start-after", args.keypose_start_after])
             previous_search_report = getattr(args, "previous_search_report", None)
             if previous_search_report is not None:
                 previous_reports = (
@@ -2833,9 +3409,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         predicate=predicate, instruction=observed["instruction"], model_sha=model_sha,
                         safety_policy=policy, controller_fields=controller_inventory["robots"][0]["fields"],
                         controller=controller, output_dir=output_dir / "expert_native_placement",
-                        keypose_experience=keypose_experience,
+                        keypose_experiences=keypose_experiences,
+                        maximum_physical_branches=args.maximum_physical_branches,
+                        maximum_rrt_preflights=args.maximum_rrt_preflights,
+                        keypose_preflight_report=keypose_preflight_report,
+                        expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
+                        expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
                     )
                     report["segments"].append({"type": "expert_native_goal_stage_control", **place_result})
+                    if not isinstance(place_result.get("final_native_task_status"), dict):
+                        place_result["final_native_task_status"] = bridge.request({"op": "native_task_status"})
                     report["final_native_task_status"] = place_result["final_native_task_status"]
                     report["task_success"] = report["final_native_task_status"].get("task_success") is True
                     report["status"] = (
@@ -2872,6 +3455,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from-grasp-report", type=Path, default=None)
     parser.add_argument("--resume-from-placement-report", type=Path, default=None)
     parser.add_argument("--resume-from-runtime-snapshot", type=Path, default=None)
+    parser.add_argument("--resume-from-keypose-preflight-report", type=Path, default=None)
     parser.add_argument("--previous-search-report", type=Path, action="append", default=[])
     parser.add_argument("--init-state", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -2886,7 +3470,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-physical-branches", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=20.0)
     parser.add_argument("--experience-library", type=Path, default=None)
-    parser.add_argument("--keypose-experience", type=Path, default=None)
+    parser.add_argument("--keypose-experience", type=Path, action="append", default=[])
     parser.add_argument("--keypose-start-after", default=None)
     args = parser.parse_args()
     resume_sources = [
@@ -2896,6 +3480,8 @@ def _parse_args() -> argparse.Namespace:
     ]
     if sum(source is not None for source in resume_sources) > 1:
         parser.error("choose only one Runtime Snapshot resume source")
+    if args.resume_from_keypose_preflight_report is not None and args.resume_from_runtime_snapshot is None:
+        parser.error("--resume-from-keypose-preflight-report requires --resume-from-runtime-snapshot")
     for name in ("student_action_budget", "student_handoff_action_budget"):
         if not 1 <= getattr(args, name) <= 256:
             parser.error(f"--{name.replace('_', '-')} must be in 1..256")
@@ -2907,8 +3493,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-physical-branches must be in 1..3")
     if not 0.5 <= args.rrt_time_budget_s <= 60:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
-    if not 1000 <= args.demonstration_horizon <= 2600:
-        parser.error("--demonstration-horizon must be in 1000..2600")
+    if not 1000 <= args.demonstration_horizon <= 3600:
+        parser.error("--demonstration-horizon must be in 1000..3600")
     if args.target_predicate is not None and len(args.target_predicate) not in (2, 3):
         parser.error("--target-predicate must contain two or three BDDL tokens")
     return args

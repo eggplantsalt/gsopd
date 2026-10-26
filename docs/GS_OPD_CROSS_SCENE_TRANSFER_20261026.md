@@ -1,6 +1,27 @@
 # GS-OPD 跨场景经验迁移与成本摊销报告（2026-10-26）
 
-## 2026-10-26 Keypose-Driven Planning：L1成功，L2部分迁移
+## L2T2跨Level续接（run55→Round60/62）：保留Pot2持抓前缀，尚未完成任务
+
+从run55的t=2589 Pot2双指稳定持抓Snapshot恢复，模型与BDDL SHA匹配。比较GS-OPD自有L0T2完整成功关键姿态和L1T2完整稳定成功关键姿态，不回放源轨迹动作。首轮4个候选中，L0来源的`region_layout_20 / yaw+180 / h=0.38 m`唯一路线通过预放置整机/持物RRT与终端IK；L1来源路线未通过RRT预算。真实RRT物理重规划11.190秒后执行41个OSC动作，t=2630因预放置Waypoint连续24步停滞而停止。Pot2仍双指抓持并移动约80.3 mm，原生状态仍2/3（Pot1 On、Stove Turnon真，Pot2 On假），task_success=false，reward=0、done=false。
+
+| 搜索指标 | 结果 |
+| --- | ---: |
+| 新增Student / 专家7D动作 | 0 / 41 |
+| 真实物理Snapshot分支 | 1 |
+| Round60 RRT实际调用 / 可执行候选 | 8 / 1 of 4 |
+| Round62备用RRT实际调用 / 新增可执行不同路线 | 4 / 0 |
+| RRT调用返回可行 / 实际筛过姿态有IK解 | 2/12（同路线、不同起点）/ 6/6 |
+| RRT预筛累计规划时长 | 166.663 s |
+| 实际路线RRT规划时长 | 11.190 s |
+| 完整3/3成功 / 稳定释放 | 0 / 未到达 |
+
+Round62从Round60失败Snapshot精确恢复；由于固定预算内没有新的不同路线同时通过预放置RRT与末端IK，未启动第二个物理分支。Round61误用默认L0T1快照根，在模型SHA门禁处停止，执行0动作；Round62显式指定L2T2初始化根后恢复通过。
+
+每个Round60动作均保存25/25子步接触样本和Geom身份（1025/1025子步、52,275条原始接触身份记录、19组Geom对）；其中Hand–Pot2非指接触出现于1025个子步，必须保留为风险证据。安全认证false。完整指标与快照哈希见[机器报告](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/l2t2_keypose_continuation_summary.json)和[Markdown报告](/opt/data/private/gs_opd/rollouts/l2t2_crosslevel_keypose_20261026_round60/task_success_first_executor_obstacle_avoidance_L2T2_20261026_175558_280342129/evidence/l2t2_keypose_continuation_summary.md)。最佳可恢复状态为Round60 t=2630 Snapshot（SHA-256 `e489a1e990b41876ced9432cdcaa94f409474d56b1f4292db89018fa33cfeefb`）。
+
+---
+
+## 历史汇总：2026-10-26 Keypose-Driven Planning（L1成功，L2阶段性迁移）
 
 ### 验证结论
 
