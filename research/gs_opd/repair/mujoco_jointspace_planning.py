@@ -75,6 +75,20 @@ def _minimum_distance(mujoco, model, data, robot_geom_ids, object_geom_ids, excl
     return best
 
 
+def _verified_static_pairs_for_scene_group(robot_geom_ids, scene_geom_ids, verified_pairs):
+    """Keep only audited robot-to-scene installation pairs for this exact group."""
+    robot = {int(value) for value in robot_geom_ids}
+    scene = {int(value) for value in scene_geom_ids}
+    selected = set()
+    for pair in verified_pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            continue
+        a, b = (int(value) for value in pair)
+        if (a in robot and b in scene) or (b in robot and a in scene):
+            selected.add(tuple(sorted((a, b))))
+    return selected
+
+
 def _exact_pair_distance(mujoco, model, data, geom_a, geom_b):
     segment = np.zeros(6, dtype=np.float64)
     value = float(mujoco.mj_geomDistance(model, data, int(geom_a), int(geom_b), 10.0, segment))
@@ -290,6 +304,12 @@ def plan_current_scene(
     forbidden = normalized_safety_policy["forbidden_objects"]
     checked_objects = normalized_safety_policy.get("checked_objects", forbidden)
     allowed_pair_ids = set(normalized_safety_policy["allowed_contact_pair_ids"])
+    static_installation_pair_ids = {
+        tuple(sorted(map(int, pair)))
+        for pair in normalized_safety_policy.get(
+            "allowed_static_installation_contact_pair_ids", set()
+        )
+    }
     robot_body_ids = set(normalized_safety_policy["robot_body_ids"])
     forbidden_body_ids = set(normalized_safety_policy["forbidden_scene_body_ids"])
     allowed_target_body_ids = set(normalized_safety_policy["allowed_target_body_ids"])
@@ -395,8 +415,12 @@ def plan_current_scene(
                 if next(geom_id for geom_id in pair if geom_id not in set(robot_geoms))
                 in item["geom_ids"]
             } if item["policy_class"] == "allowed_target_objects" else set()
+            group_static_installation_pairs = _verified_static_pairs_for_scene_group(
+                robot_geoms, item["geom_ids"], static_installation_pair_ids,
+            )
             distance = _minimum_distance(
-                mujoco, model, scratch, robot_geoms, item["geom_ids"], group_allowed_pairs
+                mujoco, model, scratch, robot_geoms, item["geom_ids"],
+                group_allowed_pairs | group_static_installation_pairs,
             )
             if distance is None or not np.isfinite(distance):
                 return ConfigurationCheck("incomplete", None, {}, diagnostics={"object_id": item["object_id"]})
@@ -484,6 +508,8 @@ def plan_current_scene(
         for contact_index in range(int(scratch.ncon)):
             contact = scratch.contact[contact_index]
             geom_a, geom_b = int(contact.geom1), int(contact.geom2)
+            if tuple(sorted((geom_a, geom_b))) in static_installation_pair_ids:
+                continue
             body_a, body_b = int(model.geom_bodyid[geom_a]), int(model.geom_bodyid[geom_b])
             if body_a in robot_bodies and body_b in robot_bodies:
                 self_contacts.append({"geom_ids": [geom_a, geom_b], "distance_m": float(contact.dist)})

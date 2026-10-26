@@ -3858,3 +3858,17 @@ Geom 74 `gripper0_hand_collision` / Body 12与Geom 117 `moka_pot_2_g14` / Body 2
 机器摘要已按两个分支的耐久动作记录离线纠正：185个真实动作、4625个子步、6387条控制边界接触记录、185步的子步完整性标记均为incomplete；不构成安全认证。两分支各自的Observation/Action NPZ、双相机MP4、25子步接触记录和失败Runtime Snapshot均完整保留。综合报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/batch_report.json`、`batch_report.md`；任务级证据：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/obstacle_avoidance_human_L0T2/task_report.json`。最佳目标Region进展Snapshot在直接路线t=322终态；侧向路线t=293终态也单独保存。
 
 **结论：任务失败并在2条分支后停止。首个实现修复确实消除了18步预算截断，但真实番茄酱瓶接触减缓了Pot1运输，12步停滞判断仍过早结束低速目标进展；24步门槛修正尚未物理验证。没有启动Pot2、没有完整成功Episode、没有安全认证或训练。**
+
+## Human L0T2全几何碰撞感知路线尝试（2026-10-26）
+
+从已验证合法的t=215 Pot1双指持抓Snapshot精确恢复，payload SHA `48b0c9faae531e1fd4654d2daaeb7f31fd315b86fb033f2ea8cbabe122bfa85a`、Integration State SHA `853f54dfb585cbc54d3d72067608f42743d0bccdc6bfeaca11976b5c1f282a6b9`、模型SHA `633b8b0956f2f38e7f1c62067608f42743d0bccdc6bfeaca11976b5c7f301606`、BDDL SHA `2c4010e44700b0d2069dcd47f489a7411ec364f31cfd69141801b49db3398af7`。初始Pot1/Pot2 `On=false`、Stove `Turnon=true`，双指抓持为真。
+
+规划器选择：检查了独立CuRobo环境和仓库内`curobo_t236_plan_grasps.py`；该封装用Franka自碰撞模型生成抓取提案，代码明确不把LIBERO活动场景障碍当作权威几何，必须再由MuJoCo筛查，故不用于本次避瓶运输。使用已有`JointSpaceRRTConnect`及`mujoco_jointspace_planning.py`活动模型适配器。最小改动将持抓物体真实Geom和完整机器人/场景Geom传给规划器；运输搜索只约束零额外间隙的真实几何不穿透，安全余量仍留给Safety Reconstruction；接触许可只接受当前模型中身份已核验的固定安装Geom对。两个不同Region放置位置/入口均由相同通用接口规划，不引入番茄酱瓶专用规则。
+
+两个Snapshot候选分支均只进行一次30秒RRT路线规划，均以`planning_time_budget_exhausted`结束；任务汇总中将旧的RRT次数低报1次修正为2次。候选分别为region_layout_04（区域局部XY `[-0.0585, 0.0585]`、入口0°）及region_layout_09（`[-0.02925, 0.0585]`、入口90°），属实质不同目标/入口。两支起始与失败Runtime Snapshot payload SHA完全相同，等于所恢复的t=215状态；规划未输出可执行路径。每次RRT的独立迭代/配置检查数没有写入原执行报告，标记unknown，未反推填造。
+
+结果：未运行OSC，Student动作0、专家物理动作0、MuJoCo物理子步0、碰撞记录0。Pot1继续稳定持抓但未运输、未放置、未松爪；Pot2阶段未启动；原生任务仍1/3，`task_success=false`，完整Task-Success Episode新增0。没有视频或完整Observation–Action Episode，因此无可用于LeRobot转换的训练轨迹。由于未获得RRT路径，本轮不能判断现有OSC是否能执行该路线，不能将失败归因为RRT→OSC接口；改用直接7D关节轨迹会偏离π₀.₅的EEF动作标签语义，需另外处理动作表示兼容性，本轮未这样做。Safety认证未运行。
+
+机器报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_collision_aware_rrt_20261026_run1/batch_report.json`、`batch_report.md`、`cross_task_summary.csv`，任务报告位于`obstacle_avoidance_human_L0T2/task_report.json`，分支和执行报告位于`stage_00/task_success_first_executor_obstacle_avoidance_human_L0T2_20261026_224008_781508768/`。因物理动作数为0，没有视频。
+
+定向测试：`test_task_success_first_executor.py`、`test_jointspace_rrt.py`、`test_task_success_first_batch.py`共53 passed、6 subtests passed；相关模块py_compile通过。完成两条路线预算后停止，不追加相似RRT或OSC调参；新增Task-Success Episode为0。

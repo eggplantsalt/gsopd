@@ -696,18 +696,34 @@ def _task_summary(task_id: str, scene: dict[str, Any], stages: list[dict[str, An
         for stage in stages for segment in stage.get("segments", [])
         if segment.get("report") and Path(segment["report"]).is_file()
     )
-    rrt_attempts = sum(
-        int(segment.get("candidate_count", 0) or 0)
-        for stage in stages for segment in stage.get("segments", [])
-    )
-    rrt_attempts += sum(
-        int(segment.get("placement_search", {}).get("RRT_preflight_count", 0) or 0)
-        + int(
-            isinstance(segment.get("transport_route_RRT"), dict)
-            and segment.get("transport_route_RRT", {}).get("status") not in {None, "not_run"}
-        )
-        for stage in stages for segment in stage.get("segments", [])
-    )
+    rrt_attempts = 0
+    for stage in stages:
+        for segment in stage.get("segments", []):
+            placement = segment.get("placement_search", {})
+            if not isinstance(placement, dict):
+                placement = {}
+            rrt_attempts += int(segment.get("candidate_count", 0) or 0)
+            rrt_attempts += int(placement.get("RRT_preflight_count", 0) or 0)
+            attempts = placement.get("candidate_attempts", [])
+            candidate_route_attempts = sum(
+                1 for attempt in attempts
+                if isinstance(attempt, dict)
+                and (
+                    attempt.get("failure_phase") == "route_preflight"
+                    or (
+                        isinstance(attempt.get("transport_route_RRT"), dict)
+                        and attempt["transport_route_RRT"].get("status") not in {None, "not_run"}
+                    )
+                )
+            )
+            segment_route = segment.get("transport_route_RRT")
+            segment_route_attempted = int(
+                isinstance(segment_route, dict)
+                and segment_route.get("status") not in {None, "not_run"}
+            )
+            # Candidate-level evidence is authoritative when present; the
+            # summary field reflects only the final physical branch.
+            rrt_attempts += max(candidate_route_attempts, segment_route_attempted)
     candidate_reports = []
     experience_templates = []
     experience_skills = []

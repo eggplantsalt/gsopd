@@ -6,10 +6,26 @@ from research.gs_opd.repair.mujoco_jointspace_planning import (
     _bilateral_finger_contact_result,
     _candidate_gripper_close_samples,
     _candidate_robot_contact_violation,
+    _verified_static_pairs_for_scene_group,
 )
 
 
 class GraspScreenContactPolicyTests(unittest.TestCase):
+    def test_planner_static_installation_exceptions_are_pair_and_scene_group_exact(self):
+        verified = {(14, 90), (15, 91)}
+        self.assertEqual(
+            _verified_static_pairs_for_scene_group({90, 91}, {14}, verified),
+            {(14, 90)},
+        )
+        self.assertEqual(
+            _verified_static_pairs_for_scene_group({90, 91}, {15, 16}, verified),
+            {(15, 91)},
+        )
+        self.assertEqual(
+            _verified_static_pairs_for_scene_group({90, 91}, {14, 15}, {(90, 91)}),
+            set(),
+        )
+
     def test_close_sweep_stays_within_both_finger_joint_limits(self):
         samples = _candidate_gripper_close_samples(
             [0.035, -0.035],

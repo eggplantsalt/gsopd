@@ -7,15 +7,16 @@
 
 The executor owns orchestration only. It reuses the original Pi0.5 inference
 adapter, Safety Bridge, Runtime Snapshots, geometry driven grasp search,
-record-only RRT, native OSC_POSE tracking, and TaskPhaseController. Safety
-Reconstruction is not called and every physical action remains a real MuJoCo
-step. Search artifacts are candidates, never safe training data.
+MuJoCo full-geometry 7D RRT, native OSC_POSE tracking, and TaskPhaseController.
+Safety Reconstruction is not called and every physical action remains a real
+MuJoCo step. Search artifacts are candidates, never safe training data.
 """
 
 from __future__ import annotations
 
 import argparse
 import cv2
+import copy
 import hashlib
 import json
 import os
@@ -97,6 +98,25 @@ def _keypose_rrt_planner_config(
         "require_safe_configurations": False,
         "seed": int(seed),
     }
+
+
+def _task_success_collision_route_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    """Keep verified geometry bindings, but remove safety margins for route search."""
+    result = copy.deepcopy(policy)
+    result["minimum_clearance_m"] = 0.0
+    for group_name in ("forbidden_objects", "allowed_target_objects", "other_scene_objects"):
+        groups = result.get(group_name, [])
+        if not isinstance(groups, list):
+            raise ValueError("collision_route_policy_geometry_groups_must_be_lists")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("collision_route_policy_geometry_group_must_be_an_object")
+            group["minimum_clearance_m"] = 0.0
+    result["source"] = (
+        f"{policy.get('source', 'active_verified_geometry')}:"
+        "task_success_collision_avoidance_zero_extra_margin"
+    )
+    return result
 
 
 def _canonical_eef_pose_identity(pose: Any) -> dict[str, list[float]]:
@@ -2012,14 +2032,16 @@ def _native_place_single(
         raise RuntimeError("native_goal_transport_start_snapshot_export_failed")
     start_snapshot_path = output_dir / "native_goal_transport_start_runtime_snapshot.pkl"
     start_snapshot_path.write_bytes(start_snapshot["payload"])
-    planning_policy = dict(safety_policy)
-    if keypose_sequence is not None:
+    planning_policy = copy.deepcopy(safety_policy)
+    if not resume_at_release:
         planning_policy["carried_object"] = {
             "object_id": target_id,
             "grasp_binding": target_binding,
             "allowed_contact_pairs": [],
             "allowed_support_contact_pairs": [],
         }
+    if route_strategy == "jointspace_rrt":
+        planning_policy = _task_success_collision_route_policy(planning_policy)
     if resume_at_release:
         planned = {
             "status": "not_required_native_goal_satisfied_resume_at_release",
@@ -2048,7 +2070,7 @@ def _native_place_single(
         }
     else:
         planned = bridge.request({
-            "op": "task_success_first_rrt",
+            "op": "rrt_connect" if route_strategy == "jointspace_rrt" else "task_success_first_rrt",
             "expected_instruction": instruction,
             "model_geometry_sha256": model_sha,
             "start_state_sha256": state_sha,
@@ -2056,7 +2078,7 @@ def _native_place_single(
                 "position_world_m": rrt_goal_eef[:3, 3].tolist(),
                 "quaternion_wxyz": _wxyz(rrt_goal_eef[:3, :3]).tolist(),
             },
-            "safety_geometry_policy": planning_policy if keypose_sequence is not None else safety_policy,
+            "safety_geometry_policy": planning_policy,
             "planner_config": {
                 "step_rad": 0.22, "connect_max_steps": 20, "goal_bias": 0.15,
                 "max_iterations": NATIVE_PLACEMENT_RRT_MAX_ITERATIONS,
@@ -2064,10 +2086,13 @@ def _native_place_single(
                 "max_candidate_routes": 2,
                 "search_time_budget_s": rrt_time_budget_s,
                 "shortcut_attempts": 24, "minimum_clearance_m": 0.0,
-                "require_safe_configurations": False, "seed": 74103,
+                "require_safe_configurations": route_strategy == "jointspace_rrt", "seed": 74103,
             },
             "ik_seed_qpos": _placement_ik_seed_portfolio(robot),
         })
+        if route_strategy == "jointspace_rrt":
+            planned["planning_mode"] = "task_success_collision_aware_zero_extra_margin"
+            planned["safety_certified"] = False
     planned["goal_role"] = rrt_goal_role
     planned["route_strategy"] = route_strategy
     planner_state_verification = {"status": "not_required_resume_at_release", "live_state_unchanged": True}
@@ -2084,6 +2109,49 @@ def _native_place_single(
         planned["live_state_unchanged"] = planner_state_verification["live_state_unchanged"]
         if not planner_state_verification["live_state_unchanged"]:
             raise RuntimeError("native_goal_transport_RRT_changed_live_integration_state")
+    planned_route_archive: dict[str, Any] | None = None
+    if (
+        route_strategy == "jointspace_rrt"
+        and planned.get("status") == "offline_feasible"
+        and planned.get("live_state_unchanged") is True
+    ):
+        route_record = {
+            "schema_version": "gs_opd_collision_aware_RRT_OSC_route.v1",
+            "task": (
+                f"{observed.get('scene_metadata', {}).get('benchmark', 'unknown')}/"
+                f"L{observed.get('scene_metadata', {}).get('level', 'unknown')}"
+                f"T{observed.get('scene_metadata', {}).get('task_id', 'unknown')}"
+            ),
+            "candidate_id": placement_candidate.get("candidate_id") if placement_candidate else None,
+            "native_goal_predicate": predicate,
+            "model_geometry_sha256": model_sha,
+            "bddl_sha256": expected_bddl_sha256,
+            "start_state_sha256": state_sha,
+            "goal_pose_world": {
+                "position_world_m": rrt_goal_eef[:3, 3].tolist(),
+                "quaternion_wxyz": _wxyz(rrt_goal_eef[:3, :3]).tolist(),
+            },
+            "planner_source": planned.get("planner_source"),
+            "planner_mode": planned.get("planning_mode"),
+            "collision_constraint": "verified full robot and carried-object geometry; zero extra clearance; no penetration",
+            "qpos_path_rad": planned.get("qpos_path"),
+            "eef_reference_poses_world": planned.get("eef_reference_poses_world"),
+            "planning_seconds": planned.get("planning_seconds"),
+            "configuration_checks": planned.get("config_checks"),
+            "iterations": planned.get("iterations"),
+            "safety_certified": False,
+        }
+        route_path = output_dir / "native_goal_transport_collision_aware_rrt_route.json"
+        _json(route_path, route_record)
+        route_bytes = route_path.read_bytes()
+        planned_route_archive = {
+            "path": str(route_path),
+            "sha256": hashlib.sha256(route_bytes).hexdigest(),
+            "qpos_path_rows": len(route_record["qpos_path_rad"]),
+            "eef_path_rows": len(route_record["eef_reference_poses_world"]),
+            "safety_certified": False,
+        }
+        planned["route_archive"] = planned_route_archive
     _advance_pose.controller_fields = controller_fields
     records: list[dict[str, Any]] = []
     frames: list[dict[str, Any]] = []
@@ -2158,10 +2226,18 @@ def _native_place_single(
                 "route_selection_status": planned.get("status"),
                 "failure_reason": planned.get("failure_reason"),
                 "time_budget_s": rrt_time_budget_s,
+                "planning_seconds": planned.get("planning_seconds"),
+                "iterations": planned.get("iterations"),
+                "configuration_checks": planned.get("config_checks"),
+                "route_candidate_count": len(planned.get("route_candidates", [])),
+                "planner_source": planned.get("planner_source"),
+                "planning_mode": planned.get("planning_mode"),
+                "carried_object_geometry_included": planning_policy.get("carried_object") is not None,
                 "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
                 "safety_certified": False,
                 "live_state_verification": planner_state_verification,
             },
+            "transport_route_archive": planned_route_archive,
             "keypose_RRT_waypoints": keypose_rrt_runs,
             "keypose_transfer": {
                 "enabled": keypose_experience is not None,
@@ -2220,8 +2296,10 @@ def _native_place_single(
         route = [start_pose, *keypose_poses]
         transport_route_source = "GS_OPD_own_success_object_and_native_region_frame_keypose_sequence"
     elif planned.get("status") == "offline_feasible" and planned.get("live_state_unchanged") is True:
-        route = _compress_eef_route(planned.get("eef_reference_poses_world"))
-        transport_route_source = "jointspace_RRT"
+        route = np.asarray(planned.get("eef_reference_poses_world"), dtype=np.float64)
+        if route.ndim != 2 or route.shape[1:] != (7,) or not np.isfinite(route).all():
+            raise RuntimeError("collision_aware_RRT_returned_an_invalid_EEF_reference_path")
+        transport_route_source = "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC"
     elif route_strategy == "elevated_osc_waypoints":
         start_pose = np.r_[robot["eef_pos"], _wxyz(eef_world[:3, :3])]
         vertically_lifted = start_pose.copy()
@@ -2265,6 +2343,7 @@ def _native_place_single(
     if (
         not resume_at_release and keypose_sequence is None
         and route_strategy != "native_region_progress_osc"
+        and route_strategy != "jointspace_rrt"
     ):
         live_contacts = bridge.request({"op": "inspect_contacts"})
         contact_escape = _object_contact_escape_direction(
@@ -2307,11 +2386,16 @@ def _native_place_single(
     ):
         target_high = goal_eef.copy()
         target_high[:3, 3] += np.asarray([0.0, 0.0, 0.14])
-        route = _compress_eef_route(np.vstack((
+        route_with_final_approach = np.vstack((
             route,
             np.r_[target_high[:3, 3], _wxyz(target_high[:3, :3])],
             np.r_[goal_eef[:3, 3], _wxyz(goal_eef[:3, :3])],
-        )))
+        ))
+        route = (
+            route_with_final_approach
+            if route_strategy == "jointspace_rrt"
+            else _compress_eef_route(route_with_final_approach)
+        )
     transport_budget_details = (
         {"actions": 0, "termination_policy": "resume_at_release"}
         if resume_at_release else _native_transport_action_budget(
@@ -2458,7 +2542,8 @@ def _native_place_single(
                         })
                 if row["native_goal_satisfied"]:
                     break
-        route = route[:1]
+        if route_strategy == "native_region_progress_osc":
+            route = route[:1]
         for waypoint_index, waypoint in enumerate(route[1:]):
             if keypose_sequence is not None:
                 keypose = keypose_sequence[waypoint_index]
@@ -2764,6 +2849,31 @@ def _native_place_single(
                             "physical_collision_response_enabled": True,
                             "safety_certified": False,
                         }
+                    rrt_tracking = None
+                    if route_strategy == "jointspace_rrt":
+                        reference_index = waypoint_index + 1
+                        reference_path = np.asarray(
+                            planned.get("eef_reference_poses_world", []), dtype=np.float64,
+                        )
+                        joint_path = np.asarray(planned.get("qpos_path", []), dtype=np.float64)
+                        if reference_index < len(reference_path) and reference_index < len(joint_path):
+                            rrt_tracking = {
+                                "tracking_mode": "native_OSC_closed_loop_to_dense_collision_aware_RRT_EEF_path",
+                                "route_archive": planned_route_archive,
+                                "rrt_source_path_index": reference_index,
+                                "rrt_reference_eef_pose_world": reference_path[reference_index].tolist(),
+                                "rrt_reference_qpos_rad": joint_path[reference_index].tolist(),
+                                "physical_collision_response_enabled": True,
+                                "safety_certified": False,
+                            }
+                        else:
+                            rrt_tracking = {
+                                "tracking_mode": "native_OSC_final_task_region_approach_after_RRT_path",
+                                "route_archive": planned_route_archive,
+                                "target_pose_world": np.asarray(subgoal, dtype=np.float64).tolist(),
+                                "physical_collision_response_enabled": True,
+                                "safety_certified": False,
+                            }
                     _advance_pose(
                         bridge, subgoal[:3], subgoal[3:],
                         f"transport_{keypose['name']}", "native_goal_transport", counter,
@@ -2773,7 +2883,7 @@ def _native_place_single(
                         stagnation_window_actions=24,
                         position_tolerance_m=0.010,
                         rotation_tolerance_rad=0.10,
-                        planning_tracking=fallback_tracking,
+                        planning_tracking=fallback_tracking or rrt_tracking,
                         absolute_action_limit=None,
                     )
                     if counter[0] > transport_action_budget:
@@ -3041,6 +3151,13 @@ def _native_place_single(
             "route_selection_status": planned.get("status"),
             "failure_reason": planned.get("failure_reason"),
             "time_budget_s": rrt_time_budget_s,
+            "planning_seconds": planned.get("planning_seconds"),
+            "iterations": planned.get("iterations"),
+            "configuration_checks": planned.get("config_checks"),
+            "route_candidate_count": len(planned.get("route_candidates", [])),
+            "planner_source": planned.get("planner_source"),
+            "planning_mode": planned.get("planning_mode"),
+            "carried_object_geometry_included": planning_policy.get("carried_object") is not None,
             "maximum_configuration_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
             "ik_seed_count": len(_placement_ik_seed_portfolio(robot)),
             "goal_role": rrt_goal_role,
@@ -3051,6 +3168,7 @@ def _native_place_single(
             "safety_certified": False,
             "live_state_verification": planner_state_verification,
         },
+        "transport_route_archive": planned_route_archive,
         "keypose_RRT_waypoints": keypose_rrt_runs,
         "transport_action_budget": transport_action_budget,
         "transport_action_budget_details": transport_budget_details,
@@ -3746,6 +3864,20 @@ def _native_place(
             "RRT_or_IK_timeout_terminates_search": False,
             "safety_certified": False,
         }]
+    elif transport_strategy == "legacy_rrt":
+        # Keep the two best distinct target-region layouts, and route both with
+        # the existing full-geometry MuJoCo 7D planner. Do not turn the second
+        # branch into an obstacle-blind elevated OSC shortcut.
+        for candidate in candidates:
+            candidate["route_strategy"] = "jointspace_rrt"
+        candidates = candidates[:max(1, min(2, int(maximum_physical_branches)))]
+        keypose_preflight = [{
+            "status": "native_region_layout_candidates_selected_for_full_geometry_RRT",
+            "candidate_ids": [row["candidate_id"] for row in candidates],
+            "RRT_preflight_count": 0,
+            "RRT_planning_occurs_once_per_physical_candidate": True,
+            "safety_certified": False,
+        }]
     elif experience_portfolio:
         candidates, candidate_experiences, keypose_preflight = _screen_native_keypose_candidates(
             bridge,
@@ -3893,6 +4025,9 @@ def _native_place(
             "status": result.get("status"),
             "failure_reason": result.get("failure_reason"),
             "failure_phase": result.get("failure_phase"),
+            "transport_route_RRT": result.get("transport_route_RRT"),
+            "transport_route_archive": result.get("transport_route_archive"),
+            "keypose_RRT_waypoints": result.get("keypose_RRT_waypoints", []),
             "recorded_actions": result.get("recorded_actions", result.get("transport_actions", 0)),
             "native_task_success": native_final.get("task_success", result.get("native_task_success")),
             "target_predicate_value": next((

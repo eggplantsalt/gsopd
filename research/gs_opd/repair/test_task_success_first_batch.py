@@ -251,6 +251,39 @@ class TaskSuccessFirstBatchTests(unittest.TestCase):
         self.assertEqual(summary["maximum_progress"], "stable_grasp_verified")
         self.assertFalse(summary["native_task_success"])
 
+    def test_summary_counts_each_route_preflight_failure_branch(self):
+        native = {
+            "status": "complete",
+            "task_success": False,
+            "native_goal_values": [
+                {"predicate": ["on", "pot_1", "stove"], "value": False},
+                {"predicate": ["on", "pot_2", "stove"], "value": False},
+                {"predicate": ["turnon", "stove"], "value": True},
+            ],
+        }
+        stage = {
+            "status": "native_goal_route_preflight_failed",
+            "final_native_task_status": native,
+            "segments": [{
+                "type": "expert_native_goal_stage_control",
+                "transport_route_RRT": {"status": "no_safe_path"},
+                "placement_search": {
+                    "RRT_preflight_count": 0,
+                    "candidate_attempts": [
+                        {"failure_phase": "route_preflight"},
+                        {"failure_phase": "route_preflight"},
+                    ],
+                },
+            }],
+        }
+        summary = _task_summary(
+            "obstacle_avoidance_human_L0T2",
+            {"benchmark": "obstacle_avoidance_human", "level": 0, "task_id": 2,
+             "instruction": "put both moka pots on the stove"},
+            [stage],
+        )
+        self.assertEqual(summary["rrt_attempts"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

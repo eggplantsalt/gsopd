@@ -590,3 +590,13 @@ Round60诊断机器报告和逐步指标见归档`evidence/round60_stagnation_di
 机器摘要已按两个分支的耐久动作记录离线纠正：185个真实动作、4625个子步、6387条控制边界接触记录、185步的子步完整性标记均为incomplete；不构成安全认证。两分支各自的Observation/Action NPZ、双相机MP4、25子步接触记录和失败Runtime Snapshot均完整保留。综合报告：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/batch_report.json`、`batch_report.md`；任务级证据：`/opt/data/private/gs_opd/rollouts/gs_opd_human_l0t2_region_progress_validation_20261026_attempt1/obstacle_avoidance_human_L0T2/task_report.json`。最佳目标Region进展Snapshot在直接路线t=322终态；侧向路线t=293终态也单独保存。
 
 **结论：任务失败并在2条分支后停止。首个实现修复确实消除了18步预算截断，但真实番茄酱瓶接触减缓了Pot1运输，12步停滞判断仍过早结束低速目标进展；24步门槛修正尚未物理验证。没有启动Pot2、没有完整成功Episode、没有安全认证或训练。**
+
+## Human L0T2规划路线切换：完整MuJoCo几何RRT两候选超时（2026-10-26）
+
+已把当前运输调用从无障碍Region-Progress路线切换到仓库已有MuJoCo 7D关节空间RRT。CuRobo现存封装用于抓取提案，并不直接承载LIBERO-Safety活动障碍场景，故本轮选用会查询当前编译模型全部机器人及场景Geom的MuJoCo适配器。任务搜索RRT采用零额外间隙的真实碰撞约束；原严格安全策略和认证标准未修改。持抓Pot几何通过活动语义绑定加入规划，固定安装接触只允许已核验的具体Geom对。
+
+自合法t=215状态仅尝试两个不同原生Region位置/入口，各调用一次30秒RRT；二者均因`planning_time_budget_exhausted`停止，合计实际OSC/Student动作0，物理子步0，Pot1未运输/放置，原生`task_success=false`。两支起点与失败Snapshot字节一致。规划器详细迭代/配置检查计数未持久化，标注unknown。无成功Episode、动作视频或LeRobot可训练数据。因没有RRT路径，OSC跟踪兼容性仍未验证；直接关节执行会改变π₀.₅动作标签表示，本轮未尝试。
+
+实现和报告修正包括：持抓Geom加入所有RRT运输路线、任务成功规划用零余量碰撞约束、MuJoCo规划器尊重审计过的固定安装接触对、保持完整RRT EEF路径并归档7D qpos与跟踪引用、两个Region候选都使用同一RRT规划器、批处理正确计数候选级RRT调用。测试53 passed、6 subtests passed。归档路径见`GS_OPD_PROGRESS.md`本节。
+
+**状态：Human L0T2任务未解决。两候选预算已用完，本路线停止；下一次采集前应先获得规划器超时的可审计配置检查/阶段耗时证据，并解决搜索预算内规划不收敛问题。不能把规划失败解释为OSC控制失配，也不能宣称避开了番茄酱瓶。**

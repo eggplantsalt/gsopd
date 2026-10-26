@@ -44,6 +44,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _verify_planner_live_state,
     _transport_exception_outcome,
     _task_success_waypoint_fallback_reason,
+    _task_success_collision_route_policy,
 )
 from research.gs_opd.repair.task_success_first_grasp_search import BridgeSession
 from research.gs_opd.repair.task_success_first_grasp_search import (
@@ -56,6 +57,26 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_collision_route_policy_removes_only_extra_clearance_margin(self):
+        strict = {
+            "source": "strict",
+            "minimum_clearance_m": 0.010,
+            "forbidden_objects": [{"object_id": "bottle", "minimum_clearance_m": 0.010}],
+            "allowed_target_objects": [{"object_id": "pot", "minimum_clearance_m": 0.010}],
+            "other_scene_objects": [{"object_id": "world", "minimum_clearance_m": 0.0}],
+            "allowed_contact_pairs": [{"robot_geom_id": 5, "scene_geom_id": 9, "minimum_clearance_m": -0.002}],
+            "forbidden_object_pairs": [{"object_id_a": "pot", "object_id_b": "bottle"}],
+        }
+        route_policy = _task_success_collision_route_policy(strict)
+        self.assertEqual(route_policy["minimum_clearance_m"], 0.0)
+        self.assertEqual(route_policy["forbidden_objects"][0]["minimum_clearance_m"], 0.0)
+        self.assertEqual(route_policy["allowed_target_objects"][0]["minimum_clearance_m"], 0.0)
+        self.assertEqual(route_policy["other_scene_objects"][0]["minimum_clearance_m"], 0.0)
+        self.assertEqual(route_policy["allowed_contact_pairs"], strict["allowed_contact_pairs"])
+        self.assertEqual(route_policy["forbidden_object_pairs"], strict["forbidden_object_pairs"])
+        self.assertEqual(strict["minimum_clearance_m"], 0.010)
+        self.assertEqual(strict["forbidden_objects"][0]["minimum_clearance_m"], 0.010)
+
     def test_region_progress_routes_are_object_relative_and_use_keypose_only_as_a_soft_side_hint(self):
         start = np.eye(4, dtype=np.float64)
         start[:3, 3] = [0.30, -0.18, 0.94]
