@@ -1,11 +1,14 @@
 # Copyright 2026 The RLinf Authors.
 # Licensed under the Apache License, Version 2.0.
-"""Bounded task-success continuation from an exact candidate9 snapshot.
+"""Bounded OA L0T0 placement branches from an exact candidate9 held-place snapshot.
 
 This is task-feasibility exploration. Strict safety evidence is preserved for
 every real action and never converted into a safety label. The two supported
 task interactions are bowl-to-plate support and gripper opening after reaching
 the placement pose; every other physical contact remains a hard stop.
+The branch planner maps object-local placement Keyposes through the measured
+hand-to-object transform, then uses CuRobo and active MuJoCo path audits before
+each closed-loop physical stage. Safety monitoring remains unchanged.
 """
 
 from __future__ import annotations
@@ -44,18 +47,14 @@ SOURCE_SNAPSHOT = Path(
 )
 PRIOR_TRANSPORT_DIR = SOURCE_SNAPSHOT.parent
 HORIZON = 1000
-MAX_SUFFIX_ACTIONS = 360
-MAX_ACTIONS_PER_WAYPOINT = 3
+# A bounded 5-step tracking window retains the existing 0.08 rad hard stop;
+# attempt 3 plateaued at 0.0376 rad after only three feedback actions.
+MAX_ACTIONS_PER_WAYPOINT = 5
 MAX_ENDPOINT_FEEDBACK_ACTIONS = 16
 MAX_RELEASE_OPEN_ACTIONS = 120
 MAX_POST_RELEASE_CLEARANCE_OPEN_ACTIONS = 75
 SUBSTEPS = 25
-LIFT_CLEARANCE_M = 0.070
-ABOVE_PLATE_CLEARANCE_M = 0.060
-PLACEMENT_BOWL_BOTTOM_CLEARANCE_M = 0.005
-PLACEMENT_XY_FIT_FRACTION = 0.80
 SETTLE_ACTIONS = 12
-PRE_RETREAT_SETTLE_ACTIONS = 6
 OPEN_ACTION = -1.0
 SEARCH_CONTACT_MAX_PENETRATION_M = 0.0001
 SEARCH_CONTACT_ROBOT_GEOM_BODY_PAIRS = {
@@ -168,8 +167,22 @@ def _object_velocity(snapshot_state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _placement_object_pose(context: dict[str, Any], collision_scene: dict[str, Any], semantic: dict[str, Any], world_base: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    """Choose a centered, collision-geometry-derived plate placement pose."""
+def _placement_object_pose(
+    context: dict[str, Any],
+    collision_scene: dict[str, Any],
+    semantic: dict[str, Any],
+    world_base: np.ndarray,
+    *,
+    xy_fraction: tuple[float, float] = (0.0, 0.0),
+    yaw_delta_deg: float = 0.0,
+    bottom_clearance_m: float = 0.001,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build an object-to-plate-region placement transform from live geometry.
+
+    Fractions are normalized within the collision-geometry-derived remaining
+    bowl fit on the plate.  They and the optional yaw are experiment choices,
+    not values reported by LIBERO-Safety.
+    """
     binding = semantic["bindings"].get(REGION_ID)
     if not isinstance(binding, dict):
         raise ValueError("active_plate_semantic_binding_missing")
@@ -184,53 +197,89 @@ def _placement_object_pose(context: dict[str, Any], collision_scene: dict[str, A
         half = np.asarray(row["half_extents_world_axes_m"], dtype=np.float64)
         vertices.extend(prior._box_corners(center, rot, half))
     verts = np.asarray(vertices)
-    lower, upper = verts.min(axis=0), verts.max(axis=0)
-    xy_center = (lower[:2] + upper[:2]) / 2.0
-    plate_top = float(upper[2])
+    support_candidates = []
+    for row in rows:
+        row_rotation = np.asarray(row["rotation_world"], dtype=np.float64)
+        row_half = np.asarray(row["half_extents_world_axes_m"], dtype=np.float64)
+        if row_rotation.shape != (3, 3) or not np.isfinite(row_rotation).all() or not np.allclose(row_rotation.T @ row_rotation, np.eye(3), atol=1e-5):
+            continue
+        thin_axis = int(np.argmin(row_half))
+        normal = row_rotation[:, thin_axis].copy()
+        if normal[2] < 0.0:
+            normal *= -1.0
+        planar_area = float(np.prod(np.delete(row_half, thin_axis)))
+        if normal[2] >= 0.95:
+            support_candidates.append((planar_area, row, thin_axis, normal))
+    if not support_candidates:
+        raise ValueError("active_plate_horizontal_support_collision_geom_unavailable")
+    _, support_geom, thin_axis, plate_normal = max(support_candidates, key=lambda item: item[0])
+    support_rotation = np.asarray(support_geom["rotation_world"], dtype=np.float64)
+    support_half = np.asarray(support_geom["half_extents_world_axes_m"], dtype=np.float64)
+    planar_axes = [axis for axis in range(3) if axis != thin_axis]
+    x_axis = support_rotation[:, max(planar_axes, key=lambda axis: support_half[axis])].copy()
+    x_axis -= plate_normal * float(np.dot(x_axis, plate_normal))
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(plate_normal, x_axis)
+    y_axis /= np.linalg.norm(y_axis)
+    plate_rotation = np.column_stack((x_axis, y_axis, plate_normal))
+    support_center = np.asarray(support_geom["center_world_m"], dtype=np.float64)
+    plate_origin = support_center + plate_normal * support_half[thin_axis]
+    plate_local_vertices = (verts - plate_origin) @ plate_rotation
+    plate_lower, plate_upper = plate_local_vertices.min(axis=0), plate_local_vertices.max(axis=0)
+    plate_xy_center = (plate_lower[:2] + plate_upper[:2]) / 2.0
+    # Geom 439 is the largest horizontal support slab. Its top face defines
+    # the support plane; the surrounding rim is not the bowl's landing height.
+    plate_top = 0.0
     context_pose = _object_pose(context)
-    object_rot = context_pose[:3, :3]
+    xy_fraction = np.asarray(xy_fraction, dtype=np.float64)
+    if xy_fraction.shape != (2,) or not np.isfinite(xy_fraction).all() or np.any(np.abs(xy_fraction) > 0.85):
+        raise ValueError("placement_xy_fraction_must_be_finite_and_within_0.85")
+    if not np.isfinite(yaw_delta_deg) or not np.isfinite(bottom_clearance_m) or bottom_clearance_m < 0.0:
+        raise ValueError("placement_yaw_or_clearance_invalid")
+    yaw_rotation = Rotation.from_rotvec(plate_rotation[:, 2] * np.deg2rad(yaw_delta_deg)).as_matrix()
+    object_rot = yaw_rotation @ context_pose[:3, :3]
     offsets = []
     min_bottom_offset = np.inf
-    max_xy_shift = np.inf
     bowl_rows = context.get("target_collision_geometries", [])
     if not bowl_rows:
         raise ValueError("live_bowl_collision_geometry_missing")
     for row in bowl_rows:
         half = np.asarray(row["size_m"], dtype=np.float64)
         corners = prior._box_corners(np.asarray(row["center_root_m"], dtype=np.float64), np.asarray(row["rotation_root"], dtype=np.float64), half)
-        min_bottom_offset = min(min_bottom_offset, float(np.min(corners @ object_rot[2, :])))
-        offsets.extend(corners @ object_rot.T)
+        world_offsets = corners @ object_rot.T
+        region_offsets = world_offsets @ plate_rotation
+        min_bottom_offset = min(min_bottom_offset, float(np.min(region_offsets[:, 2])))
+        offsets.extend(region_offsets)
     offsets = np.asarray(offsets)
     bmin, bmax = offsets[:, :2].min(axis=0), offsets[:, :2].max(axis=0)
-    robot_xy = np.asarray(world_base[:2, 3], dtype=np.float64)
-    direction = robot_xy - xy_center
-    norm = float(np.linalg.norm(direction))
-    if norm <= 1e-9:
-        raise ValueError("plate_robot_xy_direction_is_ambiguous")
-    direction /= norm
-    for axis in range(2):
-        comp = float(direction[axis])
-        if comp > 1e-9:
-            max_xy_shift = min(max_xy_shift, float((upper[axis] - xy_center[axis] - bmax[axis]) / comp))
-        elif comp < -1e-9:
-            max_xy_shift = min(max_xy_shift, float((xy_center[axis] + bmin[axis] - lower[axis]) / -comp))
-    if not np.isfinite(max_xy_shift) or max_xy_shift < 0:
-        raise ValueError("live_bowl_geometry_does_not_fit_plate_collision_aabb")
-    xy = xy_center + PLACEMENT_XY_FIT_FRACTION * max_xy_shift * direction
+    remaining = np.minimum(plate_upper[:2] - plate_xy_center - bmax, plate_xy_center + bmin - plate_lower[:2])
+    if not np.isfinite(remaining).all() or np.any(remaining < -1e-6):
+        raise ValueError("live_bowl_geometry_does_not_fit_plate_collision_frame")
+    remaining = np.maximum(remaining, 0.0)
+    xy_local = plate_xy_center + xy_fraction * remaining
     pose = context_pose.copy()
-    pose[:3, 3] = [xy[0], xy[1], plate_top + PLACEMENT_BOWL_BOTTOM_CLEARANCE_M - min_bottom_offset]
+    pose[:3, :3] = object_rot
+    target_local = np.asarray([xy_local[0], xy_local[1], plate_top + bottom_clearance_m - min_bottom_offset])
+    pose[:3, 3] = plate_origin + plate_rotation @ target_local
+    frame = np.eye(4, dtype=np.float64)
+    frame[:3, :3] = plate_rotation
+    frame[:3, 3] = plate_origin
+    selected_world = pose[:3, 3].copy()
     return pose, {
         "target_region_id": REGION_ID,
         "target_body_id": body_id,
         "target_body_name": body_name,
         "target_collision_geom_ids": sorted(int(r["geom_id"]) for r in rows),
-        "plate_top_world_z_m": plate_top,
-        "plate_collision_aabb_world_m": {"min": lower.tolist(), "max": upper.tolist()},
-        "selected_object_xy_world_m": xy.tolist(),
-        "maximum_bowl_fit_shift_m": max_xy_shift,
-        "selected_xy_fit_fraction": PLACEMENT_XY_FIT_FRACTION,
-        "bowl_collision_bottom_offset_world_z_m": min_bottom_offset,
-        "requested_bowl_bottom_clearance_m": PLACEMENT_BOWL_BOTTOM_CLEARANCE_M,
+        "support_surface_geom_id": int(support_geom["geom_id"]),
+        "plate_collision_frame_world_m": frame.tolist(),
+        "plate_collision_bounds_in_frame_m": {"min": plate_lower.tolist(), "max": plate_upper.tolist()},
+        "plate_top_in_frame_m": plate_top,
+        "remaining_bowl_center_shift_in_frame_m": remaining.tolist(),
+        "selected_xy_fraction_within_fit": xy_fraction.tolist(),
+        "selected_object_root_position_world_m": selected_world.tolist(),
+        "yaw_delta_about_region_normal_deg": float(yaw_delta_deg),
+        "bowl_collision_bottom_offset_region_z_m": min_bottom_offset,
+        "requested_bowl_bottom_clearance_m": float(bottom_clearance_m),
         "engineering_choices_not_paper_values": True,
         "target_object_root_pose_world_m": pose.tolist(),
     }
@@ -447,16 +496,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             Path(path).resolve()
             for path in source_run_report.get("artifacts", {}).get("snapshots", [])
         }
-        recorded_release_at_snapshot = any(
-            int(event.get("timestep", -1)) == start_t
-            and event.get("physical_release_confirmed") is True
-            and event.get("pad_contact_separated") is True
-            and event.get("target_robot_contacts_last_substep") == []
-            for event in source_run_report.get("release", {}).get("events", [])
-        )
-        source_snapshot_is_recorded_artifact = bool(
-            snapshot_path in recorded_snapshot_paths and recorded_release_at_snapshot
-        )
+        source_snapshot_is_recorded_artifact = snapshot_path in recorded_snapshot_paths
         source_run_report_matches = source_snapshot_is_terminal or source_snapshot_is_recorded_artifact
     prior_branch_actions = 0
     source_branch_actions_before_snapshot = 0
@@ -483,17 +523,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if route.get("execution_status") == "reached" and route.get("phase")
         )
         completed_source_phases = sorted(set(completed_source_phases))
-    if prior_branch_actions >= MAX_SUFFIX_ACTIONS:
-        raise ValueError(f"candidate9_bounded_branch_action_budget_already_exhausted:{prior_branch_actions}/{MAX_SUFFIX_ACTIONS}")
+    if start_t >= HORIZON:
+        raise ValueError("standard_task_horizon_already_exhausted_at_branch_start")
+    configured_budget = int(getattr(args, "max_suffix_actions", HORIZON - start_t))
+    if configured_budget < 1:
+        raise ValueError("branch_action_budget_must_be_positive")
+    action_budget = min(configured_budget, HORIZON - start_t)
+    branch_config = {}
+    if getattr(args, "branch_config", None):
+        branch_config = json.loads(Path(args.branch_config).read_text(encoding="utf-8"))
+        if not isinstance(branch_config, dict):
+            raise ValueError("branch_config_must_be_a_json_object")
+    candidate_id = str(branch_config.get("candidate_id", output.name))
     report: dict[str, Any] = {
         "schema": "gs_opd_oa_l0t0_candidate9_full_task_continuation.v1",
         "status": "initializing",
-        "scope": "task-feasibility completion from an exact candidate9 continuation snapshot; one bounded live branch",
+        "scope": "task-feasibility completion from one exact candidate9 held-place snapshot; one bounded live branch",
+        "candidate": {"candidate_id": candidate_id, "configuration": branch_config, "engineering_choices_not_paper_values": True},
         "source_snapshot": {"path": str(snapshot_path), "sha256": _sha(payload), "timestep": start_t, "model_geometry_sha256": MODEL_SHA},
         "source_run_report": {"path": str(source_run_report_path), "matched_snapshot_sha256_and_timestep": source_run_report_matches},
         "source_snapshot_binding": {
             "exact_terminal_snapshot_match": source_snapshot_is_terminal,
-            "recorded_release_snapshot_artifact_match": source_snapshot_is_recorded_artifact,
+            "recorded_snapshot_artifact_match": source_snapshot_is_recorded_artifact,
             "snapshot_payload_sha256": _sha(payload),
             "snapshot_timestep": start_t,
             "source_run_actions_before_snapshot": source_branch_actions_before_snapshot,
@@ -513,8 +564,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "t191_to_t199_actions": 9,
             "cumulative_continuation_actions_before_source": prior_branch_actions,
             "completed_route_phases_in_source_snapshot": completed_source_phases,
-            "branch_action_budget_total": MAX_SUFFIX_ACTIONS,
-            "branch_action_budget_remaining": MAX_SUFFIX_ACTIONS - prior_branch_actions,
+            "historical_continuation_actions_before_snapshot": prior_branch_actions,
+            "branch_action_budget_total_from_exact_snapshot": action_budget,
+            "branch_action_budget_remaining": action_budget,
             "cross_archive_timestep_continuity_claimed": False,
             "t0_to_t152_contact_monitoring_complete": True,
             "t152_to_t190_safety_certified": False,
@@ -522,7 +574,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reason": "the t=152 lift-start state was recorded as an input timestep but no exact source snapshot copy is in that archive; later exact snapshot continuations are separately attributable",
         },
         "task": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 0, "target_object_id": OBJECT_ID, "target_region_id": REGION_ID, "native_predicate": ["on", OBJECT_ID, REGION_ID]},
-        "limits": {"standard_horizon": HORIZON, "start_timestep": start_t, "maximum_suffix_actions": MAX_SUFFIX_ACTIONS, "mujoco_substeps_per_action": SUBSTEPS, "settling_actions": SETTLE_ACTIONS},
+        "limits": {"standard_horizon": HORIZON, "start_timestep": start_t, "maximum_suffix_actions": action_budget, "mujoco_substeps_per_action": SUBSTEPS, "settling_actions": SETTLE_ACTIONS},
         "task_success": False,
         "safety_success": False,
         "safety_monitoring_complete": False,
@@ -610,22 +662,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             pad_contact = grasp.get("finger_contacts", {})
             has_pad_contact = bool(pad_contact.get("left") or pad_contact.get("right") or int(pad_contact.get("contact_count", 0)) > 0)
             bridge_policy = release_transition_bridge_policy if has_pad_contact else released_bridge_policy
-        placement_pose, placement_geometry = _placement_object_pose(context, collision_scene, semantic, world_base)
+        placement_pose, placement_geometry = _placement_object_pose(
+            context,
+            collision_scene,
+            semantic,
+            world_base,
+            xy_fraction=tuple(branch_config.get("placement_xy_fraction", [0.0, 0.0])),
+            yaw_delta_deg=float(branch_config.get("placement_yaw_delta_deg", 0.0)),
+            bottom_clearance_m=float(branch_config.get("bowl_bottom_clearance_mm", 1.0)) / 1000.0,
+        )
         plate_geom_ids = set(int(x) for x in placement_geometry["target_collision_geom_ids"])
         current_eef = _world_pose(context, "eef_pose_world")
-        lift_pose = world_object.copy()
-        if "vertical_clear" not in completed_source_phases:
-            lift_pose[2, 3] += LIFT_CLEARANCE_M
-        above_pose, above_details = prior._plate_above_object_pose(context, semantic, collision_scene, world_base, ABOVE_PLATE_CLEARANCE_M)
-        candidate_route_poses = [
-            ("vertical_clear", lift_pose),
-            ("above_plate", above_pose),
-            ("place", placement_pose),
-        ]
-        route_poses = [row for row in candidate_route_poses if row[0] not in completed_source_phases]
+        region_frame = np.asarray(placement_geometry["plate_collision_frame_world_m"], dtype=np.float64)
+        above_pose = placement_pose.copy()
+        approach_clearance_m = float(branch_config.get("preplace_clearance_mm", 35.0)) / 1000.0
+        if not np.isfinite(approach_clearance_m) or approach_clearance_m < 0.010 or approach_clearance_m > 0.100:
+            raise ValueError("preplace_clearance_mm_must_be_between_10_and_100")
+        above_pose[:3, 3] += region_frame[:3, 2] * approach_clearance_m
+        # Each new placement candidate replans both object-relative Keyposes.
+        # A bounded same-candidate replan may resume from its exact reached
+        # Pre-Place artifact and skip only that already reached phase.
+        reached_at_source = {
+            str(row.get("phase")): int(row.get("terminal_timestep", -1))
+            for row in (source_run_report or {}).get("routes", [])
+            if row.get("execution_status") == "reached" and row.get("terminal_timestep") is not None
+        }
+        route_poses = []
+        if reached_at_source.get("above_plate") != start_t:
+            route_poses.append(("above_plate", above_pose))
+        route_poses.append(("place", placement_pose))
         report["initial_state"] = {"native_task_status": native_before, "grasp_state": grasp, "arm_qpos_rad": arm_q.tolist(), "gripper_qpos_m": gripper_q.tolist(), "world_base_transform_m": world_base.tolist(), "world_panda_hand_transform_m": world_hand.tolist(), "world_eef_transform_m": current_eef.tolist(), "world_bowl_pose_m": world_object.tolist(), "T_panda_hand_bowl_m": hand_object.tolist(), "strict_safety_geometry_check": bridge.request({"op": "safety_geometry_check", "safety_geometry_policy": bridge_policy})}
         report["native_task_success_before_continuation"] = native_before.get("task_success") is True
-        report["keypose_targets"] = {"vertical_clear_object_world_m": lift_pose.tolist(), "above_plate_object_world_m": above_pose.tolist(), "above_plate_geometry": above_details, "place_object_world_m": placement_pose.tolist(), "place_geometry": placement_geometry, "all_clearances_and_fractions_are_engineering_choices": True}
+        report["keypose_targets"] = {
+            "object_to_plate_region_place_transform_m": (np.linalg.inv(region_frame) @ placement_pose).tolist(),
+            "object_to_plate_region_pre_place_transform_m": (np.linalg.inv(region_frame) @ above_pose).tolist(),
+            "world_place_object_pose_m": placement_pose.tolist(),
+            "world_pre_place_object_pose_m": above_pose.tolist(),
+            "place_geometry": placement_geometry,
+            "measured_hand_to_object_transform_at_branch_start_m": hand_object.tolist(),
+            "keypose_mapping": "T_world_hand_goal = T_world_object_Keypose @ inverse(T_hand_object_measured); all poses in meters and plate collision-frame Region coordinates",
+            "all_offsets_clearances_and_yaw_variants_are_engineering_choices_not_paper_values": True,
+        }
         report["safety_policy"] = {"source": safety_policy["source"], "existing_clearance_rules_unchanged": True, "policy_proof": safety_policy["_proof"], "task_feasibility_may_record_expected_goal_support_contact_as_unsafe": True}
         report["safety_policy"]["released_state_policy"] = {
             "carried_object": None,
@@ -639,11 +716,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         recorder = EpisodeRecorder(output, bridge, record_schema="gs_opd_oa_l0t0_candidate9_task_step.v1")
         recorder.snapshot(f"resumed_candidate9_t{start_t}")
         action_log = gzip.open(output / "action_monitoring.jsonl.gz", "wt", encoding="utf-8")
-        report["physical_execution"] = {"status": "running", "control_mode": "MuJoCo mass-matrix PD joint trajectory", "action_labels": "7D joint target plus normalized gripper command; not pi0.5 native OSC", "action_budget_total_from_candidate9_continuation": MAX_SUFFIX_ACTIONS, "action_budget_remaining_at_start": MAX_SUFFIX_ACTIONS - prior_branch_actions, "task_episode_horizon": HORIZON, "strict_policy_is_recorded_not_relaxed": True}
+        report["physical_execution"] = {"status": "running", "control_mode": "MuJoCo mass-matrix PD joint trajectory", "action_labels": "7D joint target plus normalized gripper command; not pi0.5 native OSC", "action_budget_total_from_exact_snapshot": action_budget, "task_episode_horizon": HORIZON, "strict_policy_is_recorded_not_relaxed": True}
         _write(output / "task_report.json", report)
 
         def execute(qtarget: np.ndarray, phase: str, waypoint_index: int, *, grip_action: float = 0.0, allow_expected_support: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
-            if prior_branch_actions + recorder.action_count >= MAX_SUFFIX_ACTIONS or start_t + recorder.action_count >= HORIZON:
+            if recorder.action_count >= action_budget or start_t + recorder.action_count >= HORIZON:
                 raise RuntimeError("bounded_physical_or_standard_horizon_budget_exhausted")
             grasp_before_action = None
             if phase in {"release_open", "retreat", "settling"} or phase.startswith(("release", "retreat", "settling")):
@@ -651,7 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             is_released_before_action = grasp_before_action is not None and grasp_before_action.get("grasp_confirmed") is not True
             pad_contact_state = grasp_before_action.get("finger_contacts", {}) if grasp_before_action else {}
             has_pad_contact = bool(pad_contact_state.get("left") or pad_contact_state.get("right") or int(pad_contact_state.get("contact_count", 0)) > 0)
-            release_transition = bool(phase == "release_open" and grip_action < 0.0 and is_released_before_action and has_pad_contact)
+            release_transition = bool(phase in {"release_open", "retreat"} and grip_action < 0.0 and is_released_before_action and has_pad_contact)
             if release_transition:
                 action_safety_policy = release_transition_bridge_policy
                 policy_mode = "release_transition_exact_pad_pairs_only"
@@ -668,7 +745,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(f"pre_action_monitor_or_scratch_restore_incomplete:{phase}:{waypoint_index}")
             pre_search_contact = _task_feasibility_search_contact(
                 pre_evidence, set(binding["geom_ids"]), phase,
-                allow_open_release=(phase == "release_open" and grip_action < 0.0),
+                allow_open_release=(phase in {"release_open", "retreat"} and grip_action < 0.0),
                 allow_expected_plate_support=allow_expected_support,
                 plate_geom_ids=set(plate_geom_ids),
             )
@@ -688,7 +765,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(f"physical_25_substep_monitoring_incomplete:{phase}:{recorder.action_count - 1}")
             physical_search_contact = _task_feasibility_search_contact(
                 evidence, set(binding["geom_ids"]), phase,
-                allow_open_release=(phase == "release_open" and grip_action < 0.0),
+                allow_open_release=(phase in {"release_open", "retreat"} and grip_action < 0.0),
                 allow_expected_plate_support=allow_expected_support,
                 plate_geom_ids=set(plate_geom_ids),
             )
@@ -721,7 +798,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if recorder.action_count % 5 == 0:
                 recorder.snapshot(f"step_{recorder.action_count:04d}")
                 _write(output / "task_report.json", report)
-                print(f"task suffix actions={recorder.action_count}/{MAX_SUFFIX_ACTIONS} t={physical.get('timestep')} phase={phase} qerr={track['joint_error_linf_rad']:.4f} native={native.get('task_success')}", flush=True)
+                print(f"task suffix actions={recorder.action_count}/{action_budget} t={physical.get('timestep')} phase={phase} qerr={track['joint_error_linf_rad']:.4f} native={native.get('task_success')}", flush=True)
             return physical, track
 
         def make_attached_planner(state_context: dict[str, Any], scene_export: dict[str, Any], arm: np.ndarray, jaw: np.ndarray, seed: int):
@@ -767,7 +844,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             scene_now = bridge.request({"op": "collision_scene_export"})
             if scene_now.get("status") != "complete" or scene_now.get("physical_state_unchanged") is not True:
                 raise RuntimeError(f"live_collision_scene_export_incomplete_before_{phase}")
-            _, planner, device, dtype, start_state, qstart, planner_info, coverage, cubes, meshes = make_attached_planner(context_now, scene_now, arm_now, jaw_now, 20261103 + stage_i)
             object_now = _object_pose(context_now)
             fk_now = bridge.request({"op": "scratch_robot_fk_audit", "arm_joint_positions_rad": [arm_now.tolist()]})
             if fk_now.get("status") != "complete" or fk_now.get("physical_state_unchanged") is not True:
@@ -777,48 +853,83 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             hand_object_now = np.linalg.inv(hand_now) @ object_now
             hand_goal_world = desired_object_world @ np.linalg.inv(hand_object_now)
             hand_goal_base = np.linalg.inv(world_base) @ hand_goal_world
-            ik, planned, path, endpoint = api._plan_stage(planner, device, dtype, start_state, hand_goal_base, grasp_goal=False)
             route = {
                 "phase": phase,
                 "start_timestep": int(obs_now.get("timestep", -1)),
-                "start_joint_state_rad": qstart.tolist(),
+                "start_joint_state_rad": arm_now.tolist(),
                 "target_object_pose_world_m": desired_object_world.tolist(),
                 "target_panda_hand_pose_base_m": hand_goal_base.tolist(),
                 "measured_T_panda_hand_object_m": hand_object_now.tolist(),
+                "bounded_planner_seeds": [int(x) for x in branch_config.get("keypose_planner_seeds", [20261103 + stage_i])],
+                "planner_candidates": [],
+                "execution_status": "not_started",
+            }
+            report["routes"].append(route)
+            _write(output / f"route_{stage_i}_{phase}.json", route)
+            selected = None
+            for planner_seed in route["bounded_planner_seeds"]:
+                _, planner, device, dtype, start_state, qstart, planner_info, coverage, cubes, meshes = make_attached_planner(context_now, scene_now, arm_now, jaw_now, planner_seed)
+                ik, planned, path, endpoint = api._plan_stage(planner, device, dtype, start_state, hand_goal_base, grasp_goal=False)
+                candidate = {
+                    "seed": planner_seed,
+                    "ik": ik,
+                    "curobo": planned,
+                    "valid_path_point_count": len(path) if path is not None else 0,
+                    "buffered_path_point_count": planned.get("buffered_trajectory_point_count"),
+                    "full_scene_cuboid_count_without_attached_target": cubes,
+                    "full_scene_mesh_count_without_attached_target": meshes,
+                    "attached_sphere_coverage": coverage,
+                    "planner_configuration": planner_info,
+                }
+                route["planner_candidates"].append(candidate)
+                if path is None or planned.get("success") is not True:
+                    candidate["rejection_reason"] = planned.get("rejection_reason") or planned.get("status") or "planner_returned_no_success"
+                    _write(output / f"route_{stage_i}_{phase}.json", route)
+                    continue
+                if path.ndim != 2 or path.shape[1] != 7 or len(path) < 2 or not np.isfinite(path).all() or np.max(np.abs(path[0] - arm_now)) > 5e-4:
+                    candidate["rejection_reason"] = "CuRobo_path_shape_or_live_start_state_invalid"
+                    _write(output / f"route_{stage_i}_{phase}.json", route)
+                    continue
+                if len(path) - 1 + MAX_ENDPOINT_FEEDBACK_ACTIONS > action_budget - recorder.action_count:
+                    candidate["rejection_reason"] = "CuRobo_route_exceeds_remaining_physical_budget"
+                    _write(output / f"route_{stage_i}_{phase}.json", route)
+                    continue
+                audit = bridge.request({"op": "scratch_robot_path_contact_audit", "arm_joint_states_rad": path.tolist(), "gripper_joint_states_rad": np.repeat(jaw_now[None, :], len(path), axis=0).tolist(), "object_id": OBJECT_ID, "fingertip_contact_scope": "all_states", "T_eef_object_m": (np.linalg.inv(_world_pose(context_now, "eef_pose_world")) @ object_now).tolist()})
+                path_contact = _task_feasibility_path_contact(audit, set(binding["geom_ids"]), phase)
+                candidate["active_mujoco_discrete_path_audit"] = audit
+                candidate["task_feasibility_path_contact"] = path_contact
+                audit_valid = audit.get("status") == "complete" and audit.get("physical_state_unchanged") is True and int(audit.get("state_count", -1)) == len(path)
+                if not audit_valid or not path_contact.get("continue_task_search"):
+                    candidate["rejection_reason"] = path_contact.get("reason") or "exact_discrete_path_audit_incomplete"
+                    _write(output / f"route_{stage_i}_{phase}.json", route)
+                    continue
+                candidate["selected_for_execution"] = True
+                selected = (path, ik, planned, audit, path_contact, planner_info, coverage, cubes, meshes, planner_seed)
+                _write(output / f"route_{stage_i}_{phase}.json", route)
+                break
+            if selected is None:
+                route["execution_status"] = "blocked_no_curobo_route"
+                route["rejection_reason"] = "all_bounded_seeds_failed_planning_or_active_MuJoCo_path_audit"
+                last_candidate = route["planner_candidates"][-1] if route["planner_candidates"] else {}
+                route["ik"] = last_candidate.get("ik")
+                route["curobo"] = last_candidate.get("curobo")
+                route["valid_path_point_count"] = 0
+                _write(output / f"route_{stage_i}_{phase}.json", route)
+                raise RuntimeError(f"CuRobo_route_unavailable:{phase}:{route['rejection_reason']}")
+            path, ik, planned, audit, path_contact, planner_info, coverage, cubes, meshes, selected_seed = selected
+            route.update({
+                "selected_planner_seed": selected_seed,
                 "ik": ik,
                 "curobo": planned,
-                "valid_path_point_count": len(path) if path is not None else 0,
+                "valid_path_point_count": len(path),
                 "buffered_path_point_count": planned.get("buffered_trajectory_point_count"),
                 "full_scene_cuboid_count_without_attached_target": cubes,
                 "full_scene_mesh_count_without_attached_target": meshes,
                 "attached_sphere_coverage": coverage,
                 "planner_configuration": planner_info,
-                "execution_status": "not_started",
-            }
-            report["routes"].append(route)
-            _write(output / f"route_{stage_i}_{phase}.json", route)
-            if path is None or planned.get("success") is not True:
-                route["execution_status"] = "blocked_no_curobo_route"
-                route["rejection_reason"] = planned.get("rejection_reason") or planned.get("status")
-                raise RuntimeError(f"CuRobo_route_unavailable:{phase}:{route['rejection_reason']}")
-            if path.ndim != 2 or path.shape[1] != 7 or len(path) < 2 or not np.isfinite(path).all() or np.max(np.abs(path[0] - arm_now)) > 5e-4:
-                raise RuntimeError(f"CuRobo_route_shape_or_start_state_invalid:{phase}")
-            if len(path) - 1 + MAX_ENDPOINT_FEEDBACK_ACTIONS > MAX_SUFFIX_ACTIONS - (prior_branch_actions + recorder.action_count):
-                raise RuntimeError(f"CuRobo_route_exceeds_remaining_physical_budget:{phase}")
-            audit = bridge.request({"op": "scratch_robot_path_contact_audit", "arm_joint_states_rad": path.tolist(), "gripper_joint_states_rad": np.repeat(jaw_now[None, :], len(path), axis=0).tolist(), "object_id": OBJECT_ID, "fingertip_contact_scope": "all_states", "T_eef_object_m": (np.linalg.inv(_world_pose(context_now, "eef_pose_world")) @ object_now).tolist()})
+            })
             route["active_mujoco_discrete_path_audit"] = audit
-            path_contact = _task_feasibility_path_contact(audit, set(binding["geom_ids"]), phase)
             route["task_feasibility_path_contact"] = path_contact
-            audit_valid = (
-                audit.get("status") == "complete"
-                and audit.get("physical_state_unchanged") is True
-                and int(audit.get("state_count", -1)) == len(path)
-            )
-            if not audit_valid or not path_contact.get("continue_task_search"):
-                route["execution_status"] = "blocked_active_mujoco_path_audit"
-                route["rejection_reason"] = path_contact.get("reason") or "exact_discrete_path_audit_incomplete"
-                _write(output / f"route_{stage_i}_{phase}.json", route)
-                raise RuntimeError(f"active_MuJoCo_path_audit_rejected:{phase}")
             if path_contact.get("unsafe_contact_present"):
                 report["task_feasibility_path_contact_continuations"].append({"phase": phase, "path_point_count": len(path), **path_contact})
                 route["execution_status"] = "executing_with_task_only_unsafe_contact"
@@ -828,7 +939,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for waypoint_index, qtarget in enumerate(path[1:], start=1):
                 attempts = 0
                 while True:
-                    _, tracking = execute(qtarget, phase, waypoint_index)
+                    _, tracking = execute(qtarget, phase, waypoint_index, allow_expected_support=(phase == "place"))
                     attempts += 1
                     if tracking["joint_error_linf_rad"] <= 0.03:
                         break
@@ -846,7 +957,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     break
                 if len(endpoint_samples) > MAX_ENDPOINT_FEEDBACK_ACTIONS:
                     break
-                execute(final_q, f"{phase}_endpoint_feedback", len(path) - 1)
+                execute(final_q, f"{phase}_endpoint_feedback", len(path) - 1, allow_expected_support=(phase == "place"))
             route["endpoint_feedback"] = {"converged": stable, "samples": endpoint_samples}
             if not stable:
                 route["execution_status"] = "stopped_endpoint_not_stable"
@@ -879,7 +990,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "inherited_from_exact_source_snapshot": str(snapshot_path),
             }
         else:
-            remaining_budget = MAX_SUFFIX_ACTIONS - prior_branch_actions - recorder.action_count
+            remaining_budget = action_budget - recorder.action_count
             open_budget = min(MAX_RELEASE_OPEN_ACTIONS, remaining_budget)
             report["release"] = {
                 "open_command": OPEN_ACTION,
@@ -936,137 +1047,63 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("bounded_gripper_open_budget_expired_without_physical_release_confirmation")
         recorder.snapshot("release_confirmed")
 
-        # The first zero-contact action can occur before the gripper has opened
-        # far enough to stay clear while the bowl settles. Continue the real
-        # gripper command at fixed arm pose, with the same physical monitor.
-        clearance_opening = {"maximum_actions": 0, "actions": [], "complete": False}
-        current_obs = bridge.request({"op": "observe", "include_snapshot_state": True})
-        clearance_arm, _ = prior._current_arm_state(current_obs["snapshot_state"])
-        clearance_budget = min(
-            MAX_POST_RELEASE_CLEARANCE_OPEN_ACTIONS,
-            MAX_SUFFIX_ACTIONS - prior_branch_actions - recorder.action_count,
-        )
-        clearance_opening["maximum_actions"] = clearance_budget
-        for i in range(clearance_budget + 1):
-            grasp_now = bridge.request({"op": "grasp_state", "carried_binding": binding, "expected_instruction": INSTRUCTION})
-            fingers_now = grasp_now.get("finger_contacts", {})
-            closure_now = grasp_now.get("gripper_closure", {}).get("close_command_fraction", np.inf)
-            if (
-                float(closure_now) <= 0.05
-                and fingers_now.get("left") is False
-                and fingers_now.get("right") is False
-                and int(fingers_now.get("contact_count", -1)) == 0
-            ):
-                clearance_opening["complete"] = True
-                clearance_opening["terminal_grasp_state"] = grasp_now
-                break
-            if i >= clearance_budget:
-                break
-            physical, track = execute(clearance_arm, "release_open", 200 + i, grip_action=OPEN_ACTION, allow_expected_support=True)
-            clearance_evidence = _strict_contacts(physical)
-            grasp_after = bridge.request({"op": "grasp_state", "carried_binding": binding, "expected_instruction": INSTRUCTION})
+        # Hold/opening delay is a per-candidate variable. After this short
+        # bounded interval, the real opening command is coupled to a planned
+        # retreat, avoiding dozens of stationary opening actions at bowl level.
+        post_release_hold_actions = int(branch_config.get("post_release_open_actions_before_retreat", 0))
+        if not 0 <= post_release_hold_actions <= 8:
+            raise ValueError("post_release_open_actions_before_retreat_must_be_between_0_and_8")
+        post_release_open_rows = []
+        for i in range(post_release_hold_actions):
+            physical, track = execute(place_q, "release_open", 300 + i, grip_action=OPEN_ACTION, allow_expected_support=True)
             native_after = bridge.request({"op": "native_task_status"})
-            no_target_robot_contact = not _target_robot_contacts(
-                clearance_evidence, bowl_geom_ids, robot_geom_ids, substep=SUBSTEPS - 1
-            )
-            action_row = {
+            row = {
                 "timestep": physical.get("timestep"),
                 "gripper_qpos_m": prior._current_arm_state(physical["snapshot_state"])[1].tolist(),
-                "grasp_state": grasp_after,
                 "native_task_status": native_after,
-                "target_robot_contact_free_at_final_substep": no_target_robot_contact,
-                "monitoring": clearance_evidence,
                 "tracking": track,
+                "monitoring": _strict_contacts(physical),
             }
-            clearance_opening["actions"].append(action_row)
-            report["post_release_opening_clearance"] = clearance_opening
-            _write(output / "task_report.json", report)
-            _write(output / "post_release_opening_latest.json", action_row)
+            post_release_open_rows.append(row)
             if native_after.get("task_success") is not True:
-                raise RuntimeError("native_task_predicate_lost_while_fully_opening_after_release")
-            closure_after = grasp_after.get("gripper_closure", {}).get("close_command_fraction", np.inf)
-            fingers_after = grasp_after.get("finger_contacts", {})
-            if (
-                float(closure_after) <= 0.05
-                and fingers_after.get("left") is False
-                and fingers_after.get("right") is False
-                and int(fingers_after.get("contact_count", -1)) == 0
-                and no_target_robot_contact
-            ):
-                clearance_opening["complete"] = True
-                clearance_opening["terminal_grasp_state"] = grasp_after
-                break
-        report["post_release_opening_clearance"] = clearance_opening
-        if not clearance_opening["complete"]:
-            _write(output / "task_report.json", report)
-            raise RuntimeError("post_release_full_opening_budget_expired_before_stable_robot_object_separation")
-        recorder.snapshot("post_release_gripper_fully_open")
-
-        if released and not source_release_confirmed:
-            pre_retreat_rows = []
-            stable_velocity_count = 0
-            hold_obs = bridge.request({"op": "observe", "include_snapshot_state": True})
-            hold_q, _ = prior._current_arm_state(hold_obs["snapshot_state"])
-            for i in range(PRE_RETREAT_SETTLE_ACTIONS):
-                physical, track = execute(hold_q, "release_open", 100 + i, grip_action=OPEN_ACTION, allow_expected_support=True)
-                status = bridge.request({"op": "native_task_status"})
-                context_now = bridge.request({"op": "task_success_first_context", "expected_instruction": INSTRUCTION, "target_predicate": ["on", OBJECT_ID, REGION_ID]})
-                velocity = _object_velocity(physical["snapshot_state"])
-                row = {"timestep": physical.get("timestep"), "native_task_status": status, "object_pose_world_m": _object_pose(context_now).tolist(), "object_velocity": velocity, "tracking": track}
-                pre_retreat_rows.append(row)
-                stable_now = bool(
-                    velocity.get("status") == "complete"
-                    and velocity.get("linear_speed_m_s", np.inf) <= 0.01
-                    and velocity.get("angular_speed_rad_s", np.inf) <= 0.10
-                )
-                stable_velocity_count = stable_velocity_count + 1 if stable_now else 0
-                if stable_velocity_count >= 3:
-                    break
-            report["pre_retreat_settling"] = {
-                "purpose": "allow the released bowl to finish settling before retreat planning",
-                "actions": pre_retreat_rows,
-                "stable_velocity_confirmed_for_three_actions": stable_velocity_count >= 3,
-            }
-            recorder.snapshot("pre_retreat_settled")
-        elif released:
-            report["pre_retreat_settling"] = {
-                "actions": [],
-                "stable_velocity_confirmed_for_three_actions": False,
-                "skipped": True,
-                "reason": "resume_from_exact_physical_release_snapshot_and_retreat_before_the_released_bowl_can_recontact_the_open_gripper; settling will follow retreat",
-            }
+                raise RuntimeError("native_task_predicate_lost_during_candidate_opening_schedule")
+        report["release"]["post_release_opening_schedule"] = {
+            "fixed_pose_open_actions_before_retreat": post_release_hold_actions,
+            "actions": post_release_open_rows,
+            "opening_continues_during_retreat": bool(branch_config.get("open_during_retreat", True)),
+        }
+        recorder.snapshot("pre_retreat_release_schedule")
 
         released_context = bridge.request({"op": "task_success_first_context", "expected_instruction": INSTRUCTION, "target_predicate": ["on", OBJECT_ID, REGION_ID]})
         released_object = _object_pose(released_context)
         opened_obs = bridge.request({"op": "observe", "include_snapshot_state": True})
         opened_arm, opened_jaw = prior._current_arm_state(opened_obs["snapshot_state"])
         retreat_origin_world = _world_pose(released_context, "eef_pose_world")
-        retreat_direction_world = None
-        retreat_direction_evidence = None
-        if source_run_report_matches:
-            for release_event in reversed(source_run_report.get("release", {}).get("events", [])):
-                for contact in release_event.get("target_robot_contacts_last_substep", []):
-                    geom1, geom2 = contact.get("geom1", {}), contact.get("geom2", {})
-                    normal = contact.get("normal_geom1_to_geom2_world")
-                    if normal is None:
-                        continue
-                    if geom1.get("id") in bowl_geom_ids and geom2.get("name") in {pair[0] for pair in SEARCH_CONTACT_ROBOT_GEOM_BODY_PAIRS}:
-                        retreat_direction_world = np.asarray(normal, dtype=np.float64)
-                    elif geom2.get("id") in bowl_geom_ids and geom1.get("name") in {pair[0] for pair in SEARCH_CONTACT_ROBOT_GEOM_BODY_PAIRS}:
-                        retreat_direction_world = -np.asarray(normal, dtype=np.float64)
-                    if retreat_direction_world is not None:
-                        retreat_direction_evidence = {"source_timestep": release_event.get("timestep"), "contact": contact}
-                        break
-                if retreat_direction_world is not None:
-                    break
-        if retreat_direction_world is None or not np.isfinite(retreat_direction_world).all() or np.linalg.norm(retreat_direction_world) < 1e-6:
-            retreat_direction_world = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-            retreat_direction_evidence = {"fallback": "no verified target/finger-shell contact normal in source release evidence"}
-        retreat_direction_world = retreat_direction_world / np.linalg.norm(retreat_direction_world)
+        requested_retreat_direction = branch_config.get("retreat_direction_region", [0.0, 0.0, 1.0])
+        if requested_retreat_direction == "away_from_bowl":
+            hand_bowl_world = retreat_origin_world[:3, 3] - released_object[:3, 3]
+            retreat_direction_region = region_frame[:3, :3].T @ hand_bowl_world
+            retreat_direction_region[2] = 0.0
+            if np.linalg.norm(retreat_direction_region) < 1e-8:
+                retreat_direction_region = np.asarray([0.0, 0.0, 1.0])
+        else:
+            retreat_direction_region = np.asarray(requested_retreat_direction, dtype=np.float64)
+        if retreat_direction_region.shape != (3,) or not np.isfinite(retreat_direction_region).all() or np.linalg.norm(retreat_direction_region) < 1e-8:
+            raise ValueError("retreat_direction_region_must_be_finite_nonzero_3d_vector")
+        retreat_direction_region /= np.linalg.norm(retreat_direction_region)
+        retreat_direction_world = region_frame[:3, :3] @ retreat_direction_region
+        retreat_distance_m = float(branch_config.get("retreat_distance_mm", 60.0)) / 1000.0
+        if not np.isfinite(retreat_distance_m) or not 0.020 <= retreat_distance_m <= 0.100:
+            raise ValueError("retreat_distance_mm_must_be_between_20_and_100")
+        retreat_direction_evidence = {
+            "source": "candidate configuration in live plate collision frame",
+            "region_direction": retreat_direction_region.tolist(),
+            "engineering_choice_not_paper_value": True,
+        }
         retreat_stage_targets = [
             {
-                "name": "vertical_clearance_after_fully_open_gripper",
-                "world_offset_m": np.asarray([0.0, 0.0, 0.080]),
+                "name": "candidate_region_relative_retreat",
+                "world_offset_m": retreat_direction_world * retreat_distance_m,
             },
         ]
         opened_planner_source = copy.deepcopy(source_scene)
@@ -1081,7 +1118,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "retreat_direction_world": retreat_direction_world.tolist(),
             "retreat_direction_evidence": retreat_direction_evidence,
             "retreat_stage_targets": [{"name": row["name"], "world_offset_m": row["world_offset_m"].tolist()} for row in retreat_stage_targets],
-            "planner_seeds": [20261120, 20261121, 20261122],
+            "planner_seeds": [int(x) for x in branch_config.get("retreat_planner_seeds", [20261120, 20261121, 20261122])],
             "planning_method": "bounded multi-seed CuRobo candidates with per-candidate active MuJoCo path audits and feedback execution",
             "stages": [],
             "complete": False,
@@ -1113,7 +1150,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "execution_status": "not_started",
             }
             retreat["stages"].append(stage)
-            remaining_before_stage = MAX_SUFFIX_ACTIONS - prior_branch_actions - recorder.action_count
+            remaining_before_stage = action_budget - recorder.action_count
             stage["remaining_branch_actions_before_stage"] = remaining_before_stage
             selected_path = None
             selected_planner_seed = None
@@ -1188,8 +1225,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for waypoint_index, qtarget in enumerate(path[1:], start=1):
                 attempts_for_endpoint = 0
                 while True:
-                    _, tracking = execute(qtarget, "retreat", waypoint_index, allow_expected_support=True)
+                    keep_opening = bool(branch_config.get("open_during_retreat", True))
+                    _, tracking = execute(qtarget, "retreat", waypoint_index, grip_action=OPEN_ACTION if keep_opening else 0.0, allow_expected_support=True)
                     attempts_for_endpoint += 1
+                    native_at_waypoint = bridge.request({"op": "native_task_status"})
+                    if native_at_waypoint.get("task_success") is not True:
+                        raise RuntimeError(f"native_task_predicate_lost_during_retreat:{stage_index}:{waypoint_index}")
                     if tracking["joint_error_linf_rad"] <= 0.03:
                         break
                     if tracking["joint_error_linf_rad"] > 0.08 or attempts_for_endpoint >= MAX_ACTIONS_PER_WAYPOINT:
@@ -1213,9 +1254,52 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["retreat_route"] = retreat
         recorder.snapshot("retreat_complete")
 
+        # Finish physically opening only after the hand has moved away from the
+        # bowl. This check is separate from the earlier release event.
+        clearance_opening = {"maximum_actions": 0, "actions": [], "complete": False}
+        opened_state = bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"]
+        clearance_arm, _ = prior._current_arm_state(opened_state)
+        clearance_budget = min(MAX_POST_RELEASE_CLEARANCE_OPEN_ACTIONS, action_budget - recorder.action_count)
+        clearance_opening["maximum_actions"] = clearance_budget
+        for i in range(clearance_budget + 1):
+            grasp_now = bridge.request({"op": "grasp_state", "carried_binding": binding, "expected_instruction": INSTRUCTION})
+            fingers_now = grasp_now.get("finger_contacts", {})
+            closure_now = grasp_now.get("gripper_closure", {}).get("close_command_fraction", np.inf)
+            previous_evidence = monitor_rows[-1] if monitor_rows else {}
+            last_contacts_clear = bool(monitor_rows) and not _target_robot_contacts(previous_evidence, bowl_geom_ids, robot_geom_ids, substep=SUBSTEPS - 1)
+            if float(closure_now) <= 0.05 and fingers_now.get("left") is False and fingers_now.get("right") is False and int(fingers_now.get("contact_count", -1)) == 0 and last_contacts_clear:
+                clearance_opening["complete"] = True
+                clearance_opening["terminal_grasp_state"] = grasp_now
+                break
+            if i >= clearance_budget:
+                break
+            physical, track = execute(clearance_arm, "release_open", 500 + i, grip_action=OPEN_ACTION, allow_expected_support=True)
+            clearance_evidence = _strict_contacts(physical)
+            grasp_after = bridge.request({"op": "grasp_state", "carried_binding": binding, "expected_instruction": INSTRUCTION})
+            native_after = bridge.request({"op": "native_task_status"})
+            action_row = {
+                "timestep": physical.get("timestep"),
+                "gripper_qpos_m": prior._current_arm_state(physical["snapshot_state"])[1].tolist(),
+                "grasp_state": grasp_after,
+                "native_task_status": native_after,
+                "target_robot_contact_free_at_final_substep": not _target_robot_contacts(clearance_evidence, bowl_geom_ids, robot_geom_ids, substep=SUBSTEPS - 1),
+                "monitoring": clearance_evidence,
+                "tracking": track,
+            }
+            clearance_opening["actions"].append(action_row)
+            report["post_retreat_opening_clearance"] = clearance_opening
+            _write(output / "task_report.json", report)
+            if native_after.get("task_success") is not True:
+                raise RuntimeError("native_task_predicate_lost_while_finishing_open_after_retreat")
+        report["post_retreat_opening_clearance"] = clearance_opening
+        if not clearance_opening["complete"]:
+            _write(output / "task_report.json", report)
+            raise RuntimeError("post_retreat_gripper_full_open_or_contact_separation_not_confirmed")
+        recorder.snapshot("post_retreat_gripper_fully_open")
+
         q_hold, _ = prior._current_arm_state(bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"])
         settle_rows = []
-        remaining_for_settling = MAX_SUFFIX_ACTIONS - prior_branch_actions - recorder.action_count
+        remaining_for_settling = action_budget - recorder.action_count
         settle_action_count = min(SETTLE_ACTIONS, remaining_for_settling)
         if settle_action_count < 3:
             raise RuntimeError(f"bounded_branch_has_insufficient_actions_for_settling:{settle_action_count}")
@@ -1242,10 +1326,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             and final_object_velocity.get("angular_speed_rad_s", np.inf) <= 0.10
             and last_three_drift_m <= 0.002
         )
+        settle_native_continuous = bool(settle_rows and all(row.get("native_task_status", {}).get("task_success") is True for row in settle_rows))
+        complete_task_success = bool(
+            final_native.get("task_success") is True
+            and released
+            and retreat.get("complete") is True
+            and clearance_opening.get("complete") is True
+            and settle_action_count == SETTLE_ACTIONS
+            and settle_native_continuous
+        )
         report["settling"] = settle_rows
         report["settling_budget"] = {"requested_actions": SETTLE_ACTIONS, "executed_actions": settle_action_count, "complete": settle_action_count == SETTLE_ACTIONS}
-        report["final_state"] = {"timestep": int(final_obs.get("timestep", -1)), "native_task_status": final_native, "target_object_pose_world_m": _object_pose(final_context).tolist(), "object_velocity": final_object_velocity, "last_three_settling_pose_max_drift_m": last_three_drift_m, "stable_release_thresholds": {"linear_speed_m_s_max": 0.01, "angular_speed_rad_s_max": 0.10, "last_three_pose_drift_m_max": 0.002}, "grasp_state": final_grasp, "task_success": bool(final_native.get("task_success") is True), "stable_release": stable_release}
-        report["task_success"] = report["final_state"]["task_success"]
+        report["final_state"] = {"timestep": int(final_obs.get("timestep", -1)), "native_task_status": final_native, "native_task_success": bool(final_native.get("task_success") is True), "target_object_pose_world_m": _object_pose(final_context).tolist(), "object_velocity": final_object_velocity, "last_three_settling_pose_max_drift_m": last_three_drift_m, "stable_release_thresholds": {"linear_speed_m_s_max": 0.01, "angular_speed_rad_s_max": 0.10, "last_three_pose_drift_m_max": 0.002}, "grasp_state": final_grasp, "complete_task_success": complete_task_success, "stable_release": stable_release}
+        report["native_task_success"] = bool(final_native.get("task_success") is True)
+        report["task_success"] = complete_task_success
+        report["full_task_episode_complete"] = complete_task_success
+        report["stable_release_at_stop"] = stable_release
         report["suffix_safety_monitoring_complete"] = bool(len(monitor_rows) == recorder.action_count and all(r["complete_25_substep_monitoring"] for r in monitor_rows))
         report["suffix_strict_safety_certified"] = bool(report["suffix_safety_monitoring_complete"] and all(r["safety_certifiable_action"] for r in monitor_rows))
         report["safety_monitoring_complete"] = False
@@ -1276,8 +1372,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "target_object_pose_world_m": _object_pose(context_at_stop).tolist(),
                     "object_velocity": velocity_at_stop,
                 }
-                report["task_success"] = native_at_stop.get("task_success") is True
-                report["native_task_success_at_stop"] = report["task_success"]
+                report["native_task_success"] = native_at_stop.get("task_success") is True
+                report["task_success"] = False
+                report["native_task_success_at_stop"] = report["native_task_success"]
                 if isinstance(report.get("physical_execution"), dict):
                     report["physical_execution"]["status"] = (
                         "stopped_native_task_predicate_lost"
@@ -1289,7 +1386,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 report["stable_release_at_stop"] = False
                 report["safety_success"] = False
                 report["new_trainable_episodes"] = 0
-                report["episode_label"] = "task_success_trajectory_incomplete_safety_uncertified" if report["task_success"] else "task_success_not_achieved"
+                report["episode_label"] = "native_predicate_true_but_suffix_incomplete_safety_uncertified" if report["native_task_success"] else "task_success_not_achieved"
             except Exception as state_exc:
                 report["failure_state_error"] = f"{type(state_exc).__name__}: {state_exc}"
     finally:
@@ -1371,6 +1468,8 @@ def main() -> int:
     parser.add_argument("--snapshot", type=Path, default=SOURCE_SNAPSHOT)
     parser.add_argument("--source-report", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--branch-config", type=Path)
+    parser.add_argument("--max-suffix-actions", type=int, default=HORIZON)
     args = parser.parse_args()
     result = run(args)
     print(json.dumps(api._json_safe({k: result.get(k) for k in ("status", "task_success", "safety_success", "physical_actions", "error", "terminal_snapshot")}), ensure_ascii=False, sort_keys=True))

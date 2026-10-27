@@ -1,3 +1,40 @@
+## 2026-10-27：OA/L0T0 candidate9八组放置方案均未完成Task Success，候选预算耗尽
+
+### 范围与起点
+
+从candidate9历史真实持抓/运输成功前缀中，恢复t=344的Place前阶段Snapshot（SHA-256 `7e07f1e16d27aeb09066d311d982c14b33623399cb566e40bb6923cb2c057675`）。按实测手—物相对变换，将碗的盘内位置/yaw、离支持面的间隙、预放置高度、释放开度时序和撤离方向组合为最多8组确定性方案。目标坐标仍由盘碰撞几何/区域构造，不直接写BDDL或物体状态；执行均通过现有Bridge/MuJoCo物理控制器和真实Snapshot Restore。每组动作预算不超过t=344后标准1000步Horizon剩余的656步。候选空间值是本轮工程选择，不是LIBERO-Safety论文公开参数。
+
+### 八组对照
+
+| 候选 | 位置分数 (x,y) | yaw差 | 底隙/预放置高 | 真实动作 | 结论 |
+|---|---:|---:|---:|---:|---|
+| c01 center/radial | (0,0) | 0° | 1/35 mm | 0 | 盘上方CuRobo `no_result` |
+| c02 x−/vertical | (−0.55,0) | 0° | 1/50 mm | 0 | 盘上方CuRobo `no_result` |
+| c03 x+/diagonal | (+0.55,0) | +90° | 0/30 mm | 21 | 有CuRobo上方路径；waypoint 19闭环误差0.037612 rad触发停机 |
+| c04 y− | (0,−0.55) | −90° | 2/45 mm | 0 | 盘上方CuRobo `no_result` |
+| c05 y+ | (0,+0.55) | +180° | 1/25 mm | 0 | 盘上方CuRobo `no_result` |
+| c06 diagonal/high approach | (−0.45,+0.45) | +45° | 0/60 mm | 41 | 真正到达盘上方；低位Place路线`no_result` |
+| c07 diagonal | (+0.45,−0.45) | −45° | 2/40 mm | 0 | 盘上方CuRobo `no_result` |
+| c08 diagonal/delayed open | (−0.4,−0.4) | +135° | 1/35 mm | 80 | 到达t=424预放置点；Place路线`no_result` |
+
+主搜索共有142个真实动作、3550个MuJoCo子步；每个物理动作都有完整25子步监测，142/142。严格安全规则下安全认证动作0，Safety Success=false。c03/06/08均在仍持碗时停止，未发生松爪、撤离或Settling。完整Task Success=false；新可训练Episode=0。
+
+### Place重规划与精确失败证据
+
+针对c08实际到达的t=424状态保存Snapshot（SHA-256 `0e693527a9cbcc16a33aeca69fb8f16795ce6f33568a29ba3df2a31a6da7680d`），同一姿态/放置配置只额外尝试三组有界planner seed，不计为新候选。三次Place均为0/8 IK解，CuRobo全部`no_result`，物理动作0。报告在`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_placement_branch_search_20261027_130938/candidate_08/replan_place/run/task_report.json`。因此阻塞点是实测持抓变换下的低位Place末端目标不可达/无可规划路径；现有证据不支持将失败归因于某个单独碰撞Geom。
+
+### 轨迹与安全边界
+
+八方案主归档：`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_placement_branch_search_20261027_130938/`，包含`search_report.json/md`及每候选`task_report.json`、真实物理动作/状态、逐动作和逐子步监测、双相机视频、分阶段Snapshot与终态Snapshot。目标可行性搜索允许记录真实接触继续探索；这些动作没有被标成安全轨迹，也没有松动既有10 mm/2 mm安全认证规则。未改BDDL，未直接写机器人qpos或物体状态，未修改场景碰撞物。Action为关节空间控制，不兼容π₀.₅原生OSC标签；0条新可训练Episode。
+
+另披露一次意外重复执行：调用`search_candidate9_placement.py --help`误启动搜索驱动（脚本没有help-only处理），之后已停止父进程和重复c06分支。该重复不是第9种候选，保存到`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_placement_branch_search_20261027_130818/candidate_06/run/`：27动作/675子步、25子步监测27/27、严格安全动作0；中断报告停留在`initializing`，终态Snapshot读到EOFError，最后可恢复Snapshot在t=369。含此重复的原始执行总计169动作/4225子步，监测169/169，安全认证0。
+
+### 结论与下一步
+
+八组上限已耗尽。**完整Task Success=false；稳定释放=false；撤离与Settling未完成；Safety Success=false；新可训练Episode=0。** 当前唯一阻塞是找到基于真实持抓关系、位于盘面合法支持高度且存在碰撞可行IK解的Place Keypose。下一步先以t=424实物/末端变换和盘面碰撞支持几何进行离线目标重建及IK/碰撞核验；本轮不追加物理分支。
+
+---
+
 ## 2026-10-27：OA/L0T0 candidate9真实释放后任务谓词丢失，搜索在t=418停止
 
 本轮按“完整Task-Success轨迹生成”续接唯一场景`obstacle_avoidance/L0T0`。从candidate9已完成Pre-Grasp/Grasp/运输/Place的精确状态继续，修正旧报告把`grasp_confirmed=false`误记为实际松脱的问题。真实释放判定现要求：夹爪状态不再确认抓持、左右指垫接触计数为0、完整25子步监测完成，且最后子步目标碗与全部机器人碰撞Geom无接触。attempt12的t=372动作满足该判据，原生`on(akita_black_bowl_1, plate_1)=true`；但当时夹爪命令仍有0.72闭合比例，恢复快照后右指外壳又与碗相触。

@@ -1,4 +1,24 @@
-## 当前路线：OA/L0T0完整Task-Success示范，先解决真实释放与撤离（2026-10-27）
+## 当前路线：OA/L0T0放置候选预算耗尽，先解决低位Place可达性（2026-10-27）
+
+唯一目标继续为从candidate9真实持抓前缀取得`obstacle_avoidance/L0T0`原生Task Success。已从t=344真实Place前Snapshot按8组上限搜索盘内位置、放置朝向、接近高度、开爪时序与撤离方向；5组没有上方路线，3组真实执行到21/41/80动作。最长c08分支到t=424仍双指持碗，低位Place目标在三组seed下均0/8 IK且CuRobo `no_result`。本轮没有释放、撤离或Settling。
+
+| 指标 | 状态 |
+|---|---|
+| Task Success（放置、松爪、撤离、Settling后原生谓词） | false |
+| 完整稳定释放 | false |
+| 候选方案 | 8/8，不再扩展本轮预算 |
+| 主搜索实际物理运行 | 142动作 / 3550子步 |
+| 完整25子步监测 | 142/142动作 |
+| Safety Success | false；严格安全认证0动作，规则未更改 |
+| 新增可训练Episode | 0 |
+
+任务可行性探索与安全认证分开。没有修改BDDL、直接写qpos或搬动物体，也没有将不安全接触认证为安全。双相机视频、分阶段/终态Snapshot、碰撞监测与逐动作记录位于`oa_l0t0_candidate9_placement_branch_search_20261027_130938`归档。意外重复的candidate6进程另有27动作/675子步，已停止且未计为新方案；末态Snapshot损坏情况在进度文档中披露。
+
+**唯一工程阻塞：**从真实t=424测得的碗—夹爪相对变换，构造既贴合盘面支持几何、又存在IK解且经全场景碰撞筛查通过的Place目标。后续先离线确定该Keypose并验证IK/碰撞；本轮8组物理候选额度已耗尽，不继续执行新分支。历史目标与完整证据见[当前局部目标](GS_OPD_CURRENT_GOAL.md)和[进度记录](GS_OPD_PROGRESS.md)。
+
+---
+
+## 历史路线：OA/L0T0释放清除/撤离受阻（attempt22，2026-10-27)
 
 唯一场景仍为`obstacle_avoidance/L0T0`。candidate9已产生真实运输和盘面放置前缀；从精确t=372松爪Snapshot恢复后，完整开爪46步使原生`on(bowl, plate)`在t=418从true变false，因此已立即停止。撤离尝试未执行：CuRobo多seed路线通过不了活动MuJoCo碰撞审计；接触法向变体IK无解或出现非法碰撞。t=372的瞬时Task Success及兄弟分支t=373–375的低速状态不构成稳定释放或完整Episode。
 

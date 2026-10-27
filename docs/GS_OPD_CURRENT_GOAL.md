@@ -1,4 +1,18 @@
-## 当前局部目标：OA/L0T0完整Task-Success轨迹在释放清除/撤离处受阻（2026-10-27）
+## 当前局部目标：OA/L0T0放置分支搜索预算耗尽，Place姿态无可用IK路线（2026-10-27）
+
+本轮从candidate9真实持抓的t=344 Place前Snapshot恢复，按对象相对放置姿态、盘内位置/朝向、接近高度、开爪等待和撤离方向评估了8组不同配置，达到本次授权上限。任务成功判据保持为松爪、撤离和Settling后原生`task_success=true`。结果：**完整Task Success=false，稳定释放=false，Retreat/Settling未完成，Safety Success=false，新增可训练Episode=0**。不安全接触只作为任务可行性搜索记录；10 mm/2 mm安全规则没有改变。
+
+8组中5组在CuRobo的盘上方路线阶段返回`no_result`、没有物理动作；3组执行真实MuJoCo闭环，共142动作/3550子步，142/142动作完成25子步监测，但严格安全认证通过0动作。c03在到达上方目标前闭环跟踪停止；c06以41动作到达盘上方后，Place规划失败；c08以80动作到达t=424上方预放置点后，Place规划仍失败。c08从可恢复t=424 Snapshot进行同候选三seed重规划，3组均为0/8 IK且CuRobo `no_result`，没有增加新姿态候选或物理动作。碗仍被持抓，没有进入松爪、撤离或Settling。
+
+起点Snapshot：`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_full_task_20261027_attempt07/stage_place_t344_runtime_snapshot.pkl`（t=344，SHA-256 `7e07f1e16d27aeb09066d311d982c14b33623399cb566e40bb6923cb2c057675`）。最完整执行前缀是c08 t=424 Snapshot，SHA-256 `0e693527a9cbcc16a33aeca69fb8f16795ce6f33568a29ba3df2a31a6da7680d`。8候选及同候选重规划报告：`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_placement_branch_search_20261027_130938/`；其中保存真实动作、逐子步监测、双相机视频和阶段/终态Snapshot。候选3/6/8数据均为任务可行性探索，且不是π₀.₅原生OSC标签。
+
+有一次由无help-only实现的`--help`误调用启动了重复c06进程；进程已停止。它额外记录27动作/675子步，27/27完成25子步监测、严格安全认证0，最终报告未完成且末态Snapshot不可恢复（EOFError），最后可恢复保存点t=369。它未作为第9个不同姿态候选；原始数量单独披露，避免与8组比较混淆。
+
+**当前唯一阻塞：**基于t=424真实物体/夹爪相对变换，构造位于盘面支持高度、同时存在可达IK且能通过碰撞检查的Place Keypose。c08三seed均未找到该目标的IK，c06也未返回Place路线。此次8组预算已耗尽，不再追加物理分支。下一工程步骤先针对测得的夹持关系和盘面支持几何离线确定Place目标高度/姿态并核验IK；只有新的有限搜索预算明确后才继续物理分支。
+
+---
+
+## 历史目标：OA/L0T0释放清除/撤离受阻（attempt22，2026-10-27）
 
 唯一交付目标仍是从candidate9历史真实抓持起点完成`obstacle_avoidance/L0T0`原生任务：运输、放置、真实松爪、撤离和Settling；可行数据与Safety认证严格分开。本轮从精确t=372释放Snapshot做了一次真实续接，46个开爪动作后在t=418原生`on(bowl, plate)`转为false，立即停机。故**当前末态Task Success=false、Safety Success=false、完整Episode=0、新增可训练Episode=0**。t=372曾短暂满足原生任务谓词；attempt12兄弟分支t=373–375连续3步低速，但随后撤离路径审计发现右指外壳重新接触，不能认定为稳定释放或完整Episode。
 
