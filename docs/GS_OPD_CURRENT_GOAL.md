@@ -1,10 +1,18 @@
-## 当前局部目标：LIBERO-Safety OA/L0T0示范生成器最小复现（2026-10-27）
+## 当前局部目标：OA/L0T0 candidate9持抓运输到盘上方（2026-10-27）
 
-当前唯一试点为`obstacle_avoidance/L0T0`：将炉灶上的Akita黑碗放到盘子。Human L0T2与此前自研Task-Success-First RRT、Region-Progress及CuRobo局部修补路线暂停。论文式Keypose、五变体和坐标转换已实现并通过17项真实数值测试；代码与原论文/官方接口边界见[复现规格](GS_OPD_LIBERO_SAFETY_DATA_REPRO_SPEC.md)。
+当前唯一任务为`obstacle_avoidance/L0T0`：从candidate9的`t=190`合法双指持抓Snapshot恢复，把炉灶上的Akita黑碗运输至盘上方；不执行放置、松爪或撤离。来源Integration State精确匹配，活动模型/BDDL指纹相同。目标定位已修正：`plate_1`按活动语义绑定解析为`plate_1_main`及10个编译碰撞Geom，不再请求不存在的BDDL Site。60 mm盘面余量与盘内朝机器人侧选点是明确的本轮工程选择。
 
-阶段A通过：对象/目标Region局部SE(3)、米制、WXYZ四元数、工具帧和确定性变体均有测试。阶段B使用活动MuJoCo完整场景和CuRobo成功规划了两组的Pre-Grasp/Grasp路径，但两组闭爪scratch审计都发现非指垫—碗接触及夹爪自碰撞，故没有完整分阶段路线。阶段C按门槛未执行；Bridge保持0动作/0 timestep，原生任务仍false，释放未验证，安全监测为unknown，安全认证未通过，新增可训练Episode为0。
+CuRobo产生41个有效轨迹点，精确MuJoCo路径筛查未发现非法碰撞。真实MuJoCo闭环执行9个7D关节PD动作、225个子步后停在t=199；碗仍被左右真实指垫抓持，但距上方目标仍390.100 mm，未到达且原生任务成功为false。waypoint 10的动作前scratch预演发现Geom 73 `gripper0_finger1_collision`将碰撞碗Geom 113/114，故该动作未发送并保留t=199现场Snapshot。没有直接写入机器人qpos/物体状态，也未改BDDL或安全规则；qpos由现有物理控制器和MuJoCo动力学更新。
 
-**唯一阻塞：**需要一组闭爪时仅左右真实指垫接触目标碗、且无夹爪自碰撞的抓持Keypose。下一次只验证一个可量测功能：闭爪抓持终点的真实Geom对筛选；筛选通过后再重新评估阶段B，不直接启动物理Episode。
+225/225原始接触样本及225/225逐子步几何结果已记录，但Bridge组合监测为9/9 incomplete、严格几何为9/9 unsafe；持碗局部余量低于原有2 mm要求。故安全监测未完整通过、安全认证false；这与路径可行性分开报告。9帧双相机视频和t=199可恢复Snapshot在`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_transport_above_plate_20261027_attempt06/`。新增可训练Episode为0；7D关节动作不是π₀.₅原生OSC标签。
+
+**唯一阻塞：**在维持真实双指抓持、既有碰撞规则和闭环反馈下，解决waypoint 10的非指垫碰撞并证明后续运输路线可执行。下一轮先基于t=199预演证据处理这一个阻塞；不重跑本次路线、不进行无限重试，也不把安全认证降级为几何无碰撞结论。论文规格及来源边界见[复现规格](GS_OPD_LIBERO_SAFETY_DATA_REPRO_SPEC.md)。
+
+---
+
+## 历史目标：LIBERO-Safety OA/L0T0示范生成器最小复现准备（2026-10-27）
+
+此前阶段A对象/Region局部SE(3)、米制、WXYZ四元数、工具帧和固定种子变体通过17项数值测试。初始阶段B的两组Keypose Bundle只完成Pre-Grasp/Grasp规划，并在scratch闭爪审计发现非指垫Finger Geom/碗接触及夹爪自碰撞；这些历史记录仍保留。candidate9后续真实持抓状态提供了新的实验起点，并不抹除上述拒绝证据。
 
 ---
 

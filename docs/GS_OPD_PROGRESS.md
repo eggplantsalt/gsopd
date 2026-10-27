@@ -1,3 +1,19 @@
+## 2026-10-27：OA/L0T0 candidate9更正盘目标并执行有界MuJoCo运输，waypoint 10预演触发停机
+
+本轮只从`oa_l0t0_c09_feasible_lift_5sy0p49a/terminal_runtime_snapshot.pkl`精确恢复`obstacle_avoidance/L0T0`候选9的`t=190`状态。来源Snapshot SHA-256为`2e8abb5e…a7f68ac9`，452维Integration State逐元素一致，活动模型SHA为`40fd3ac3…edd408d2`；BDDL和物体/机器人初态未改。旧目标查询把`plate_1`误当成BDDL Site，现按活动语义绑定解析到Body 28 `plate_1_main`，再用编译模型中的10个碰撞盒Geom 439–448计算盘面。目标碗碰撞底部高于盘碰撞几何60 mm、并在盘碰撞AABB内向当前机器人基座方向偏移的比例属于本次复现工程选择，不是论文参数或BDDL放置状态；本轮没有放置或松爪。
+
+CuRobo在完整活动场景及附着碗几何下提取41个有效关节轨迹点；1800点缓冲仅取有效前41点。碗的40个真实碰撞Geom由320个附着球覆盖。对41个配置执行的精确MuJoCo scratch接触复核报告0个非法接触。CuRobo粗粒度指链接筛选只用于规划内部，不能视为接触许可；所有真实动作前继续执行完整MuJoCo逐子步预演。
+
+本轮实际发送9个7D关节目标PD动作，MuJoCo从`t=190`推进到`t=199`，没有开爪/放置动作。终态左右指垫仍与目标碗接触，Bridge抓持判定通过。碗根位姿从`[-0.270710,-0.138359,0.968015] m`移动到`[-0.234556,-0.053742,0.960253] m`；上方目标根位姿为`[0.050782,0.211703,0.977553] m`，终态位置误差390.100 mm，因此**未到达盘上方**，原生`task_success=false`。机器人关节仅由物理控制器/模拟器更新，没有直接写入qpos或物体状态。
+
+第10个物理动作没有发出：从t=199终态做的25子步精确MuJoCo预演，在逻辑waypoint 10预测非指垫Geom 73 `gripper0_finger1_collision`与碗Geom 113/114 `akita_black_bowl_1_g30/g31`接触。每对预测16个子步，最深约−0.0279 mm；这是未执行的预演风险，不是前9步的实测碰撞。前9步实测到的机器人—碗接触仅为已核验左右指垫Geom 74/77，未观察到非指垫或自碰撞。现场保存在`t=199`终态Snapshot，不重试当前路线。
+
+逐动作均记录25/25原始接触样本和25/25几何结果，共225+225条；但Bridge组合监测状态9/9为`incomplete`，几何状态9/9为`unsafe`。实际持碗几何余量约0.0158–0.1062 mm，低于原有2 mm持物余量；没有改动既有10 mm/2 mm门限。应报告为接触/几何采样覆盖已留档、严格监测未通过/不完整，不能宣称安全认证。9帧双相机视频可解码（20 FPS、512×256合成画面）；t=199终态Snapshot SHA-256为`1bf854b8…aabb22932`，Bridge只读恢复验证timestep和Integration State均精确匹配。无新可训练Episode；标签是7D关节目标，不是π₀.₅原生OSC动作。
+
+实现入口`research/gs_opd/libero_safety_repro/transport_candidate9_above_plate.py`；本次机器报告、诊断、阻塞waypoint预演、双相机视频、逐步记录及Snapshot均在`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_transport_above_plate_20261027_attempt06/`。下一唯一任务是处理持抓状态下waypoint 10的真实非指垫接触并重新建立有反馈的避碰运输可行性；保持现有安全阈值，且安全认证仍被t=190以来的2 mm持物余量违规单独阻断。
+
+---
+
 ## 2026-10-27：LIBERO-Safety OA/L0T0 Keypose最小端到端复现停在阶段B
 
 本轮只处理`obstacle_avoidance/L0T0`（炉灶上的碗放到盘子），读取并恢复了已提交的[LIBERO-Safety复现规格](GS_OPD_LIBERO_SAFETY_DATA_REPRO_SPEC.md)。阶段A的独立对象/Region局部Keypose、严格SE(3)变换和固定种子五变体实现通过17项数值测试；JUnit报告为`reports/libero_safety_repro/stage_a_junit.xml`。工程扰动、初始抬升、预抓取/预放置与撤离距离均单独标为复现选择，未声称来自论文。

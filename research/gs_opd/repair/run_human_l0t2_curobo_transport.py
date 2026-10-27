@@ -876,7 +876,13 @@ def _settling_evidence(
 
 
 class EpisodeRecorder:
-    def __init__(self, output_dir: Path, bridge: BridgeSession):
+    def __init__(
+        self,
+        output_dir: Path,
+        bridge: BridgeSession,
+        *,
+        record_schema: str = "gs_opd_curobo_human_l0t2_episode_step.v1",
+    ):
         self.output_dir = output_dir
         self.bridge = bridge
         self.frames_dir = output_dir / "dual_camera_frames"
@@ -892,6 +898,9 @@ class EpisodeRecorder:
         self.monitoring_incomplete_actions = 0
         self.control_mode = "joint_space_mass_matrix_PD_torque"
         self.endpoint_convergence_events: list[dict[str, Any]] = []
+        if not isinstance(record_schema, str) or not record_schema:
+            raise ValueError("episode_record_schema_must_be_non_empty")
+        self.record_schema = record_schema
 
     def snapshot(self, label: str) -> str | None:
         result = self.bridge.request({"op": "export_runtime_snapshot"})
@@ -1007,7 +1016,7 @@ class EpisodeRecorder:
         snapshot_state = reply.get("snapshot_state", {})
         q_actual = _arm_q_from_snapshot(snapshot_state)
         record = {
-            "schema": "gs_opd_curobo_human_l0t2_episode_step.v1",
+            "schema": self.record_schema,
             "step_index": self.action_count,
             "phase": phase,
             "control_mode": self.control_mode,

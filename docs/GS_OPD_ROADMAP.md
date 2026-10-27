@@ -134,6 +134,16 @@
 
 # GS-OPD 总体路线
 
+## 当前试点优先级：LIBERO-Safety OA/L0T0 candidate9有限运输（2026-10-27）
+
+此前自研Task-Success-First RRT、Region-Progress、CuRobo局部修补及Human L0T2路线继续暂停。本阶段只复现LIBERO-Safety论文式稀疏Keypose到真实MuJoCo执行功能，不启动19,664条批量生成或模型训练；唯一场景为`obstacle_avoidance/L0T0`。
+
+candidate9的t=190 Snapshot已精确恢复，`plate_1`现通过活动语义Body绑定及10个MuJoCo碰撞盒定位。CuRobo得41个有效路点，41态完整MuJoCo scratch路径筛查无非法接触。真实闭环发出9个关节目标动作、观察225个物理子步后停止于t=199：持抓保持，但碗离上方目标390.100 mm。第10路点预演将使非指垫Geom 73与目标碗Geom 113/114接触，故没有发送。双相机视频、动作/状态记录和可精确恢复Snapshot已留存；原生task_success=false、稳定释放未尝试、新增可训练Episode=0。
+
+任务可行性与安全认证分别记录。每步均留有25个原始接触样本和25个几何结果，但Bridge组合监测为incomplete且严格几何为unsafe；目标持抓局部间隙低于原有2 mm规则。安全认证false，不放宽阈值。当前唯一阻塞是解决t=199到waypoint 10的非指垫碰撞并证明闭环运输可行；认证阻塞仍单独记录，不能把CuRobo静态无碰撞路径当作安全成功Episode。详细数据见[进度记录](GS_OPD_PROGRESS.md)与[当前局部目标](GS_OPD_CURRENT_GOAL.md)。
+
+---
+
 ## 最新里程碑：经验复用已验证到抓取技能，尚未降低完整任务成功成本（2026-10-26）
 
 当前跨场景验收以 [GS_OPD_CROSS_SCENE_TRANSFER_20261026.md](GS_OPD_CROSS_SCENE_TRANSFER_20261026.md) 为准；其更新并取代下方先前的run1–run3成本统计。
