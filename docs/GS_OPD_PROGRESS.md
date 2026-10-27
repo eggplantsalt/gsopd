@@ -1,3 +1,19 @@
+## 2026-10-27：OA/L0T0 candidate9真实释放后任务谓词丢失，搜索在t=418停止
+
+本轮按“完整Task-Success轨迹生成”续接唯一场景`obstacle_avoidance/L0T0`。从candidate9已完成Pre-Grasp/Grasp/运输/Place的精确状态继续，修正旧报告把`grasp_confirmed=false`误记为实际松脱的问题。真实释放判定现要求：夹爪状态不再确认抓持、左右指垫接触计数为0、完整25子步监测完成，且最后子步目标碗与全部机器人碰撞Geom无接触。attempt12的t=372动作满足该判据，原生`on(akita_black_bowl_1, plate_1)=true`；但当时夹爪命令仍有0.72闭合比例，恢复快照后右指外壳又与碗相触。
+
+从精确`t=372` release Snapshot继续后，在固定机器人位置逐步真实开爪。运行到`t=418`共执行46个动作/1150个MuJoCo子步，46/46动作均有完整25子步采样，机器人关节目标跟踪误差为0。被许可用于**任务可行性继续**的唯一浅接触Pair为碗Geom112 `akita_black_bowl_1_g29`—右指外壳Geom76 `gripper0_finger2_collision`（Body `akita_black_bowl_1_main`—`gripper0_rightfinger`）：46步合计1065条重复子步记录、1个独立Geom Pair，最深−0.04434 mm。此0.1 mm限值只用于本任务搜索继续；原严格监测仍把接触标unsafe，46步中安全可认证动作0，没改既有10 mm/2 mm规则。
+
+真实开爪期间，原生`on(bowl, plate)`在t=373–417维持true，t=418变为false；终态碗仍与右指外壳及右指垫接触，线速度0.01584 m/s、角速度0.18732 rad/s。按“掉落/控制阻塞即停”要求立即停止，没有继续撤离或尝试回放。最终原生任务成功false，Safety Success false，新增可训练Episode 0。attempt12兄弟分支曾在t=373–375连续3步满足低物体速度条件，但后续撤离审计发现指外壳重新接触，故不把这段认定为稳定释放或完整Episode。
+
+撤离路线做了有界、只规划不执行的搜索：①纯竖直80 mm，3个CuRobo seed均复现同一41点路径，活动MuJoCo审计发现最深约−12.1至−13.2 mm的右指外壳/碗碰撞；②沿`t=371`真实接触法向偏移20 mm并上升80 mm，3个seed均得到61点路线，但每条含571条非法接触记录，拒绝；③50 mm法向或15/40 mm短竖直目标没有可用IK。没有执行这些撤离路线，没有放宽碰撞门限。累计candidate9延续动作`t=199→418`为219，仍在标准1000步任务Horizon内；本轮分支从t=372执行46步。
+
+终态完整记录在`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_full_task_20261027_attempt22/`：`task_report.json/md`、逐步动作及状态`physical_step_records.jsonl.gz`、逐动作/逐子步监测`action_monitoring.jsonl.gz`、双相机视频`dual_camera_agentview_wrist_20fps.mp4`、相机帧及可恢复t=418 Snapshot（SHA-256 `1781a017…dbeee5`）。`collision_pair_summary.json`按唯一Pair聚合46步接触；`retreat_search_summary.json`记录attempt14–21所有候选与拒绝原因。此前的全开过渡报告和未执行路径/碰撞审计分别保存在同目录和attempt18–21。t=372中间Snapshot绑定attempt12的源报告与释放事件；动作预算按t=361到t=372的11个实际动作核算，不能把t=373–375的兄弟分支稳定等待重复计入。
+
+**当前唯一阻塞：**开爪清除右指外壳接触时，黑碗在盘面上的原生`on`谓词丢失；保持该位置开爪后也没有满足现有碰撞规则的CuRobo撤离路径。下一步应先重建放置/释放Keypose，使夹爪能完全打开而不推动碗、并从该位置有通过MuJoCo审计的撤离路线；不重跑t=372全开分支。Task Success、稳定释放与安全认证继续分开，安全Episode和新增训练Episode都为0。
+
+---
+
 ## 2026-10-27：OA/L0T0 candidate9更正盘目标并执行有界MuJoCo运输，waypoint 10预演触发停机
 
 本轮只从`oa_l0t0_c09_feasible_lift_5sy0p49a/terminal_runtime_snapshot.pkl`精确恢复`obstacle_avoidance/L0T0`候选9的`t=190`状态。来源Snapshot SHA-256为`2e8abb5e…a7f68ac9`，452维Integration State逐元素一致，活动模型SHA为`40fd3ac3…edd408d2`；BDDL和物体/机器人初态未改。旧目标查询把`plate_1`误当成BDDL Site，现按活动语义绑定解析到Body 28 `plate_1_main`，再用编译模型中的10个碰撞盒Geom 439–448计算盘面。目标碗碰撞底部高于盘碰撞几何60 mm、并在盘碰撞AABB内向当前机器人基座方向偏移的比例属于本次复现工程选择，不是论文参数或BDDL放置状态；本轮没有放置或松爪。

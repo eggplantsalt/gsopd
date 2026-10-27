@@ -245,6 +245,15 @@ def _robot_yaml(gripper_mode: str, gripper_qpos_m=None) -> dict:
         kinematics["self_collision_ignore"][link_name] = [
             item for item in ignored if item != "attached_object"
         ]
+    # The official Franka collision model attaches the carried object between
+    # the two finger links. Preserve only those two object/finger pairs. The
+    # broader hand and arm exemptions stay removed, and the active MuJoCo
+    # path audit still checks actual geom identities (including non-pad finger
+    # geoms) before any physical execution.
+    for finger_link in ("panda_leftfinger", "panda_rightfinger"):
+        ignored = kinematics["self_collision_ignore"].setdefault(finger_link, [])
+        if "attached_object" not in ignored:
+            ignored.append("attached_object")
     return cfg
 
 
@@ -264,8 +273,6 @@ def _make_planner(source: dict, world_base: np.ndarray, gripper_mode: str, seed:
         random_seed=int(seed),
         max_batch_size=1,
         max_goalset=1,
-        interpolation_dt=0.05,
-        interpolation_buffer_size=1800,
     )
     planner = MotionPlanner(planner_cfg)
     planner.update_world(full_world)
@@ -281,13 +288,16 @@ def _make_planner(source: dict, world_base: np.ndarray, gripper_mode: str, seed:
         "corrected_lock_joint_values": copy.deepcopy(cfg["robot_cfg"]["kinematics"]["lock_joints"]),
         "collision_exceptions": {
             "grasp_contact_links": cfg["robot_cfg"]["kinematics"]["grasp_contact_link_names"],
-            "attached_object_removed_from_self_collision_ignore": True,
+            "attached_object_ignored_only_against_finger_links": ["panda_leftfinger", "panda_rightfinger"],
+            "attached_object_hand_and_arm_collision_checks_retained": True,
             "hand_is_not_a_grasp_contact_exception": True,
+            "exact_physical_geom_pairs_require_active_mujoco_path_audit": True,
         },
         "scene_cuboid_count": cuboid_count,
         "scene_mesh_count": mesh_count,
-        "interpolation_buffer_size": 1800,
-        "interpolation_dt_s": 0.05,
+        "trajectory_interpolation": "CuRobo v0.8 MotionPlanner/TrajOptSolver defaults; only interpolated_last_tstep points are exposed as executable",
+        "legacy_interpolation_dt_parameter": "unsupported_by_CuRobo_v0.8_and_not_passed",
+        "legacy_interpolation_buffer_size_parameter": "unsupported_by_CuRobo_v0.8_and_not_passed",
         "seed": int(seed),
     }
 
@@ -310,8 +320,9 @@ def _plan_stage(planner, device, dtype, current_state, transform_base_tool, *, g
     ik_success = _tensor(ik.success)
     ik_row = {
         "success": ik_success.reshape(-1).tolist() if ik_success is not None else None,
+        "feasible": _metric(getattr(ik, "feasible", None)),
         "position_error": _metric(getattr(ik, "position_error", None)),
-        "orientation_error": _metric(getattr(ik, "orientation_error", None)),
+        "orientation_error": _metric(getattr(ik, "orientation_error", getattr(ik, "rotation_error", None))),
         "position_error_norm": _metric(getattr(ik, "position_error_norm", None)),
         "solver_status": str(getattr(ik, "status", "unavailable")),
         "solution_joint_states_rad": None,

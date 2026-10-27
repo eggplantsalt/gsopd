@@ -1,4 +1,16 @@
-## 当前局部目标：OA/L0T0 candidate9持抓运输到盘上方（2026-10-27）
+## 当前局部目标：OA/L0T0完整Task-Success轨迹在释放清除/撤离处受阻（2026-10-27）
+
+唯一交付目标仍是从candidate9历史真实抓持起点完成`obstacle_avoidance/L0T0`原生任务：运输、放置、真实松爪、撤离和Settling；可行数据与Safety认证严格分开。本轮从精确t=372释放Snapshot做了一次真实续接，46个开爪动作后在t=418原生`on(bowl, plate)`转为false，立即停机。故**当前末态Task Success=false、Safety Success=false、完整Episode=0、新增可训练Episode=0**。t=372曾短暂满足原生任务谓词；attempt12兄弟分支t=373–375连续3步低速，但随后撤离路径审计发现右指外壳重新接触，不能认定为稳定释放或完整Episode。
+
+失败终态可从`/opt/data/private/gs_opd/rollouts/oa_l0t0_candidate9_full_task_20261027_attempt22/terminal_runtime_snapshot.pkl`恢复（t=418，SHA-256 `1781a017…dbeee5`）。真实动作记录、1150个逐子步接触样本、双相机视频、Snapshot及错误报告同目录。46/46动作有完整25子步监测，但0步满足严格Safety认证；唯一浅Pair为碗Geom112—右指外壳Geom76，最大穿透44.3 μm，仅作为unsafe任务搜索证据。
+
+有界撤离规划尝试均拒绝：垂直80 mm路线和多seed候选因右指外壳与碗产生毫米级碰撞；接触法向短目标无IK或仍有大量非法碰撞。仅在最终分支行动预算内执行了全开尝试，任务谓词丢失后停止。安全阈值和BDDL未改，物体状态只由MuJoCo物理执行更新；`plan_oa_l0t0.py`保留原规划算法，仅适配CuRobo 0.8删除的插值参数并修正随身物体只对左右指Link的模型配对，实际每步仍以完整MuJoCo审计为准。没有直接写qpos或重置。
+
+**下一步唯一阻塞：**重新确定Place/Release Keypose与夹爪开度，使夹爪能真实全开且不把碗从盘上推离，并让撤离路线在真实MuJoCo全几何审核下通过。不要从t=372重复全开分支，也不扩展其他场景；先离线筛查少量真实目标，再最多执行一个有界分支。验收需分别报告原生Task Success、稳定释放、撤离/Settling、逐子步监测、Safety Success及新Episode数。细节见[最新进度记录](GS_OPD_PROGRESS.md)。
+
+---
+
+## 历史目标：OA/L0T0 candidate9持抓运输到盘上方（2026-10-27）
 
 当前唯一任务为`obstacle_avoidance/L0T0`：从candidate9的`t=190`合法双指持抓Snapshot恢复，把炉灶上的Akita黑碗运输至盘上方；不执行放置、松爪或撤离。来源Integration State精确匹配，活动模型/BDDL指纹相同。目标定位已修正：`plate_1`按活动语义绑定解析为`plate_1_main`及10个编译碰撞Geom，不再请求不存在的BDDL Site。60 mm盘面余量与盘内朝机器人侧选点是明确的本轮工程选择。
 

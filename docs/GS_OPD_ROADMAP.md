@@ -1,4 +1,21 @@
-## 当前路线：LIBERO-Safety OA/L0T0 Keypose复现（2026-10-27）
+## 当前路线：OA/L0T0完整Task-Success示范，先解决真实释放与撤离（2026-10-27）
+
+唯一场景仍为`obstacle_avoidance/L0T0`。candidate9已产生真实运输和盘面放置前缀；从精确t=372松爪Snapshot恢复后，完整开爪46步使原生`on(bowl, plate)`在t=418从true变false，因此已立即停止。撤离尝试未执行：CuRobo多seed路线通过不了活动MuJoCo碰撞审计；接触法向变体IK无解或出现非法碰撞。t=372的瞬时Task Success及兄弟分支t=373–375的低速状态不构成稳定释放或完整Episode。
+
+| 验收项 | 当前状态 |
+|---|---|
+| 原生Task Success（终止Snapshot） | false；t=372曾为true，t=418丢失 |
+| 稳定释放 | 兄弟分支t=373–375有3步低速度证据，但撤离审计发现指外壳重接触；最终失败分支不稳定 |
+| Retreat / 最终 Settling | 未完成；所有MuJoCo路径审计拒绝 |
+| 25子步监测 | 本分支46/46完整（1150子步），严格安全可认证动作0 |
+| Safety Success | false，既有安全规则未放宽 |
+| 新可训练Episode | 0 |
+
+下一阶段只有一个工程任务：在真实放置几何下重新确定Place/Release Keypose与全开姿态，使打开夹爪不推动黑碗，且CuRobo撤离路线通过完整MuJoCo审计。先做有限离线几何/IK/碰撞筛查，再执行一个有界真实分支；若任务谓词丢失或控制停滞立即停机并保留Snapshot。保持Task feasibility与Safety certification分开；本试点完成前不推广其他场景。详细记录见[当前局部目标](GS_OPD_CURRENT_GOAL.md)和[进度文档](GS_OPD_PROGRESS.md)。
+
+---
+
+## 历史路线：LIBERO-Safety OA/L0T0 Keypose复现准备（2026-10-27）
 
 单场景最小复现优先，试点为`obstacle_avoidance/L0T0`。已完成对象/Region局部SE(3)与每阶段五个固定种子变体（阶段A通过，17项测试）。真实完整MuJoCo障碍场景接入CuRobo后，两组Keypose Bundle均仅完成Pre-Grasp/Grasp规划；闭爪scratch审计发现非指垫Finger Geom与碗相交以及夹爪自碰撞，路线严格拒绝。
 
