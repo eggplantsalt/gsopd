@@ -66,11 +66,31 @@ def classify_contacts(
         forbidden_target = any(
             a in target and b in forbidden for a, b in [pair, pair[::-1]]
         )
-        if (robot and not (allow_grasp and pad_target)) or forbidden_target:
+        distance = contact.get("signed_contact_distance_m")
+        legal_pad_penetration = (
+            distance is not None
+            and np.isfinite(float(distance))
+            and float(distance) >= -0.002
+        )
+        if (robot and not (allow_grasp and pad_target and legal_pad_penetration)) or forbidden_target:
             illegal.append(contact)
         if pad_target:
             contacted.update(set(pair) & pads)
     return {"complete": True, "illegal": illegal, "pad_ids": sorted(contacted)}
+
+
+def complete_geometry_evidence(result):
+    monitor = result.get("contact_monitoring", {})
+    geometry = monitor.get("geometry_monitoring", {})
+    steps = geometry.get("substeps", [])
+    return (
+        monitor.get("status") == "complete"
+        and monitor.get("captured_physics_substeps") == 25
+        and monitor.get("unavailable_contact_substeps") == 0
+        and geometry.get("status") == "complete"
+        and len(steps) == 25
+        and all(item.get("status") == "complete" for item in steps)
+    )
 
 
 def main():
@@ -81,6 +101,7 @@ def main():
     parser.add_argument("--approach-report", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--forbidden-object", action="append", required=True)
+    parser.add_argument("--safety-policy-dir", type=Path, required=True)
     args = parser.parse_args()
     approach = json.loads(args.approach_report.read_text())
     route = next(r for r in approach["routes"] if r["accepted"])
@@ -127,6 +148,43 @@ def main():
         forbidden.update(bindings[name]["semantic_geom_ids"])
     report["forbidden_objects"] = args.forbidden_object
     report["forbidden_geom_ids"] = sorted(forbidden)
+    policies = {}
+    expected_forbidden = set(args.forbidden_object)
+    expected_pairs = {
+        (pad, gid)
+        for pad in pads
+        for gid in target
+    }
+    for phase in ("approach", "grasp"):
+        policy_path = args.safety_policy_dir / f"{phase}_policy.json"
+        policy = json.loads(policy_path.read_text())
+        actual_forbidden = {
+            item["object_id"] for item in policy["forbidden_objects"]
+        }
+        actual_target = {
+            item["object_id"] for item in policy["allowed_target_objects"]
+        }
+        actual_pairs = {
+            (item["robot_geom_id"], item["scene_geom_id"])
+            for item in policy["allowed_contact_pairs"]
+        }
+        if policy["minimum_clearance_m"] < 0.010:
+            raise ValueError("forbidden_clearance_below_10mm")
+        if actual_forbidden != expected_forbidden:
+            raise ValueError("forbidden_objects_differ_from_episode")
+        if actual_target != {source["config"]["target_object_id"]}:
+            raise ValueError("grasp_target_differs_from_episode")
+        if any(item["minimum_clearance_m"] < 0.010 for item in policy["forbidden_objects"]):
+            raise ValueError("forbidden_object_margin_below_10mm")
+        if phase == "approach" and actual_pairs:
+            raise ValueError("approach_must_not_allow_target_contact")
+        if phase == "grasp" and actual_pairs != expected_pairs:
+            raise ValueError("grasp_contact_pairs_differ_from_verified_pads")
+        if any(item["minimum_clearance_m"] < -0.002 for item in policy["allowed_contact_pairs"]):
+            raise ValueError("grasp_penetration_exceeds_2mm")
+        policies[phase] = policy
+    report["safety_policy_dir"] = str(args.safety_policy_dir.resolve())
+    report["safety_policy_mode"] = "physical_preview_and_real_execution_25_substeps"
     complete_steps = 0
     illegal_observed = []
     gripper_current_action = np.array([0.0, 0.0])
@@ -134,48 +192,43 @@ def main():
     def robot():
         return observation["snapshot_state"]["robot_states"][0]
 
-    def scratch_guard(q_target, jaw_target, allow_grasp):
-        q = np.asarray(robot()["joint_qpos"])
-        jaw = np.asarray(robot()["gripper_qpos"])
-        count = max(2, int(np.ceil(np.max(np.abs(q_target - q)) / 0.01)) + 1)
-        qs, jaws = [], []
-        for alpha in np.linspace(0.0, 1.0, count):
-            for beta in np.linspace(0.0, 1.0, 5):
-                qs.append((q + alpha * (q_target - q)).tolist())
-                jaws.append((jaw + beta * (jaw_target - jaw)).tolist())
-        audit = bridge.request(
-            {
-                "op": "scratch_robot_path_contact_audit",
-                "object_id": source["config"]["target_object_id"],
-                "arm_joint_states_rad": qs,
-                "gripper_joint_states_rad": jaws,
-                "fingertip_contact_scope": "all_states" if allow_grasp else "none",
-            }
+    def physical_guard(q_target, allow_grasp, grip):
+        request = {
+            "op": "preview_joint_trajectory_step",
+            "action_index": recorder.action_count,
+            "joint_target_qpos_rad": np.asarray(q_target, dtype=float).tolist(),
+            "gripper_action": float(grip),
+            "joint_position_kp": 50.0,
+            "safety_geometry_policy": policies["grasp" if allow_grasp else "approach"],
+        }
+        preview = bridge.request(request)
+        monitoring = preview.get("contact_monitoring", {})
+        samples = preview.get("substep_contacts", [])
+        checks = [
+            classify_contacts(s, geoms, pads, target, allow_grasp, forbidden)
+            for s in samples
+        ]
+        valid = (
+            preview.get("status") == "complete"
+            and preview.get("main_restore_verified") is True
+            and monitoring.get("status") == "complete"
+            and monitoring.get("captured_physics_substeps") == 25
+            and monitoring.get("unavailable_contact_substeps") == 0
+            and len(checks) == 25
+            and all(c["complete"] and not c["illegal"] for c in checks)
+            and complete_geometry_evidence(preview)
         )
-        if (
-            audit.get("status") != "complete"
-            or not audit.get("physical_state_unchanged")
-            or audit.get("illegal_contact_count") != 0
-        ):
-            path = (
-                args.output_dir / f"rejected_next_step_{recorder.action_count:04d}.json"
-            )
-            path.write_text(json.dumps(api._json_safe(audit), indent=2) + "\n")
-            raise RuntimeError(f"next_motor_step_static_safety_gate:{path}")
+        if not valid:
+            path = args.output_dir / f"rejected_next_step_{recorder.action_count:04d}.json"
+            path.write_text(json.dumps(api._json_safe(preview), indent=2) + "\n")
+            raise RuntimeError(f"next_motor_step_physical_branch_rejected:{path}")
+        return preview
 
     def step(q_target, phase, grip=0.0, allow_grasp=False):
         nonlocal observation, complete_steps, gripper_current_action
         if recorder.action_count >= 1000:
             raise RuntimeError("standard_1000_step_horizon_exhausted")
-        next_action = np.clip(
-            gripper_current_action + np.array([-1.0, 1.0]) * 0.01 * np.sign(grip),
-            -1.0,
-            1.0,
-        )
-        jaw_target = np.array(
-            [0.02 * (next_action[0] + 1), 0.02 * (next_action[1] - 1)]
-        )
-        scratch_guard(q_target, jaw_target, allow_grasp)
+        preview = physical_guard(q_target, allow_grasp, grip)
         observation = bridge.request(
             {
                 "op": "joint_trajectory_step",
@@ -183,16 +236,29 @@ def main():
                 "joint_target_qpos_rad": np.asarray(q_target).tolist(),
                 "gripper_action": grip,
                 "joint_position_kp": 50.0,
+                "safety_geometry_policy": policies["grasp" if allow_grasp else "approach"],
             }
         )
-        gripper_current_action = next_action
+        if observation.get("status") == "failed":
+            raise RuntimeError(f"real_joint_step_failed:{observation.get('error')}")
+        predicted = np.asarray(preview["predicted_mujoco_integration_state"], dtype=float)
+        actual = np.asarray(observation["snapshot_state"]["mujoco_integration_state"], dtype=float)
+        replay_matches = predicted.shape == actual.shape and np.allclose(
+            predicted, actual, rtol=0.0, atol=1e-7
+        )
         recorder.record(observation, np.asarray(q_target), phase, grip)
+        if not replay_matches:
+            raise RuntimeError("preview_vs_live_MuJoCo_state_mismatch")
         substeps = observation.get("substep_contacts", [])
         checks = [
             classify_contacts(s, geoms, pads, target, allow_grasp, forbidden)
             for s in substeps
         ]
-        complete = len(checks) == 25 and all(s["complete"] for s in checks)
+        complete = (
+            len(checks) == 25
+            and all(s["complete"] for s in checks)
+            and complete_geometry_evidence(observation)
+        )
         if complete:
             complete_steps += 1
         illegal = [c for s in checks for c in s["illegal"]]
@@ -207,6 +273,8 @@ def main():
                         "native": native,
                         "raw_contact_monitoring_complete": complete,
                         "illegal_contact_record_count": len(illegal),
+                        "geometry_status": observation.get("contact_monitoring", {}).get("geometry_monitoring", {}).get("status"),
+                        "minimum_forbidden_clearance_m": observation.get("contact_monitoring", {}).get("geometry_monitoring", {}).get("minimum_clearance_m"),
                     }
                 )
             )

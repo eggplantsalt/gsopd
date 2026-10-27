@@ -6071,6 +6071,48 @@ def _contact_monitor_result(monitor):
     }
 
 
+def _preview_joint_trajectory_step(request):
+    """Simulate one joint motor step from a recoverable snapshot."""
+    caller_snapshot = _capture_snapshot()
+    caller_diagnostic = _snapshot_diagnostics(canonicalize_kinematics=True)
+    monitor = _new_contact_monitor(request.get("safety_geometry_policy"))
+    result = {"status": "incomplete", "main_restore_verified": False}
+    try:
+        _, reward, done, _, contacts = _run_joint_trajectory_step_with_contact_monitor(
+            request, int(request.get("action_index", 0)), monitor
+        )
+        predicted = _snapshot_diagnostics(canonicalize_kinematics=True)
+        result.update(
+            status="complete",
+            reward=float(reward),
+            done=bool(done),
+            substep_contacts=contacts,
+            contact_monitoring=_contact_monitor_result(monitor),
+            predicted_gripper_qpos=predicted["robot_states"][0]["gripper_qpos"],
+            predicted_mujoco_integration_state=predicted["mujoco_integration_state"],
+        )
+    except Exception as exc:
+        result.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            contact_monitoring=_contact_monitor_result(monitor),
+        )
+    finally:
+        try:
+            _restore_snapshot(caller_snapshot)
+            result["main_restore_verified"] = bool(
+                _tracking_value_equal(caller_snapshot, _capture_snapshot())
+                and _tracking_value_equal(
+                    caller_diagnostic,
+                    _snapshot_diagnostics(canonicalize_kinematics=True),
+                )
+            )
+        except Exception as exc:
+            result["restore_error"] = f"{type(exc).__name__}: {exc}"
+            result["main_restore_verified"] = False
+    return result
+
+
 def _normalize_branch_candidates(raw_candidates):
     if not isinstance(raw_candidates, (list, tuple)):
         raise ValueError("candidates must be a list of candidate action sequences")
@@ -6701,8 +6743,10 @@ try:
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
                     result["safety_geometry"] = monitor["geometry_substeps"][-1] if monitor.get("geometry_substeps") else None
+                elif request["op"] == "preview_joint_trajectory_step":
+                    result = _preview_joint_trajectory_step(request)
                 elif request["op"] == "joint_trajectory_step":
-                    monitor = _new_contact_monitor()
+                    monitor = _new_contact_monitor(request.get("safety_geometry_policy"))
                     try:
                         obs, reward, done, info, substep_contacts = (
                             _run_joint_trajectory_step_with_contact_monitor(
