@@ -216,7 +216,7 @@ def _attached_spheres(source: dict) -> tuple[np.ndarray, dict]:
     }
 
 
-def _robot_yaml(gripper_mode: str) -> dict:
+def _robot_yaml(gripper_mode: str, gripper_qpos_m=None) -> dict:
     path = Path(get_robot_configs_path()) / "franka.yml"
     cfg = load_yaml(str(path))
     cfg = copy.deepcopy(cfg)
@@ -225,12 +225,22 @@ def _robot_yaml(gripper_mode: str) -> dict:
     lock_joints = kinematics["lock_joints"]
     if gripper_mode == "open":
         lock_joints["panda_finger_joint1"] = 0.04
-        lock_joints["panda_finger_joint2"] = -0.04
+        lock_joints["panda_finger_joint2"] = 0.04
     elif gripper_mode == "closed":
         lock_joints["panda_finger_joint1"] = 0.0
         lock_joints["panda_finger_joint2"] = 0.0
     else:
         raise ValueError(f"unsupported_gripper_mode:{gripper_mode}")
+    if gripper_qpos_m is not None:
+        jaw = np.asarray(gripper_qpos_m, dtype=np.float64)
+        if jaw.shape != (2,) or not np.isfinite(jaw).all() or not (
+            0 <= jaw[0] <= .04 and -.04 <= jaw[1] <= 0
+        ):
+            raise ValueError("expected_Panda_MuJoCo_prismatic_joint_values_in_meters")
+        # The URDF right joint axis is -Y with positive range; MuJoCo uses +Y
+        # with negative range. Joint values therefore have opposite signs.
+        lock_joints["panda_finger_joint1"] = float(jaw[0])
+        lock_joints["panda_finger_joint2"] = float(-jaw[1])
     for link_name, ignored in kinematics["self_collision_ignore"].items():
         kinematics["self_collision_ignore"][link_name] = [
             item for item in ignored if item != "attached_object"
@@ -238,10 +248,10 @@ def _robot_yaml(gripper_mode: str) -> dict:
     return cfg
 
 
-def _make_planner(source: dict, world_base: np.ndarray, gripper_mode: str, seed: int):
+def _make_planner(source: dict, world_base: np.ndarray, gripper_mode: str, seed: int, *, gripper_qpos_m=None):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
-    cfg = _robot_yaml(gripper_mode)
+    cfg = _robot_yaml(gripper_mode, gripper_qpos_m)
     cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = 320
     full_world, cuboid_count, mesh_count = _make_world(source, world_base, exclude_target=False)
     planner_cfg = MotionPlannerCfg.create(

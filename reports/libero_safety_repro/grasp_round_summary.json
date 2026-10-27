@@ -1,0 +1,246 @@
+{
+  "schema": "libero_safety_grasp_round_summary.v1",
+  "base_commit": "a0d4ae52",
+  "A": "previous 17 tests preserved; no reimplementation",
+  "B": "one complete pre-grasp/grasp route; full pick-place route not attempted before measured grasp",
+  "C": "one real physics prefix, stopped before next motor command",
+  "task_success": false,
+  "stable_release": false,
+  "safety_certified": false,
+  "safety_monitoring_executed_prefix_complete": true,
+  "safety_monitoring_remaining_episode": "unknown",
+  "new_trainable_episodes": 0,
+  "physical_actions": 141,
+  "physics_substeps": 3525,
+  "illegal_observed_contact_records": 0,
+  "phase_events": [
+    {
+      "phase": "pre_grasp",
+      "physical_actions": 38,
+      "endpoint_error": {
+        "position_error_m": 0.000743936501854419,
+        "orientation_error_rad": 0.001613751932372077
+      }
+    },
+    {
+      "phase": "grasp",
+      "physical_actions": 13,
+      "endpoint_error": {
+        "position_error_m": 0.0003833923576129577,
+        "orientation_error_rad": 0.00040725093008402646
+      }
+    }
+  ],
+  "local_candidates": 12,
+  "static_bilateral_candidates": [],
+  "approach_routes_attempted": 1,
+  "selected_candidate": 9,
+  "next_motor_guard": {
+    "state_count": 10,
+    "illegal_record_count": 4,
+    "first_rejected_state": {
+      "state_index": 4,
+      "arm_joint_positions_rad": [
+        -0.13419033528358323,
+        0.26246079459431265,
+        -0.0950317604901763,
+        -2.5941406919966745,
+        -0.6421565611763929,
+        2.75962182684481,
+        1.488940432687425
+      ],
+      "gripper_joint_positions_rad": [
+        0.0017999999999999882,
+        -0.0017999999999999882
+      ],
+      "contact_count": 7,
+      "illegal_contact_count": 2,
+      "contacts": [
+        {
+          "geom_ids": [
+            113,
+            76
+          ],
+          "geom_names": [
+            "akita_black_bowl_1_g30",
+            "gripper0_finger2_collision"
+          ],
+          "body_ids": [
+            23,
+            16
+          ],
+          "distance_m": -8.836134064446589e-05,
+          "is_verified_fingertip_target_pair": false,
+          "allowed": false
+        },
+        {
+          "geom_ids": [
+            114,
+            76
+          ],
+          "geom_names": [
+            "akita_black_bowl_1_g31",
+            "gripper0_finger2_collision"
+          ],
+          "body_ids": [
+            23,
+            16
+          ],
+          "distance_m": -8.836134064446589e-05,
+          "is_verified_fingertip_target_pair": false,
+          "allowed": false
+        },
+        {
+          "geom_ids": [
+            77,
+            112
+          ],
+          "geom_names": [
+            "gripper0_finger2_pad_collision",
+            "akita_black_bowl_1_g29"
+          ],
+          "body_ids": [
+            17,
+            23
+          ],
+          "distance_m": -0.0004230049256286672,
+          "is_verified_fingertip_target_pair": true,
+          "allowed": true
+        },
+        {
+          "geom_ids": [
+            77,
+            112
+          ],
+          "geom_names": [
+            "gripper0_finger2_pad_collision",
+            "akita_black_bowl_1_g29"
+          ],
+          "body_ids": [
+            17,
+            23
+          ],
+          "distance_m": -0.0004363517919139427,
+          "is_verified_fingertip_target_pair": true,
+          "allowed": true
+        },
+        {
+          "geom_ids": [
+            77,
+            112
+          ],
+          "geom_names": [
+            "gripper0_finger2_pad_collision",
+            "akita_black_bowl_1_g29"
+          ],
+          "body_ids": [
+            17,
+            23
+          ],
+          "distance_m": -0.00035300850650048547,
+          "is_verified_fingertip_target_pair": true,
+          "allowed": true
+        },
+        {
+          "geom_ids": [
+            77,
+            113
+          ],
+          "geom_names": [
+            "gripper0_finger2_pad_collision",
+            "akita_black_bowl_1_g30"
+          ],
+          "body_ids": [
+            17,
+            23
+          ],
+          "distance_m": -4.623342318776566e-05,
+          "is_verified_fingertip_target_pair": true,
+          "allowed": true
+        },
+        {
+          "geom_ids": [
+            77,
+            114
+          ],
+          "geom_names": [
+            "gripper0_finger2_pad_collision",
+            "akita_black_bowl_1_g31"
+          ],
+          "body_ids": [
+            17,
+            23
+          ],
+          "distance_m": -4.623342318776566e-05,
+          "is_verified_fingertip_target_pair": true,
+          "allowed": true
+        }
+      ],
+      "illegal_contacts": [
+        {
+          "geom_ids": [
+            113,
+            76
+          ],
+          "geom_names": [
+            "akita_black_bowl_1_g30",
+            "gripper0_finger2_collision"
+          ],
+          "body_ids": [
+            23,
+            16
+          ],
+          "distance_m": -8.836134064446589e-05,
+          "is_verified_fingertip_target_pair": false,
+          "allowed": false
+        },
+        {
+          "geom_ids": [
+            114,
+            76
+          ],
+          "geom_names": [
+            "akita_black_bowl_1_g31",
+            "gripper0_finger2_collision"
+          ],
+          "body_ids": [
+            23,
+            16
+          ],
+          "distance_m": -8.836134064446589e-05,
+          "is_verified_fingertip_target_pair": false,
+          "allowed": false
+        }
+      ]
+    }
+  },
+  "next_unique_blocker": "validate one motor-driven closure step in independent scratch dynamics; commanded aperture is not actual next-step aperture",
+  "artifacts": {
+    "diagnosis": {
+      "path": "/opt/data/private/gs_opd/rollouts/libero_safety_grasp_diagnosis_20261027/contact_diagnosis.json",
+      "sha256": "bfb53fcbd87424c82d6295b6f91ba2adf9f8416bb3c4dc6df1c8c2066956f902"
+    },
+    "history": {
+      "path": "/opt/data/private/gs_opd/rollouts/libero_safety_grasp_diagnosis_20261027/historical_grasp_audit.json",
+      "sha256": "71adf3f73eb4e9802572741db5d39a2f8155d3dc728975e95a417e1e02d3669a"
+    },
+    "screen": {
+      "path": "/opt/data/private/gs_opd/rollouts/libero_safety_local_grasp_20261027_attempt01/grasp_search_report.json",
+      "sha256": "2861602906fc22dacdaeb17ecae76252179686d950c730f39cd651ea8a7358e2"
+    },
+    "approach": {
+      "path": "/opt/data/private/gs_opd/rollouts/libero_safety_grasp_approach_20261027/approach_report.json",
+      "sha256": "19f2ae930393ecf3d0bf6c069a284d059a47b81bae80a87a5d57ec4d3a876f86"
+    },
+    "physical": {
+      "path": "/opt/data/private/gs_opd/rollouts/libero_safety_real_grasp_20261027_attempt02/execution_report.json",
+      "sha256": "6160066863777c4e69fe11b92328a0b3ca646713d5fd340b2808cfd65a9c6fea"
+    }
+  },
+  "zero_action_setup_failure": {
+    "path": "/opt/data/private/gs_opd/rollouts/libero_safety_real_grasp_20261027/execution_report.json",
+    "reason": "initial Panda motor current_action [0] needed existing scalar/pair parser; no physics executed"
+  },
+  "control_mode": "existing MuJoCo mass-matrix PD torque, gripper position actuators",
+  "pi05_native_action_compatible": false
+}

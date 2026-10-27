@@ -1,0 +1,19 @@
+{
+  "status": "passed",
+  "urdf": "/workspace/gsopd_curobo_eval/curobo_partial/curobo/content/assets/robot/franka_description/franka_panda.urdf",
+  "right_axis": {
+    "xyz": "0 -1 0"
+  },
+  "right_limit": {
+    "effort": "20",
+    "lower": "0.0",
+    "upper": "0.04",
+    "velocity": "0.2"
+  },
+  "mapped_lock_joints_m": {
+    "panda_finger_joint1": 0.02034956030547619,
+    "panda_finger_joint2": 0.020349524915218353
+  },
+  "mapping": "q_urdf = [q_mujoco_left, -q_mujoco_right]",
+  "geometry_is_not_identical": "URDF finger joint Z origin 0.0584m vs MuJoCo 0.0524m; exact MuJoCo audits remain mandatory"
+}

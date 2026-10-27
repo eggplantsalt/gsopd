@@ -1,0 +1,3949 @@
+{
+  "schema": "libero_safety_grasp_contact_diagnosis.v1",
+  "route_report": "/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt07/stage_b_route_report.json",
+  "route_sha256": "317b320678be9d0103de584ec9e6fd554e420d15c5284e385cf3bf5f67e590d0",
+  "scene_source": "/opt/data/private/gs_opd/rollouts/gs_opd_libero_safety_repro_oa_l0t0_stage_b_20261027_attempt04/scene_source.json.gz",
+  "scene_source_sha256": "b6645c90b6e043d148cf465c758300cba904b52740a16f0d3f90567152618d6e",
+  "model_geometry_sha256": "40fd3ac3f0efd60a4a3de827b45e7228f4e67c6238c86d7957586dc8edd408d2",
+  "archived_bundles": [
+    {
+      "bundle_seed": 20261027,
+      "selected_grasp_variant_id": 0,
+      "sample_count": 1,
+      "measurement": "scratch qpos assignment and mj_forward; no motor integration",
+      "jaw_joint_unit": "meter (prismatic); legacy RPC suffix _rad is inaccurate",
+      "illegal_contact_record_count": 13,
+      "illegal_unique_pair_count": 10,
+      "pairs": [
+        {
+          "geom_ids": [
+            73,
+            77
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006235347617474001,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0006235347617474001,
+          "deepest_penetration_m": 0.0006235347617474001
+        },
+        {
+          "geom_ids": [
+            73,
+            111
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 111,
+              "geom_name": "akita_black_bowl_1_g28",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -1.60989520196489e-05,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -1.60989520196489e-05,
+          "deepest_penetration_m": 1.60989520196489e-05
+        },
+        {
+          "geom_ids": [
+            73,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0010901331007597706,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0010901331007597706,
+          "deepest_penetration_m": 0.0010901331007597706
+        },
+        {
+          "geom_ids": [
+            73,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0018395790591018647,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0018395790591018647,
+          "deepest_penetration_m": 0.0018395790591018647
+        },
+        {
+          "geom_ids": [
+            73,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0018395790591018647,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0018395790591018647,
+          "deepest_penetration_m": 0.0018395790591018647
+        },
+        {
+          "geom_ids": [
+            74,
+            76
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006235347617473947,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0006235347617473947,
+          "deepest_penetration_m": 0.0006235347617473947
+        },
+        {
+          "geom_ids": [
+            74,
+            77
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999978,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999977,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999978,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999977,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 4,
+          "minimum_signed_distance_m": -0.0004999999999999978,
+          "deepest_penetration_m": 0.0004999999999999978
+        },
+        {
+          "geom_ids": [
+            74,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0014982666416261104,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0013565166169676474,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0012146331286320637,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 3,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0014982666416261104,
+          "deepest_penetration_m": 0.0014982666416261104
+        },
+        {
+          "geom_ids": [
+            74,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0005380056067720888,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006093792986024259,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0009893226043788637,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0007693349062387345,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0009893226043788637,
+          "deepest_penetration_m": 0.0009893226043788637
+        },
+        {
+          "geom_ids": [
+            74,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0005380056067720888,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006093792986024259,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0009893226043788637,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0007693349062387345,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0009893226043788637,
+          "deepest_penetration_m": 0.0009893226043788637
+        },
+        {
+          "geom_ids": [
+            76,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00199815962146977,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.00199815962146977,
+          "deepest_penetration_m": 0.00199815962146977
+        },
+        {
+          "geom_ids": [
+            76,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0020260900086481884,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0020260900086481884,
+          "deepest_penetration_m": 0.0020260900086481884
+        },
+        {
+          "geom_ids": [
+            76,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0020260900086481884,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0020260900086481884,
+          "deepest_penetration_m": 0.0020260900086481884
+        },
+        {
+          "geom_ids": [
+            77,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0011016933925510814,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0010308069798025167,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0012450310615401033,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0011726802521636415,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0012450310615401033,
+          "deepest_penetration_m": 0.0012450310615401033
+        },
+        {
+          "geom_ids": [
+            77,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0022527962771493972,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0023861342037777874,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0020936839917569377,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 3,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0023861342037777874,
+          "deepest_penetration_m": 0.0023861342037777874
+        },
+        {
+          "geom_ids": [
+            77,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0022527962771493972,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0023861342037777874,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0020936839917569377,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 3,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0023861342037777874,
+          "deepest_penetration_m": 0.0023861342037777874
+        }
+      ]
+    },
+    {
+      "bundle_seed": 20261028,
+      "selected_grasp_variant_id": 3,
+      "sample_count": 1,
+      "measurement": "scratch qpos assignment and mj_forward; no motor integration",
+      "jaw_joint_unit": "meter (prismatic); legacy RPC suffix _rad is inaccurate",
+      "illegal_contact_record_count": 14,
+      "illegal_unique_pair_count": 11,
+      "pairs": [
+        {
+          "geom_ids": [
+            73,
+            77
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006235347617473667,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0006235347617473667,
+          "deepest_penetration_m": 0.0006235347617473667
+        },
+        {
+          "geom_ids": [
+            73,
+            111
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 111,
+              "geom_name": "akita_black_bowl_1_g28",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0015162884826449266,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0015162884826449266,
+          "deepest_penetration_m": 0.0015162884826449266
+        },
+        {
+          "geom_ids": [
+            73,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0016392792497723892,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0016392792497723892,
+          "deepest_penetration_m": 0.0016392792497723892
+        },
+        {
+          "geom_ids": [
+            73,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0016180998775395966,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0016180998775395966,
+          "deepest_penetration_m": 0.0016180998775395966
+        },
+        {
+          "geom_ids": [
+            73,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 73,
+              "geom_name": "gripper0_finger1_collision",
+              "body_id": 14,
+              "body_name": "gripper0_leftfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_leftfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0016180998775395966,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0016180998775395966,
+          "deepest_penetration_m": 0.0016180998775395966
+        },
+        {
+          "geom_ids": [
+            74,
+            76
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0006235347617473944,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0006235347617473944,
+          "deepest_penetration_m": 0.0006235347617473944
+        },
+        {
+          "geom_ids": [
+            74,
+            77
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": true,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999959,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999963,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999963,
+              "allowed": false
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004999999999999959,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 4,
+          "minimum_signed_distance_m": -0.0004999999999999963,
+          "deepest_penetration_m": 0.0004999999999999963
+        },
+        {
+          "geom_ids": [
+            74,
+            111
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 111,
+              "geom_name": "akita_black_bowl_1_g28",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0010725035110649372,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0010725035110649372,
+          "deepest_penetration_m": 0.0010725035110649372
+        },
+        {
+          "geom_ids": [
+            74,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0010697193317029548,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0009562555224926516,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0009834723291249736,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0008700085199146703,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0010697193317029548,
+          "deepest_penetration_m": 0.0010697193317029548
+        },
+        {
+          "geom_ids": [
+            74,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0011120554422119234,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0005476748394175784,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 2,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0011120554422119234,
+          "deepest_penetration_m": 0.0011120554422119234
+        },
+        {
+          "geom_ids": [
+            74,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 74,
+              "geom_name": "gripper0_finger1_pad_collision",
+              "body_id": 15,
+              "body_name": "gripper0_finger_joint1_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "left",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint1_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0011120554422119234,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0005476748394175784,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 2,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0011120554422119234,
+          "deepest_penetration_m": 0.0011120554422119234
+        },
+        {
+          "geom_ids": [
+            76,
+            111
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 111,
+              "geom_name": "akita_black_bowl_1_g28",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.001507957339599159,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.001507957339599159,
+          "deepest_penetration_m": 0.001507957339599159
+        },
+        {
+          "geom_ids": [
+            76,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0014262255796029732,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0014262255796029732,
+          "deepest_penetration_m": 0.0014262255796029732
+        },
+        {
+          "geom_ids": [
+            76,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0014930469699566042,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0014930469699566042,
+          "deepest_penetration_m": 0.0014930469699566042
+        },
+        {
+          "geom_ids": [
+            76,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 76,
+              "geom_name": "gripper0_finger2_collision",
+              "body_id": 16,
+              "body_name": "gripper0_rightfinger",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 0,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_rightfinger",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0014930469699566042,
+              "allowed": false
+            }
+          ],
+          "contact_record_count": 1,
+          "sample_count": 1,
+          "illegal_record_count": 1,
+          "minimum_signed_distance_m": -0.0014930469699566042,
+          "deepest_penetration_m": 0.0014930469699566042
+        },
+        {
+          "geom_ids": [
+            77,
+            111
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 111,
+              "geom_name": "akita_black_bowl_1_g28",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00011004377467782936,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0004476014085217781,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 2,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0004476014085217781,
+          "deepest_penetration_m": 0.0004476014085217781
+        },
+        {
+          "geom_ids": [
+            77,
+            112
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 112,
+              "geom_name": "akita_black_bowl_1_g29",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0009099121277672243,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0007964483185569211,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.000823665125189243,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.0007102013159789398,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 4,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.0009099121277672243,
+          "deepest_penetration_m": 0.0009099121277672243
+        },
+        {
+          "geom_ids": [
+            77,
+            113
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 113,
+              "geom_name": "akita_black_bowl_1_g30",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00011396668852886214,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00043185821751672287,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 2,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.00043185821751672287,
+          "deepest_penetration_m": 0.00043185821751672287
+        },
+        {
+          "geom_ids": [
+            77,
+            114
+          ],
+          "identities": [
+            {
+              "geom_id": 77,
+              "geom_name": "gripper0_finger2_pad_collision",
+              "body_id": 17,
+              "body_name": "gripper0_finger_joint2_tip",
+              "category": "robot",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": "right",
+              "is_target": false,
+              "robot_link_mujoco": "gripper0_finger_joint2_tip",
+              "curobo_link": null
+            },
+            {
+              "geom_id": 114,
+              "geom_name": "akita_black_bowl_1_g31",
+              "body_id": 23,
+              "body_name": "akita_black_bowl_1_main",
+              "category": "scene",
+              "collision_enabled": true,
+              "contype": 1,
+              "conaffinity": 1,
+              "finger_pad_side": null,
+              "is_target": true,
+              "robot_link_mujoco": null,
+              "curobo_link": null
+            }
+          ],
+          "robot_self_collision": false,
+          "records": [
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00011396668852886214,
+              "allowed": true
+            },
+            {
+              "sample_index": 0,
+              "gripper_joint_positions_m": [
+                0.0,
+                0.0
+              ],
+              "signed_distance_m": -0.00043185821751672287,
+              "allowed": true
+            }
+          ],
+          "contact_record_count": 2,
+          "sample_count": 1,
+          "illegal_record_count": 0,
+          "minimum_signed_distance_m": -0.00043185821751672287,
+          "deepest_penetration_m": 0.00043185821751672287
+        }
+      ]
+    }
+  ],
+  "physics_claim": "static configurations only; no grasp success or safety certification",
+  "live_controls": {
+    "physical_actions": 0,
+    "live_integration_state_unchanged": true,
+    "final_timestep": 0,
+    "native_task_success": false,
+    "controls": [
+      {
+        "arm_pose": "initial_arm_away_from_bowl",
+        "mode": "original_scene",
+        "sample_count": 8,
+        "self_pairs": [
+          {
+            "geom_ids": [
+              73,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 73,
+                "geom_name": "gripper0_finger1_collision",
+                "body_id": 14,
+                "body_name": "gripper0_leftfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_leftfinger",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490499017,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617474186,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617474186,
+            "deepest_penetration_m": 0.0006235347617474186
+          },
+          {
+            "geom_ids": [
+              74,
+              76
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 76,
+                "geom_name": "gripper0_finger2_collision",
+                "body_id": 16,
+                "body_name": "gripper0_rightfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_rightfinger",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490499234,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.000623534761747418,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.000623534761747418,
+            "deepest_penetration_m": 0.000623534761747418
+          },
+          {
+            "geom_ids": [
+              74,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -6.938893903907228e-18,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -6.937877464370523e-18,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -6.938893903907228e-18,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -6.937877464370523e-18,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000063,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000063,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000063,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000063,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000063,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0005000000000000048,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0005000000000000048,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0005000000000000048,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0005000000000000048,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 13,
+            "sample_count": 3,
+            "illegal_record_count": 13,
+            "minimum_signed_distance_m": -0.0005000000000000048,
+            "deepest_penetration_m": 0.0005000000000000048
+          }
+        ],
+        "sample_counts": [
+          {
+            "sample": 0,
+            "jaw_q_m": [
+              0.02034956030547619,
+              -0.020349524915218353
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 1,
+            "jaw_q_m": [
+              0.01,
+              -0.01
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 2,
+            "jaw_q_m": [
+              0.005,
+              -0.005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 3,
+            "jaw_q_m": [
+              0.002,
+              -0.002
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 4,
+            "jaw_q_m": [
+              0.001,
+              -0.001
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 5,
+            "jaw_q_m": [
+              0.0005,
+              -0.0005
+            ],
+            "contacts": 4,
+            "illegal": 4
+          },
+          {
+            "sample": 6,
+            "jaw_q_m": [
+              0.00025,
+              -0.00025
+            ],
+            "contacts": 7,
+            "illegal": 7
+          },
+          {
+            "sample": 7,
+            "jaw_q_m": [
+              0.0,
+              -0.0
+            ],
+            "contacts": 6,
+            "illegal": 6
+          }
+        ]
+      },
+      {
+        "arm_pose": "20261027",
+        "mode": "original_scene",
+        "sample_count": 8,
+        "self_pairs": [
+          {
+            "geom_ids": [
+              73,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 73,
+                "geom_name": "gripper0_finger1_collision",
+                "body_id": 14,
+                "body_name": "gripper0_leftfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_leftfinger",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490497906,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617474001,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617474001,
+            "deepest_penetration_m": 0.0006235347617474001
+          },
+          {
+            "geom_ids": [
+              74,
+              76
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 76,
+                "geom_name": "gripper0_finger2_collision",
+                "body_id": 16,
+                "body_name": "gripper0_rightfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_rightfinger",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0001235499449049746,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473947,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473947,
+            "deepest_penetration_m": 0.0006235347617473947
+          },
+          {
+            "geom_ids": [
+              74,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.983482822431881e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.9949319973733282e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.9949319973733282e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.983482822431881e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000023,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000024,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000024,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000023,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999978,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999977,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999978,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999977,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 12,
+            "sample_count": 3,
+            "illegal_record_count": 12,
+            "minimum_signed_distance_m": -0.0004999999999999978,
+            "deepest_penetration_m": 0.0004999999999999978
+          }
+        ],
+        "sample_counts": [
+          {
+            "sample": 0,
+            "jaw_q_m": [
+              0.02034956030547619,
+              -0.020349524915218353
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 1,
+            "jaw_q_m": [
+              0.01,
+              -0.01
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 2,
+            "jaw_q_m": [
+              0.005,
+              -0.005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 3,
+            "jaw_q_m": [
+              0.002,
+              -0.002
+            ],
+            "contacts": 15,
+            "illegal": 2
+          },
+          {
+            "sample": 4,
+            "jaw_q_m": [
+              0.001,
+              -0.001
+            ],
+            "contacts": 28,
+            "illegal": 6
+          },
+          {
+            "sample": 5,
+            "jaw_q_m": [
+              0.0005,
+              -0.0005
+            ],
+            "contacts": 31,
+            "illegal": 10
+          },
+          {
+            "sample": 6,
+            "jaw_q_m": [
+              0.00025,
+              -0.00025
+            ],
+            "contacts": 33,
+            "illegal": 12
+          },
+          {
+            "sample": 7,
+            "jaw_q_m": [
+              0.0,
+              -0.0
+            ],
+            "contacts": 33,
+            "illegal": 12
+          }
+        ]
+      },
+      {
+        "arm_pose": "20261027",
+        "mode": "scratch_target_displaced_control",
+        "sample_count": 8,
+        "self_pairs": [
+          {
+            "geom_ids": [
+              73,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 73,
+                "geom_name": "gripper0_finger1_collision",
+                "body_id": 14,
+                "body_name": "gripper0_leftfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_leftfinger",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490497906,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617474001,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617474001,
+            "deepest_penetration_m": 0.0006235347617474001
+          },
+          {
+            "geom_ids": [
+              74,
+              76
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 76,
+                "geom_name": "gripper0_finger2_collision",
+                "body_id": 16,
+                "body_name": "gripper0_rightfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_rightfinger",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0001235499449049746,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473947,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473947,
+            "deepest_penetration_m": 0.0006235347617473947
+          },
+          {
+            "geom_ids": [
+              74,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.983482822431881e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.9949319973733282e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.9949319973733282e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 5,
+                "gripper_joint_positions_m": [
+                  0.0005,
+                  -0.0005
+                ],
+                "signed_distance_m": -1.983482822431881e-17,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000023,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000024,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000024,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000023,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999978,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999977,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999978,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999977,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 12,
+            "sample_count": 3,
+            "illegal_record_count": 12,
+            "minimum_signed_distance_m": -0.0004999999999999978,
+            "deepest_penetration_m": 0.0004999999999999978
+          }
+        ],
+        "sample_counts": [
+          {
+            "sample": 0,
+            "jaw_q_m": [
+              0.02034956030547619,
+              -0.020349524915218353
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 1,
+            "jaw_q_m": [
+              0.01,
+              -0.01
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 2,
+            "jaw_q_m": [
+              0.005,
+              -0.005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 3,
+            "jaw_q_m": [
+              0.002,
+              -0.002
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 4,
+            "jaw_q_m": [
+              0.001,
+              -0.001
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 5,
+            "jaw_q_m": [
+              0.0005,
+              -0.0005
+            ],
+            "contacts": 4,
+            "illegal": 4
+          },
+          {
+            "sample": 6,
+            "jaw_q_m": [
+              0.00025,
+              -0.00025
+            ],
+            "contacts": 6,
+            "illegal": 6
+          },
+          {
+            "sample": 7,
+            "jaw_q_m": [
+              0.0,
+              -0.0
+            ],
+            "contacts": 6,
+            "illegal": 6
+          }
+        ]
+      },
+      {
+        "arm_pose": "20261028",
+        "mode": "original_scene",
+        "sample_count": 8,
+        "self_pairs": [
+          {
+            "geom_ids": [
+              73,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 73,
+                "geom_name": "gripper0_finger1_collision",
+                "body_id": 14,
+                "body_name": "gripper0_leftfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_leftfinger",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490497106,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473667,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473667,
+            "deepest_penetration_m": 0.0006235347617473667
+          },
+          {
+            "geom_ids": [
+              74,
+              76
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 76,
+                "geom_name": "gripper0_finger2_collision",
+                "body_id": 16,
+                "body_name": "gripper0_rightfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_rightfinger",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0001235499449049889,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473944,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473944,
+            "deepest_penetration_m": 0.0006235347617473944
+          },
+          {
+            "geom_ids": [
+              74,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.000250000000000007,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.000250000000000007,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999959,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999963,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999963,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999959,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 9,
+            "sample_count": 2,
+            "illegal_record_count": 9,
+            "minimum_signed_distance_m": -0.0004999999999999963,
+            "deepest_penetration_m": 0.0004999999999999963
+          }
+        ],
+        "sample_counts": [
+          {
+            "sample": 0,
+            "jaw_q_m": [
+              0.02034956030547619,
+              -0.020349524915218353
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 1,
+            "jaw_q_m": [
+              0.01,
+              -0.01
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 2,
+            "jaw_q_m": [
+              0.005,
+              -0.005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 3,
+            "jaw_q_m": [
+              0.002,
+              -0.002
+            ],
+            "contacts": 3,
+            "illegal": 0
+          },
+          {
+            "sample": 4,
+            "jaw_q_m": [
+              0.001,
+              -0.001
+            ],
+            "contacts": 31,
+            "illegal": 8
+          },
+          {
+            "sample": 5,
+            "jaw_q_m": [
+              0.0005,
+              -0.0005
+            ],
+            "contacts": 27,
+            "illegal": 8
+          },
+          {
+            "sample": 6,
+            "jaw_q_m": [
+              0.00025,
+              -0.00025
+            ],
+            "contacts": 34,
+            "illegal": 15
+          },
+          {
+            "sample": 7,
+            "jaw_q_m": [
+              0.0,
+              -0.0
+            ],
+            "contacts": 33,
+            "illegal": 14
+          }
+        ]
+      },
+      {
+        "arm_pose": "20261028",
+        "mode": "scratch_target_displaced_control",
+        "sample_count": 8,
+        "self_pairs": [
+          {
+            "geom_ids": [
+              73,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 73,
+                "geom_name": "gripper0_finger1_collision",
+                "body_id": 14,
+                "body_name": "gripper0_leftfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_leftfinger",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.00012354994490497106,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473667,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473667,
+            "deepest_penetration_m": 0.0006235347617473667
+          },
+          {
+            "geom_ids": [
+              74,
+              76
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 76,
+                "geom_name": "gripper0_finger2_collision",
+                "body_id": 16,
+                "body_name": "gripper0_rightfinger",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 0,
+                "conaffinity": 1,
+                "finger_pad_side": null,
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_rightfinger",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0001235499449049889,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0006235347617473944,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 2,
+            "sample_count": 2,
+            "illegal_record_count": 2,
+            "minimum_signed_distance_m": -0.0006235347617473944,
+            "deepest_penetration_m": 0.0006235347617473944
+          },
+          {
+            "geom_ids": [
+              74,
+              77
+            ],
+            "identities": [
+              {
+                "geom_id": 74,
+                "geom_name": "gripper0_finger1_pad_collision",
+                "body_id": 15,
+                "body_name": "gripper0_finger_joint1_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "left",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint1_tip",
+                "curobo_link": null
+              },
+              {
+                "geom_id": 77,
+                "geom_name": "gripper0_finger2_pad_collision",
+                "body_id": 17,
+                "body_name": "gripper0_finger_joint2_tip",
+                "category": "robot",
+                "collision_enabled": true,
+                "contype": 1,
+                "conaffinity": 1,
+                "finger_pad_side": "right",
+                "is_target": false,
+                "robot_link_mujoco": "gripper0_finger_joint2_tip",
+                "curobo_link": null
+              }
+            ],
+            "robot_self_collision": true,
+            "records": [
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.000250000000000007,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.0002500000000000074,
+                "allowed": false
+              },
+              {
+                "sample_index": 6,
+                "gripper_joint_positions_m": [
+                  0.00025,
+                  -0.00025
+                ],
+                "signed_distance_m": -0.000250000000000007,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999959,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999963,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999963,
+                "allowed": false
+              },
+              {
+                "sample_index": 7,
+                "gripper_joint_positions_m": [
+                  0.0,
+                  -0.0
+                ],
+                "signed_distance_m": -0.0004999999999999959,
+                "allowed": false
+              }
+            ],
+            "contact_record_count": 9,
+            "sample_count": 2,
+            "illegal_record_count": 9,
+            "minimum_signed_distance_m": -0.0004999999999999963,
+            "deepest_penetration_m": 0.0004999999999999963
+          }
+        ],
+        "sample_counts": [
+          {
+            "sample": 0,
+            "jaw_q_m": [
+              0.02034956030547619,
+              -0.020349524915218353
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 1,
+            "jaw_q_m": [
+              0.01,
+              -0.01
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 2,
+            "jaw_q_m": [
+              0.005,
+              -0.005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 3,
+            "jaw_q_m": [
+              0.002,
+              -0.002
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 4,
+            "jaw_q_m": [
+              0.001,
+              -0.001
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 5,
+            "jaw_q_m": [
+              0.0005,
+              -0.0005
+            ],
+            "contacts": 0,
+            "illegal": 0
+          },
+          {
+            "sample": 6,
+            "jaw_q_m": [
+              0.00025,
+              -0.00025
+            ],
+            "contacts": 7,
+            "illegal": 7
+          },
+          {
+            "sample": 7,
+            "jaw_q_m": [
+              0.0,
+              -0.0
+            ],
+            "contacts": 6,
+            "illegal": 6
+          }
+        ]
+      }
+    ]
+  },
+  "historical_success": {
+    "npz": "/workspace/zy_workspace/RLinf/logs/gs_opd/eval/pi05_libero_full_trajectory_lora_constant_lr_attempt3_obstacle_avoidance_l0t0_20261020/student_rollout.npz",
+    "npz_sha256": "0005c809d2ed6ae9829e3708887d715b127535dd1174dcb302354f208cad7f2b",
+    "evaluation_report": "/workspace/zy_workspace/RLinf/logs/gs_opd/eval/pi05_libero_full_trajectory_lora_constant_lr_attempt3_obstacle_avoidance_l0t0_20261020/evaluation_report.json",
+    "task": {
+      "suite": "LIBERO-Safety obstacle_avoidance",
+      "level": 0,
+      "task_id": 0,
+      "initial_state_index": 0,
+      "instruction": "pick up the akita black bowl on the stove and place it on the plate"
+    },
+    "native_success_reported": true,
+    "frame_count": 711,
+    "first_bilateral_frame": 46,
+    "longest_clean_bilateral_post_state_run": 1,
+    "clean_bilateral_frames": [
+      473
+    ],
+    "stable_pad_only_prefix_found": false,
+    "audit_scope": "post-action contacts only; sufficient to reject nonpad evidence, not certify substep safety",
+    "pose_convention": "MuJoCo snapshot EEF/root quaternions WXYZ; object-local SE(3), meters",
+    "source_actions_replayed": false
+  },
+  "full_diagnosis": "/opt/data/private/gs_opd/rollouts/libero_safety_grasp_diagnosis_20261027/contact_diagnosis.json",
+  "full_historical_audit": "/opt/data/private/gs_opd/rollouts/libero_safety_grasp_diagnosis_20261027/historical_grasp_audit.json"
+}
