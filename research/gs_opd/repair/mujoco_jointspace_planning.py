@@ -40,7 +40,10 @@ def _unit(value: Any, size: int, name: str) -> np.ndarray:
     return array
 
 
-def _minimum_distance(mujoco, model, data, robot_geom_ids, object_geom_ids, excluded_pairs=None):
+def _minimum_distance(
+    mujoco, model, data, robot_geom_ids, object_geom_ids, excluded_pairs=None,
+    *, return_detail=False,
+):
     excluded_pairs = excluded_pairs or set()
     pairs = []
     for robot_id in robot_geom_ids:
@@ -54,9 +57,10 @@ def _minimum_distance(mujoco, model, data, robot_geom_ids, object_geom_ids, excl
             )
             pairs.append((lower_bound, int(robot_id), int(object_id)))
     if not pairs:
-        return 10.0
+        return {"distance_m": 10.0, "pair": None} if return_detail else 10.0
     pairs.sort(key=lambda item: item[0])
     best = None
+    best_pair = None
     attempted = 0
     for lower_bound, robot_id, object_id in pairs:
         if best is not None and lower_bound >= best:
@@ -65,14 +69,26 @@ def _minimum_distance(mujoco, model, data, robot_geom_ids, object_geom_ids, excl
         value = float(mujoco.mj_geomDistance(model, data, robot_id, object_id, 10.0, fromto))
         attempted += 1
         if not np.isfinite(value):
-            return None
+            return {"distance_m": None, "pair": None} if return_detail else None
         if value < 10.0 and (best is None or value < best):
             best = value
+            if return_detail:
+                best_pair = {
+                    "robot_geom_id": robot_id,
+                    "robot_geom_name": mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, robot_id
+                    ),
+                    "object_geom_id": object_id,
+                    "object_geom_name": mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, object_id
+                    ),
+                    "closest_points_world": fromto.tolist(),
+                }
     if best is None:
-        return 10.0
+        return {"distance_m": 10.0, "pair": None} if return_detail else 10.0
     if any(bound < best for bound, _, _ in pairs[attempted:]):
-        return None
-    return best
+        return {"distance_m": None, "pair": None} if return_detail else None
+    return {"distance_m": best, "pair": best_pair} if return_detail else best
 
 
 def _verified_static_pairs_for_scene_group(robot_geom_ids, scene_geom_ids, verified_pairs):
@@ -145,6 +161,63 @@ def _candidate_gripper_close_samples(open_qpos, closed_qpos, joint_limits, *, sa
     return samples
 
 
+def _candidate_closed_gripper_qpos(
+    candidate, fallback_qpos, joint_limits, *, pad_gap_joint_offset_m=0.0
+):
+    """Resolve the scratch close posture for one candidate's estimated jaw width.
+
+    Geometry candidates describe the desired pad separation in meters. The
+    Panda gripper uses symmetric finger-joint positions. The measured active
+    model offset between joint separation and physical pad gap is added before
+    mapping the requested physical width. Candidates without width metadata
+    retain the verified historical posture as a compatibility fallback.
+    """
+    fallback = np.asarray(fallback_qpos, dtype=np.float64)
+    limits = np.asarray(joint_limits, dtype=np.float64)
+    if (
+        fallback.ndim != 1
+        or not np.isfinite(fallback).all()
+        or limits.shape != (fallback.size, 2)
+        or not np.isfinite(limits).all()
+        or np.any(limits[:, 0] > limits[:, 1])
+    ):
+        raise ValueError("fallback_gripper_posture_or_joint_limits_are_malformed")
+    width_value = candidate.get("estimated_clamp_width_m")
+    if width_value is None:
+        closed = fallback.copy()
+        source = "historical_stable_gripper_qpos_fallback_missing_candidate_width"
+    else:
+        if isinstance(width_value, bool):
+            raise ValueError("candidate_estimated_clamp_width_m_must_be_finite_positive")
+        width = float(width_value)
+        if not np.isfinite(width) or width <= 0.0:
+            raise ValueError("candidate_estimated_clamp_width_m_must_be_finite_positive")
+        maximum = candidate.get("maximum_opening_m")
+        if maximum is not None:
+            if isinstance(maximum, bool):
+                raise ValueError("candidate_maximum_opening_m_must_be_finite_positive")
+            maximum = float(maximum)
+            if not np.isfinite(maximum) or maximum <= 0.0:
+                raise ValueError("candidate_maximum_opening_m_must_be_finite_positive")
+            if width > maximum + 1e-9:
+                raise ValueError("candidate_estimated_clamp_width_exceeds_maximum_opening")
+        if fallback.size != 2:
+            raise ValueError("candidate_width_mapping_requires_two_Panda_gripper_joints")
+        gap_offset = float(pad_gap_joint_offset_m)
+        if not np.isfinite(gap_offset):
+            raise ValueError("active_pad_gap_joint_offset_m_must_be_finite")
+        joint_separation = width + gap_offset
+        if joint_separation <= 0.0:
+            raise ValueError("calibrated_candidate_gripper_joint_separation_must_be_positive")
+        closed = np.asarray(
+            [joint_separation / 2.0, -joint_separation / 2.0], dtype=np.float64
+        )
+        source = "candidate_pad_width_with_active_MuJoCo_pad_gap_calibration"
+    if np.any(closed < limits[:, 0] - 1e-8) or np.any(closed > limits[:, 1] + 1e-8):
+        raise ValueError("candidate_closed_gripper_qpos_is_outside_gripper_joint_limits")
+    return closed, source
+
+
 def _bilateral_finger_contact_result(side_distances_m, *, tolerance_m=0.002):
     """Require both verified finger sides to reach the target within tolerance."""
     if not isinstance(side_distances_m, dict) or set(side_distances_m) != {"left", "right"}:
@@ -165,6 +238,32 @@ def _bilateral_finger_contact_result(side_distances_m, *, tolerance_m=0.002):
     }
 
 
+def _candidate_eef_to_live_object_transform(
+    world_eef_at_grasp: np.ndarray, world_object_at_grasp: np.ndarray
+) -> np.ndarray:
+    """Return the held transform from co-located candidate grasp poses.
+
+    A historical post-grasp object pose is not aligned with the current
+    candidate EEF pose. Use the live object pose at the candidate close instant;
+    the historical pose remains a separate scene-layout prior.
+    """
+    eef = np.asarray(world_eef_at_grasp, dtype=np.float64)
+    target = np.asarray(world_object_at_grasp, dtype=np.float64)
+    for name, transform in (("eef", eef), ("object", target)):
+        if (
+            transform.shape != (4, 4)
+            or not np.isfinite(transform).all()
+            or not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)
+        ):
+            raise ValueError(f"candidate_{name}_grasp_pose_must_be_a_finite_rigid_transform")
+        rotation = transform[:3, :3]
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5) or not np.isclose(
+            np.linalg.det(rotation), 1.0, atol=1e-5
+        ):
+            raise ValueError(f"candidate_{name}_grasp_pose_rotation_is_not_in_SO3")
+    return np.linalg.inv(eef) @ target
+
+
 def _candidate_robot_contact_violation(
     geom_a,
     geom_b,
@@ -180,6 +279,7 @@ def _candidate_robot_contact_violation(
     other_scene_body_ids,
     allowed_static_installation_pair_ids,
     allow_target_gripper,
+    allowed_target_contact_geom_ids=None,
 ):
     """Classify one MuJoCo contact using the screen's unchanged contact policy."""
     robot_bodies = set(robot_body_ids)
@@ -195,10 +295,15 @@ def _candidate_robot_contact_violation(
     scene_body = body_b if body_a in robot_bodies else body_a
     robot_geom = geom_a if body_a in robot_bodies else geom_b
     target_contact = scene_body in set(target_body_ids)
+    target_contact_geom_ids = (
+        set(gripper_geom_ids)
+        if allowed_target_contact_geom_ids is None
+        else set(int(value) for value in allowed_target_contact_geom_ids)
+    )
     if (
         allow_target_gripper
         and target_contact
-        and robot_geom in set(gripper_geom_ids)
+        and robot_geom in target_contact_geom_ids
         and float(distance_m) >= -0.002
     ):
         return None
@@ -631,6 +736,7 @@ def screen_grasp_candidates(
     expected_instruction: str,
     actual_instruction: str,
     clearance_m: float = 0.010,
+    strict_target_contact_policy: bool = False,
 ) -> dict[str, Any]:
     """Offline scratch-only grasp, lift, and exit feasibility screening.
 
@@ -644,6 +750,10 @@ def screen_grasp_candidates(
 
     if expected_instruction != actual_instruction:
         raise ValueError("task_instruction_does_not_match_the_active_BDDL_task")
+    if not isinstance(strict_target_contact_policy, bool):
+        raise ValueError("strict_target_contact_policy_must_be_boolean")
+    if strict_target_contact_policy and float(clearance_m) < 0.010:
+        raise ValueError("strict_target_contact_policy_requires_at_least_10mm_nonpad_clearance")
     if (
         not np.isfinite(float(clearance_m))
         or float(clearance_m) < 0.0
@@ -814,12 +924,8 @@ def screen_grasp_candidates(
             raise ValueError(f"verified_{side}_fingertip_pad_geom_is_not_unique")
         pad_geom_ids[side] = int(matches[0])
 
-    close_samples = _candidate_gripper_close_samples(
-        open_gripper,
-        closed_gripper,
-        gripper_limits,
-        sample_count=9,
-    )
+    pad_geom_id_set = set(pad_geom_ids.values())
+    target_contact_geom_ids = pad_geom_id_set if strict_target_contact_policy else gripper_geoms
 
     def fingertip_distances():
         distances = {}
@@ -842,11 +948,18 @@ def screen_grasp_candidates(
         )
         return value
 
+    active_open_pad_gap_m = pad_opening_width()
+    if active_open_pad_gap_m is None:
+        raise ValueError("active_open_pad_gap_unavailable_for_candidate_width_calibration")
+    active_open_joint_separation_m = float(open_gripper[0] - open_gripper[1])
+    pad_gap_joint_offset_m = active_open_joint_separation_m - float(active_open_pad_gap_m)
+
     def evaluate(q, *, held=False, eef_to_object=None, allow_target_gripper=False):
         set_arm(q)
         if held:
             apply_carried_pose(eef_to_object)
         distances = {}
+        minimum_pairs = {}
         violations = []
         for group in all_groups:
             group_id = group["object_id"]
@@ -854,19 +967,36 @@ def screen_grasp_candidates(
             if (allow_target_gripper or held) and group_id == target_object_id:
                 excluded_pairs.update({
                     tuple(sorted((int(gripper_geom), int(target))))
-                    for gripper_geom in gripper_geoms for target in group["geom_ids"]
+                    for gripper_geom in target_contact_geom_ids for target in group["geom_ids"]
                 })
             excluded_pairs.update(
                 pair for pair in static_installation_pairs
                 if any(geom_id not in robot_geoms for geom_id in pair)
                 and any(geom_id in set(group["geom_ids"]) for geom_id in pair)
             )
-            distance = _minimum_distance(
-                mujoco, model, scratch, robot_geoms,
+            clearance_robot_geoms = robot_geoms
+            if strict_target_contact_policy and group_id == target_object_id:
+                clearance_robot_geoms = np.asarray(
+                    sorted(set(int(value) for value in robot_geoms) - pad_geom_id_set),
+                    dtype=np.int64,
+                )
+            record_pair = strict_target_contact_policy and group_id == target_object_id
+            distance_result = _minimum_distance(
+                mujoco, model, scratch, clearance_robot_geoms,
                 np.asarray(sorted(group["geom_ids"]), dtype=np.int64), excluded_pairs,
+                return_detail=record_pair,
             )
+            if record_pair:
+                distance = distance_result["distance_m"]
+                minimum_pairs[group_id] = distance_result["pair"]
+            else:
+                distance = distance_result
             if distance is None:
-                return {"status": "incomplete", "distances_m": distances, "violations": ["geom_distance_unavailable"]}
+                return {
+                    "status": "incomplete", "distances_m": distances,
+                    "minimum_pair_by_object": minimum_pairs,
+                    "violations": ["geom_distance_unavailable"],
+                }
             distances[group_id] = distance
             required = float(group["minimum_clearance_m"])
             if group_id in {item["object_id"] for item in forbidden_groups}:
@@ -891,6 +1021,7 @@ def screen_grasp_candidates(
                 other_scene_body_ids=other_scene_body_ids,
                 allowed_static_installation_pair_ids=static_installation_pairs,
                 allow_target_gripper=allow_target_gripper or held,
+                allowed_target_contact_geom_ids=target_contact_geom_ids,
             )
             if contact_violation is not None:
                 contact_violation["geom_names"] = [
@@ -930,7 +1061,11 @@ def screen_grasp_candidates(
                     },
                 )
                 if distance is None:
-                    return {"status": "incomplete", "distances_m": distances, "violations": ["carried_geom_distance_unavailable"]}
+                    return {
+                        "status": "incomplete", "distances_m": distances,
+                        "minimum_pair_by_object": minimum_pairs,
+                        "violations": ["carried_geom_distance_unavailable"],
+                    }
                 key = f"carried:{target_object_id}->{group['object_id']}"
                 distances[key] = distance
                 required = clearance_m if group in forbidden_groups else 0.0
@@ -946,7 +1081,13 @@ def screen_grasp_candidates(
                     if pair_distance is None or pair_distance < -0.002:
                         violations.append({"carried_support_contact_exceeded_tolerance": True, "geom_ids": list(pair), "distance_m": pair_distance, "minimum_allowed_m": -0.002})
         minimum = min(distances.values(), default=10.0)
-        return {"status": "unsafe" if violations else "pass", "distances_m": distances, "minimum_distance_m": minimum, "violations": violations}
+        return {
+            "status": "unsafe" if violations else "pass",
+            "distances_m": distances,
+            "minimum_distance_m": minimum,
+            "minimum_pair_by_object": minimum_pairs,
+            "violations": violations,
+        }
 
     results = []
     forbidden_object_ids = {item["object_id"] for item in forbidden_groups}
@@ -1026,8 +1167,12 @@ def screen_grasp_candidates(
         stage_failures = []
         entry = {
             "candidate_id": str(candidate.get("candidate_id")),
+            "estimated_clamp_width_m": candidate.get("estimated_clamp_width_m"),
+            "candidate_maximum_opening_m": candidate.get("maximum_opening_m"),
             "status": "rejected",
             "screening_type": "offline_scratch_only",
+            "closed_grasp_target_pose_world_source": "active_scene_target_pose_at_candidate_close",
+            "historical_object_pose_prior_used_for": "target_layout_clearance_only",
             "finger_target_distance_m": {"left": None, "right": None},
             "finger_distance_status": "not_evaluated_before_closed_grasp_ik",
             "joint_reachability": {},
@@ -1035,6 +1180,28 @@ def screen_grasp_candidates(
         try:
             mujoco.mj_setState(model, scratch, integration, integration_spec)
             mujoco.mj_forward(model, scratch)
+            candidate_closed_gripper, close_qpos_source = _candidate_closed_gripper_qpos(
+                candidate,
+                closed_gripper,
+                gripper_limits,
+                pad_gap_joint_offset_m=pad_gap_joint_offset_m,
+            )
+            close_samples = _candidate_gripper_close_samples(
+                open_gripper,
+                candidate_closed_gripper,
+                gripper_limits,
+                sample_count=9,
+            )
+            entry["gripper_close_qpos"] = {
+                "source": close_qpos_source,
+                "joint_qpos": candidate_closed_gripper.tolist(),
+                "estimated_pad_separation_m": candidate.get("estimated_clamp_width_m"),
+                "active_pad_gap_joint_offset_m": (
+                    pad_gap_joint_offset_m
+                    if candidate.get("estimated_clamp_width_m") is not None
+                    else None
+                ),
+            }
             transform = np.asarray(candidate["object_to_eef"], dtype=np.float64)
             direction = np.asarray(candidate["approach_direction_object"], dtype=np.float64)
             if transform.shape != (4, 4) or direction.shape != (3,) or not np.isfinite(transform).all() or not np.isfinite(direction).all():
@@ -1072,7 +1239,7 @@ def screen_grasp_candidates(
                 entry["pregrasp_check"] = pre_check
                 if pre_check["status"] != "pass":
                     stage_failures.append("pregrasp_full_geom_or_self_collision")
-            set_gripper(closed_gripper)
+            set_gripper(candidate_closed_gripper)
             grasp_seeds = ([pre_ik[1]] if pre_ik is not None else []) + (seeds or []) + [live.qpos[qadr].copy()]
             grasp_ik = solve_ik(position, quaternion, grasp_seeds)
             if grasp_ik is None:
@@ -1139,6 +1306,11 @@ def screen_grasp_candidates(
             entry["target_layout_clearances_m"] = target_layout_clearances
             if not target_layout_safe:
                 stage_failures.append("predicted_stable_target_pose_violates_forbidden_object_clearance")
+            # The post-close pose above is a layout prior only. Restore the
+            # target to the active scene pose before checking pad contact at
+            # this candidate's t0 grasp pose; otherwise a historical lifted
+            # object is tested against a gripper that remains at t0.
+            set_target_pose(object_body_transform)
             # The pregrasp-to-target path above is intentionally checked with
             # the live OPEN posture. At the target, hold the arm at its closed-
             # gripper IK and sweep only scratch gripper qpos through the full
@@ -1178,7 +1350,7 @@ def screen_grasp_candidates(
             entry["bilateral_fingertip_contact"] = bilateral_result
             entry["gripper_opening_range"] = {
                 "open_joint_qpos": open_gripper.tolist(),
-                "closed_joint_qpos": closed_gripper.tolist(),
+                "closed_joint_qpos": candidate_closed_gripper.tolist(),
                 "open_pad_gap_m": opening_values[0] if opening_values else None,
                 "closed_pad_gap_m": opening_values[-1] if opening_values else None,
                 "pad_gap_change_m": (
@@ -1218,7 +1390,9 @@ def screen_grasp_candidates(
             set_arm(grasp_ik[1])
             eef_r = np.asarray(scratch.site_xmat[eef_site_id]).reshape(3, 3)
             world_eef_grasp = np.eye(4); world_eef_grasp[:3, :3] = eef_r; world_eef_grasp[:3, 3] = scratch.site_xpos[eef_site_id]
-            eef_to_object = np.linalg.inv(world_eef_grasp) @ predicted_object
+            eef_to_object = _candidate_eef_to_live_object_transform(
+                world_eef_grasp, object_body_transform
+            )
             lift_positions = [position + np.asarray([0.0, 0.0, 0.030]), position + np.asarray([0.0, 0.0, 0.080])]
             held_q = [grasp_ik[1]]
             held_checks = []
@@ -1262,12 +1436,14 @@ def screen_grasp_candidates(
                 "finger_target_distance_m": side_distances,
                 "bilateral_fingertip_contact": bilateral_result,
                 "gripper_close_path_checks": close_path_checks,
+                "closed_grasp_target_pose_world_source": "active_scene_target_pose_at_candidate_close",
+                "candidate_eef_to_object_transform_source": "active_scene_target_pose_at_candidate_close",
                 "gripper_opening_range": entry["gripper_opening_range"],
                 "pregrasp_check": pre_check,
                 "grasp_check": grasp_check,
                 "approach_path_checks": approach_checks,
                 "predicted_stable_target_pose_clearance_m": target_layout_clearances,
-                "predicted_stable_object_pose_source": "historical_t141_close_result_as_unverified_scratch_prior",
+                "predicted_stable_object_pose_source": "historical_t141_close_result_used_for_target_layout_prior_only",
                 "held_path_checks": held_checks,
                 "minimum_observed_clearance_m": min((item["minimum_distance_m"] for item in [pre_check, grasp_check, *held_checks] if item.get("minimum_distance_m") is not None), default=None),
                 "preferred_ik_seed_qpos": pre_ik[1].tolist(),
@@ -1294,13 +1470,35 @@ def screen_grasp_candidates(
         "operation": "screen_grasp_candidates",
         "status": "complete" if unchanged else "unsafe",
         "screening_type": "offline_scratch_only_not_physical_execution",
+        "target_contact_policy": {
+            "mode": "pad_only_with_nonpad_clearance" if strict_target_contact_policy else "legacy_all_finger_geometries",
+            "strict_pad_only": bool(strict_target_contact_policy),
+            "allowed_target_contact_geom_ids": sorted(
+                int(value) for value in target_contact_geom_ids
+            ),
+            "minimum_nonpad_robot_to_target_clearance_m": (
+                float(clearance_m) if strict_target_contact_policy else None
+            ),
+            "maximum_authorized_pad_penetration_m": (
+                -0.002 if strict_target_contact_policy else None
+            ),
+        },
+        "object_pose_alignment": {
+            "close_contact_object_pose_source": "active_scene_target_pose_at_candidate_close",
+            "historical_post_close_pose_use": "target_layout_clearance_prior_only",
+            "held_object_transform_source": "candidate_grasp_eef_relative_to_active_scene_target_pose",
+        },
         "candidate_count": len(candidates),
         "feasible_count": len(feasible),
         "failure_class_counts": failure_counts,
         "failure_class_membership_counts": failure_membership_counts,
-        "gripper_close_sweep_sample_count": len(close_samples),
+        "gripper_close_sweep_sample_count": 9,
         "gripper_open_joint_qpos": open_gripper.tolist(),
-        "gripper_closed_joint_qpos": closed_gripper.tolist(),
+        "gripper_open_pad_gap_m": float(active_open_pad_gap_m),
+        "gripper_open_joint_separation_m": active_open_joint_separation_m,
+        "pad_gap_joint_offset_m": pad_gap_joint_offset_m,
+        "historical_fallback_closed_joint_qpos": closed_gripper.tolist(),
+        "candidate_closed_joint_qpos_source": "candidate_physical_pad_width_calibrated_from_active_open_pad_gap_when_present_otherwise_historical_fallback",
         "candidates": results,
         "ranked_candidate_ids": [item["candidate_id"] for item in feasible],
         "live_state_unchanged": unchanged,

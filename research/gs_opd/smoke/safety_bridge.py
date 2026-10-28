@@ -575,6 +575,43 @@ def _restore_runtime_snapshot(payload):
     }
 
 
+def _sync_osc_controller_goal_to_live_state():
+    """Align OSC's cached goal with the restored live pose without stepping physics."""
+    sim = env.sim
+    if len(env.robots) != 1:
+        raise ValueError("OSC_goal_sync_requires_exactly_one_robot")
+    controller = env.robots[0].controller
+    if getattr(controller, "name", type(controller).__name__) != "OSC_POSE":
+        raise ValueError("OSC_goal_sync_requires_OSC_POSE_controller")
+    before = _mujoco_integration_state(sim)
+    live_joint_target = np.asarray(sim.data._data.qpos[controller.qpos_index], dtype=np.float64).copy()
+    prior_nullspace_target = np.asarray(getattr(controller, "initial_joint", []), dtype=np.float64).copy()
+    qacc_warmstart = sim.data._data.qacc_warmstart.copy()
+    controller.update(force=True)
+    # Runtime snapshots may come from a different controller mode. OSC's
+    # nullspace posture target otherwise remains at the reset-time joints and
+    # can pull the restored arm away while a small Cartesian command is sent.
+    controller.update_initial_joints(live_joint_target)
+    sim.data._data.qacc_warmstart[:] = qacc_warmstart
+    after = _mujoco_integration_state(sim)
+    if before.shape != after.shape or not np.array_equal(before, after):
+        raise RuntimeError("OSC_goal_sync_changed_physical_integration_state")
+    return {
+        "status": "complete",
+        "operation": "sync_osc_controller_goal_to_live_state",
+        "physical_state_unchanged": True,
+        "integration_state_sha256": hashlib.sha256(after.tobytes()).hexdigest(),
+        "goal_position_world_m": np.asarray(controller.goal_pos, dtype=np.float64).tolist(),
+        "goal_orientation_world_matrix": np.asarray(controller.goal_ori, dtype=np.float64).tolist(),
+        "live_joint_target_rad": live_joint_target.tolist(),
+        "prior_nullspace_joint_target_rad": prior_nullspace_target.tolist(),
+        "synchronized_nullspace_joint_target_rad": np.asarray(controller.initial_joint, dtype=np.float64).tolist(),
+        "method": "refresh live MuJoCo state, set robosuite OSC nullspace joint reference to restored live joints, and reset pose goals",
+        "qpos_written": False,
+        "physics_advanced": False,
+    }
+
+
 def _json_value(value):
     if value is None:
         return None
@@ -5610,6 +5647,7 @@ def _new_contact_monitor(safety_policy=None):
         "unavailable_contact_substeps": 0,
         "control_steps": [],
         "geometry_substeps": [],
+        "substep_contacts": [],
         "safety_policy": normalized_policy,
         "_events": {},
     }
@@ -5817,6 +5855,11 @@ def _run_env_step_with_contact_monitor(action, action_index, monitor):
                 candidate_substep_start + substep_index,
                 contacts,
             )
+            monitor["substep_contacts"].append({
+                "physics_substep_index": int(substep_index),
+                "status": sample_status,
+                "contacts": copy.deepcopy(contacts.get("contacts", [])),
+            })
         except Exception as exc:
             sample_status = "unavailable"
             (monitor["contact_substeps"],
@@ -5828,7 +5871,7 @@ def _run_env_step_with_contact_monitor(action, action_index, monitor):
             )
             contacts = {"status": "unavailable", "contacts": []}
         geometry = _substep_safety_geometry(monitor, contacts)
-        if geometry is not None and geometry.get("status") != "complete":
+        if geometry is not None and geometry.get("status") not in {"complete", "unsafe"}:
             control_step["capture_error"] = (
                 control_step.get("capture_error")
                 or "substep_geometry_safety_" + str(geometry.get("status"))
@@ -6007,7 +6050,7 @@ def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monit
     return obs, reward, done, info, substep_contacts
 
 
-def _contact_monitor_result(monitor):
+def _contact_monitor_result(monitor, *, include_substep_contacts=False):
     control_steps = monitor["control_steps"]
     expected_counts = [
         step["expected_physics_substeps"] for step in control_steps
@@ -6032,7 +6075,7 @@ def _contact_monitor_result(monitor):
     else:
         status = "incomplete"
     events = [monitor["_events"][key] for key in sorted(monitor["_events"])]
-    return {
+    result = {
         "status": status,
         "sampling_point": "immediately_after_each_successful_MjSim.step",
         "expected_physics_substeps_per_control_step": monitor[
@@ -6069,6 +6112,9 @@ def _contact_monitor_result(monitor):
         "events": events,
         "interpretation": "Observed physical contacts only; no safety verdict is assigned.",
     }
+    if include_substep_contacts:
+        result["substep_contacts"] = monitor.get("substep_contacts", [])
+    return result
 
 
 def _preview_joint_trajectory_step(request):
@@ -6607,8 +6653,148 @@ def _native_task_goal_status(predicate=None):
     }
 
 
+def _compiled_object_support_region(object_name, binding=None):
+    """Expose a native object target as a measured support-region envelope."""
+    task_env = env.env
+    obj = task_env.objects_dict.get(object_name) or task_env.fixtures_dict.get(object_name)
+    if obj is None:
+        raise ValueError(f"native_goal_target_is_neither_a_compiled_site_nor_object:{object_name}")
+    model = env.sim.model._model
+    data = env.sim.data._data
+    root_body = int(env.sim.model.body_name2id(obj.root_body))
+    root_position = np.asarray(data.xpos[root_body], dtype=np.float64)
+    root_rotation = np.asarray(data.xmat[root_body], dtype=np.float64).reshape(3, 3)
+    if binding is None:
+        bindings = _task_semantic_geometry_bindings().get("bindings", {})
+        binding = bindings.get(object_name)
+    geom_ids = binding.get("geom_ids", []) if isinstance(binding, dict) else []
+    if not geom_ids:
+        raise ValueError(f"native_object_target_has_no_compiled_collision_geometry:{object_name}")
+
+    lower = np.full(3, np.inf, dtype=np.float64)
+    upper = np.full(3, -np.inf, dtype=np.float64)
+    geom_rows = []
+    for geom_id in sorted(int(value) for value in geom_ids):
+        geom_type = int(model.geom_type[geom_id])
+        size = np.asarray(model.geom_size[geom_id], dtype=np.float64).copy()
+        center_offset_geom = np.zeros(3, dtype=np.float64)
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+            mesh_id = int(model.geom_dataid[geom_id])
+            vertex_start = int(model.mesh_vertadr[mesh_id])
+            vertex_count = int(model.mesh_vertnum[mesh_id])
+            vertices = np.asarray(
+                model.mesh_vert[vertex_start : vertex_start + vertex_count],
+                dtype=np.float64,
+            )
+            if vertices.ndim != 2 or vertices.shape[1] != 3 or not len(vertices):
+                raise ValueError(f"native_object_target_mesh_has_no_vertices:{geom_id}")
+            geom_lower, geom_upper = vertices.min(axis=0), vertices.max(axis=0)
+            center_offset_geom = (geom_lower + geom_upper) * 0.5
+            half_extents_geom = (geom_upper - geom_lower) * 0.5
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+            half_extents_geom = size[:3]
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+            half_extents_geom = size[:3]
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+            half_extents_geom = np.repeat(size[0], 3)
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+            half_extents_geom = np.asarray([size[0], size[0], size[1]], dtype=np.float64)
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+            half_extents_geom = np.asarray(
+                [size[0], size[0], size[0] + size[1]], dtype=np.float64
+            )
+        elif geom_type == int(mujoco.mjtGeom.mjGEOM_PLANE):
+            half_extents_geom = np.asarray(
+                [max(float(size[0]), 1e-6), max(float(size[1]), 1e-6), 0.0],
+                dtype=np.float64,
+            )
+        else:
+            raise ValueError(
+                f"native_object_target_collision_geom_type_unsupported:{geom_id}:{geom_type}"
+            )
+        geom_position = np.asarray(data.geom_xpos[geom_id], dtype=np.float64)
+        geom_rotation = np.asarray(data.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+        rotation_root = root_rotation.T @ geom_rotation
+        center_root = root_rotation.T @ (geom_position - root_position)
+        center_root += rotation_root @ center_offset_geom
+        extent_root = np.abs(rotation_root) @ half_extents_geom
+        geom_lower_root, geom_upper_root = center_root - extent_root, center_root + extent_root
+        lower = np.minimum(lower, geom_lower_root)
+        upper = np.maximum(upper, geom_upper_root)
+        geom_rows.append({
+            "geom_id": geom_id,
+            "geom_name": str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)),
+            "geometry_type": geom_type,
+            "center_root_m": center_root.tolist(),
+            "half_extents_root_m": extent_root.tolist(),
+        })
+
+    if (
+        not np.isfinite(lower).all() or not np.isfinite(upper).all()
+        or np.any(upper[:2] <= lower[:2]) or np.any(upper[2:] < lower[2:])
+    ):
+        raise ValueError(f"native_object_target_support_envelope_is_invalid:{object_name}")
+    center_root = (lower + upper) * 0.5
+    half_extents_root = (upper - lower) * 0.5
+    support_root = np.asarray([center_root[0], center_root[1], upper[2]], dtype=np.float64)
+    return {
+        "name": object_name,
+        "parent_name": str(obj.root_body),
+        "site_id": None,
+        "site_position_world_m": (root_position + root_rotation @ support_root).tolist(),
+        "site_rotation_world": root_rotation.tolist(),
+        "site_size_m": [float(half_extents_root[0]), float(half_extents_root[1]), 0.0],
+        "site_local_position_m": support_root.tolist(),
+        "site_local_quaternion_wxyz": None,
+        "support_geometry_kind": "compiled_object_collision_envelope",
+        "support_object_id": object_name,
+        "support_root_body_id": root_body,
+        "support_root_position_world_m": root_position.tolist(),
+        "support_root_rotation_world": root_rotation.tolist(),
+        "support_envelope_lower_root_m": lower.tolist(),
+        "support_envelope_upper_root_m": upper.tolist(),
+        "support_collision_geometries": geom_rows,
+    }
+
+
+def _task_scene_object_collision_envelopes():
+    """Return measured collision envelopes for active task objects and fixtures."""
+    binding_result = _task_semantic_geometry_bindings()
+    bindings = binding_result.get("bindings", {})
+    rows = []
+    errors = []
+    for object_name, binding in sorted(bindings.items()):
+        try:
+            envelope = _compiled_object_support_region(object_name, binding=binding)
+            rows.append({
+                "object_id": object_name,
+                "mapping_name": binding.get("mapping_name"),
+                "collision_geom_count": len(binding.get("geom_ids", [])),
+                "root_position_world_m": envelope["support_root_position_world_m"],
+                "root_rotation_world": envelope["support_root_rotation_world"],
+                "envelope_lower_root_m": envelope["support_envelope_lower_root_m"],
+                "envelope_upper_root_m": envelope["support_envelope_upper_root_m"],
+                "collision_geometries": envelope["support_collision_geometries"],
+                "geometry_source": "active_compiled_MuJoCo_collision_geometries",
+            })
+        except Exception as exc:
+            errors.append({
+                "object_id": object_name,
+                "mapping_name": binding.get("mapping_name"),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return {
+        "operation": "task_scene_object_collision_envelopes",
+        "status": "complete" if rows and not errors else "partial" if rows else "unavailable",
+        "read_only": True,
+        "model_geometry_sha256": binding_result.get("model_geometry_sha256"),
+        "objects": rows,
+        "unavailable_objects": errors,
+    }
+
+
 def _native_goal_query_details(predicate):
-    """Read one native On relation and its compiled live target site."""
+    """Read one native On relation and its compiled live target geometry."""
     if not isinstance(predicate, (list, tuple)) or len(predicate) != 3:
         raise ValueError("native_goal_query_requires_a_three_item_relation")
     predicate = list(predicate)
@@ -6618,10 +6804,22 @@ def _native_goal_query_details(predicate):
     subject, region = predicate[1], predicate[2]
     site_object = env.env.object_sites_dict.get(region)
     if site_object is None:
-        raise ValueError(f"compiled_BDDL_site_is_unavailable:{region}")
-    site_id = int(env.sim.model.site_name2id(region))
-    site_position = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
-    site_rotation = np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+        region_geometry = _compiled_object_support_region(region)
+    else:
+        site_id = int(env.sim.model.site_name2id(region))
+        site_position = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
+        site_rotation = np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+        region_geometry = {
+            "name": region,
+            "parent_name": site_object.parent_name,
+            "site_id": site_id,
+            "site_position_world_m": site_position.tolist(),
+            "site_rotation_world": site_rotation.tolist(),
+            "site_size_m": np.asarray(site_object.size, dtype=np.float64).tolist(),
+            "site_local_position_m": np.asarray(site_object.site_pos, dtype=np.float64).tolist(),
+            "site_local_quaternion_wxyz": np.asarray(site_object.site_quat, dtype=np.float64).tolist(),
+            "support_geometry_kind": "compiled_BDDL_site",
+        }
     subject_object = env.env.get_object(subject)
     subject_body = int(env.sim.model.body_name2id(subject_object.root_body))
     subject_position = np.asarray(env.sim.data.body_xpos[subject_body], dtype=np.float64)
@@ -6633,16 +6831,7 @@ def _native_goal_query_details(predicate):
         "predicate": predicate,
         "predicate_is_native_goal": True,
         "predicate_value": bool(env.env._eval_predicate(predicate)),
-        "region": {
-            "name": region,
-            "parent_name": site_object.parent_name,
-            "site_id": site_id,
-            "site_position_world_m": site_position.tolist(),
-            "site_rotation_world": site_rotation.tolist(),
-            "site_size_m": np.asarray(site_object.size, dtype=np.float64).tolist(),
-            "site_local_position_m": np.asarray(site_object.site_pos, dtype=np.float64).tolist(),
-            "site_local_quaternion_wxyz": np.asarray(site_object.site_quat, dtype=np.float64).tolist(),
-        },
+        "region": region_geometry,
         "subject": {
             "name": subject,
             "body_id": subject_body,
@@ -6739,7 +6928,9 @@ try:
                     last_reward = reward
                     last_done = done
                     result = pack(obs, reward, done, include_snapshot_state=True)
-                    result["contact_monitoring"] = _contact_monitor_result(monitor)
+                    result["contact_monitoring"] = _contact_monitor_result(
+                        monitor, include_substep_contacts=True
+                    )
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
                     result["safety_geometry"] = monitor["geometry_substeps"][-1] if monitor.get("geometry_substeps") else None
@@ -6798,6 +6989,16 @@ try:
                         result = {
                             "status": "restore_failed",
                             "error": f"Runtime Snapshot restore failed: {type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "sync_osc_controller_goal_to_live_state":
+                    try:
+                        result = _sync_osc_controller_goal_to_live_state()
+                    except Exception as exc:
+                        result = {
+                            "status": "unavailable",
+                            "operation": "sync_osc_controller_goal_to_live_state",
+                            "physical_state_unchanged": None,
+                            "error": f"OSC goal synchronization failed: {type(exc).__name__}: {exc}",
                         }
                 elif request["op"] == "restore":
                     snapshot_id = request.get("snapshot_id")
@@ -7084,6 +7285,18 @@ try:
                             "read_only": True,
                             "error": f"{type(exc).__name__}: {exc}",
                         }
+                elif request["op"] == "task_scene_object_collision_envelopes":
+                    try:
+                        result = _task_scene_object_collision_envelopes()
+                    except Exception as exc:
+                        result = {
+                            "operation": "task_scene_object_collision_envelopes",
+                            "status": "unavailable",
+                            "read_only": True,
+                            "objects": [],
+                            "unavailable_objects": [],
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
                 elif request["op"] == "task_success_first_articulation_context":
                     try:
                         result = _task_success_first_articulation_context(request)
@@ -7203,6 +7416,9 @@ try:
                             expected_instruction=expected_instruction,
                             actual_instruction=task.language,
                             clearance_m=float(request.get("clearance_m", 0.010)),
+                            strict_target_contact_policy=request.get(
+                                "strict_target_contact_policy", False
+                            ),
                         )
                         result["model_geometry_sha256"] = actual_model
                         result["safety_policy_source"] = request.get("safety_geometry_policy", {}).get("source")

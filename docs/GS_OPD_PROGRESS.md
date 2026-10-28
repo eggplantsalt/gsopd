@@ -1,3 +1,343 @@
+## 2026-10-28 11:23 Asia/Shanghai：耦合 XYZ 抓姿筛查无解；845步成功源的姿态迁移受模型身份阻塞
+
+围绕 attempt41 的真实成功抓姿 `geom113_jaw0_approach2_+1_flip+1`，完成16个耦合候选：接近轴roll为±5°，对象局部x偏移±0.5 mm、y/z偏移±4 mm。严格scratch screen结果为0/16可行，失败类为collision 7、grasp geometry 9。起始Snapshot SHA `bc86043308518e857703b319b2c309e4e9ca62b332fc939be20235991610cba7`，模型/BDDL分别为 `085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840` / `b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12`。screen [报告](/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_attempt41_coupled_xyz_pose_grid_screen/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_110033_783345572/strict_grasp_geometry_screen.json) SHA `b7da9a5ffe449e98c77ca2e85cc1848020fd43fb2b6335388581e0c8a037fee9`；0实体动作、0路线预检、live Integration State未变。该候选族停止，不扩大任意小网格。
+
+转查未用于attempt41抓姿先验的845步历史源。NPZ有845个7D transition，metadata为L0T0/state0/seed0，末行844 `reward=1, done=true`；NPZ SHA `846a92621f6c9cf4399a63306f767853c03ceb927cf1b20aae72b8608585ac51`。同目录`live_left_bspline_osc_report.json` SHA `7b1a4427d079800e0692ffe98ec90a07015923e33bdb95d02ca9816670bf0075`只记录749个B-Spline/native OSC运输控制步（749步均grasp-confirmed且完整监测），不是整个845步Episode的报告；稳定释放仍未认证。规划几何SHA `d18a4f135f70ed1112288cf0669a11ccbb2deb9ce7b4ca7f2351bb628ab46511`记录MuJoCo 3.3.2、模型SHA `085817…`和state ID `ad464…`，但749步报告中的抓持state ID没有与此state ID匹配。此前只读scratch重建曾得到模型SHA `40fd3ac3f0efd60a4a3de827b45e7228f4e67c6238c86d7957586dc8edd408d2`（同报MuJoCo 3.3.2）；这项重建没有独立落盘报告。因此尚不能安全转用导出的EEF姿态，本轮未导入或筛选该姿态、未执行物理动作，也未继承任何安全标签。
+
+自动恢复/候选切换方面，executor保留身份核验的恢复Snapshot与OSC joint-limit recovery路径，物理分支预算为1、RRT预检预算为1；对应`test_automatic_recovery.py`、`test_automatic_recovery_runtime.py`、`test_local_recovery.py`为39 passed、3 subtests passed。attempt41因任务成功没有触发自动恢复，不能声称真实恢复执行已验证。四组核心回归再加三组恢复测试共161 passed、13 subtests passed。
+
+当前继续保持Level B：attempt41原生1000步内成功有效；Level A未完成。下一步先复现成功源的导出运行时，核对模型几何指纹和精确状态链接；若无法复原则切换到独立核验的711/848步来源或不同任务阶段。聚焦回归命令覆盖抓姿screen、候选搜索、执行器与V3，共122 passed、10 subtests passed；8个相关模块py_compile、两个CLI `--help`、`git diff --check`及JSON解码通过。机器记录：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/progress.json`；来源身份审计独立报告SHA `c80a7550ab6bfb8153e84dc8b3e3c27767c0345e38d3f09b462ddde139a930a3`。
+
+## 2026-10-28 10:47：完成L0T0局部接触偏移筛查；开夹假设未成候选
+
+按已编译目标几何在唯一成功抓姿`geom113_jaw0_approach2_+1_flip+1`上追加object-local-y偏移−8/−6/−4/−2 mm，共4个完整scratch候选。4/4均未通过：预抓取与抓取IK均可达，但approach、闭合扫描及目标接触几何失败；failure class为collision 3、grasp geometry 1。左右pad有符号距离范围约−2.428至−0.436 mm，没有一个满足完整Strict筛选。无路线预检、无实体动作，live state unchanged。screen SHA `5ee2db723e6c549e108b2d8614749089173d23a4c0fe2c15d78754684cc1f62c`，run report SHA `ef36f2ada1e42d09926fe3c7963fdf259a9c978ae684dd009a544c9a05c3a4de`；起始Snapshot SHA仍为`bc86043308518e857703b319b2c309e4e9ca62b332fc939be20235991610cba7`。
+
+复核L0T2开口范围假设后，没有依据仅为55 mm模板增加执行器动作：同一`geom117`宽度的flip+1变体预抓取IK不可达；flip−1变体虽IK可达，但预抓取几何碰撞、approach失败，且t0开口闭合扫描不合法。14.2 mm同族变体亦由预抓取/approach碰撞拒绝。因此最大开口可能改变其中一项夹距检查，但没有证据能解除主要几何/IK阻塞；本轮不改执行器，也不执行开夹动作。
+
+L0T0离散池（48基姿、12方向变体和4个几何偏移）仍0 Strict可行。当前等级保持Level B，禁止无Strict候选启动RRT或物理分支。下一步应转向能同时优化接触点、夹爪姿态与非pad间距的不同候选生成方法，而不是继续单轴平移。
+
+## 2026-10-28 10:43：实测成功抓持宽度交叉核验
+
+用attempt41真实稳定抓持qpos对闭合校准做独立数量核验：物理候选宽度2.560 mm加实测offset 1.000 mm，映射关节间距3.560 mm；V3真实抓持最后qpos `[1.5070676,-2.0569291] mm`的间距是3.5639967 mm，两者只差约4 μm。新增`test_calibrated_narrow_width_matches_physical_successful_grasp_joint_gap`。抓姿screen、候选搜索、V3门控三组聚焦测试共75 passed、4 subtests passed。
+
+L0T2另有候选`geom117_jaw2_approach0_+1_flip-1`的目标宽度55 mm，小于声明最大opening 87 mm，但大于合法t0当前pad gap 39.699 mm；因此从当前open姿态出发的闭合样本不是单调闭合，筛查正确拒绝。若以后恢复此抓姿，需要先在scratch中建模到更大open姿态的明确控制动作、重新做接近安全筛查，并由物理执行器发出同语义动作；本轮未改执行器，未运行该动作。机器进度JSON已记录此项后续假设。
+
+## 2026-10-28 10:40：回归套件与归档一致性复核
+
+RLinf虚拟环境下合并运行抓姿screen、候选搜索和V3门控三组测试：74 passed、4 subtests passed；模块`py_compile`、`git diff --check`与机器`progress.json` JSON解码均通过。校准屏幕报告的任务/模型/BDDL/起始Snapshot指纹互相匹配；L0T0与L0T2三批均`live_state_unchanged=true`，0动作、0路线预检。attempt41原始V3报告不改写；独立posthoc审计覆盖抓姿167条+放置502条=669条、16,725个子步。该审计确认动作/记录完整，不提升unsafe几何记录为Safety Pass；最终仍Level B。
+
+## 2026-10-28 10:39：按实测pad gap校准候选闭爪qpos并复筛
+
+继续审计发现候选宽度是物理指垫间距，而Panda关节间距与MuJoCo指垫几何间距相差约1 mm。attempt41 L0T0合法t0开爪状态的指关节间距为40.699085 mm，MuJoCo测量pad geomDistance仅39.699085 mm；若把目标宽度直接映射到相同的关节间距，所有候选闭合开度会窄1 mm。现于scratch状态测活动open pad gap，以`open_joint_separation - open_pad_gap`计算模型偏移，并将“候选物理宽度+实测偏移”映射为对称Panda闭爪qpos。每候选报告和汇总均记录测量值、偏移与实际qpos；无宽度经验技能仍用来源核验过的历史姿态。
+
+12项聚焦测试通过：18.68 mm物理宽度加1.00 mm偏移得到`[+9.84,-9.84] mm`；没有候选宽度时忽略校准并回退；非法宽度/偏移被拒绝。py_compile及diff检查通过。
+
+重新用校准逻辑筛选：L0T0合法state0候选索引0–47共48项，0 Strict可行（collision 21、grasp geometry 26、IK 1）；L0T2/state0基础候选0–15共16项，0 Strict可行（IK 7、collision 4、grasp geometry 5）。三份报告均显示校准偏移约1.000 mm、物理动作0、RRT 0、起始payload SHA精确匹配且live state unchanged。报告完整路径和SHA见machine `progress.json` 的`latest_grasp_screen_calibration.corrected_screens`。10:23未校准与10:35未计offset的屏幕报告已被这些最终校准报告取代。
+
+没有Strict可行抓姿，故不启动物理分支。V3 attempt41仍为Level B原生任务成功；未获得严格安全完整Episode、稳定释放认证或训练资格。后续探索必须以新的完整碰撞几何/接触姿态证据为前提，不再重复宽度池。
+
+## 2026-10-28 10:35：修正候选专属夹距后复核L0T0与L0T2
+
+发现`screen_grasp_candidates()`在候选循环外只读取attempt41历史稳定抓持的闭合关节姿态，并把它用于所有碰撞几何抓姿。候选`estimated_clamp_width_m`与此历史姿态不一致时，闭合扫描、闭合抓取IK和指垫距离均按错误夹距计算。新增候选专属映射：Panda双指闭合qpos为`[width/2, -width/2]`；校验最大开口、有限正宽度和关节限位；候选没有宽度元数据时保留经过核验的历史qpos回退。每个候选报告记录所选姿态和来源。
+
+回归测试`test_mujoco_jointspace_grasp_screen.py`共12项通过；py_compile与`git diff --check`通过。宽度18.68 mm会生成`[+9.34,-9.34] mm`，而不是复用attempt41的`[+1.507,-2.057] mm`。无宽度经验技能明确继续使用历史抓持姿态。
+
+按修复后逻辑复筛同一合法t0状态：L0T0 48/48唯一几何候选仍无Strict解（collision 23、grasp geometry 24、IK 1），分两份报告；L0T2 state0的16个基础几何候选也无Strict解（IK 7、collision 4、grasp geometry 5）。三个MuJoCo scratch screen均0物理动作、0 RRT，且分别确认精确起始Snapshot载荷SHA、live Integration State未变化。修正屏幕及SHA见本文件同目录机器记录`progress.json`的`latest_grasp_screen_correction`。
+
+该修复更正了此前不同夹距候选的拒绝证据；旧的roll/tilt/offset报告中无宽度模板使用了正确历史回退，仍可用；旧几何候选变体的闭合阶段结论需谨慎使用，接近路径的全几何检查仍按实际open夹爪姿态执行。attempt41仍为Level B原生任务成功；没有Strict Safety Success、稳定释放认证或合格训练Episode。下一步保留最高价值合法Snapshot与attempt41归档，避免无变化的夹姿重复搜索；后续若有新接触几何或候选构造证据，应从本修正入口重新进行有界筛选。
+
+## 2026-10-28 10:17：L0T0完整48姿态池与两种局部方向扰动均无Strict解
+
+在attempt41精确L0T0/state0 t0 Snapshot上使用真实task-success稳定抓持报告做先验，完整筛完活动MuJoCo几何生成器的48/48唯一基姿；结果0 Strict可行，失败类collision 23、grasp geometry 24、IK 1。再对真实成功基姿筛接近轴roll ±5/10/15°与jaw-axis tilt ±5/10/15°，各6项均0可行；pad中心保持类候选的非pad指部—黑碗碰撞仍在，approach endpoint的手部接触也未消除。全60项screen均为scratch-only，物理动作0、RRT 0、t0 live state unchanged。完整候选池由四份报告覆盖，最后索引40–47屏幕SHA `614c655bc95093f12965cd4557e51c1d9132b562c2aae68fb44b5c5df1147c82`；roll SHA `0678ab34737dc3e0cfdf937c5a0e740b77b7677e696c8a5c6520db3f17d2db69`；tilt SHA `6cf9ecfee1e6fd58de617ce2e902d99717ca07a3d26a564118ff17d13480ee0e`。
+
+最后一批首先揭示显式`candidate-id`被9个经验模板占用生成预算、使几何ID46/47不可见的通用缺陷。修复为显式ID模式先生成完整48项，再按ID选择；没有显式ID时保留原经验模板优先和候选上限。增加两个回归测试，2 passed；随后重跑8项筛选成功完成且0可行。零动作拒绝报告SHA `47708d0355122271180920163c882d08057ebb3a0de6128164aab04cee820cab`，修复后报告SHA `48295afba2a09e4b9ca3be6ed0d5ee54b891e530a9cb06a7c7b64a945ba18aca`。
+
+完整几何基姿与局部姿态roll/tilt池均停止。基于实际最近碰撞对（成功基姿手指碰碗g32，另一侧为g29，g29/g30/g32沿目标local-y分布）下一次只筛该成功抓姿的对象local-y偏移−2/−4/−6/−8 mm，共4项。目标是让pad中心离开相邻g32同时保持与g30指垫接触；若4项无可行姿态则切换到不同构造的抓姿来源，不启动失败候选的路线规划或物理分支。
+
+## 2026-10-28 10:07：L0T0成功抓姿及首批不同姿态的Strict离线筛选
+
+以attempt41完整任务成功Episode中的真实双侧稳定抓持、37.119 mm抬升报告和动作/状态NPZ作为抓姿筛选先验，仅用于闭爪关节值、闭合后物体姿态及IK种子，不回放源动作、不继承安全资格；筛选从同一合法L0T0/state0 t0 Snapshot scratch restore。对物理成功候选`geom113_jaw0_approach2_+1_flip+1`单独筛查：预抓取通过、双侧pad距离为-0.295/-0.087 mm（均在2 mm许可范围内），但最后接近/闭合时非pad指部穿入黑碗约0.153 mm，掌部在接近阶段也与碗几何接触。报告`l0t0_attempt41_strict_screen_followup/.../strict_grasp_geometry_screen.json` SHA `44f7037257174336d9986db28871f00b55ebcb5419a1c68e5588dbea915a48c2`，1/0。
+
+为测试该非pad干涉机制，对同一基姿绕接近轴±5/10/15°做6个scratch变体。0 Strict可行；±5/10°仍有非pad手指—碗干涉，±15°pad穿透达到约2.378 mm，超过2 mm许可。报告SHA `0678ab34737dc3e0cfdf937c5a0e740b77b7677e696c8a5c6520db3f17d2db69`。之后筛查由同一活动几何候选池生成的其余15个不同基姿（排除已测成功抓姿），0 Strict可行；失败类为collision 7、grasp geometry 8，多个候选在闭合时非pad指部侵入碗，部分pad自身穿透超过2 mm。报告SHA `27b7f334907e7643c4882b8d1b08c3188c559660c6acf849ed39c514bccd9150`。三批合计22项、0物理动作、0路线预检、live Snapshot未变。BDDL、安全规则和10 mm/2 mm阈值未变。
+
+当前正在转向完全不同的剩余几何候选（生成池索引16–47），分两批最多24项screen。若全池仍无Strict候选，则停止本几何生成族；不对失败抓姿启动RRT或真实分支。
+
+## 2026-10-28 10:02：V3 attempt41完成原生成功；修复双归档动作审计
+
+从精确L0T0/state0合法t0 Snapshot（SHA `bc86043308518e857703b319b2c309e4e9ca62b332fc939be20235991610cba7`）启动V3 `experience_task_success`，模型SHA `085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840`、BDDL SHA `b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12`。使用候选`geom113_jaw0_approach2_+1_flip+1`；RRT预检和物理分支均按1次预算执行，未使用Strict screen gate。抓姿搜索报告28个连续稳定持抓状态，抬升37.119 mm；随后完成一次原生放置分支。原生谓词`on(akita_black_bowl_1, plate_1)`首次在t669为true、reward=1、done=true，1000步时域任务成功。
+
+V3原始外层报告成功分类，但复核发现其中`physical_action_audit`只找抓姿搜索报告，未合并放置段；同时抓姿报告动作数应读取`branch_control_actions`。按要求保留原始报告不改，修复审计器并生成独立后验报告`attempt41_v3_physical_action_audit_posthoc.json`（SHA-256 `758dfaebd6deea1b5b958052e242d21d6524f65a461ed6b347eed10525b62e88`）。两段共2个物理分支、669条动作记录（抓姿搜索167、放置502），16,725个物理子步；669条记录均有完整25子步接触/几何监测，7D动作维度、状态—动作字段、分支动作计数及放置段子步总数均一致。unsafe几何诊断状态为669/669；它不是安全认证。稳定释放/settle与撤离未完成，Strict-10mm为false/未获同Episode认证，训练资格false，V3此backend未导出可用Observation-Action训练轨迹。
+
+原始V3报告SHA `d6a39efc0f6665ae1caa88a8322e6a75e95c49891695657945bd1c44aec8f694`；内层executor报告SHA `67aca9bc6fe8d512635346fc7e9d6beae48d214e44797da87eb9f686ed094f7a`。新增双归档聚合回归测试，相关2项测试通过；`py_compile`与`git diff --check`通过。attempt41是Level B完整任务成功证据，不提升为Level A、安全通过或训练样本。L0T2 attempt40的122项Strict screen仍为0可行，旧抓姿变体族停止。
+
+## 2026-10-28 09:25：滚转screen定位g11碰撞对；转向相邻g13接触段
+
+为解释attempt39最佳闭合间隙仅0.446 mm，`mujoco_jointspace_planning._minimum_distance`新增可选最近Geom对、名称与世界最近点返回；Strict pad-only screen逐阶段保存目标对象最近对。新增单元覆盖后，grasp-screen/search聚焦测试37 passed，`py_compile`与`git diff --check`通过。
+
+在准确L0T2/state0 t0 Snapshot与活动目标`on(moka_pot_2, flat_stove_1_cook_region)`上，对两个`geom115_jaw0_approach1_+1_flip±1`姿态做接近轴滚转±10/20/30°共12项scratch screen。0 Strict可行，动作0、live state unchanged、RRT 0。±10°时指垫目标距离仍在授权的2 mm内，但非pad `gripper0_finger1/2_collision`已穿入 `moka_pot_2_g11`约1.78–1.85 mm；±20/30°穿入约3.98–6.39 mm且pad穿透超过2 mm。屏幕报告SHA `e4203c5f8fc7057b68d3d23f629e09c4c1371a0bb632a79d9ae60d50a7ae8215`；run report SHA `d9ae879c704f86bf3f5e211d0f021c4461e883e27bf64ea568b326d2d5fc5843`。首次缺少精确目标谓词的调用在几何屏幕前拒绝，零动作归档保留。
+
+碰撞对表明g11是把手内侧的直接阻挡段。活动碰撞几何中g12中心为对象局部y=0.05829 m，邻接g13中心为y=0.07546 m（外移17.17 mm）。局部策略据此调整为两个基姿分别筛+14/+17.17/+20 mm接触中心偏移，共6项，验证是否能夹持g13而避开g11；若仍无Strict候选则停止该抓姿分支。物理分支维持关闭。
+
+## 2026-10-28 09:18：把手接触面局部y偏移仍未改善非pad净距
+
+按`moka_pot_2_g12`编译碰撞Geom朝pot外侧方向新增screen-only接触面候选：两个`geom115_jaw0_approach1_+1_flip±1`基姿，各沿对象局部y平移+4/+8/+11 mm，共6项。新通用offset helper和`--candidate-offset-object-y-mm`保留候选ID限定、screen-only及每批24项上限；相关搜索测试28 passed，py_compile和diff检查通过。
+
+严格screen报告SHA `f63ca8664f89c4f43ec537f94eea11248cbc5030754028cc5aa4bde1c7754d28`，6项全部因闭爪/闭合抓姿collision失败；动作0、live state unchanged、Route preflight 0。各项pad距离约0.078/0.343 mm，但最佳nonpad close-sweep clearance为0.446 mm，距10 mm门槛仍差9.554 mm。平移contact patch没有缓解gripper-body到Moka Pot的闭合干涉。
+
+纳入前述48基姿、48 height/jaw扰动、2历史pose和本批6项后，L0T2共104次scratch screen、0严格可行。机器汇总SHA `ae9d44090035338e70a74e235527fde0e31722262e1bbf4e139625e43a4518b7`。下一候选族须改变耦合EEF朝向和接触面几何，不能再平移同一handle抓姿；screen上限24，物理分支仍关闭。
+
+## 2026-10-28 09:12：resume Snapshot在V3启动前验证；旧screen不能套用到t329
+
+V3 strict gate此前只比对resume文件SHA，resume envelope本身的task/model/BDDL/init-state/seed/instruction由下游executor在Bridge启动后才检查。现在gate复用grasp-search的identity validator，在engine/Bridge前验证envelope身份和有限MuJoCo状态；没有resume参数时，还逐项匹配t0 Snapshot manifest的payload、model与integration-state SHA。严格报告仍必须和准确的起点payload SHA相符。
+
+只读审计L0T2 t329 Runtime Snapshot：文件`/opt/data/private/gs_opd/rollouts/l0t2_round0_t249_operational_lift_20261024_branch1/snapshots/timestep_000329.pkl`的payload SHA `34f213c63d87be1a26cd69a3e4d442f9df9f2dcf4d406230a32ecea1dcd00673`；integration-state SHA `a24835bf1b93399a78d2802e71f551984289b5f19a59b2e09f9de6b1fb270ed1`，任务、模型、BDDL、seed与初态均与t0 manifest一致。将t0 screen错误地配给t329时，V3归档`rejected_strict_grasp_screen`并以`strict_grasp_screen_start_snapshot_hash_mismatch`停止；report SHA `06ed14d701a40f6b3bf8d8518087738d86e5c72bfbfa142955bef4911df0f078`，engine/Bridge/action均0。它不能证明t329有合格抓姿。
+
+新增恢复正向/负向、初始manifest payload绑定与错误resume拒绝覆盖；V3聚焦测试31 passed，`py_compile`和`git diff --check`通过。最新t0真实screen仍12/0；对应blocked report SHA `2d3c20e427699f48765e58d8e8f4469b2dfd6cf3b37ab37a0732b55ef13a190c`，动作0。
+
+## 2026-10-28 09:08：有界抓姿变体耗尽；补齐V3异常归档和正向候选锁定
+
+L0T2两个把手方向的近似抓姿继续做了两组有界scratch screen：jaw局部倾角±5/10/15°共12项（SHA `1ad8fc1ff9003b5d97842091841035ec939065735a5227ff84fbf0c32c1a9e69`），对象局部z接触高度±5/10/15 mm共12项（SHA `f3db0324384aa491de63b1a5c218c556bc7d830e1da795f785d0d19d1309ecef`）。两组均0 Strict可行，都是0物理动作、live state unchanged、无RRT。纳入原48个唯一基础抓姿、此前24个变体和2个哈希验证历史姿态后，共98次screen、0可行；汇总`l0t2_strict_grasp_pool_summary.json` SHA `b82c4ad5ae56ae04c27cce2af2f258e9bdc28732d4859110debeef7c13011f21`。
+
+继续V3接口审计时发现两处错误输入未必留下拒绝归档：合法screen搭配不支持的backend会在归档逻辑外抛错；错误阈值字段类型会触发未捕获`TypeError`。两者现在都输出`rejected_strict_grasp_screen` manifest/report，明确engine与Bridge未启动、动作0。另加正向接线回归，确认gate选中的排序可行candidate ID会传给executor的`--candidate-id`。`test_trajectory_generator_v3.py`为28 passed；`py_compile`与`git diff --check`通过。
+
+用最新12项height screen再次执行真实V3入口，归档位于`l0t2_attempt39_v3_strict_block_type_safe_rerun/v3_report.json`，SHA `8bffd2cd95c393f6507ff79cc5d17fb6b62f58a738f39c9dd42461fcd9dc8d4d`；状态`blocked_no_strict_grasp_candidate`、12/0、engine=false、Bridge=false、动作0。当前没有具备Strict抓姿的L0T2 active stage，物理分支关闭。下一步核验resume Snapshot的来源/manifest关联以及恢复后的阶段身份，并保持阈值和BDDL不变。
+
+## 2026-10-28 09:02：严格门禁加入Snapshot任务/初态/seed逐字段匹配
+
+复核Snapshot manifest后发现仅比对model geometry与BDDL SHA不能明确证明同一benchmark/task/init-state/seed。V3 strict screen gate现在将这四项及环境seed同screen任务身份逐字段比较；不匹配会生成此前新增的`rejected_strict_grasp_screen`零动作终态。增加manifest task identity回归后，Adapter+V3聚焦测试28 passed，五个相关Python模块`py_compile`与`git diff --check`通过。
+
+用真实L0T2 t0 report再次复现，manifest身份完全匹配；最后候选窗口8/0仍在任何checkpoint、engine、Bridge之前阻断。最终本次代码下报告SHA `1d5371852684132769c68da718e68d62c1d58f0ba505fd8b9ee4c4d6d07237ac`，物理动作0。该修改补全身份约束，不改变任务条件或安全阈值。
+
+## 2026-10-28 09:00：L0T2 48项有限抓姿池全部耗尽；最新V3门禁保持阻断
+
+检查编译几何候选排序后发现attempt39首批只屏幕化候选索引0–15；为关闭有限候选池而扩展同一生成器的后续窗口16–39和40–47。三批分别16、24、8项；通过candidate ID确认共48个唯一姿态（9个Experience模板和39个活动编译几何候选），无重复、0 Strict可行。失败主类共collision 20、grasp geometry 14、IK 14。此前24个接触高度/jaw倾角变体与2个经过哈希验证的历史成功姿态也全0可行。累计74次离线评估；全部零物理动作、live Snapshot状态未变、无RRT预检。策略及Snapshot/model/BDDL指纹未变。汇总报告`l0t2_strict_grasp_pool_summary.json` SHA `efa24bdd3a0607c54b372fec1f97e2d2b79bfff3d5fc24c868a8d0143b2f8154`。
+
+用最后8项屏幕报告重新运行V3 Strict gate，报告SHA `6d1c60150d16f3d06676cd06a8ee2cc9e48b0efd2785b55b61dc0fe191ff2593`，candidate 8/feasible 0；`engine_launched=false`、`bridge_started=false`、物理动作0。至此L0T2离散编译几何候选池和已验证的有限变体不再扩展。剩余工作聚焦V3通用接口/恢复，不能把本次screen当作物理成功或安全认证。
+
+## 2026-10-28 08:54：run53技能迁移审计完成；V3拒绝路径补齐耐久归档
+
+对L1T2 run53稳定释放分支与L0T2 t329持抓Snapshot分别执行正式Safety Bridge reset→Snapshot restore→只读`native_goal_query`，两个查询都核对模型身份，物理动作0。源L1T2 run53 region与目标L0T2 region尺寸均为[0.075,0.075,0.0025] m、朝向均为单位阵，中心世界位移约11.995 mm；放置经验因此可按当前region坐标重算，不能复制源世界坐标。run53 25 mm局部内移/释放分支为77动作、1925子步，20步/500子步Settling期间谓词保持、最终松爪稳定；但撤离时仍有22个Pot-hand接触子步、`safety_certified=false`，不构成Strict-10mm先验。
+
+阶段也不匹配：run53源t1335已经满足Pot2 `On`，处于区域内移/释放阶段；L0T2 t329仍是持抓抬升/运输阶段，Pot2 `On=false`，距目标Region中心很远。L0T2 t0严格抓姿16个候选及追加24个局部变体全部失败，t329还有0.527 mm非pad穿透与4.316 mm最小距离。故没有执行跨场景物理分支或路线预检。查询与兼容性审计分别位于`l1t2_run53_skill_transfer_audit/scene_goal_queries.json`（SHA `5c2a40487b2dff82d0e90e4bd1f0c2840b158d9d12e4844500db85441085b39c`）和`run53_transfer_compatibility_audit.json`（SHA `8948fc7a4434c3c407aae0d6a27a15863e46bf0e33e270a5d71653d1ffcaac12`）。
+
+V3严格门禁代码审计发现，错误Snapshot SHA会抛出异常但未写任何V3终态报告。现在严格screen拒绝路径保存`rejected_strict_grasp_screen`报告，并记录拒绝理由、engine/Bridge未启动与0动作；screen校验还拒绝已有路线预检、非scratch screen、候选计数/排序不一致及错误JSON根结构。新增5个回归用例，Adapter+V3聚焦测试27 passed；五个相关Python文件`py_compile`及`git diff --check`通过。使用真实L0T2零候选screen重跑最新入口，报告SHA `d9c2d640b6949ad6e0435ce4e385cd3fc060791588608c8bd2a4ce625a0d029a`，仍在engine/Bridge之前以`blocked_no_strict_grasp_candidate`结束，物理动作0。
+
+L1T2局部技能的跨场景可重定位性已只读确认，但不是可立即运行的安全分支。下一步回到通用V3接口/自动恢复检查；只有未来某个确切L0T2阶段获得Strict screen可行姿态、报告身份完全匹配并且对应任务阶段通过路线门禁，才允许物理验证。
+
+## 2026-10-28 08:49：L0T2经验阶段核验完成；严格抓姿门禁阻止V3物理启动
+
+以登记经验库确认`obstacle_avoidance/L0T2`的目标为`on(moka_pot_2, flat_stove_1_cook_region)`，匹配到9个Moka Pot抓姿模板、`object_transfer_cycle:moka_pot:t239`阶段技能和9个L0T2成功关键姿态。1093步源示范首次原生成功于t1053，但t21–56有Ginger Beer危险接触；1460步重构Episode通过Operational Safety，Strict-10mm未通过。任何来源标签均未继承。当前合法t0 Snapshot SHA `28a2874ea83a53e973666bd962315528930a035d89834a098e02d63bb97cde46`，模型几何SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，BDDL SHA `901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c`。
+
+已新增`l0t2_grasp_reference_adapter.py`：从Operational-Safety来源重建t249–329的连续持抓/抬升先验，逐项核验任务、Snapshot、模型、BDDL、轨迹和Source report身份；将真实世界抓姿值不变地规范化供严格screen使用，并明确不转移Safety或训练资格。Adapter报告SHA `9329ebacd11f980b649a6f20c12a1f676338ecc70e6fb07a4041054f83ed679f`，Source trace SHA `5e6ee716cc82d15b757a1522524deaf610e65f61c5a71d38344620c8c35a5163`，目标Pot抬升39.13 mm。t329 Snapshot虽可作为合法操作阶段起点，但非pad finger对Pot2穿透约0.527 mm、最小target clearance 4.316 mm，不能作为Strict-10mm物理分支起点。
+
+在初始L0T2状态以活动编译几何和不变10 mm/2 mm政策screen 16个候选（9个经验、7个生成），0可行：9个collision、4个抓姿几何、3个IK失败；物理动作0、live state不变、没有RRT。基于2个最接近先验再筛12个接触高度变体和12个jaw倾角变体，两批均0可行。重定位现有L0T2 Keypose得到7个余下里程碑，但只做离线SE(3)重定位审计，没有路线预检或物理执行。最新screen SHA `69a0b7282ad706bd7f3f86341966b5eb89983fc1fdb0c43784f921dab8d85cad`。
+
+V3现在接收`--strict-grasp-screen-report`：核对任务、BDDL/模型、确切起始Snapshot与未变严格阈值；0个可行抓姿时写入`blocked_no_strict_grasp_candidate`并在checkpoint、engine和Bridge之前停止。L0T2 attempt39验证报告SHA `4dbf2921027180e51e78294f2383020144031f2ee316c83cee9645a6d2e0cd22`，确认候选16/0，`engine_launched=false`、`bridge_started=false`、动作0。相关测试22 passed；五个相关Python文件`py_compile`与`git diff --check`通过。
+
+本轮转向按原定顺序审计L1T2 run53的局部放置/释放技能作为跨场景候选。run53的25 mm区域内移分支具有真实稳定释放证据，但其源技能仍`Safety certified=false`且撤离阶段有Pot手部接触，因此只是局部任务技能先验；尚未把它移植到L0T2，也不启动t329物理分支。下一实验先比较源技能、L0T2活动几何与起点状态的严格兼容性；任何严格screen未通过的状态继续停在物理执行前。
+
+## 2026-10-28 08:40：attempt38 quaternion差异完成工具帧归因；切换L0T2审计
+
+对照robosuite `single_arm.py` 与Safety Bridge记录路径后，确认`post_robot0_eef_quat`为EEF body quaternion（robosuite按`xyzw`传感器输出再转存），而`robot_states[0].eef_quat`为EEF site rotation（Safety Bridge按MuJoCo `wxyz`记录）。二者稳定相差约90°，抽样step 0/27/39/46/51/74/160/700的body-to-site旋转最大矩阵偏差0.000887；这不是同帧数据损坏。attempt38仍使用物理状态重算的EEF site pose做object-relative先验，以匹配规划器工具帧；原始NPZ及先前哈希化报告不改写。
+
+L0T0 attempt38筛选结果不变：2个历史先验均因approach及非pad手指—碗几何失败被拒绝，0动作、0 RRT。按原定回退路线开始检查L0T2完整成功经验、Experience Registry匹配、重构Episode和合法Snapshot身份；物理分支须等一个具体完整阶段通过活动几何及有界路线门禁。
+
+## 2026-10-28 08:37：attempt38从历史成功episode提取抓姿；L0T0筛选分支停止
+
+711步attempt3与848步attempt1轨迹的metadata确认都是obstacle_avoidance/L0T0/state0、env_seed0，真实成功标记为success_once/done，动作维度7；base checkpoint同为`pi05_rlinf_libero_sft`，LoRA adapter分别为`660519912d288ab3a56f503eb0313d579d5bf552570ea558c4210440edbbb69e`和`84adc2edb43639dda5c6c93bf37248286219114f1d6e11d99e276c548152bac5`。两源均有完整子步记录；严格安全资格不继承。
+
+用直接MuJoCo物理state里的object root和EEF world pose（WXYZ）提取连续抓持窗口：attempt3步51–74，双pad从步46开始且碗比初始高32.1 mm；attempt1步82–104，双pad从步81开始且碗高36.6 mm。接近方向由首个手—碗接触前的步骤20至26/27 EEF运动估计。两个相对抓姿位置仅差0.845 mm、方向相差4.82°，属于相近先验而非大幅多样化姿态。
+
+来源NPZ里的`post_robot0_eef_quat`与同一步`post_physical_state_json.robot_states[0].eef_quat`明显不一致；历史姿态先验只使用后者（由`forwarded_copy_of_mujoco_integration_state`生成），并在机器记录中保留这个数据一致性缺口。candidate prior JSON经NPZ/result/evaluation/contact报告SHA、task/state、loaded adapter、连续step窗口、双pad接触与≥30 mm抬升校验；没有重放历史动作。
+
+attempt38实际调用统一grasp search的screen-only模式，验证2个历史pose候选：两者目标pad距离分别约[-0.415,-1.072] mm与[-0.359,-0.472] mm，但非pad—碗最小距离分别为−1.555 mm和−0.973 mm；两者approach与闭爪/持物几何门禁失败。screen complete、feasible=0、物理动作0、live state unchanged=true，无RRT。报告SHA `ee3e874a2491d12d7187c981c12ccc13a6761451b0fe50078e468c3e0d2ccfba`，screen SHA `a6826c894e1f11ec82b9f0591d3d044bffa0b598d05d4120dfb98ac4aae4457b`。
+
+候选输入：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt38_historical_grasp_pose_prior_screen/historical_grasp_pose_priors.json`，SHA `9d3a9f7bdb59c66d7af512b57e835cd01c4dac973cdfe686331840da61c0b5a8`。screen报告归档：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt38_historical_grasp_pose_prior_screen/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_083118_093724377/run_report.json`。此结果结束当前L0T0抓姿扩展；下一步回到既定顺序检查L0T2完整成功阶段的经验重定位与安全物理执行。
+
+## 2026-10-28 08:19：attempt33–37 pose-aligned严格抓姿筛选与一次机制切换
+
+修正attempt28–32发现的对象/EEF时间帧错位后，attempt33和34在合法t0 Snapshot上重新筛查48个不同的几何/经验候选。两批各24个，均`live_state_unchanged=true`、物理动作0、可行数0。25/48候选的双侧pad距离达到±2 mm接触区，但活动严格门禁检测到非pad finger—碗编译Geom穿透约0.095–0.111 mm；其余包含接近路径或接触几何失败。报告SHA分别为`474ad334015b95508886a216783bbfe535083f1d970d32271892eaa13a6d05d3`、`166716e2a5e0ee63aa70442637191bc89f8325d01586cf2d2131fbcbc1772095`。
+
+之后依次检查3种实质不同的有界参数化：attempt35对4个基姿态施加jaw轴±10/15/20°旋转；24项、0可行，最近非pad clearance为−2.076 mm。attempt36施加approach轴±10/20/30° roll；24项、0可行，最近为−1.499 mm。attempt37沿活动目标物体局部z把接触中心偏移±5/10/15 mm；24项、0可行。attempt37的最佳pad距离约+0.995/−0.991 mm，但指2—碗非pad距离约−0.805 mm；较高位置将pad距离推至约±3.53 mm。三组均无RRT、无物理动作、live state不变，分别只说明这些候选参数化未通过既定门禁，不能认证安全。
+
+attempt37报告：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt37_object_z_offset_screen/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_081707_204419156/run_report.json`，SHA-256 `d33e49a944f61d591fd4485dd15c9412ad99938608655b922f772403d68413ac`；screen SHA `3be0c8ad7c08ccb0a15522d5710cebdb9f74c6fce447395bec18a0ed0fc30df6`。同一t0 Snapshot身份SHA `bc860433…610cba7`、模型/几何SHA `085817d1…3b2e840`、BDDL SHA `b631d2f9…b7fe12`；筛选记录start-state SHA `4c2419e66b0ebc95b8966b1cd9b5b3c3123cab2a0aa47bc4afbb7eeed06bf50f`。
+
+下一步依照既定回退路线审计711步、848步的真实Student成功轨迹，提取与已失败候选实质不同且有实际双指接触/抓持证据的object-relative变换。仅有限scratch复筛；无完整几何通过项不执行抓取。attempt37新增offset生成器及回归覆盖后，聚焦测试32 passed，四个相关模块`py_compile`与`git diff --check`通过。
+
+## 2026-10-28 08:10：抓姿筛选发现对象Pose错位；attempt28–32接触结论暂时撤回
+
+代码复核发现`screen_grasp_candidates()`在approach检查后，把目标碗切到attempt21闭合/抬升后的历史世界Pose（比t0高约37.4 mm），却让候选EEF留在当前t0抓姿，然后继续测闭爪pad距离和候选held transform。这样close接触双方不在同一世界时刻，可能伪造指垫间隙与碰撞。attempt28–32的几何screen虽保持live state不变、没有物理动作，但其闭爪和held阶段筛选结果无效；因此“48候选均不可行/候选池耗尽”的结论暂停，不作为最终研究证据。
+
+已修复：历史抬升Pose只用于目标物体路径clearance prior；闭爪碰撞检查前把scratch目标恢复到活动t0 Pose；候选held transform从候选EEF抓姿和活动t0目标Pose共同计算。新增37.4 mm差异回归样例。当前聚焦pytest 28 passed，相关模块py_compile及diff检查通过。下一步以相同模型、BDDL、Snapshot、阈值重新筛48个候选（两个24批次），物理执行继续禁止直至有通过项。
+
+## 历史记录（筛选错帧、结论已撤回）：attempt28–32 初始筛选
+
+从合法 L0T0/state0 t0 Snapshot（SHA `bc860433…610cba7`，模型SHA `085817d1…3b2e840`，BDDL SHA `b631d2f9…b7fe12`）重新运行 scratch-only 抓姿筛选。安全策略只采用活动BDDL中的`CheckRobotContact`/`CheckContact`对象关系；目标碗只允许指垫Geom 74/77接触、指垫穿透最多2 mm，所有非指垫机器人—碗距离要求至少10 mm。attempt21报告仅提供经身份/哈希验证的闭爪qpos、闭合后物体pose和IK seed，不回放其动作，也不继承安全标签。
+
+attempt28检查16个候选，0可行。扩展后attempt30检查24个；attempt31检查第二批24个，但因`diversify_candidates`依赖候选池大小，两批有2个重复；attempt32用明确候选ID补筛此前未覆盖的2个。合计66次筛选、48个唯一几何/经验候选，全部0可行。失败集中在 approach/closure：非指垫手部或指节几何侵入碗、指垫距离仍为约4.5–10 mm，未形成双侧≤2 mm接触；attempt32的两个候选还在预抓位姿发生碰撞。每次live integration state均保持不变，物理动作/子步均为0，无RRT、无物理候选分支。
+
+attempt29曾因遗漏`--task-id 0`启动到默认L0T1；Bridge依据模型指纹拒绝恢复L0T0快照，0动作，归档保留。没有把此输入错误计作物理尝试。
+
+实现现在提供24个候选/批次、最多48个scratch生成池，屏幕候选ID可以只在screen-only模式重复传入；物理候选预算仍为16。严格策略现写进screen JSON，完成但零可行候选时CLI退出码为0。回归测试27 passed；相关模块`py_compile`、`--help`和候选窗口/多ID边界验证通过。未改变BDDL、10 mm/2 mm阈值；不启动未通过筛选的抓姿。
+
+机器记录：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/progress.json`中的`offline_grasp_screening_attempts`。attempt30–32归档在`l0t0_state0_attempt30_strict_grasp_screen_24/`、`l0t0_state0_attempt31_strict_grasp_screen_offset24/`、`l0t0_state0_attempt32_strict_grasp_screen_remaining2/`。结论：当前基于编译Geom主轴的48候选池耗尽，Strict grasp仍无候选；新的抓姿参数化前不进入物理分支。整轮已有attempt27 Level B原生任务成功，Operational/Strict Safety与安全训练资格仍未通过。
+
+## 2026-10-28：attempt27首个原生任务成功；修复终止后撤离动作
+
+安全归因补充：活动 BDDL SHA-256 `b631d2f9…d7b7fe12` 的 `:constraints` 仅声明机器人不得接触香水瓶与白色置物盒、黑碗不得接触这两者；`On(akita_black_bowl_1, flat_stove_1_cook_region)` 是初始关系，`On(akita_black_bowl_1, plate_1)` 是目标关系。attempt21/27 的在线几何策略标为 diagnostic-only，却把所有非目标对象都作为 forbidden，因此碗—炉灶和碗—盘支撑接触造成的 unsafe 不能直接当作正式安全违例，也不能据此认证通过。Strict-10mm 有独立的真实失败证据：t168 `gripper0_finger1_collision` 与碗几何穿透约0.183 mm；t669 `gripper0_finger2_collision` 到碗仅约0.244 mm。香水瓶越障路线没有手—瓶接触，但完整 Operational Safety 仍未认证。证据见 `safety_attribution.json`；后续仅在离线候选筛选和未来物理分支中使用有来源的 BDDL 约束映射，阈值不变。
+
+attempt27从attempt21的t167合法抬升持抓Snapshot精确恢复（Snapshot SHA `ba43889b…e943e088`，integration-state SHA `07b2def7…90a1edf`）。原生谓词`On(akita_black_bowl_1, plate_1)`首次在t669成立，reward=1、done=true；此前167步抓取前缀与502步运输/放置后缀形成669步连续Episode，满足1000步时域。释放条件已被控制器观测并进入`withdrawal`，但settle和撤离没有完成，故`stable_release_verified=false`。
+
+终态审计发现源后缀还记录了t670的一个withdrawal动作，而环境在t669已终止。该动作从成功Episode中剔除；新review NPZ仅含截至首次done的669组7D动作与状态，不含双相机Observation，因此不是训练包。原始报告、Snapshot和帧归档未改写。归档：`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt27_obstacle_overflight/task_success_first_executor_obstacle_avoidance_L0T0_20261028_065344_974183682/expert_native_goal_stage_control/placement_branch_00_region_layout_12_direct_region_progress/review_episode_audit.json`，NPZ SHA-256 `8887dc6c…b1b6df48`。
+
+有效669动作的16,725个物理子步记录完整，但几何状态仍有unsafe样本；`operational_safety=not_certified`、Strict-10mm=false、`safe_training_eligible=false`。attempt27越障路线避免了手部与香水瓶接触，但不能据此称安全成功。结果为验收Level B。
+
+执行器现于native `done=true`后停止release/withdrawal/settle动作，并报告终态跳过撤离；新增终止边界回归测试。聚焦测试43 passed、6 subtests，py_compile和`git diff --check`通过。下一步先离线筛选不同的抓姿，要求非指垫—碗几何至少10 mm且指垫穿透不超过2 mm，并按活动BDDL约束预检路线；没有筛选和预检通过的候选时不启动物理分支，也不复跑同一路线。
+
+## 2026-10-28：attempt26越障路线在零动作门禁失败，修复上下文接线
+
+attempt26从attempt21 t167合法持抓Snapshot恢复；在物理动作前因`_native_place_single`未收到`target_context`而报告`NameError`。报告SHA `e9f92bab7cf4286d7defb69b12b8f070a58648fc10caac25ef4aad42eac3c7b7`，动作/子步均0、timestep保持167，原快照未改变。修复方式是在函数候选摆放调用显式传入已通过活动BDDL、model SHA核验的目标碰撞上下文；release续接路径不需要该上下文。聚焦验证42 passed、6 subtests；py_compile和diff检查通过。此为执行接线修复，attempt27按同一路线单分支重跑。
+
+## 2026-10-28：attempt25证实香水瓶碰撞；attempt26转为编译几何越障路线
+
+attempt25从attempt24的精确t353终态恢复，执行24个动作、600个MuJoCo子步后在t377停滞。每步25/25子步记录完整，双侧抓持保留，native Task Success仍为false。实际接触记录显示手部Geom与`bottle_of_perfume_1_g37/g45/g85`碰撞；最大接触力约12.45 N，几何最小clearance -0.563 mm。执行器报告SHA `f046d68f1660bb1a0fee89b28668e6683129ae0968b18877cefe51e6c1743bfa`，失败Snapshot SHA `5f2ed18f62800d6f06adcb9c5e03a0694aef589b33e5635955813723b6a052b3`。因此直接路线与两个水平侧绕方向不能视为已避开瓶子。
+
+正式Bridge顺序（启动、显式reset、恢复快照）后，attempt25终态精确恢复成功，模型SHA `085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840`，9/9活动对象与固定物碰撞包络齐全。根据这些活动几何，attempt21 t167合法持抓抬升快照的直达走廊中有6个包络相交，最高香水瓶顶为1.21847 m。目标碗根越障高度按当前碰撞Geom最低点加0.05 m间隙算为1.26697 m（plate区域局部z=0.34804 m），EEF预计约1.29881 m。
+
+attempt26规划从attempt21精确抬升快照启动（SHA `ba43889b75039390c81dbda834b80a4ba51db8039af2dff57059b5e4e943e088`，t167），仅执行一个真实物理分支；原生目标路线先抬高越障再直达plate中心。此调整是基于碰撞包络的路线规划估算，实际碰撞、预算、Task Success、安全结果以新的物理记录为准；没有安全认证。
+
+## 2026-10-28：attempt24 正向侧绕行在首个中间点停滞，attempt25镜像绕行
+
+attempt24 从 attempt22 的timestep329终态快照恢复，以 `keypose_side_region_progress` 执行24个真实OSC动作、600个MuJoCo子步；每个动作的监测完整，双侧抓持未丢失。第一侧向中间点在24步内进展不足，原生目标仍为false。终态快照已保存，当前timestep353。
+
+已新增镜像方向 `keypose_side_region_progress_reverse`，并用测试确认它跨越到直达线的另一侧。attempt25 从 attempt24 精确终态恢复，固定plate中心候选并仅运行一个反向侧绕行物理分支。仍保持原任务时域、BDDL、成功阈值和安全标注。聚焦pytest 41 passed、6 subtests；`py_compile`、`git diff --check`通过。
+
+## 2026-10-28：attempt23 RRT预检无有界IK解，attempt24切换侧向绕行
+
+attempt23 从 attempt22 的精确终态快照启动，task timestep保持329。一次12秒全几何放置RRT预检返回 `task_goal_has_no_bounded_current_scene_inverse_kinematics_solution`，因此没有执行物理动作，快照保持不变。
+
+attempt24 从同一快照恢复，强制使用 `keypose_side_region_progress` 原生区域绕行，通过一个真实OSC物理分支绕开 attempt22 停滞的直达走廊。中心摆放目标、对象碰撞包络和BDDL谓词保持不变；预计进展与终态仍待实测。当前聚焦pytest为41 passed、6 subtests；代码编译和diff检查通过。
+
+## 2026-10-28：attempt22 支撑面映射通过，直接OSC运输在走廊停滞
+
+attempt22 精确恢复了 attempt21 的37.1 mm抬升快照，采用由10个编译碰撞Geom推导的plate_1支撑包络；居中候选位于支撑面局部[0,0]。单一路线实际执行162个动作、4050个MuJoCo子步，子步记录完整。双侧抓持持续确认；碗到目标中心的水平距离由49.1 cm降至31.6 cm，随后连续24步进展不足而安全停止。原生BDDL谓词仍为false，终态快照SHA-256 `c8c0e8cb575086c419a2b406abfd70027ce6da4bc03e0b9a85cc014736d3eca8`。direct OSC路线预算在该起点预估1278步，而当时预留的传输预算为497步，说明该路线在标准1000步任务时域内不适用。
+
+已加入可选 `--native-region-route-variant`，可从中途精确快照恢复并强制使用侧向绕行。attempt23先从 attempt22 终态做一次12秒全几何RRT放置预检，最多执行一个物理分支；若无路线，可无损回到该终态快照尝试侧向绕行。当前聚焦pytest为41 passed、6 subtests；`py_compile`与`git diff --check`通过。安全认证、Strict10mm及任务成功仍未达到。
+
+## 2026-10-28：attempt21 首次稳定抓取抬升，修复 plate_1 对象支撑区域映射
+
+attempt21 使用候选 `geom113_jaw0_approach2_+1_flip+1__rrt0` 完成167个控制动作、4175个MuJoCo子步；子步记录完整，几何监测167步均记录为unsafe。抓取稳定性连续状态28/28通过，碗抬升37.1 mm，达到内部30 mm抓取抬升门槛。原生BDDL任务仍未成功：executor在摆放开始前报 `native_region_candidate_geometry_binding_unavailable`。审计确认 `plate_1` 是活动BDDL中的物体目标，不是 `object_sites_dict` site；site-only 查询错误地拒绝了合法目标。
+
+已将 Bridge 的 native goal 查询扩展为：对site目标保持编译site读取；对对象目标从绑定的编译碰撞几何构造实时支撑包络。plate_1 当前包络由10个碰撞Geom测得，候选器已调整为在对象支撑面上优先居中，最终成功仍只由原生BDDL谓词确认。未改BDDL、成功阈值、场景对象或Safety Reconstruction。只读Bridge目标查询通过；候选中心核验通过；`py_compile`、`git diff --check`通过；聚焦pytest为40 passed、6 subtests。
+
+attempt22 正从 attempt21 的精确抬升 Runtime Snapshot 继续，使用最多1条物理摆放分支和1次RRT预检。native task success、Strict10mm及安全训练资格仍未通过/未认证。
+
+## 2026-10-28：attempt20四个新姿态RRT均超时，attempt21测试最后几何候选
+
+attempt20从干净seed0/state0初态对候选索引10–13执行4次有界RRT预检：`geom112_jaw1_approach2_+1_flip+1`、`geom112_jaw0_approach2_+1_flip-1`、`geom111_jaw0_approach2_-1_flip+1`和`geom111_jaw1_approach2_-1_flip-1`均在约12秒达到规划预算且无路线。没有物理分支、动作或物理子步。V3报告SHA-256 `daa6179edcebacdac7e31553a2c0799c33d70e0beb19a6cdda39bc15410fd33a`，搜索报告SHA-256 `f688731a012678aefdf044e30688bc96fec5ffe046076690262c6000f9b4f401`。
+
+attempt21仅剩未测的`geom113_jaw0_approach2_+1_flip+1`；编译Geom对应夹持轴宽约2.56 mm，路线和接触可行性未知。将使用同一哈希核验的t0 Snapshot，最多1个RRT预检和1个物理分支；Failure memory输入attempt8–14、17–20，排除先前失败的精确候选—路线对。当前代码聚焦验证70项测试+6 subtests、`py_compile`与`git diff --check`通过。attempt21准备启动。
+
+## 2026-10-28：attempt19 geom113预检超时，attempt20合并四个有界预检
+
+attempt19从哈希核验的seed0/state0初态筛选`geom113_jaw1_approach2_+1_flip+1`，其RRT预检在12.00秒时预算耗尽，没有生成路线，也没有物理分支或动作。V3报告SHA-256 `d4434ce41f83c554d0b81b0fc4950696170ef6ddc3e5c9fa2901eaf9aab35818`，搜索报告SHA-256 `e8cc709b83470dc5f696be8fa7ff963fb5c80062c1503171ce05efcc6ddb6d09`。归档保留，计入零物理动作预检。
+
+attempt20仍从同一干净初态出发，使用`candidate_start_index=10`、最多4个12秒RRT预检，对候选10–13作一次批量筛选，最多仅对一个有路线的候选执行物理验证。Failure memory输入attempt8–14和17–19有效报告，跳过先前失败的精确候选—路线配对；attempt15/16元数据不完整零动作报告不作为failure memory。当前动态目标跟踪、候选位姿对齐门及其回归覆盖已通过70项测试+6 subtests、`py_compile`与`git diff --check`。attempt20准备启动。
+
+## 2026-10-28：attempt18动态跟踪仍未到抓姿；attempt19换目标几何和干净初态
+
+attempt18执行17步RRT预抓取与60步动态对象相对接近，共77动作/1,925物理子步；77/77动作25/25样本完整，几何监测77步均`unsafe`。动态跟踪把姿态误差从约17°降至0.2°，位置误差降至6.9 mm，但两侧指垫从未接触目标，且碗在接近阶段沿桌面滑移约53.7 mm，60步预算耗尽后停止，没有闭爪、稳定抓持、抬升或Task Success。该结果不支持继续延长这条同一目标路线。
+
+新的位姿/接触记录显示：attempt11源Snapshot一开始存在夹爪—碗碰撞，恢复后首个预抓取动作就让接触消失；后续碗与炉灶燃烧器保持接触并移动。因此attempt19不再从这个扰动态续接，而从经哈希验证的seed0/state0原始Snapshot出发，换到另一个活动碰撞几何候选`geom113_jaw1_approach2_+1_flip+1`。最多一个RRT预检和一个物理分支；动态对象相对跟踪仍用于真实表面接近，抓姿误差仍须≤4 mm/0.045 rad才可闭爪。Failure memory导入attempt8–14、17–18。70项聚焦测试+6 subtests、`py_compile`和`git diff --check`通过，attempt19准备启动。
+
+## 2026-10-28：attempt17固定世界坐标接近失配，attempt18改为实时对象相对跟踪
+
+attempt17从attempt11经身份核验的末态Snapshot执行17步RRT/OSC预抓取、30步表面接近和18步闭爪，共65动作、1,625子步；65/65动作的25/25物理子步记录完整，65步几何监测均为`unsafe`。接近使目标碗移动并转动；现有实现把规划时的世界系抓姿固定下来，闭爪时EEF相对当前碗仍差16.6 mm、16.9°，并且没有左右指接触。无稳定抓持、抬升或原生Task Success，Safety未认证，Strict 10 mm=false，训练资格=false。失败Snapshot SHA-256 `e726dc1fde50048f8212c656ec2afacb34084e736f3453fef51300a526bafc73`；V3/executor/search报告哈希分别为`0ebe84a41336c69a98ce29271318345f549898825863281b634c8a2bab6c56ff`、`fd731cfe25194824ab2ed2a0f084608ac5542ddd7cd9076c07a015fef0311f4c`、`9aace512f2dd536692c23a37629759307627255c6ccdbe45d7f0c662dc1ab480`。
+
+attempt18在同一经验证的接触快照上运行同一几何候选，但表面接近的每个OSC控制周期都会读取当前目标根位姿，并重算原有生成候选的`object_to_eef`目标。偏离候选时不作原位闭爪；闭爪必须先满足4 mm/0.045 rad跟踪容差。Failure memory导入attempt8–14和17，动态对象相对跟踪在route ID中单独标识；仅1个预检和1个物理分支。70项聚焦测试+6 subtests、`py_compile`和`git diff --check`通过，attempt18准备启动。
+
+## 2026-10-28：attempt16无物理动作的输入校验失败，attempt17重跑
+
+attempt16在Failure memory输入核验阶段拒绝了attempt15搜索报告：该报告源于前一轮矩阵索引错误，没有`native_goal_predicate`元数据。V3报告SHA-256 `335183fbf52bdf27fe951a8c309ccb6d67e6a4b8729f6a53a4e866a5ea003831`；动作审计确认物理分支0、动作0、子步0。该归档保留，不纳入后续failure memory。
+
+attempt17重用attempt11身份核验的双接触Snapshot与精确候选；failure memory仅导入attempt8–14通过身份检查的报告。候选抓姿对齐判据为4 mm和0.045 rad；当前位姿不满足时按成功的RRT预检继续原生OSC路径与候选接近，最多执行1个物理分支。矩阵形状修正后69项聚焦测试+6 subtests通过，`py_compile`与`git diff --check`通过。attempt17准备启动。
+
+## 2026-10-28：attempt15零动作形状故障已修复，attempt16继续候选接近
+
+attempt15在当前接触Snapshot上完成了一个RRT预检，结果`offline_feasible`；随后姿态对齐检查把目标4×4矩阵误当成7D `[position, quaternion]`数组索引，导致预检/runner错误，没有真实物理分支、动作或子步。该0动作归档保留在`l0t0_state0_attempt15_contact_pose_alignment/`，V3/executor/search报告SHA-256分别为`e54325df7c1f69ca859f392c57d10733f5a368ad920a2fd5d3d6daa172c87fb3`、`a7f832b99b02f862887711e83f7441a9c29a14d1ed0c65d7732d40e5ea7b4a4a`、`eb53cd072a1dd684b8c2cb8d8fc66f2e88595026b30e4464898e5ab8a11c4b2e`。
+
+矩阵输入现直接传入SE(3)对齐检查；使用同一attempt11接触Snapshot，闭爪仍须满足候选目标误差≤4 mm、≤0.045 rad，否则按规划结果继续对象相对接近。聚焦测试69项+6 subtests、`py_compile`和`git diff --check`通过。attempt16最多1次预检和1个真实分支，Failure memory包含attempt8–15报告，准备启动。
+
+## 2026-10-28：attempt14验证闭爪错位；attempt15加候选抓姿对齐条件
+
+attempt14从attempt11的精确Snapshot开始，两个中性等待动作期间双侧接触保留；随后首个闭爪动作（25%）即失去左指接触，50%时两侧均失去。20动作/500物理子步，20/20动作子步监测完整，几何监测20步均为`unsafe`，无稳定抓持或抬升；原生Task Success=false，Safety未认证，Strict 10 mm=false，训练资格=false。
+
+离线由同一失败Snapshot和候选`object_to_eef`变换重算，发现EEF与候选抓姿相差103.2 mm、106.9°。旧接触探测只用宽松的位置距离≤约0.28 m，因而把“碰到目标物”误判成“已处在这个候选抓姿”，然后在错误位姿闭爪。这解释了attempt12和14的相同滑脱，也淘汰了继续增加等待时间的计划。attempt14失败Snapshot SHA-256 `bb5df0bb5f16b00f96494fdfaa8a52cbdbd7b9629f2124cd7fac1efb875090c1`；V3/executor/search报告哈希依次为`df4ac7fba7285f2558760f4fbd1bcdac2e49d53a5aa988c4d9d715f8f3a75963`、`f60339bc003baaf0a156f5d8622a8cd4c65bf3e1e768b551e32fb67f19cf351e`、`427abd34c5568762185a182b96d960e3869d3509657f56a644abcd42813ca29b`。
+
+attempt15将原位闭爪条件收紧到已有OSC跟踪容差：位置误差≤4 mm且姿态误差≤0.045 rad。其余带目标接触但偏离候选抓姿的状态继续候选当前场景路线和OSC接近，不原位闭爪。该判据只是技能闭合准备度，不是安全门槛；BDDL和Safety阈值不变。failure memory导入attempt8–14报告。聚焦测试69项+6 subtests、`py_compile`与`git diff --check`通过，attempt15准备启动。
+
+## 2026-10-28：attempt13等待过久丢失接触，attempt14收紧等待步数
+
+attempt13在attempt11精确接触Snapshot上只执行了3个原生中性动作，75个物理子步均有完整记录。前两步后左右目标指接触仍在，碗线速度约7.4 mm/s、角速度约0.09 rad/s；第三步后左侧接触丢失，闭爪阶段没有启动。几何监测3步均为`unsafe`，Task Success、稳定抓持、抬升和安全训练资格均false。失败态Snapshot SHA-256 `78f06cc6475bfafe4174436682f0a4aa22fe8b43818647432a671d7969970cc4`；V3/executor/search报告哈希依次为`092077d1cd104248758106a65f996b3ec14bfd5a71b7ddb6753a69992a561460`、`850e264e8fad9aa5bc75f9845c3479ecf0823630e73dd006a11a0ae35434e1c5`、`36d43a19e7c5cd04181b779d74b05305cc27767a2a187923a24d62ba85449883`。
+
+attempt14将中性等待上限缩至2步，接触仍在时立即闭爪；更新路线签名为`live_target_contact_settle2_close_probe`，并导入attempt8–13报告，让Failure memory跳过先前精确失败的接近/立即闭爪/长等待组合。只运行同一精确几何抓姿、一个预检和一个物理分支。聚焦测试68项+6 subtests、`py_compile`与`git diff --check`通过。attempt14准备启动。
+
+## 2026-10-28：attempt12原位闭爪失败，改为接触稳定后再闭爪
+
+attempt12_retry1从attempt11完全相同的双指接触Snapshot恢复，精确执行1个抓姿、1个物理分支。夹爪到25%和50%闭合时左右指仍接触黑碗；75%时左指接触消失，完全闭合时两侧接触均消失。18个闭爪动作内碗移动约12.7 mm，没有稳定抓持或抬升。18/18动作均记录完整25/25物理子步（450子步），动作与状态记录有效；几何监测18步均为`unsafe`，Operational Safety未认证，Strict 10 mm=false，训练资格=false。
+
+失败态Snapshot SHA-256 `8c57e312d5bd670ff3b1e8c473db2dc7a2abed0eaeb6c5f25bf0f3e3a0106861`；V3/executor/search报告SHA-256依次为`0e65c6216e1881958d6311a1c52ab35fb2d94d45f4bbd7cac805b757546e4bfc`、`53b1946ad29623b054654b93ccbb0d4b189e324d000692e870ec466f2b698c15`、`30590e08f35eb4e11acef3abb0fa9672a5b558c790792f73c7318cfe60ac4b72`。
+
+针对闭合时物体仍有运动的证据，attempt13使用同一个经身份核验的attempt11接触Snapshot与同一抓姿，但先以原生零动作保持双侧接触；只有物体线速度低于0.015 m/s、角速度低于0.08 rad/s并连续满足3次才提前结束等待，最多等待20步，接着沿用原抓持监测闭爪与抬升。若20步内未达到速度条件但双侧接触仍在，则记录并继续一次闭爪验证；若接触先丢失即停止该分支。没有写入机器人或物体状态，也不改安全判据。改动后`py_compile`、`git diff --check`和聚焦测试68项+6 subtests通过。attempt13正在运行。
+
+## 2026-10-28：attempt11碰撞几何抓姿双指接触，精确快照续接闭爪
+
+attempt11从哈希核验的seed0/state0初态搜索活动碰撞几何抓姿索引7–9。索引7和9的RRT预检分别以12.0秒耗尽且无路线；索引8 `geom111_jaw1_approach2_-1_flip+1`得到一条路线，实际执行90步预抓取和60步接近后仍未达到目标姿态。末态出现真实目标指垫接触：左指1组、右指3组，合计4个接触；夹爪仍张开（动作`[0,0]`），故没有稳定抓持或抬升。该双指接触是可继续验证的物理状态，不是任务成功或安全通过。
+
+本轮仅执行150个动作/3,750个MuJoCo子步。V3审计确认150/150动作完整覆盖25/25子步，7D动作与状态行有效；几何样本150步均为`unsafe`。原生Task Success=false，稳定抓持/抬升=false，Operational Safety未认证，Strict 10 mm=false，safe training=false。失败Snapshot经模型、BDDL、task、seed和init-state身份校验，可精确恢复；payload SHA-256 `36572abebac8e85ad5227f6ad5b4b5b28c2c078508f940e6928663aafb08fbcc`，integration-state SHA-256 `0534c2a3202340d7f540f3ad09d1f9d65d4088f6ad6d4c21337b402d193c0899`。V3报告SHA-256 `ef53725efec9561ded5a33bddba38a88b2e637beac10bb902b896d0ffcc8cb74`，搜索报告SHA-256 `3359d00878462d671e73f53ed38385406c8300b429dfdd846e77d9e55eaf2360`。
+
+据此新增V3的`--resume-from-runtime-snapshot`与`--grasp-candidate-id`，报告记录resume快照哈希，并向executor和search传递精确候选。grasp search现在能识别左右双指都已接触目标的实时状态，在接触姿态原位闭爪，避免先退回预抓取点。attempt12将只尝试`geom111_jaw1_approach2_-1_flip+1`，从上述Snapshot恢复，最多1次RRT预检和1个物理分支，闭爪后按现有抓持监测验证并尝试抬升。它会导入attempt8–11搜索报告；Failure memory跳过旧接近路线，新的原位闭爪路线单独计为新物理探测。聚焦测试68项+6 subtests、`py_compile`和`git diff --check`均通过。
+
+## 2026-10-28：attempt10_retry1三种经验接近路线均失败，监测审计完成
+
+attempt10_retry1从同一哈希核验的seed0/state0 Snapshot启动，attempt8与attempt9报告均通过身份校验并输入failure memory。索引3–5的`side_u_pos`执行123步预抓取、50步接近、18步闭爪；`side_u_neg`执行134步预抓取、58步接近、18步闭爪；两路闭爪时均无左右指接触。`opposite`高位路线执行318步后在预抓取阶段超时，期间记录到炉面—右指约−0.535 mm穿透和黑碗—左指接触。三路均无稳定双指抓持、抬升、释放或Task Success。失败记忆分类分别是两次`grasp_or_lift`和一次`contact_blocked`，建议改抓姿/接近族或改变侧面/高度与路线。
+
+共719个真实动作/17,975个MuJoCo物理子步。V3审计验证719/719动作的25/25子步监控完整、7D动作及状态行有效，动作记录行与分支计数一致；719步几何状态均为`unsafe`。监控完整只说明违规和接触被采集到，不代表安全。原生Task Success=false，稳定抓持/释放=false，Strict 10 mm=false，Operational Safety未认证，safe training=false。V3报告SHA-256为`3603a67ce60fdfd94ee047f7f9bb4485633a4c0e13606e796070424723185617`；搜索报告SHA-256为`b34a42cf84c3d7d33e972fc78936cfc52939eb1594543116989d6eb79fe305a1`。运行及三份分支Snapshot位于`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt10_retry1/`。
+
+attempt10首次启动的executor参数故障仍单独归档：V3传入`--candidate-start-index 3`后，中间层以code 2退出，未创建Bridge、Snapshot或物理动作。现已将参数贯通V3→executor→grasp search；相关聚焦套件50项+6 subtests通过，`py_compile`与`git diff --check`通过。下一轮attempt11转向由活动黑碗碰撞几何生成的夹爪姿态，选择索引7–9，使用同一初态并导入attempt8、attempt9、attempt10_retry1失败报告；最多3次RRT预检、3个真实分支、标准1000步horizon。该选择依据是三种经验接近变化都未建立指垫接触，而几何候选改变了夹爪相对黑碗的抓持姿态。阈值、BDDL和场景物体不变。
+
+## 2026-10-28：V3生成器九次尝试；经验抓持迁移与监测审计
+
+本阶段将工作路线从已耗尽预算的candidate9放置姿态搜索，切换到新生成器V3：使用已验证L0T0成功轨迹的路线结构作为先验，从当前`obstacle_avoidance/L0T0/state0`重新观测和规划，通过现有原生OSC_POSE控制执行；不回放历史动作、不重复candidate9放置搜索。该调整保留原定单场景完整任务与安全门线，并在路线变化时记录原因。
+
+新增`research/gs_opd/repair/l0t0_success_reference.py`，校验存档成功轨迹任务身份、7D动作、奖励/终止字段及哈希，只输出路线先验；新增`trajectory_generator_v3.py`作为统一入口，包含单Bridge生命周期、活动BDDL/谓词/语义Geom只读预检、运行清单和结果分级，并适配已有经验任务执行器。当前用于物理验证的后端选取左侧B-Spline/原生OSC_POSE路线。经验库命中仅为黑碗局部抓持先验，未把来源安全标签迁移到本次运行，也未声称它已参与该后端的抓取控制。
+
+静态检查：RLinf venv `py_compile`通过；`git diff --check`通过；V3聚焦测试14/14通过。旧成功参考为845个7D执行动作、原生终端reward=1且done=true，路线为左侧B-Spline、0.02 m/s、749个OSC动作；来源未证明稳定释放或Strict 10 mm安全。
+
+### 真实回合状态与下一次修正
+
+seed 0/state0候选在`l0t0_state0_attempt2/`通过Bridge预检后执行291个真实动作：50个Student动作、241个当前场景左侧B-Spline/OSC动作。原生终态reward=0、`done=false`、Task Success=false；路线在第241个OSC动作停止，原因是夹持相对旋转达到0.200040 rad并越过原有0.20 rad控制门限。终态grasp状态仍通过，未发现该runner判定的unexpected contact；Student及OSC合计291/291动作的25个MuJoCo子步记录完整，Observation–Action trace维度与长度有效。稳定释放未发生，操作安全未认证，Strict 10 mm未通过/未评估，可训练Episode=0。
+
+归档在`/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt2/`。其中`v3_report.json`已按native Task Success重分类为`task_incomplete`；`direct_bspline_osc_report.json`保留停止原因和逐步物理证据。第一轮`attempt1/`是预检握手错误、0物理动作归档。
+
+attempt3尝试让EEF随实时碗姿态保持抓持变换，结果更差：Student 50步后，OSC走206步即达到0.213534 rad停止；episode共256动作，碗姿态相对起点变化达3.012 rad，球心最大误差12.247 mm。原生Task Success=false；256/256动作25/25子步采集完整；未释放，安全/Strict 10 mm/训练资格均false。该控制调整已经撤回。状态Bundle有18条几何筛选通过的路线（左/右/上三方向），它们未做物理安全认证。attempt4右绕`trajectory-002`执行50个Student动作和146个OSC动作；总第196动作时发现目标碗Geom106—木柜基座Geom454接触，第17/25个子步发生、8个子步采样、最大力7.045 N，随后停机。任务失败，196/196动作的25子步记录完整。
+
+attempt5上绕`trajectory-003`执行50个Student动作和240个OSC动作；因抓持相对旋转0.200061 rad越过既有0.20 rad门限而停机，未见非预期碰撞，球心跟踪误差峰值9.729 mm。attempt6左绕`trajectory-004`执行50个Student动作和242个OSC动作；同一门限以0.200224 rad触发，球心跟踪峰值7.959 mm，未见非预期碰撞。两回合终态原生reward=0、`done=false`、Task Success=false；均未释放或完成撤离。attempt5的290/290、attempt6的292/292动作均有完整25/25子步监测及有效Observation–Action trace；操作安全未认证、Strict 10 mm false/未评估、训练资格false。
+
+跨路线对比显示attempt2左绕、attempt5上绕、attempt6左绕的抓持旋转误差在OSC第50/100/150/200步几乎重合（约0.0001/0.0096/0.0375/0.183 rad），随后都在约240步触发同一门限。attempt6新鲜Student抓持起始时，左右接触记录分别为1/5个Geom Pair；黑碗局部经验模板来自相同任务的抓持搜索，已验证双侧抓持和36.3 mm抬升，但该模板的当前后端控制没有使用。按trace计算，当前物体到EEF变换与模板平移差23.13 mm、旋转差16.47°；Student段结束时黑碗线速度0.1046 m/s、角速度0.0755 rad/s，机械臂最大关节速度0.283 rad/s。该局部模板来源本身`source_native_task_success=false`且`safety_certified=false`，只能作为待物理复核的抓持先验。
+
+attempt7在50步Student之后加入20个原生OSC零位移/闭爪动作。碗线速度由0.104629降至0.002015 m/s、角速度由0.075531降至0.003916 rad/s；20/20等待动作监测完整，抓持保持且未报碰撞。等待后重查几何并重建上绕路径，但在路线OSC第229步仍因相对旋转0.200091 rad触发既有门限。总计299动作，原生reward=0、done=false、Task Success=false；299/299动作均有25/25子步，trace有效。稳定释放、操作安全、Strict 10 mm与安全训练资格均未通过/未认证。
+
+attempt8改用`experience_task_success`，从经哈希核验的attempt7 seed0/state0 Snapshot启动。相同任务的`object_to_eef`模板被插入首个抓持候选，并在当前MuJoCo场景重新定位和规划；3个RRT预检均因12秒预算耗尽。高位接近fallback真实执行102步预抓取路线，随后60步对象相对接近；一次局部RRT也超时，fallback OSC再执行32步后该接近段预算耗尽。唯一分支共194步、4850子步，未形成稳定双指抓持、抬升、释放或原生Task Success；失败类型为`route_stalled`，没有目标接触Pair。
+
+attempt8原报告把194/194个逐步监测标成不完整。复查原始记录后确认每个动作均有完整25/25接触与几何子步，共4850/4850样本，7D动作及状态记录行有效；根因是旧判断把测得的几何`unsafe`状态误认为漏采样。已修正为将监测覆盖与安全判定分开，并追加`attempt8_posthoc_monitoring_audit.json`，没有改写原始run报告。几何监测状态194/194为unsafe，Safety/Strict 10 mm未认证、训练资格false；首个样本含碗Geom119—炉灶燃烧器Geom494约1.8 μm接触，不能把完整观测误写成安全通过。
+
+下一回合保持同一真实初态与标准1000步预算，V3新增`--previous-search-report`并做来源哈希记录。attempt9将输入attempt8抓持搜索报告，让既有route-failure memory跳过精确失败的候选—路线对，再安排不同的对象相对接近方向；最多3个真实分支、3次12秒RRT预检。不重试同一失败路线、不放宽阈值或改BDDL。attempt1—attempt8分别归档。
+
+**首次预检失败记录：**目录`l0t0_state0_attempt1/`中的Bridge成功初始化并输出ready标记，但V3此前用裸TCP `connect_ex`轮询端口；该未认证连接触发Bridge单连接认证循环退出。manifest显示物理动作0，runner/model推理未启动。现已用可绑定端口检查和ready日志门控替换裸TCP探测，首个连接直接使用带authkey的Bridge协议。该次零动作故障保存在`attempt1/`；随后attempt2—attempt6均为真实MuJoCo运行。
+
+备份的既有worktree改动位于该run父目录`backups/`。完整接口、限制、命令与真实回合结论见[Trajectory Generator V3说明](GS_OPD_TRAJECTORY_GENERATOR_V3.md)；当前局部目标和路线分别见[当前目标](GS_OPD_CURRENT_GOAL.md)与[总体路线](GS_OPD_ROADMAP.md)。
+
 ## 2026-10-27：OA/L0T0 candidate9八组放置方案均未完成Task Success，候选预算耗尽
 
 ### 范围与起点

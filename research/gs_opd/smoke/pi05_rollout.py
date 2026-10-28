@@ -49,6 +49,12 @@ def parse_args():
         help="Optional Python/NumPy/PyTorch RNG seed for a reproducible Student rollout.",
     )
     parser.add_argument(
+        "--bridge-port",
+        type=int,
+        default=38567,
+        help="Local Safety Bridge TCP port (default: 38567).",
+    )
+    parser.add_argument(
         "--result-out",
         type=Path,
         default=Path(
@@ -161,6 +167,12 @@ def parse_args():
         help="Optional candidate_id from the current geometrically screened B-Spline bundle (requires --direct-bspline-osc-left).",
     )
     parser.add_argument(
+        "--bspline-pre-route-hold-actions",
+        type=int,
+        default=0,
+        help="Run this many monitored zero-delta, closed-gripper OSC actions after Student grasp and before refreshing route geometry (0..100).",
+    )
+    parser.add_argument(
         "--bspline-left-001-toward-004-interp-10pct",
         action="store_true",
         help="Compatibility alias for --bspline-left-001-toward-004-fraction 0.10.",
@@ -176,6 +188,8 @@ def parse_args():
     args = parser.parse_args()
     if args.max_steps < 0:
         parser.error("--max-steps must be zero or greater")
+    if not 1024 <= args.bridge_port <= 65535:
+        parser.error("--bridge-port must be in 1024..65535")
     if args.record_substep_contacts and not args.record_physical_state:
         parser.error("--record-substep-contacts requires --record-physical-state")
     if args.video_out is not None and args.video_out.suffix != ".mp4":
@@ -251,6 +265,10 @@ def parse_args():
         parser.error("--bspline-candidate-id requires --direct-bspline-osc-left")
     if args.bspline_candidate_id is not None and not args.bspline_candidate_id.strip():
         parser.error("--bspline-candidate-id must not be empty")
+    if not 0 <= args.bspline_pre_route_hold_actions <= 100:
+        parser.error("--bspline-pre-route-hold-actions must be in [0, 100]")
+    if args.bspline_pre_route_hold_actions and not direct_osc_enabled:
+        parser.error("--bspline-pre-route-hold-actions requires --direct-bspline-osc-left")
     if sum((probe_enabled, collection_enabled, trajectory_validation_enabled)) > 1:
         parser.error("probe, collection, and trajectory physical validation modes are mutually exclusive")
     if grasp_smoke_enabled and (
@@ -2167,7 +2185,7 @@ print("MODEL LOADED", flush=True)
 import time
 import json
 
-conn = Client(("127.0.0.1", 38567), authkey=b"gs-opd-local")
+conn = Client(("127.0.0.1", args.bridge_port), authkey=b"gs-opd-local")
 steps = 0
 chunks = 0
 episode_reward_sum = 0.0
@@ -2581,6 +2599,7 @@ try:
                         video_frames=video_frames,
                         video_frame_encoder=get_video_frame,
                         candidate_id=args.bspline_candidate_id,
+                        pre_route_hold_actions=args.bspline_pre_route_hold_actions,
                         interpolate_left_001_to_004_fraction=(
                             args.bspline_left_001_toward_004_fraction
                         ),

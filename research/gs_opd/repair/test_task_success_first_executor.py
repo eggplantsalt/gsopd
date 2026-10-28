@@ -29,6 +29,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
     _native_region_progress_route,
+    _native_region_corridor_obstacle_clearance,
     _keypose_rrt_call_count,
     _native_region_entry_offset_m,
     _native_placement_planner_target,
@@ -43,8 +44,11 @@ from research.gs_opd.repair.task_success_first_executor import (
     _verified_runtime_snapshot_descriptor,
     _verify_planner_live_state,
     _transport_exception_outcome,
+    _native_episode_terminated,
     _task_success_waypoint_fallback_reason,
     _task_success_collision_route_policy,
+    _task_success_first_grasp_search_command,
+    _parse_args as _parse_task_success_executor_args,
 )
 from research.gs_opd.repair.task_success_first_grasp_search import BridgeSession
 from research.gs_opd.repair.task_success_first_grasp_search import (
@@ -52,11 +56,83 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
     _compress_eef_route_with_indices,
     _verified_resume_runtime_snapshot,
     _pose_tracking_error_within_tolerance,
+    _live_contact_pose_is_close_to_candidate,
+    _object_relative_target_pose,
     _pose_tracking_window_stagnated,
 )
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_candidate_start_index_is_validated_by_executor_cli(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", ["task_success_first_executor.py", "--candidate-start-index", "3"]):
+            args = _parse_task_success_executor_args()
+        self.assertEqual(args.candidate_start_index, 3)
+
+    def test_resume_and_exact_grasp_candidate_cli(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--candidate-start-index", "0",
+            "--resume-from-runtime-snapshot", "failed.pkl",
+            "--candidate-id", "geom111_jaw1_approach2_-1_flip+1",
+        ]):
+            args = _parse_task_success_executor_args()
+        self.assertEqual(args.resume_from_runtime_snapshot, Path("failed.pkl"))
+        self.assertEqual(args.candidate_id, "geom111_jaw1_approach2_-1_flip+1")
+
+    def test_native_region_route_variant_cli(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py",
+            "--native-region-route-variant", "keypose_side_region_progress",
+        ]):
+            args = _parse_task_success_executor_args()
+        self.assertEqual(args.native_region_route_variant, "keypose_side_region_progress")
+
+    def test_bounded_grasp_search_forwards_candidate_window_and_failure_reports(self):
+        from argparse import Namespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous_reports = [root / "attempt8.json", root / "attempt9.json"]
+            args = Namespace(
+                benchmark="obstacle_avoidance",
+                level=0,
+                task_id=0,
+                init_state=0,
+                seed=0,
+                camera_resolution=256,
+                expert_port=38570,
+                maximum_candidates=16,
+                candidate_start_index=0,
+                maximum_rrt_preflights=3,
+                maximum_physical_branches=3,
+                rrt_time_budget_s=12.0,
+                demonstration_horizon=1000,
+                resume_from_keypose_preflight_report=None,
+                experience_library=root / "experience.json",
+                previous_search_report=previous_reports,
+                candidate_id="geom111_jaw1_approach2_-1_flip+1",
+            )
+            command = _task_success_first_grasp_search_command(
+                args,
+                snapshot_root=root / "snapshots",
+                expert_root=root / "attempt10",
+                predicate=["on", "akita_black_bowl_1", "plate_1"],
+                resume_from_runtime_snapshot=root / "failed.pkl",
+            )
+
+        self.assertEqual(command[command.index("--candidate-start-index") + 1], "0")
+        self.assertEqual(command[command.index("--resume-from-runtime-snapshot") + 1], str(root / "failed.pkl"))
+        self.assertEqual(command[command.index("--candidate-id") + 1], "geom111_jaw1_approach2_-1_flip+1")
+        self.assertEqual(
+            [command[index + 1] for index, value in enumerate(command) if value == "--previous-search-report"],
+            [str(path.resolve()) for path in previous_reports],
+        )
+
     def test_collision_route_policy_removes_only_extra_clearance_margin(self):
         strict = {
             "source": "strict",
@@ -95,6 +171,14 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             route_variant="keypose_side_region_progress",
             keypose_side_region=np.asarray([0.0, 1.0]),
         )
+        positive = _native_region_progress_route(
+            start, goal, region=region,
+            route_variant="keypose_side_region_progress",
+        )
+        reverse = _native_region_progress_route(
+            start, goal, region=region,
+            route_variant="keypose_side_region_progress_reverse",
+        )
         self.assertTrue(direct["no_fixed_preplace_pose"])
         self.assertGreater(direct["adaptive_transit_height_region_m"], goal[2, 3] - 0.90)
         self.assertEqual(direct["waypoints"][0]["role"], "adaptive_clearance")
@@ -103,6 +187,14 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             "adaptive_clearance_with_keypose_side_detour",
         )
         np.testing.assert_allclose(side["waypoints"][-1]["object_pose_world"], goal)
+        midpoint_xy = (start[:2, 3] + goal[:2, 3]) * 0.5
+        line_xy = goal[:2, 3] - start[:2, 3]
+        positive_offset = np.asarray(positive["waypoints"][0]["object_pose_world"])[:2, 3] - midpoint_xy
+        reverse_offset = np.asarray(reverse["waypoints"][0]["object_pose_world"])[:2, 3] - midpoint_xy
+        positive_cross = line_xy[0] * positive_offset[1] - line_xy[1] * positive_offset[0]
+        reverse_cross = line_xy[0] * reverse_offset[1] - line_xy[1] * reverse_offset[0]
+        self.assertGreater(positive_cross, 0.0)
+        self.assertLess(reverse_cross, 0.0)
         np.testing.assert_allclose(direct["waypoints"][-1]["object_pose_world"], goal)
 
     def test_joint_limit_diagnostic_reports_the_measured_small_overage(self):
@@ -134,6 +226,13 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             "bilateral_grasp_lost_during_native_goal_transport",
         )
         self.assertIsNone(_transport_grasp_loss_reason(release))
+
+    def test_terminal_native_success_stops_before_withdrawal_or_settling_actions(self):
+        self.assertTrue(_native_episode_terminated({"done": True, "task_success": True}))
+        self.assertTrue(_native_episode_terminated({"done": True, "task_success": False}))
+        self.assertFalse(_native_episode_terminated({"done": False, "task_success": True}))
+        self.assertFalse(_native_episode_terminated({"task_success": True}))
+        self.assertFalse(_native_episode_terminated(None))
 
     def test_transport_budget_scales_past_legacy_360_cap_and_reserves_next_object(self):
         route = np.asarray([
@@ -452,6 +551,70 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         self.assertEqual(candidates[0]["orientation_source"], "compatible_completed_object_pose")
         np.testing.assert_allclose(candidates[0]["rotation_world"], occupied["target_root_pose_world"]["rotation"])
 
+    def test_object_support_region_ranks_centered_placement_first(self):
+        target = self._placement_context("object_b", [0.11, 0.02, 1.14])
+        candidates = _generate_native_region_placement_candidates(
+            predicate=["on", "object_b", "plate"],
+            region={
+                "site_position_world_m": [0.0, 0.0, 0.92],
+                "site_rotation_world": np.eye(3).tolist(),
+                "site_size_m": [0.07, 0.07, 0.0],
+                "support_geometry_kind": "compiled_object_collision_envelope",
+            },
+            target_context=target,
+            occupied_contexts=[],
+            maximum_candidates=4,
+        )
+        self.assertEqual(len(candidates), 4)
+        np.testing.assert_allclose(candidates[0]["region_local_xy_m"], [0.0, 0.0])
+        self.assertEqual(candidates[0]["support_centering_penalty_m"], 0.0)
+
+    def test_native_region_route_raises_above_measured_corridor_obstacles(self):
+        start = np.eye(4, dtype=np.float64)
+        goal = np.eye(4, dtype=np.float64)
+        goal[0, 3] = 1.0
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.0],
+            "site_rotation_world": np.eye(3).tolist(),
+            "site_size_m": [0.1, 0.1, 0.0],
+        }
+        obstacle = {
+            "object_id": "bottle",
+            "mapping_name": "objects_dict",
+            "root_position_world_m": [0.0, 0.0, 0.0],
+            "root_rotation_world": np.eye(3).tolist(),
+            "envelope_lower_root_m": [0.45, -0.05, 0.0],
+            "envelope_upper_root_m": [0.55, 0.05, 0.5],
+            "collision_geom_count": 1,
+        }
+        scene = {
+            "status": "complete",
+            "model_geometry_sha256": "model",
+            "objects": [obstacle],
+            "unavailable_objects": [],
+        }
+        clearance = _native_region_corridor_obstacle_clearance(
+            start_object_world=start,
+            goal_object_world=goal,
+            region=region,
+            target_context=self._placement_context("bowl", [0.0, 0.0, 0.0]),
+            object_to_eef=np.eye(4),
+            scene_envelopes=scene,
+            excluded_object_ids={"bowl", "plate"},
+            expected_model_sha256="model",
+        )
+        self.assertEqual([row["object_id"] for row in clearance["intersecting_objects"]], ["bottle"])
+        self.assertAlmostEqual(clearance["maximum_intersecting_obstacle_top_world_m"], 0.5)
+        self.assertAlmostEqual(clearance["required_transit_height_region_m"], 0.6)
+        route = _native_region_progress_route(
+            start,
+            goal,
+            region=region,
+            route_variant="direct_region_progress",
+            obstacle_clearance_height_region_m=clearance["required_transit_height_region_m"],
+        )
+        self.assertGreaterEqual(route["adaptive_transit_height_region_m"], 0.6)
+
     def test_placement_waypoint_stagnation_detection_keeps_progressing_routes(self):
         self.assertFalse(_pose_tracking_window_stagnated(
             [(0.10, 0.2), (0.09, 0.18), (0.08, 0.16), (0.07, 0.14)],
@@ -463,6 +626,67 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         ))
         self.assertFalse(_pose_tracking_error_within_tolerance(0.006, 0.05, 0.004, 0.045))
         self.assertTrue(_pose_tracking_error_within_tolerance(0.006, 0.05, 0.010, 0.10))
+
+    def test_live_contact_close_requires_candidate_pose_alignment(self):
+        current = np.eye(4, dtype=np.float64)
+        aligned_target = np.eye(4, dtype=np.float64)
+        aligned_target[:3, 3] = [0.003, 0.0, 0.0]
+        angle = 0.03
+        aligned_target[:3, :3] = [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        aligned, position_error, rotation_error = _live_contact_pose_is_close_to_candidate(
+            current, aligned_target,
+        )
+        self.assertTrue(aligned)
+        self.assertAlmostEqual(position_error, 0.003)
+        self.assertAlmostEqual(rotation_error, angle)
+
+        incidental_contact_pose = np.eye(4, dtype=np.float64)
+        incidental_contact_pose[:3, 3] = [0.1032, 0.0, 0.0]
+        incidental_contact_pose[:3, :3] = [
+            [np.cos(1.86), -np.sin(1.86), 0.0],
+            [np.sin(1.86), np.cos(1.86), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        aligned, position_error, rotation_error = _live_contact_pose_is_close_to_candidate(
+            current, incidental_contact_pose,
+        )
+        self.assertFalse(aligned)
+        self.assertAlmostEqual(position_error, 0.1032)
+        self.assertAlmostEqual(rotation_error, 1.86)
+
+    def test_object_relative_target_pose_tracks_live_object_state(self):
+        relative = np.eye(4, dtype=np.float64)
+        relative[:3, 3] = [0.02, 0.0, 0.0]
+        first_state = {
+            "object_states": {
+                "target": {
+                    "body_id": 23,
+                    "root_pos": [0.0, 0.0, 0.0],
+                    "root_quat": [1.0, 0.0, 0.0, 0.0],
+                },
+            },
+        }
+        second_state = {
+            "object_states": {
+                "target": {
+                    "body_id": 23,
+                    "root_pos": [0.01, 0.0, 0.0],
+                    "root_quat": [np.cos(0.05), 0.0, 0.0, np.sin(0.05)],
+                },
+            },
+        }
+        first_position, _ = _object_relative_target_pose(first_state, 23, relative)
+        second_position, _ = _object_relative_target_pose(second_state, 23, relative)
+        np.testing.assert_allclose(first_position, [0.02, 0.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(
+            second_position,
+            [0.01 + 0.02 * np.cos(0.1), 0.02 * np.sin(0.1), 0.0],
+            atol=1e-9,
+        )
 
     def test_planner_exception_is_not_misclassified_as_live_state_mutation(self):
         result = _verify_planner_live_state(

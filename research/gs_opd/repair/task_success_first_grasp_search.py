@@ -30,7 +30,7 @@ import time
 from collections import Counter
 from multiprocessing.connection import Client
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -47,7 +47,7 @@ from research.gs_opd.repair.task_success_first_search import (
     route_control_action_budget,
     route_signature,
     robot_contact_escape_direction,
-    unilateral_target_contact_sides,
+    target_finger_contact_sides,
 )
 from research.gs_opd.repair.task_skill_experience import (
     alternate_experience_approach_candidates,
@@ -70,12 +70,20 @@ DEFAULT_OUTPUT_ROOT = Path("/opt/data/private/gs_opd/rollouts")
 BRIDGE_AUTHKEY = b"gs-opd-local"
 EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION = 25
 MAX_GEOMETRY_CANDIDATES = 16
+MAX_OFFLINE_GEOMETRY_SCREEN_BATCH = 24
+MAX_OFFLINE_GEOMETRY_GENERATION = 48
 MAX_RRT_PREFLIGHTS = 8
 MAX_PHYSICAL_BRANCHES = 3
 MAX_BRANCH_CONTROL_ACTIONS = 440
 MAX_PREFIX_CONTROL_ACTIONS = 320
 MAX_APPROACH_CONTROL_ACTIONS = 60
 MAX_CLOSE_CONTROL_ACTIONS = 18
+MAX_LIVE_CONTACT_SETTLE_ACTIONS = 2
+LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S = 0.015
+LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S = 0.08
+LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES = 3
+LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M = 0.004
+LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD = 0.045
 MAX_LIFT_CONTROL_ACTIONS = 40
 MINIMUM_OBJECT_LIFT_M = 0.030
 LIFT_COMMAND_M = 0.040
@@ -151,8 +159,10 @@ def generate_geometry_candidates(
     context: dict[str, Any], *, maximum_candidates: int = MAX_GEOMETRY_CANDIDATES
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Enumerate opposing-pad grasps on the active target's compiled geometry."""
-    if isinstance(maximum_candidates, bool) or not 1 <= maximum_candidates <= MAX_GEOMETRY_CANDIDATES:
-        raise ValueError(f"maximum_candidates_must_be_in_1..{MAX_GEOMETRY_CANDIDATES}")
+    if isinstance(maximum_candidates, bool) or not 1 <= maximum_candidates <= MAX_OFFLINE_GEOMETRY_GENERATION:
+        raise ValueError(
+            f"maximum_candidates_must_be_in_1..{MAX_OFFLINE_GEOMETRY_GENERATION}"
+        )
     target_pose = _pose(
         context["target_root_pose_world"]["position_m"],
         context["target_root_pose_world"]["rotation"],
@@ -275,12 +285,596 @@ def generate_geometry_candidates(
     }
 
 
+def _candidate_window(
+    candidates: list[dict[str, Any]], *, start: int, count: int
+) -> list[dict[str, Any]]:
+    if isinstance(start, bool) or start < 0 or isinstance(count, bool) or count < 1:
+        raise ValueError("candidate_window_start_and_count_must_be_nonnegative_and_positive")
+    return candidates[start : start + count]
+
+
+def _candidate_generation_limit(args: argparse.Namespace) -> int:
+    """Generate the full pool when an exact candidate ID pins a pose."""
+    if args.candidate_id:
+        return MAX_OFFLINE_GEOMETRY_GENERATION
+    if args.strict_grasp_screen_only:
+        return int(args.candidate_start_index + args.maximum_candidates)
+    return int(args.maximum_candidates)
+
+
+def _combine_candidate_sources(
+    geometry_candidates: list[dict[str, Any]],
+    experience_candidates: list[dict[str, Any]],
+    *,
+    generation_limit: int,
+    requested_candidate_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Keep pinned IDs addressable even when experience poses fill the pool cap."""
+    if requested_candidate_ids:
+        requested = set(requested_candidate_ids)
+        by_id: dict[str, dict[str, Any]] = {}
+        for candidate in (*experience_candidates, *geometry_candidates):
+            candidate_id = str(candidate.get("candidate_id", ""))
+            if candidate_id in requested:
+                by_id.setdefault(candidate_id, candidate)
+        return [by_id[candidate_id] for candidate_id in requested_candidate_ids if candidate_id in by_id]
+    geometry_capacity = max(0, generation_limit - len(experience_candidates))
+    return [*experience_candidates, *geometry_candidates[:geometry_capacity]]
+
+
+def generate_grasp_tilt_variants(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    tilt_degrees: list[float],
+    rotation_axis: str = "jaw",
+) -> list[dict[str, Any]]:
+    """Rotate candidate orientation while anchoring its bilateral pad center."""
+    if rotation_axis not in {"jaw", "approach"}:
+        raise ValueError("grasp_orientation_rotation_axis_must_be_jaw_or_approach")
+    target_pose = np.asarray(target_pose_world, dtype=np.float64)
+    eef_position = np.asarray(eef_position_world, dtype=np.float64)
+    if target_pose.shape != (4, 4) or not np.isfinite(target_pose).all():
+        raise ValueError("grasp_tilt_target_pose_must_be_finite_4x4")
+    if eef_position.shape != (3,) or not np.isfinite(eef_position).all():
+        raise ValueError("grasp_tilt_eef_position_must_be_finite_xyz")
+    angles = [float(value) for value in tilt_degrees]
+    if (
+        not angles
+        or not np.isfinite(angles).all()
+        or any(abs(value) <= 1e-8 or abs(value) > 30.0 for value in angles)
+        or len(set(angles)) != len(angles)
+    ):
+        raise ValueError("grasp_tilt_angles_must_be_unique_nonzero_values_within_30_degrees")
+    variants = []
+    for candidate in candidates:
+        transform = np.asarray(candidate.get("object_to_eef"), dtype=np.float64)
+        pad_center = np.asarray(candidate.get("pad_center_eef_m_from_active_open_pose"), dtype=np.float64)
+        approach_distance = float(candidate.get("approach_distance_m", 0.0606))
+        if (
+            transform.shape != (4, 4)
+            or pad_center.shape != (3,)
+            or not np.isfinite(transform).all()
+            or not np.isfinite(pad_center).all()
+            or not np.isfinite(approach_distance)
+            or approach_distance <= 0.0
+        ):
+            raise ValueError("grasp_tilt_base_candidate_transform_or_pad_center_is_invalid")
+        original_rotation = transform[:3, :3]
+        object_pad_center = transform[:3, 3] + original_rotation @ pad_center
+        for angle in angles:
+            tilted = dict(candidate)
+            new_transform = transform.copy()
+            local_axis = "y" if rotation_axis == "jaw" else "z"
+            axis_rotation = Rotation.from_euler(local_axis, angle, degrees=True).as_matrix()
+            new_rotation = original_rotation @ axis_rotation
+            new_transform[:3, :3] = new_rotation
+            new_transform[:3, 3] = object_pad_center - new_rotation @ pad_center
+            direction = new_rotation[:, 2]
+            world_eef = target_pose @ new_transform
+            pregrasp_world = world_eef[:3, 3] - target_pose[:3, :3] @ direction * approach_distance
+            variant_label = "jaw_tilt" if rotation_axis == "jaw" else "approach_roll"
+            variant_id = f"{candidate['candidate_id']}__{variant_label}_{angle:+.1f}deg"
+            tilted.update({
+                "candidate_id": variant_id,
+                "source_candidate_id": str(candidate["candidate_id"]),
+                "object_to_eef": new_transform.tolist(),
+                "approach_direction_object": direction.tolist(),
+                "pregrasp_eef_distance_m": float(np.linalg.norm(pregrasp_world - eef_position)),
+                "candidate_source": str(candidate.get("candidate_source", "")) + "+jaw_axis_tilt_variant",
+                "orientation_perturbation": {
+                    "type": f"rotation_about_gripper_{rotation_axis}_axis",
+                    "angle_degrees": angle,
+                    "pad_center_anchor_preserved": True,
+                },
+            })
+            variants.append(tilted)
+    return variants
+
+
+def generate_grasp_roll_variants(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    roll_degrees: list[float],
+) -> list[dict[str, Any]]:
+    """Roll the jaw pair around the approach axis without shifting pad center."""
+    return generate_grasp_tilt_variants(
+        candidates,
+        target_pose_world=target_pose_world,
+        eef_position_world=eef_position_world,
+        tilt_degrees=roll_degrees,
+        rotation_axis="approach",
+    )
+
+
+def generate_grasp_surface_offset_variants(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    offset_object_mm: list[float],
+    offset_object_axis: str = "z",
+) -> list[dict[str, Any]]:
+    """Shift pad centers along one active-object axis while preserving contact orientation."""
+    target_pose = np.asarray(target_pose_world, dtype=np.float64)
+    eef_position = np.asarray(eef_position_world, dtype=np.float64)
+    offsets = [float(value) for value in offset_object_mm]
+    if offset_object_axis not in {"x", "y", "z"}:
+        raise ValueError("grasp_surface_offset_object_axis_must_be_x_y_or_z")
+    if target_pose.shape != (4, 4) or not np.isfinite(target_pose).all():
+        raise ValueError("grasp_surface_offset_target_pose_must_be_finite_4x4")
+    if eef_position.shape != (3,) or not np.isfinite(eef_position).all():
+        raise ValueError("grasp_surface_offset_eef_position_must_be_finite_xyz")
+    if (
+        not offsets
+        or not np.isfinite(offsets).all()
+        or any(abs(value) <= 1e-8 or abs(value) > 20.0 for value in offsets)
+        or len(set(offsets)) != len(offsets)
+    ):
+        raise ValueError("grasp_surface_offsets_must_be_unique_nonzero_values_within_20mm")
+    variants = []
+    for candidate in candidates:
+        transform = np.asarray(candidate.get("object_to_eef"), dtype=np.float64)
+        pad_center = np.asarray(candidate.get("pad_center_eef_m_from_active_open_pose"), dtype=np.float64)
+        approach = np.asarray(candidate.get("approach_direction_object"), dtype=np.float64)
+        approach_distance = float(candidate.get("approach_distance_m", 0.0606))
+        if (
+            transform.shape != (4, 4)
+            or pad_center.shape != (3,)
+            or approach.shape != (3,)
+            or not all(np.isfinite(value).all() for value in (transform, pad_center, approach))
+            or not np.isfinite(approach_distance)
+            or approach_distance <= 0.0
+        ):
+            raise ValueError("grasp_surface_offset_base_candidate_is_invalid")
+        for offset_mm in offsets:
+            tilted = dict(candidate)
+            new_transform = transform.copy()
+            axis_index = {"x": 0, "y": 1, "z": 2}[offset_object_axis]
+            delta = np.zeros(3, dtype=np.float64)
+            delta[axis_index] = offset_mm / 1000.0
+            new_transform[:3, 3] += delta
+            world_eef = target_pose @ new_transform
+            approach_world = target_pose[:3, :3] @ (approach / np.linalg.norm(approach))
+            pregrasp_world = world_eef[:3, 3] - approach_world * approach_distance
+            tilted.update({
+                "candidate_id": (
+                    f"{candidate['candidate_id']}__object_{offset_object_axis}_{offset_mm:+.1f}mm"
+                ),
+                "source_candidate_id": str(candidate["candidate_id"]),
+                "object_to_eef": new_transform.tolist(),
+                "pregrasp_eef_distance_m": float(np.linalg.norm(pregrasp_world - eef_position)),
+                "candidate_source": (
+                    str(candidate.get("candidate_source", ""))
+                    + f"+object_surface_{offset_object_axis}_offset"
+                ),
+                "surface_contact_offset": {
+                    "object_axis": offset_object_axis,
+                    "offset_mm": offset_mm,
+                    "rotation_preserved": True,
+                },
+            })
+            variants.append(tilted)
+    return variants
+
+
+def generate_grasp_coupled_tilt_offset_variants(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    tilt_degrees: list[float],
+    rotation_axis: str,
+    offset_object_mm: list[float],
+    offset_object_axis: str,
+) -> list[dict[str, Any]]:
+    """Combine a pad-center-anchored wrist rotation with one object-frame shift axis."""
+    return generate_grasp_coupled_pose_grid_variants(
+        candidates,
+        target_pose_world=target_pose_world,
+        eef_position_world=eef_position_world,
+        tilt_degrees=tilt_degrees,
+        rotation_axis=rotation_axis,
+        offsets_by_object_axis={offset_object_axis: offset_object_mm},
+    )
+
+
+def generate_grasp_coupled_pose_grid_variants(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    tilt_degrees: list[float],
+    rotation_axis: str,
+    offsets_by_object_axis: dict[str, list[float]],
+) -> list[dict[str, Any]]:
+    """Generate a bounded Cartesian grid of wrist rotations and object-frame shifts."""
+    if not candidates:
+        raise ValueError("coupled_grasp_perturbations_require_base_candidates")
+    if not isinstance(offsets_by_object_axis, dict) or not offsets_by_object_axis:
+        raise ValueError("coupled_grasp_perturbations_require_object_frame_offsets")
+    if any(axis not in {"x", "y", "z"} for axis in offsets_by_object_axis):
+        raise ValueError("coupled_grasp_offset_axes_must_be_x_y_or_z")
+    oriented = generate_grasp_tilt_variants(
+        candidates,
+        target_pose_world=target_pose_world,
+        eef_position_world=eef_position_world,
+        tilt_degrees=tilt_degrees,
+        rotation_axis=rotation_axis,
+    )
+    for candidate in oriented:
+        candidate["_coupled_base_candidate_id"] = str(candidate.get("source_candidate_id", ""))
+        candidate["_coupled_offsets_by_axis"] = {}
+    coupled = oriented
+    for axis in ("x", "y", "z"):
+        if axis not in offsets_by_object_axis:
+            continue
+        coupled = generate_grasp_surface_offset_variants(
+            coupled,
+            target_pose_world=target_pose_world,
+            eef_position_world=eef_position_world,
+            offset_object_mm=offsets_by_object_axis[axis],
+            offset_object_axis=axis,
+        )
+        for variant in coupled:
+            offsets = dict(variant["_coupled_offsets_by_axis"])
+            offsets[axis] = float(variant["surface_contact_offset"]["offset_mm"])
+            variant["_coupled_offsets_by_axis"] = offsets
+    for variant in coupled:
+        orientation_candidate_id = next(
+            str(variant["candidate_id"]).split(f"__object_{axis}_", 1)[0]
+            for axis in ("x", "y", "z")
+            if f"__object_{axis}_" in str(variant["candidate_id"])
+        )
+        base_candidate_id = str(variant.pop("_coupled_base_candidate_id"))
+        offsets = dict(variant.pop("_coupled_offsets_by_axis"))
+        variant["source_candidate_id"] = base_candidate_id
+        variant["coupled_surface_contact_offsets"] = {
+            "object_axes_mm": offsets,
+            "rotation_preserved_after_offsets": True,
+        }
+        variant["coupled_pose_perturbation"] = {
+            "base_candidate_id": base_candidate_id,
+            "orientation_candidate_id": orientation_candidate_id,
+            "composition_order": "rotate_about_gripper_axis_then_translate_in_object_frame_axes",
+        }
+    return coupled
+
+
+def load_historical_grasp_pose_prior_candidates(
+    path: Path,
+    *,
+    benchmark: str,
+    level: int,
+    task_id: int,
+    init_state: int,
+    seed: int,
+    target_object_id: str,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    active_pad_center_eef_m: np.ndarray,
+    maximum_candidates: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load task-matched grasp poses recomputed from hashed physical-state samples."""
+    path = Path(path).resolve()
+    prior_set = json.loads(path.read_text(encoding="utf-8"))
+    if prior_set.get("schema_version") != "gs_opd_historical_grasp_pose_priors.v1":
+        raise ValueError("historical_grasp_pose_prior_schema_version_mismatch")
+    expected_task = {
+        "benchmark": benchmark,
+        "level": int(level),
+        "task_id": int(task_id),
+        "init_state": int(init_state),
+        "seed": int(seed),
+        "target_object_id": target_object_id,
+    }
+    if prior_set.get("task") != expected_task:
+        raise ValueError("historical_grasp_pose_prior_task_identity_mismatch")
+    if prior_set.get("safety_qualification_inherited") is not False:
+        raise ValueError("historical_grasp_pose_prior_must_not_inherit_safety_qualification")
+    source_rows = prior_set.get("source_episodes")
+    candidate_rows = prior_set.get("candidates")
+    if not isinstance(source_rows, list) or not source_rows or not isinstance(candidate_rows, list):
+        raise ValueError("historical_grasp_pose_prior_sources_or_candidates_missing")
+    if not 1 <= len(candidate_rows) <= int(maximum_candidates):
+        raise ValueError("historical_grasp_pose_prior_candidate_count_exceeds_search_budget")
+
+    source_by_id: dict[str, dict[str, Any]] = {}
+    for source in source_rows:
+        source_id = str(source.get("source_episode_id", ""))
+        if not source_id or source_id in source_by_id:
+            raise ValueError("historical_grasp_pose_prior_source_episode_id_invalid")
+        trajectory = Path(str(source.get("trajectory_npz", ""))).resolve()
+        expected_sha = str(source.get("trajectory_npz_sha256", ""))
+        if not trajectory.is_file() or _sha256_file(trajectory) != expected_sha:
+            raise ValueError(f"historical_grasp_pose_source_npz_sha256_mismatch:{source_id}")
+        result_path = Path(str(source.get("result_json", ""))).resolve()
+        if not result_path.is_file() or _sha256_file(result_path) != source.get("result_json_sha256"):
+            raise ValueError(f"historical_grasp_pose_source_result_sha256_mismatch:{source_id}")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("success_once") is not True or result.get("done") is not True:
+            raise ValueError(f"historical_grasp_pose_source_not_native_success:{source_id}")
+        if source.get("native_task_success") is not True:
+            raise ValueError(f"historical_grasp_pose_source_success_attestation_missing:{source_id}")
+        if source.get("safety_qualification_inherited") is not False:
+            raise ValueError(f"historical_grasp_pose_source_safety_label_inheritance_forbidden:{source_id}")
+        contact_report_path = Path(str(source.get("contact_evidence_report", ""))).resolve()
+        if (
+            not contact_report_path.is_file()
+            or _sha256_file(contact_report_path) != source.get("contact_evidence_report_sha256")
+        ):
+            raise ValueError(f"historical_grasp_pose_source_contact_report_sha256_mismatch:{source_id}")
+        evaluation_path = Path(str(source.get("evaluation_report_json", ""))).resolve()
+        if (
+            not evaluation_path.is_file()
+            or _sha256_file(evaluation_path) != source.get("evaluation_report_json_sha256")
+        ):
+            raise ValueError(f"historical_grasp_pose_source_evaluation_report_sha256_mismatch:{source_id}")
+        evaluation_report = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        evaluation_task = evaluation_report.get("task", {})
+        evaluation_model = evaluation_report.get("model", {})
+        if (
+            evaluation_task.get("level") != int(level)
+            or evaluation_task.get("task_id") != int(task_id)
+            or evaluation_task.get("initial_state_index") != int(init_state)
+            or benchmark not in str(evaluation_task.get("suite", ""))
+            or evaluation_model.get("base_checkpoint") != source.get("base_checkpoint_path")
+            or evaluation_model.get("adapter_sha256") != source.get("adapter_sha256")
+        ):
+            raise ValueError(f"historical_grasp_pose_source_model_or_task_identity_mismatch:{source_id}")
+        if not (
+            evaluation_model.get("adapter_loaded_during_rollout") is True
+            or evaluation_model.get("adapter_loaded_marker") is True
+        ):
+            raise ValueError(f"historical_grasp_pose_source_adapter_load_unverified:{source_id}")
+        with np.load(trajectory, allow_pickle=False) as trace:
+            if "metadata_json" not in trace or "step_dones" not in trace:
+                raise ValueError(f"historical_grasp_pose_source_trace_fields_missing:{source_id}")
+            metadata = json.loads(str(trace["metadata_json"].item()))
+            dones = np.asarray(trace["step_dones"], dtype=bool)
+            actual = {
+                "suite": metadata.get("suite"),
+                "level": metadata.get("level"),
+                "task_id": metadata.get("task_id"),
+                "initial_state_index": metadata.get("initial_state_index"),
+                "env_seed": metadata.get("env_seed"),
+                "action_dim": metadata.get("action_dim"),
+                "steps": metadata.get("steps"),
+            }
+            required = {
+                "suite": benchmark,
+                "level": int(level),
+                "task_id": int(task_id),
+                "initial_state_index": int(init_state),
+                "env_seed": int(seed),
+                "action_dim": 7,
+                "steps": int(source.get("steps", -1)),
+            }
+            if (
+                actual != required
+                or metadata.get("checkpoint_path") != source.get("base_checkpoint_path")
+                or metadata.get("lora_checkpoint_path") != source.get("lora_adapter_path")
+                or not len(dones) or not bool(dones[-1])
+            ):
+                raise ValueError(f"historical_grasp_pose_source_trace_identity_mismatch:{source_id}")
+        if source.get("strict_safety_qualified") is True:
+            raise ValueError(f"historical_grasp_pose_source_qualification_must_remain_episode_local:{source_id}")
+        source_by_id[source_id] = {
+            "source_episode_id": source_id,
+            "trajectory_npz": str(trajectory),
+            "trajectory_npz_sha256": expected_sha,
+            "result_json": str(result_path),
+            "result_json_sha256": source["result_json_sha256"],
+            "evaluation_report_json": str(evaluation_path),
+            "evaluation_report_json_sha256": source["evaluation_report_json_sha256"],
+            "contact_evidence_report": str(contact_report_path),
+            "contact_evidence_report_sha256": source["contact_evidence_report_sha256"],
+            "base_checkpoint_path": source["base_checkpoint_path"],
+            "base_checkpoint_sha256": source.get("base_checkpoint_sha256"),
+            "lora_adapter_path": source["lora_adapter_path"],
+            "adapter_sha256": source["adapter_sha256"],
+            "steps": int(source["steps"]),
+            "native_task_success": True,
+            "strict_safety_qualified": False,
+            "safety_qualification_inherited": False,
+        }
+
+    target_pose = np.asarray(target_pose_world, dtype=np.float64)
+    eef_position = np.asarray(eef_position_world, dtype=np.float64)
+    pad_center = np.asarray(active_pad_center_eef_m, dtype=np.float64)
+    if (
+        target_pose.shape != (4, 4)
+        or not np.isfinite(target_pose).all()
+        or any(arr.shape != shape or not np.isfinite(arr).all() for arr, shape in (
+            (eef_position, (3,)), (pad_center, (3,))
+        ))
+    ):
+        raise ValueError("historical_grasp_pose_active_scene_context_invalid")
+
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in candidate_rows:
+        candidate_id = str(row.get("candidate_id", ""))
+        source_id = str(row.get("source_episode_id", ""))
+        if not candidate_id or candidate_id in seen_ids or source_id not in source_by_id:
+            raise ValueError("historical_grasp_pose_candidate_id_or_source_invalid")
+        seen_ids.add(candidate_id)
+        window = row.get("stable_grasp_window_control_steps")
+        samples = row.get("physical_pose_samples")
+        if (
+            not isinstance(window, list) or len(window) != 2
+            or not isinstance(samples, list) or len(samples) < 3
+            or row.get("bilateral_pad_contact_verified") is not True
+            or row.get("object_lift_verified") is not True
+        ):
+            raise ValueError(f"historical_grasp_pose_contact_lift_evidence_missing:{candidate_id}")
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in window):
+            raise ValueError(f"historical_grasp_pose_window_indices_invalid:{candidate_id}")
+        sample_indices = [sample.get("control_step_index") for sample in samples]
+        if (
+            sample_indices != list(range(window[0], window[1] + 1))
+            or window[1] >= source_by_id[source_id]["steps"]
+        ):
+            raise ValueError(f"historical_grasp_pose_samples_not_contiguous:{candidate_id}")
+        contact_evidence = row.get("bilateral_pad_contact_evidence")
+        lift_evidence = row.get("object_lift_evidence")
+        if (
+            not isinstance(contact_evidence, dict)
+            or contact_evidence.get("left_pad_first_control_step") is None
+            or contact_evidence.get("right_pad_first_control_step") is None
+            or max(
+                int(contact_evidence["left_pad_first_control_step"]),
+                int(contact_evidence["right_pad_first_control_step"]),
+            ) > window[0]
+            or not isinstance(lift_evidence, dict)
+        ):
+            raise ValueError(f"historical_grasp_pose_bilateral_contact_evidence_invalid:{candidate_id}")
+        lift_threshold = float(lift_evidence.get("threshold_m", 0.03))
+        initial_object_z = float(lift_evidence.get("initial_object_root_z_m", float("nan")))
+        if not np.isfinite(lift_threshold) or lift_threshold < 0.03 or not np.isfinite(initial_object_z):
+            raise ValueError(f"historical_grasp_pose_lift_evidence_invalid:{candidate_id}")
+        transforms = []
+        sample_object_z = []
+        for sample in samples:
+            try:
+                object_pos = np.asarray(sample["object_root_position_world_m"], dtype=np.float64)
+                object_quat = np.asarray(sample["object_root_quaternion_world_wxyz"], dtype=np.float64)
+                eef_pos = np.asarray(sample["eef_position_world_m"], dtype=np.float64)
+                eef_quat = np.asarray(sample["eef_quaternion_world_wxyz"], dtype=np.float64)
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"historical_grasp_pose_sample_fields_invalid:{candidate_id}") from exc
+            if (
+                object_pos.shape != (3,) or eef_pos.shape != (3,)
+                or object_quat.shape != (4,) or eef_quat.shape != (4,)
+                or not all(np.isfinite(value).all() for value in (
+                    object_pos, object_quat, eef_pos, eef_quat
+                ))
+                or np.linalg.norm(object_quat) < 1e-8
+                or np.linalg.norm(eef_quat) < 1e-8
+            ):
+                raise ValueError(f"historical_grasp_pose_sample_pose_invalid:{candidate_id}")
+            object_transform = np.eye(4, dtype=np.float64)
+            object_transform[:3, :3] = Rotation.from_quat(
+                object_quat[[1, 2, 3, 0]] / np.linalg.norm(object_quat)
+            ).as_matrix()
+            object_transform[:3, 3] = object_pos
+            sample_object_z.append(float(object_pos[2]))
+            eef_transform = np.eye(4, dtype=np.float64)
+            eef_transform[:3, :3] = Rotation.from_quat(
+                eef_quat[[1, 2, 3, 0]] / np.linalg.norm(eef_quat)
+            ).as_matrix()
+            eef_transform[:3, 3] = eef_pos
+            transforms.append(np.linalg.inv(object_transform) @ eef_transform)
+        if sample_object_z[0] - initial_object_z < lift_threshold:
+            raise ValueError(f"historical_grasp_pose_lift_threshold_not_met:{candidate_id}")
+        translation = np.mean([transform[:3, 3] for transform in transforms], axis=0)
+        rotation_mean = np.mean([transform[:3, :3] for transform in transforms], axis=0)
+        u, _, vt = np.linalg.svd(rotation_mean)
+        rotation = u @ np.diag([1.0, 1.0, np.linalg.det(u @ vt)]) @ vt
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = translation
+
+        approach_evidence = row.get("approach_direction_evidence")
+        if not isinstance(approach_evidence, dict):
+            raise ValueError(f"historical_grasp_approach_evidence_missing:{candidate_id}")
+        def relative_eef_position(sample: dict[str, Any]) -> np.ndarray:
+            object_pos = np.asarray(sample["object_root_position_world_m"], dtype=np.float64)
+            object_quat = np.asarray(sample["object_root_quaternion_world_wxyz"], dtype=np.float64)
+            eef_pos = np.asarray(sample["eef_position_world_m"], dtype=np.float64)
+            object_rotation = Rotation.from_quat(
+                object_quat[[1, 2, 3, 0]] / np.linalg.norm(object_quat)
+            ).as_matrix()
+            return object_rotation.T @ (eef_pos - object_pos)
+        approach_start = approach_evidence.get("start_pose")
+        approach_end = approach_evidence.get("end_pose")
+        if not isinstance(approach_start, dict) or not isinstance(approach_end, dict):
+            raise ValueError(f"historical_grasp_approach_samples_missing:{candidate_id}")
+        first_gripper_contact = int(row.get("first_gripper_target_contact_control_step", -1))
+        approach_start_index = int(approach_start.get("control_step_index", -1))
+        approach_end_index = int(approach_end.get("control_step_index", -1))
+        if not 0 <= approach_start_index < approach_end_index < first_gripper_contact:
+            raise ValueError(f"historical_grasp_approach_not_contact_free_prefix:{candidate_id}")
+        approach = relative_eef_position(approach_end) - relative_eef_position(approach_start)
+        approach_norm = float(np.linalg.norm(approach))
+        if approach_norm < 1e-5:
+            raise ValueError(f"historical_grasp_approach_direction_degenerate:{candidate_id}")
+        approach /= approach_norm
+        if row.get("approach_direction_object") is not None:
+            recorded = np.asarray(row["approach_direction_object"], dtype=np.float64)
+            if recorded.shape != (3,) or not np.isfinite(recorded).all() or not np.allclose(
+                recorded / max(float(np.linalg.norm(recorded)), 1e-12), approach, atol=2e-4
+            ):
+                raise ValueError(f"historical_grasp_approach_direction_mismatch:{candidate_id}")
+        approach_distance = float(row.get("approach_distance_m", 0.0606))
+        if not np.isfinite(approach_distance) or not 0.02 <= approach_distance <= 0.12:
+            raise ValueError(f"historical_grasp_approach_distance_invalid:{candidate_id}")
+        world_eef = target_pose @ transform
+        pregrasp = world_eef[:3, 3] - target_pose[:3, :3] @ approach * approach_distance
+        candidates.append({
+            "candidate_id": candidate_id,
+            "candidate_source": "hashed_success_episode_object_relative_grasp_pose_prior",
+            "source_candidate_id": candidate_id,
+            "source_episode_id": source_id,
+            "source_episode": source_by_id[source_id],
+            "object_to_eef": transform.tolist(),
+            "approach_direction_object": approach.tolist(),
+            "approach_distance_m": approach_distance,
+            "pregrasp_eef_distance_m": float(np.linalg.norm(pregrasp - eef_position)),
+            "pad_center_eef_m_from_active_open_pose": pad_center.tolist(),
+            "ik_seed_qpos": [],
+            "jaw_axis_index_in_geom": -1,
+            "approach_axis_index_in_geom": -1,
+            "approach_sign": 0,
+            "jaw_sign": 0,
+            "historical_episode_stable_bilateral_grasp_prior_used": True,
+            "historical_source_episode_qualification_inherited": False,
+            "source_stable_grasp_window_control_steps": [int(window[0]), int(window[1])],
+            "source_bilateral_pad_contact_evidence": row["bilateral_pad_contact_evidence"],
+            "source_object_lift_evidence": row["object_lift_evidence"],
+        })
+    return candidates, {
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "schema_version": prior_set["schema_version"],
+        "task_identity_verified": True,
+        "source_episode_count": len(source_by_id),
+        "candidate_count": len(candidates),
+        "source_action_replay": False,
+        "source_safety_qualification_inherited": False,
+    }
+
+
 class BridgeSession:
     _READ_ONLY_RECONNECT_OPS = frozenset({
         "observe", "native_task_status", "native_goal_query", "inspect_contacts",
         "grasp_state", "geometry_inventory", "gripper_geometry_inventory",
         "task_semantic_geometry_bindings", "repair_context",
         "task_success_first_context", "task_success_first_articulation_context",
+        "task_scene_object_collision_envelopes",
         "robot_joint_limit_inventory", "compiled_model_fingerprint_details",
         "trajectory_tracking_capabilities", "scratch_robot_fk_audit",
         "scratch_carried_geom_distance_audit",
@@ -488,6 +1082,53 @@ def _runtime_eef_pose(snapshot_state: dict[str, Any]) -> np.ndarray:
     return _pose(robot.get("eef_pos"), rotation)
 
 
+def _object_relative_target_pose(
+    snapshot_state: dict[str, Any],
+    target_body_id: int,
+    object_to_target: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    target_transform = _runtime_object_pose(
+        _object_state(snapshot_state, target_body_id)
+    ) @ np.asarray(object_to_target, dtype=np.float64)
+    return target_transform[:3, 3], _wxyz(target_transform[:3, :3])
+
+
+def _pose_tracking_error_components(
+    current_pose: np.ndarray,
+    target_pose: np.ndarray,
+) -> tuple[float, float]:
+    current_pose = np.asarray(current_pose, dtype=np.float64)
+    target_pose = np.asarray(target_pose, dtype=np.float64)
+    if (
+        current_pose.shape != (4, 4)
+        or target_pose.shape != (4, 4)
+        or not np.isfinite(current_pose).all()
+        or not np.isfinite(target_pose).all()
+    ):
+        raise ValueError("pose_tracking_error_requires_finite_4x4_poses")
+    position_error = float(np.linalg.norm(target_pose[:3, 3] - current_pose[:3, 3]))
+    rotation_error = float(np.linalg.norm(Rotation.from_matrix(
+        target_pose[:3, :3] @ current_pose[:3, :3].T
+    ).as_rotvec()))
+    return position_error, rotation_error
+
+
+def _live_contact_pose_is_close_to_candidate(
+    current_pose: np.ndarray,
+    target_pose: np.ndarray,
+) -> tuple[bool, float, float]:
+    position_error, rotation_error = _pose_tracking_error_components(
+        current_pose, target_pose,
+    )
+    aligned = _pose_tracking_error_within_tolerance(
+        position_error,
+        rotation_error,
+        LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
+        LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
+    )
+    return aligned, position_error, rotation_error
+
+
 def _learned_grasp_template(
     candidate: dict[str, Any],
     branch: dict[str, Any],
@@ -664,6 +1305,138 @@ def _build_safety_policy(context: dict[str, Any], semantic: dict[str, Any], geom
     }
 
 
+def _build_bddl_grasp_screen_policy(
+    context: dict[str, Any],
+    semantic: dict[str, Any],
+    geometry: dict[str, Any],
+    bddl_text: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a scratch-screen policy from the active BDDL contact constraints."""
+    from research.gs_opd.repair.automatic_recovery_runtime import _parse_bddl_entities
+
+    _fixtures, _objects, forbidden_robot, forbidden_pairs, goal_targets = _parse_bddl_entities(bddl_text)
+    target_id = str(context["target_object_id"])
+    if target_id not in goal_targets or not forbidden_robot:
+        raise ValueError("active_BDDL_screen_policy_has_no_target_or_robot_contact_constraints")
+    bindings = semantic.get("bindings", {})
+    required = set(forbidden_robot) | set(goal_targets) | {
+        name for pair in forbidden_pairs for name in pair
+    }
+    missing = sorted(required - set(bindings))
+    if missing:
+        raise ValueError(f"active_BDDL_screen_policy_entities_are_unbound:{missing}")
+
+    groups_by_name: dict[str, dict[str, Any]] = {}
+    categories = {
+        "forbidden_objects": [],
+        "allowed_target_objects": [],
+        "other_scene_objects": [],
+    }
+    covered_bodies: set[int] = set()
+    for object_id, binding in bindings.items():
+        body_ids = sorted(int(value) for value in binding.get("collision_body_ids", []))
+        geom_ids = sorted(int(value) for value in binding.get("geom_ids", []))
+        if not body_ids or not geom_ids:
+            if object_id in required:
+                raise ValueError(f"active_BDDL_screen_policy_entity_has_no_collision_geometry:{object_id}")
+            continue
+        category = (
+            "forbidden_objects" if object_id in forbidden_robot
+            else "allowed_target_objects" if object_id in goal_targets
+            else "other_scene_objects"
+        )
+        margin = 0.010 if category != "other_scene_objects" else 0.0
+        group = {
+            "object_id": str(object_id),
+            "body_ids": body_ids,
+            "body_names": [str(value) for value in binding.get("collision_body_names", [])],
+            "geom_ids": geom_ids,
+            "minimum_clearance_m": margin,
+        }
+        if len(group["body_names"]) != len(body_ids):
+            raise ValueError(f"active_BDDL_screen_policy_body_names_incomplete:{object_id}")
+        categories[category].append(group)
+        groups_by_name[str(object_id)] = group
+        covered_bodies.update(body_ids)
+
+    scene_geoms = [
+        item for item in geometry.get("geometries", [])
+        if item.get("collision_enabled") is True and item.get("category") == "scene"
+    ]
+    all_scene_bodies = {int(item["body_id"]) for item in scene_geoms}
+    residual_bodies = sorted(all_scene_bodies - covered_bodies)
+    if residual_bodies:
+        body_names = {
+            int(item["body_id"]): str(item["body_name"])
+            for item in geometry.get("bodies", [])
+        }
+        residual_geom_ids = sorted(
+            int(item["geom_id"]) for item in scene_geoms
+            if int(item["body_id"]) in set(residual_bodies)
+        )
+        categories["other_scene_objects"].append({
+            "object_id": "unmapped_scene_environment",
+            "body_ids": residual_bodies,
+            "body_names": [body_names.get(value, f"body_{value}") for value in residual_bodies],
+            "geom_ids": residual_geom_ids,
+            "minimum_clearance_m": 0.0,
+        })
+    if not categories["forbidden_objects"] or not categories["allowed_target_objects"]:
+        raise ValueError("active_BDDL_screen_policy_collision_groups_are_incomplete")
+
+    target_binding = bindings[target_id]
+    pad_geom_ids = sorted({
+        int(item["geom_id"])
+        for side in context["fingertip_pad_geometries"].values()
+        for item in side
+    })
+    if len(pad_geom_ids) != 2:
+        raise ValueError("strict_grasp_screen_requires_two_active_Panda_fingertip_pad_geometries")
+    allowed_pairs = [
+        {
+            "robot_geom_id": pad_id,
+            "scene_geom_id": int(scene_id),
+            "minimum_clearance_m": -0.002,
+        }
+        for pad_id in pad_geom_ids
+        for scene_id in target_binding["geom_ids"]
+    ]
+    normalized_forbidden_pairs = []
+    for object_a, object_b in forbidden_pairs:
+        if object_a not in groups_by_name or object_b not in groups_by_name:
+            raise ValueError(f"active_BDDL_forbidden_pair_has_unclassified_geometry:{object_a}:{object_b}")
+        a, b = groups_by_name[object_a], groups_by_name[object_b]
+        normalized_forbidden_pairs.append({
+            "object_id_a": object_a,
+            "object_id_b": object_b,
+            "body_ids_a": a["body_ids"],
+            "body_ids_b": b["body_ids"],
+            "geom_ids_a": a["geom_ids"],
+            "geom_ids_b": b["geom_ids"],
+        })
+    policy = {
+        "source": "active_BDDL_CheckRobotContact_CheckContact_candidate_screen_only",
+        "minimum_clearance_m": 0.010,
+        "forbidden_objects": categories["forbidden_objects"],
+        "allowed_target_objects": categories["allowed_target_objects"],
+        "other_scene_objects": categories["other_scene_objects"],
+        "allowed_contact_pairs": allowed_pairs,
+        "forbidden_object_pairs": normalized_forbidden_pairs,
+        "allowed_carried_support_contact_geom_ids": [],
+        "carried_object": None,
+    }
+    semantics = {
+        "forbidden_robot_contact_objects": sorted(forbidden_robot),
+        "forbidden_object_contact_pairs": [list(pair) for pair in forbidden_pairs],
+        "goal_target_objects": sorted(goal_targets),
+        "support_contacts_added_as_exceptions": False,
+        "source_and_goal_support_semantics": "recorded from BDDL relations; no additional support exception is introduced by this candidate screen",
+        "nonpad_target_clearance_m": 0.010,
+        "authorized_pad_target_penetration_m": -0.002,
+    }
+    return policy, semantics
+
+
 def _record_step(
     bridge: BridgeSession,
     action: np.ndarray,
@@ -696,16 +1469,7 @@ def _record_step(
         grasp = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
     sample = monitor.update(grasp, rollout_step=action_index)
     contact_monitoring = reply.get("contact_monitoring", {})
-    substeps = contact_monitoring.get("geometry_monitoring", {}).get("substeps", [])
-    expected = contact_monitoring.get("expected_physics_substeps_per_control_step")
-    captured = contact_monitoring.get("captured_physics_substeps")
-    monitoring_complete = not bool(
-        contact_monitoring.get("status") != "complete"
-        or expected != EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION
-        or captured != EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION
-        or len(substeps) != EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION
-        or any(item.get("status") != "complete" for item in substeps)
-    )
+    monitoring_complete = _contact_substep_monitoring_complete(contact_monitoring)
     snapshot_state = reply.get("snapshot_state", {})
     record = {
         "candidate_id": candidate_id,
@@ -751,6 +1515,50 @@ def _record_step(
         raise RuntimeError("environment_done_during_grasp_only_branch")
 
 
+def _contact_substep_monitoring_complete(contact_monitoring: dict[str, Any]) -> bool:
+    """Check observation coverage separately from the observed safety verdict.
+
+    The Safety Bridge marks measured geometry samples as ``unsafe`` when a
+    clearance/contact rule is violated. Those samples are still present and
+    must not be counted as missing monitoring.
+    """
+    if not isinstance(contact_monitoring, dict):
+        return False
+    expected = EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION
+    if (
+        contact_monitoring.get("status") != "complete"
+        or contact_monitoring.get("expected_physics_substeps_per_control_step") != expected
+        or contact_monitoring.get("captured_physics_substeps") != expected
+        or contact_monitoring.get("unobserved_expected_substeps", 0) != 0
+        or contact_monitoring.get("unavailable_contact_substeps", 0) != 0
+    ):
+        return False
+    control_steps = contact_monitoring.get("control_steps")
+    if not isinstance(control_steps, list) or len(control_steps) != 1:
+        return False
+    for step in control_steps:
+        if (
+            step.get("status") != "complete"
+            or step.get("expected_physics_substeps") != expected
+            or step.get("captured_physics_substeps") != expected
+            or step.get("unobserved_expected_substeps", 0) != 0
+            or step.get("capture_error") is not None
+        ):
+            return False
+    geometry = contact_monitoring.get("geometry_monitoring", {})
+    substeps = geometry.get("substeps", []) if isinstance(geometry, dict) else []
+    complete_geometry_statuses = {"complete", "unsafe"}
+    return bool(
+        geometry.get("status") in complete_geometry_statuses
+        and len(substeps) == expected
+        and all(
+            isinstance(item, dict)
+            and item.get("status") in complete_geometry_statuses
+            for item in substeps
+        )
+    )
+
+
 def _advance_pose(
     bridge: BridgeSession,
     target_position: np.ndarray,
@@ -772,6 +1580,9 @@ def _advance_pose(
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
     planning_tracking: dict[str, Any] | None = None,
+    target_pose_provider: Callable[
+        [dict[str, Any]], tuple[np.ndarray, np.ndarray]
+    ] | None = None,
     absolute_action_limit: int | None = MAX_BRANCH_CONTROL_ACTIONS,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
@@ -793,6 +1604,19 @@ def _advance_pose(
         if stop_condition is not None and stop_condition():
             return False
         observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+        if target_pose_provider is not None:
+            target_position, target_quaternion = target_pose_provider(
+                observed.get("snapshot_state", {})
+            )
+            target_position = np.asarray(target_position, dtype=np.float64)
+            target_quaternion = np.asarray(target_quaternion, dtype=np.float64)
+            if (
+                target_position.shape != (3,)
+                or target_quaternion.shape != (4,)
+                or not np.isfinite(target_position).all()
+                or not np.isfinite(target_quaternion).all()
+            ):
+                raise ValueError("dynamic_target_pose_provider_returned_invalid_pose")
         robot = observed["snapshot_state"]["robot_states"][0]
         current_position = np.asarray(robot["eef_pos"], dtype=np.float64)
         current_quaternion = np.asarray(robot["eef_quat"], dtype=np.float64)
@@ -992,30 +1816,122 @@ def _run_physical_branch(
         @ np.asarray(candidate["object_to_eef"], dtype=np.float64)
     )
     initial_eef_world = _runtime_eef_pose(initial_runtime_state)
-    initial_grasp_distance_m = float(np.linalg.norm(
-        initial_eef_world[:3, 3] - initial_grasp_world[:3, 3]
-    ))
-    unilateral_sides = unilateral_target_contact_sides(initial_grasp_state)
-    close_from_live_contact = bool(
-        unilateral_sides
-        and initial_grasp_distance_m <= max(
-            0.12,
-            float(candidate.get("approach_distance_m", 0.0))
-            + float(candidate.get("pregrasp_eef_distance_m", 0.0))
-            + 0.035,
+    initial_pose_aligned, initial_grasp_distance_m, initial_grasp_rotation_error_rad = (
+        _live_contact_pose_is_close_to_candidate(
+            initial_eef_world, initial_grasp_world,
         )
     )
-    branch["initial_target_finger_contact_sides"] = list(unilateral_sides)
+    initial_contact_sides = target_finger_contact_sides(initial_grasp_state)
+    close_from_live_contact = bool(initial_contact_sides and initial_pose_aligned)
+    branch["initial_target_finger_contact_sides"] = list(initial_contact_sides)
     branch["initial_eef_to_migrated_grasp_pose_m"] = initial_grasp_distance_m
+    branch["initial_eef_to_migrated_grasp_rotation_error_rad"] = initial_grasp_rotation_error_rad
+    branch["live_contact_close_pose_aligned_with_candidate"] = initial_pose_aligned
+    branch["live_contact_close_pose_tolerance"] = {
+        "position_error_max_m": LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
+        "rotation_error_max_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
+    }
     branch["pregrasp_route_skipped_due_to_live_target_contact"] = close_from_live_contact
     if close_from_live_contact:
+        if len(initial_contact_sides) == 2:
+            settle_actions = 0
+            settled_samples = 0
+            maximum_linear_speed = 0.0
+            maximum_angular_speed = 0.0
+            settle_start_object = _object_state(
+                initial_runtime_state, int(target_binding["body_id"])
+            )
+            settle_start_position = np.asarray(
+                settle_start_object.get("root_pos"), dtype=np.float64
+            )
+            while settle_actions < MAX_LIVE_CONTACT_SETTLE_ACTIONS:
+                object_state = _object_state(
+                    initial_runtime_state, int(target_binding["body_id"])
+                ) if settle_actions == 0 else _object_state(
+                    records[-1]["snapshot_state"], int(target_binding["body_id"])
+                )
+                velocity = np.asarray(object_state.get("joint_qvel"), dtype=np.float64)
+                if velocity.shape != (6,) or not np.isfinite(velocity).all():
+                    raise RuntimeError("live_contact_settle_object_velocity_unavailable")
+                linear_speed = float(np.linalg.norm(velocity[:3]))
+                angular_speed = float(np.linalg.norm(velocity[3:]))
+                maximum_linear_speed = max(maximum_linear_speed, linear_speed)
+                maximum_angular_speed = max(maximum_angular_speed, angular_speed)
+                if (
+                    linear_speed <= LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S
+                    and angular_speed <= LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S
+                ):
+                    settled_samples += 1
+                else:
+                    settled_samples = 0
+                if settled_samples >= LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES:
+                    break
+                _record_step(
+                    bridge,
+                    np.zeros(7, dtype=np.float32),
+                    "task_success_first_live_bilateral_contact_settle",
+                    candidate_id,
+                    action_counter[0],
+                    target_binding,
+                    context["instruction"],
+                    policy,
+                    monitor,
+                    records,
+                    frames,
+                )
+                action_counter[0] += 1
+                settle_actions += 1
+                settled_sides = target_finger_contact_sides(
+                    records[-1].get("grasp_state", {})
+                )
+                if len(settled_sides) != 2:
+                    branch["live_contact_settle_failure"] = {
+                        "reason": "bilateral_target_contact_lost",
+                        "actions": settle_actions,
+                        "remaining_contact_sides": list(settled_sides),
+                    }
+                    raise RuntimeError("live_bilateral_target_contact_lost_during_settle")
+            settle_end_state = (
+                records[-1]["snapshot_state"] if settle_actions else initial_runtime_state
+            )
+            settle_end_object = _object_state(
+                settle_end_state, int(target_binding["body_id"])
+            )
+            branch["live_contact_settle"] = {
+                "actions": settle_actions,
+                "status": (
+                    "settled_with_bilateral_contact"
+                    if settled_samples >= LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES
+                    else "action_budget_exhausted_bilateral_contact_preserved"
+                ),
+                "required_consecutive_low_velocity_samples": LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES,
+                "linear_speed_threshold_m_s": LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S,
+                "angular_speed_threshold_rad_s": LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S,
+                "maximum_observed_linear_speed_m_s": maximum_linear_speed,
+                "maximum_observed_angular_speed_rad_s": maximum_angular_speed,
+                "consecutive_low_velocity_samples_at_end": settled_samples,
+                "object_displacement_m": float(np.linalg.norm(
+                    np.asarray(settle_end_object["root_pos"], dtype=np.float64)
+                    - settle_start_position
+                )),
+                "state_was_only_observed_and_held_with_native_zero_action": True,
+            }
+        else:
+            branch["live_contact_settle"] = {
+                "actions": 0,
+                "status": "skipped_without_bilateral_target_contact",
+            }
         branch["live_contact_close_probe_action_budget"] = MAX_CLOSE_CONTROL_ACTIONS
         live_close_actions = 0
         while live_close_actions < MAX_CLOSE_CONTROL_ACTIONS and not monitor.stable:
             _record_step(
                 bridge,
                 np.asarray([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
-                "task_success_first_live_unilateral_contact_close_probe",
+                (
+                    "task_success_first_live_bilateral_contact_close_probe"
+                    if len(initial_contact_sides) == 2
+                    else "task_success_first_live_unilateral_contact_close_probe"
+                ),
                 candidate_id,
                 action_counter[0],
                 target_binding,
@@ -1030,7 +1946,7 @@ def _run_physical_branch(
         branch["live_contact_close_probe_actions"] = live_close_actions
         branch["live_contact_close_probe_grasp"] = monitor.diagnostics()
         if not monitor.stable:
-            raise RuntimeError("unilateral_live_contact_close_probe_did_not_stabilize")
+            raise RuntimeError("live_target_contact_close_probe_did_not_stabilize")
         branch["live_contact_close_probe_succeeded"] = True
     else:
         branch["live_contact_close_probe_succeeded"] = False
@@ -1050,15 +1966,27 @@ def _run_physical_branch(
         target_quaternion: np.ndarray,
         phase: str,
         maximum_steps: int,
+        target_pose_provider: Callable[
+            [dict[str, Any]], tuple[np.ndarray, np.ndarray]
+        ] | None = None,
     ) -> None:
         try:
             _advance_pose(
                 bridge, target_position, target_quaternion, phase, candidate_id,
                 action_counter, maximum_steps, target_binding, context["instruction"],
                 policy, monitor, records, frames,
+                target_pose_provider=target_pose_provider,
             )
             return
         except TimeoutError as original_error:
+            if target_pose_provider is not None:
+                branch["local_replans"].append({
+                    "phase": phase,
+                    "status": "dynamic_object_relative_target_did_not_converge",
+                    "failure_reason": str(original_error),
+                    "safety_certified": False,
+                })
+                raise original_error
             if len(branch["local_replans"]) >= 2:
                 raise original_error
             remaining_budget = MAX_BRANCH_CONTROL_ACTIONS - action_counter[0]
@@ -1203,9 +2131,21 @@ def _run_physical_branch(
     )
     object_to_eef = np.asarray(candidate["object_to_eef"], dtype=np.float64)
     grasp_world = root_pose @ object_to_eef
-    approach_world = root_pose[:3, :3] @ np.asarray(
-        candidate["approach_direction_object"], dtype=np.float64
-    )
+
+    def object_relative_target_provider(
+        object_to_target: np.ndarray,
+    ) -> Callable[[dict[str, Any]], tuple[np.ndarray, np.ndarray]]:
+        relative_transform = np.asarray(object_to_target, dtype=np.float64)
+
+        def provide(snapshot_state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+            return _object_relative_target_pose(
+                snapshot_state,
+                int(target_binding["body_id"]),
+                relative_transform,
+            )
+
+        return provide
+
     if not close_from_live_contact:
         approach_start_actions = action_counter[0]
         migrated_waypoints = candidate.get("historical_approach_waypoints_object_xyz_quaternion_wxyz", [])
@@ -1226,6 +2166,7 @@ def _run_physical_branch(
                     _wxyz(world_waypoint[:3, :3]),
                     "migrated_object_relative_approach",
                     remaining,
+                    target_pose_provider=object_relative_target_provider(relative_pose),
                 )
             remaining = MAX_APPROACH_CONTROL_ACTIONS - (action_counter[0] - approach_start_actions)
             if remaining <= 0:
@@ -1237,7 +2178,9 @@ def _run_physical_branch(
             _wxyz(grasp_world[:3, :3]),
             "task_success_first_surface_approach" if not migrated_waypoints else "migrated_object_relative_grasp_endpoint",
             remaining,
+            target_pose_provider=object_relative_target_provider(object_to_eef),
         )
+        branch["surface_approach_target_frame"] = "live_target_object_root_pose_times_generated_object_to_eef"
     branch["surface_approach_reached"] = True
 
     close_actions = 0
@@ -1503,12 +2446,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "search_budget": {
             "geometry_candidates_max": args.maximum_candidates,
             "candidate_start_index": int(args.candidate_start_index),
+            "candidate_generation_limit": (
+                int(args.candidate_start_index + args.maximum_candidates)
+                if args.strict_grasp_screen_only else int(args.maximum_candidates)
+            ),
+            "candidate_tilt_degrees": list(args.candidate_tilt_degrees),
+            "candidate_roll_degrees": list(args.candidate_roll_degrees),
+            "candidate_offset_object_x_mm": list(args.candidate_offset_object_x_mm),
+            "candidate_offset_object_z_mm": list(args.candidate_offset_object_z_mm),
+            "candidate_offset_object_y_mm": list(args.candidate_offset_object_y_mm),
+            "candidate_coupled_perturbations": bool(args.candidate_coupled_perturbations),
+            "historical_grasp_pose_priors_json": (
+                str(args.historical_grasp_pose_priors_json.resolve())
+                if args.historical_grasp_pose_priors_json else None
+            ),
             "RRT_preflights_max": args.maximum_rrt_preflights,
             "physical_snapshot_branches_max": args.maximum_physical_branches,
             "branch_control_actions_max": MAX_BRANCH_CONTROL_ACTIONS,
             "pregrasp_route_actions_max": MAX_PREFIX_CONTROL_ACTIONS,
             "approach_actions_max": MAX_APPROACH_CONTROL_ACTIONS,
             "close_actions_max": MAX_CLOSE_CONTROL_ACTIONS,
+            "live_contact_settle_actions_max": MAX_LIVE_CONTACT_SETTLE_ACTIONS,
+            "live_contact_settle_linear_speed_threshold_m_s": LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S,
+            "live_contact_settle_angular_speed_threshold_rad_s": LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S,
+            "live_contact_settle_required_consecutive_samples": LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES,
             "lift_actions_max": MAX_LIFT_CONTROL_ACTIONS,
             "MuJoCo_substeps_per_control_action": EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION,
             "candidate_id_filter": args.candidate_id,
@@ -1640,8 +2601,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ignore_object_id=str(context["target_object_id"]),
         )
         report["initial_robot_contact_escape"] = initial_contact_escape
+        candidate_generation_limit = _candidate_generation_limit(args)
         candidates, generation = generate_geometry_candidates(
-            context, maximum_candidates=args.maximum_candidates
+            context, maximum_candidates=candidate_generation_limit
         )
         experience_use = {
             "library_path": str(args.experience_library) if args.experience_library else None,
@@ -1681,7 +2643,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 inserted_template_ids = []
                 alternate_count = 0
                 for template_rank, matched_template in enumerate(templates):
-                    if len(experience_candidates) >= args.maximum_candidates:
+                    if len(experience_candidates) >= candidate_generation_limit:
                         break
                     prior = instantiate_grasp_candidate(
                         matched_template, context, source_library=str(args.experience_library)
@@ -1693,13 +2655,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         matched_template["template_id"], blocked_candidate_ids
                     ):
                         alternates = alternate_experience_approach_candidates(prior)
-                        capacity = args.maximum_candidates - len(experience_candidates)
+                        capacity = candidate_generation_limit - len(experience_candidates)
                         experience_candidates.extend(alternates[:capacity])
                         alternate_count += min(len(alternates), capacity)
-                candidates = [
-                    *experience_candidates,
-                    *candidates[:max(0, args.maximum_candidates - len(experience_candidates))],
-                ]
+                candidates = _combine_candidate_sources(
+                    candidates,
+                    experience_candidates,
+                    generation_limit=candidate_generation_limit,
+                    requested_candidate_ids=args.candidate_id,
+                )
                 experience_use.update({
                     "inserted_template_ids": inserted_template_ids,
                     "migrated_grasp_prior_inserted": bool(experience_candidates),
@@ -1712,16 +2676,97 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "historical_approach_waypoints_object_xyz_quaternion_wxyz", []
                     ) if experience_candidates else [],
                 })
+        historical_pose_prior_set = None
+        if args.historical_grasp_pose_priors_json is not None:
+            candidates, historical_pose_prior_set = load_historical_grasp_pose_prior_candidates(
+                args.historical_grasp_pose_priors_json,
+                benchmark=args.benchmark,
+                level=args.level,
+                task_id=args.task_id,
+                init_state=args.init_state,
+                seed=args.seed,
+                target_object_id=target_id,
+                target_pose_world=_pose(
+                    context["target_root_pose_world"]["position_m"],
+                    context["target_root_pose_world"]["rotation"],
+                ),
+                eef_position_world=np.asarray(
+                    context["eef_pose_world"]["position_m"], dtype=np.float64
+                ),
+                active_pad_center_eef_m=np.asarray(
+                    context["symmetric_pad_center_eef_m"], dtype=np.float64
+                ),
+                maximum_candidates=args.maximum_candidates,
+            )
+            copied_prior_path = output_dir / "historical_grasp_pose_priors.json"
+            copied_prior_path.write_bytes(args.historical_grasp_pose_priors_json.read_bytes())
+            historical_pose_prior_set["archived_input_copy"] = str(copied_prior_path)
+            report["historical_grasp_pose_prior_set"] = historical_pose_prior_set
+            experience_use["hashed_success_episode_pose_priors_used"] = True
+            experience_use["historical_pose_prior_set"] = historical_pose_prior_set
         report["experience_transfer"] = experience_use
         report["imported_search_failure_memory"] = imported_failure_memory
-        candidates = diversify_candidates(candidates)
-        if args.candidate_id is not None:
+        generated_candidate_count = len(candidates)
+        if args.candidate_id:
+            generated_ids = {candidate.get("candidate_id") for candidate in candidates}
+            missing_ids = set(args.candidate_id) - generated_ids
+            if missing_ids:
+                raise ValueError(f"requested_candidate_ids_not_generated:{sorted(missing_ids)}")
             candidates = [
                 candidate for candidate in candidates
-                if candidate.get("candidate_id") == args.candidate_id
+                if candidate.get("candidate_id") in set(args.candidate_id)
             ]
-            if not candidates:
-                raise ValueError(f"requested_candidate_id_not_generated:{args.candidate_id}")
+        orientation_angles = args.candidate_tilt_degrees or args.candidate_roll_degrees
+        offsets_by_axis = {
+            axis: values
+            for axis, values in (
+                ("x", args.candidate_offset_object_x_mm),
+                ("y", args.candidate_offset_object_y_mm),
+                ("z", args.candidate_offset_object_z_mm),
+            )
+            if values
+        }
+        offset_values = next(iter(offsets_by_axis.values())) if offsets_by_axis else []
+        target_pose_for_variants = _pose(
+            context["target_root_pose_world"]["position_m"],
+            context["target_root_pose_world"]["rotation"],
+        )
+        eef_position_for_variants = np.asarray(
+            context["eef_pose_world"]["position_m"], dtype=np.float64
+        )
+        offset_axis = next(iter(offsets_by_axis), "z")
+        if args.candidate_coupled_perturbations:
+            candidates = generate_grasp_coupled_pose_grid_variants(
+                candidates,
+                target_pose_world=target_pose_for_variants,
+                eef_position_world=eef_position_for_variants,
+                tilt_degrees=orientation_angles,
+                rotation_axis="approach" if args.candidate_roll_degrees else "jaw",
+                offsets_by_object_axis=offsets_by_axis,
+            )
+        elif orientation_angles:
+            candidates = generate_grasp_tilt_variants(
+                candidates,
+                target_pose_world=target_pose_for_variants,
+                eef_position_world=eef_position_for_variants,
+                tilt_degrees=orientation_angles,
+                rotation_axis="approach" if args.candidate_roll_degrees else "jaw",
+            )
+        elif offset_values:
+            candidates = generate_grasp_surface_offset_variants(
+                candidates,
+                target_pose_world=target_pose_for_variants,
+                eef_position_world=eef_position_for_variants,
+                offset_object_mm=offset_values,
+                offset_object_axis=offset_axis,
+            )
+        if args.strict_grasp_screen_only:
+            candidates = _candidate_window(
+                candidates,
+                start=args.candidate_start_index,
+                count=args.maximum_candidates,
+            )
+        candidates = diversify_candidates(candidates)
         if not candidates:
             raise RuntimeError("no_supported_collision_geometry_produced_a_pad_grasp_candidate")
         _write_json(output_dir / "geometry_candidates.json", candidates)
@@ -1730,6 +2775,188 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         _write_json(output_dir / "initial_safety_diagnostics.json", initial_safety)
         _write_json(output_dir / "safety_policy_diagnostic_only.json", policy)
         _advance_pose.controller_fields = controller["robots"][0]["fields"]
+
+        if args.strict_grasp_screen_only:
+            reference_report_path = args.strict_screen_reference_report.resolve()
+            reference_report = json.loads(reference_report_path.read_text(encoding="utf-8"))
+            reference_scope = reference_report.get("scope", {})
+            expected_identity = {
+                "benchmark": args.benchmark,
+                "level": args.level,
+                "task_id": args.task_id,
+                "init_state": args.init_state,
+                "environment_seed": args.seed,
+                "model_geometry_sha256": model_sha,
+                "bddl_sha256": manifest["scene_metadata"]["bddl_sha256"],
+            }
+            mismatches = {
+                key: {"expected": value, "actual": reference_scope.get(key)}
+                for key, value in expected_identity.items()
+                if reference_scope.get(key) != value
+            }
+            stable_grasp = reference_report.get("success", {}).get("stable_bilateral_grasp", {})
+            if reference_report.get("success", {}).get("target_object_id") != target_id:
+                mismatches["target_object_id"] = {
+                    "expected": target_id,
+                    "actual": reference_report.get("success", {}).get("target_object_id"),
+                }
+            if stable_grasp.get("stable_grasp_observed") is not True:
+                mismatches["stable_grasp_observed"] = {
+                    "expected": True,
+                    "actual": stable_grasp.get("stable_grasp_observed"),
+                }
+            if float(reference_report.get("success", {}).get("target_lift_delta_m") or 0.0) < MINIMUM_OBJECT_LIFT_M:
+                mismatches["target_lift_delta_m"] = {
+                    "expected_at_least_m": MINIMUM_OBJECT_LIFT_M,
+                    "actual": reference_report.get("success", {}).get("target_lift_delta_m"),
+                }
+            if mismatches:
+                raise ValueError(f"strict_screen_reference_identity_or_grasp_evidence_mismatch:{mismatches}")
+            reference_npz = Path(
+                reference_report.get("artifacts", {}).get("actions_and_robot_states_npz", "")
+            ).resolve()
+            if not reference_npz.is_file():
+                raise FileNotFoundError("strict_screen_reference_action_state_npz_is_missing")
+            reference_archive = Path(reference_report.get("archive", "")).resolve()
+            hash_manifest_path = reference_archive / "artifact_hashes.json"
+            if not hash_manifest_path.is_file():
+                raise FileNotFoundError("strict_screen_reference_artifact_hash_manifest_is_missing")
+            relative_reference_npz = reference_npz.relative_to(reference_archive).as_posix()
+            reference_hashes = json.loads(hash_manifest_path.read_text(encoding="utf-8"))
+            reference_npz_sha = _sha256_file(reference_npz)
+            expected_npz_hash = reference_hashes.get(relative_reference_npz, {}).get("sha256")
+            if expected_npz_hash != reference_npz_sha:
+                raise ValueError("strict_screen_reference_action_state_npz_sha256_mismatch")
+            with np.load(reference_npz, allow_pickle=False) as trace:
+                required_trace_keys = {
+                    "arm_joint_qpos_rad", "gripper_qpos", "target_root_position_world_m",
+                    "target_root_quaternion_wxyz",
+                }
+                if not required_trace_keys.issubset(trace.files):
+                    raise ValueError("strict_screen_reference_trace_is_missing_required_pose_or_gripper_arrays")
+                reference_arm = np.asarray(trace["arm_joint_qpos_rad"], dtype=np.float64)
+                reference_gripper = np.asarray(trace["gripper_qpos"], dtype=np.float64)
+                reference_position = np.asarray(trace["target_root_position_world_m"], dtype=np.float64)
+                reference_quaternion = np.asarray(trace["target_root_quaternion_wxyz"], dtype=np.float64)
+            if (
+                reference_arm.ndim != 2 or reference_arm.shape[1] != 7 or not len(reference_arm)
+                or reference_gripper.ndim != 2 or reference_gripper.shape[1] != 2
+                or reference_position.ndim != 2 or reference_position.shape[1] != 3
+                or reference_quaternion.ndim != 2 or reference_quaternion.shape[1] != 4
+                or len({len(reference_arm), len(reference_gripper), len(reference_position), len(reference_quaternion)}) != 1
+                or not all(np.isfinite(value).all() for value in (reference_arm, reference_gripper, reference_position, reference_quaternion))
+            ):
+                raise ValueError("strict_screen_reference_trace_arrays_are_malformed")
+            closed_gripper_qpos = reference_gripper[-1].tolist()
+            reference_arm_qpos = reference_arm[-1].tolist()
+            predicted_object_pose = np.eye(4, dtype=np.float64)
+            predicted_object_pose[:3, :3] = Rotation.from_quat(
+                reference_quaternion[-1][[1, 2, 3, 0]]
+            ).as_matrix()
+            predicted_object_pose[:3, 3] = reference_position[-1]
+            for candidate in candidates:
+                candidate["ik_seed_qpos"] = [
+                    np.asarray(context["arm_qpos"], dtype=np.float64).tolist(),
+                    reference_arm_qpos,
+                ]
+            screen_policy, task_safety_semantics = _build_bddl_grasp_screen_policy(
+                context, semantic, geometry, bddl_path.read_text(encoding="utf-8")
+            )
+            state_sha = _state_sha(search_start_state)
+            screen = bridge.request({
+                "op": "screen_grasp_candidates",
+                "expected_instruction": instruction,
+                "model_geometry_sha256": model_sha,
+                "start_state_sha256": state_sha,
+                "safety_geometry_policy": screen_policy,
+                "target_object_id": target_id,
+                "target_root_body_id": int(target_semantic_binding["root_body_id"]),
+                "left_finger_geom_ids": None,
+                "right_finger_geom_ids": None,
+                "clearance_m": 0.010,
+                "strict_target_contact_policy": True,
+                "closed_gripper_qpos": closed_gripper_qpos,
+                "predicted_stable_object_pose_world": predicted_object_pose.tolist(),
+                "candidates": candidates,
+            })
+            if screen.get("status") != "complete" or screen.get("live_state_unchanged") is not True:
+                raise RuntimeError(
+                    f"strict_offline_grasp_screen_incomplete:{screen.get('failure_reason') or screen.get('status')}"
+                )
+            strict_screen_report = {
+                "schema_version": "gs_opd_strict_pad_only_grasp_screen.v1",
+                "status": "complete",
+                "task_safety_semantics": task_safety_semantics,
+                "task": expected_identity,
+                "native_goal_predicate": context["native_goal_predicate"],
+                "start_snapshot_payload_sha256": _sha256_bytes(search_start_payload),
+                "candidate_window": {
+                    "start_index": int(args.candidate_start_index),
+                    "screened_candidate_count": len(candidates),
+                    "generated_candidate_count": generated_candidate_count,
+                    "geometry_generation_limit": int(candidate_generation_limit),
+                    "batch_limit": MAX_OFFLINE_GEOMETRY_SCREEN_BATCH,
+                    "orientation_perturbation_count": len(orientation_angles),
+                    "orientation_perturbation_axis": (
+                        "approach" if args.candidate_roll_degrees else "jaw"
+                    ) if orientation_angles else None,
+                    "orientation_perturbation_degrees": list(orientation_angles),
+                    "surface_contact_offset_mm": list(offset_values),
+                    "surface_contact_offset_object_axis": (
+                        offset_axis if len(offsets_by_axis) == 1
+                        else ("multiple" if offsets_by_axis else None)
+                    ),
+                    "surface_contact_offsets_by_object_axis_mm": {
+                        axis: list(values) for axis, values in offsets_by_axis.items()
+                    },
+                    "coupled_pose_perturbations": bool(args.candidate_coupled_perturbations),
+                },
+                "screen_policy_source": screen_policy["source"],
+                "reference_prior": {
+                    "report": str(reference_report_path),
+                    "report_status": reference_report.get("status"),
+                    "actions_and_robot_states_npz": str(reference_npz),
+                    "npz_sha256": reference_npz_sha,
+                    "stable_grasp_verified_in_source": True,
+                    "used_only_for_closed_gripper_qpos_and_post_close_object_pose_and_IK_seed": True,
+                    "source_actions_replayed": False,
+                    "safety_qualification_inherited": False,
+                },
+                "screening": screen,
+                "physical_actions": 0,
+                "live_integration_state_unchanged": True,
+                "safety_certified": False,
+                "strict_safety_candidate_only": True,
+                "route_preflight_performed": False,
+                "next_step": (
+                    "Run bounded exact-scene RRT preflight only for ranked candidates; physical execution requires a separate explicit selection and remains prohibited by this screen-only mode."
+                ),
+            }
+            screen_path = output_dir / "strict_grasp_geometry_screen.json"
+            _write_json(screen_path, strict_screen_report)
+            report.update({
+                "status": (
+                    "offline_strict_grasp_candidates_available_route_preflight_pending"
+                    if int(screen.get("feasible_count", 0)) > 0
+                    else "no_strict_pad_only_grasp_candidate_in_generated_set"
+                ),
+                "strict_grasp_screen_only": True,
+                "strict_grasp_geometry_screen": str(screen_path),
+                "strict_grasp_geometry_screen_sha256": _sha256_file(screen_path),
+                "strict_safety_screen_policy_source": screen_policy["source"],
+                "safety_certified": False,
+                "physical_actions": 0,
+                "archive": str(output_dir),
+                "artifacts": {
+                    "physical_control_actions": 0,
+                    "screen_report": str(screen_path),
+                    "candidate_count": len(candidates),
+                    "offline_feasible_candidate_count": int(screen.get("feasible_count", 0)),
+                    "source_actions_replayed": False,
+                },
+            })
+            _write_json(output_dir / "run_report.json", report)
+            return report
 
         candidate_start = int(args.candidate_start_index)
         candidates_to_plan = candidates[candidate_start : candidate_start + args.maximum_rrt_preflights]
@@ -1828,32 +3055,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "carried_binding": target_binding,
                 "expected_instruction": instruction,
             })
-            live_contact_sides = unilateral_target_contact_sides(live_grasp_state)
-            live_grasp_distance_m = float(np.linalg.norm(start_pose[:3] - target_pose[:3, 3]))
-            live_close_distance_limit_m = max(
-                0.12,
-                float(candidate.get("approach_distance_m", 0.0))
-                + float(candidate.get("pregrasp_eef_distance_m", 0.0))
-                + 0.035,
+            live_contact_sides = target_finger_contact_sides(live_grasp_state)
+            live_eef_transform = _pose(
+                start_pose[:3],
+                Rotation.from_quat(start_pose[3:][[1, 2, 3, 0]]).as_matrix(),
+            )
+            live_pose_aligned, live_grasp_distance_m, live_grasp_rotation_error_rad = (
+                _live_contact_pose_is_close_to_candidate(
+                    live_eef_transform, target_pose,
+                )
             )
             if (
-                not routes
+                (not routes or len(live_contact_sides) == 2)
                 and live_contact_sides
-                and live_grasp_distance_m <= live_close_distance_limit_m
+                and live_pose_aligned
             ):
-                # A live target contact is itself a physically validated local
-                # starting point. Preserve it and try closing in place even if
-                # the migrated EEF target has no IK solution from this state.
+                # Close only when measured opposing contacts coincide with the
+                # generated candidate pose; incidental contact elsewhere is not
+                # treated as a grasp-ready state.
                 routes = [{
-                    "route_index": "live_contact_close_probe",
+                    "route_index": "live_contact_pose_aligned_close_probe",
                     "eef_reference_poses_world": [start_pose.tolist(), start_pose.tolist()],
-                    "route_source": "live_unilateral_target_contact_close_probe",
+                    "route_source": "live_target_contact_pose_aligned_close_probe",
                     "live_contact_sides": list(live_contact_sides),
                 }]
                 summary["live_contact_close_probe_admitted_after_RRT_failure"] = {
                     "finger_sides": list(live_contact_sides),
                     "eef_to_migrated_grasp_pose_m": live_grasp_distance_m,
-                    "maximum_close_probe_distance_m": live_close_distance_limit_m,
+                    "eef_to_migrated_grasp_rotation_error_rad": live_grasp_rotation_error_rad,
+                    "pose_alignment_tolerances": {
+                        "position_m": LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
+                        "rotation_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
+                    },
                     "RRT_status": planner_response.get("status"),
                     "RRT_failure_reason": planner_response.get("failure_reason"),
                     "no_object_or_robot_state_written": True,
@@ -1931,12 +3164,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if not poses:
                     continue
                 signature = (
-                    "live_contact_close_probe_"
+                    f"{route.get('route_source', 'live_target_contact_close_probe')}_"
                     + "_".join(route.get("live_contact_sides", []))
                     if route.get("live_contact_sides")
                     else route_signature(poses)
                 )
                 route_id = f"rrt{route.get('route_index', 0)}:{signature}"
+                if not live_pose_aligned and not route.get("live_contact_sides"):
+                    route_id = f"{route_id}:live_object_relative_target"
                 if signature in seen_route_signatures:
                     continue
                 seen_route_signatures.add(signature)
@@ -2300,23 +3535,134 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--experience-library", type=Path, default=None)
     parser.add_argument("--previous-search-report", type=Path, action="append", default=[])
     parser.add_argument(
-        "--candidate-id", default=None,
-        help="limit a local retry to one previously generated object-relative candidate",
+        "--candidate-id", action="append", default=[],
+        help="limit a local retry to a previously generated candidate; repeat only in screen-only mode",
     )
-    parser.add_argument("--maximum-candidates", type=int, default=MAX_GEOMETRY_CANDIDATES)
-    parser.add_argument("--candidate-start-index", type=int, default=0)
+    parser.add_argument(
+        "--candidate-tilt-degrees", type=float, action="append", default=[],
+        help="screen-only jaw-axis tilt variants for selected candidate IDs; repeat for bounded angles",
+    )
+    parser.add_argument(
+        "--candidate-roll-degrees", type=float, action="append", default=[],
+        help="screen-only jaw-pair roll around approach axis for selected candidate IDs",
+    )
+    parser.add_argument(
+        "--candidate-offset-object-z-mm", type=float, action="append", default=[],
+        help="screen-only contact-height offsets along active object local z for selected candidate IDs",
+    )
+    parser.add_argument(
+        "--candidate-offset-object-y-mm", type=float, action="append", default=[],
+        help="screen-only contact-patch offsets along active object local y for selected candidate IDs",
+    )
+    parser.add_argument(
+        "--candidate-offset-object-x-mm", type=float, action="append", default=[],
+        help="screen-only contact-patch offsets along active object local x for selected candidate IDs",
+    )
+    parser.add_argument(
+        "--candidate-coupled-perturbations", action="store_true",
+        help="explicitly combine one orientation family and one or more object-axis offset families in screen-only mode",
+    )
+    parser.add_argument(
+        "--historical-grasp-pose-priors-json", type=Path, default=None,
+        help="screen-only, task-matched grasp poses recomputed from hashed successful episode physical-state samples",
+    )
+    parser.add_argument(
+        "--maximum-candidates", type=int, default=MAX_GEOMETRY_CANDIDATES,
+        help="candidate count; physical search <=16, scratch screen <=24 per batch",
+    )
+    parser.add_argument(
+        "--candidate-start-index", type=int, default=0,
+        help="physical candidate start, or scratch-screen window offset",
+    )
     parser.add_argument("--maximum-rrt-preflights", type=int, default=MAX_RRT_PREFLIGHTS)
     parser.add_argument("--maximum-physical-branches", type=int, default=MAX_PHYSICAL_BRANCHES)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
+    parser.add_argument(
+        "--strict-grasp-screen-only", action="store_true",
+        help="run scratch-only full-geometry pad-only/10mm screening, then exit before RRT or physical actions",
+    )
+    parser.add_argument(
+        "--strict-screen-reference-report", type=Path, default=None,
+        help="identity-checked prior physical grasp report used only for close-joint and post-close pose priors",
+    )
     args = parser.parse_args()
+    maximum_batch = (
+        MAX_OFFLINE_GEOMETRY_SCREEN_BATCH
+        if args.strict_grasp_screen_only else MAX_GEOMETRY_CANDIDATES
+    )
+    if not 1 <= args.maximum_candidates <= maximum_batch:
+        parser.error(f"--maximum-candidates must be in 1..{maximum_batch} for this mode")
     if not 1 <= args.maximum_rrt_preflights <= MAX_RRT_PREFLIGHTS:
         parser.error(f"--maximum-rrt-preflights must be in 1..{MAX_RRT_PREFLIGHTS}")
-    if not 0 <= args.candidate_start_index < args.maximum_candidates:
+    if args.strict_grasp_screen_only:
+        if args.candidate_start_index < 0 or (
+            args.candidate_start_index + args.maximum_candidates
+            > MAX_OFFLINE_GEOMETRY_GENERATION
+        ):
+            parser.error(
+                "screen-only candidate window must fit within generated indices "
+                f"0..{MAX_OFFLINE_GEOMETRY_GENERATION - 1}"
+            )
+    elif not 0 <= args.candidate_start_index < args.maximum_candidates:
         parser.error("--candidate-start-index must select an index inside the geometry candidate budget")
+    if args.candidate_id and args.candidate_start_index != 0:
+        parser.error("--candidate-id requires --candidate-start-index 0")
+    if len(args.candidate_id) > 1 and not args.strict_grasp_screen_only:
+        parser.error("multiple --candidate-id values require --strict-grasp-screen-only")
+    if args.candidate_tilt_degrees and args.candidate_roll_degrees:
+        parser.error("choose either --candidate-tilt-degrees or --candidate-roll-degrees")
+    perturbation_flags = sum(bool(values) for values in (
+        args.candidate_tilt_degrees,
+        args.candidate_roll_degrees,
+        args.candidate_offset_object_x_mm,
+        args.candidate_offset_object_z_mm,
+        args.candidate_offset_object_y_mm,
+    ))
+    orientation_family_count = int(bool(args.candidate_tilt_degrees)) + int(bool(args.candidate_roll_degrees))
+    offset_families = {
+        axis: values
+        for axis, values in (
+            ("x", args.candidate_offset_object_x_mm),
+            ("y", args.candidate_offset_object_y_mm),
+            ("z", args.candidate_offset_object_z_mm),
+        )
+        if values
+    }
+    if args.candidate_coupled_perturbations:
+        if orientation_family_count != 1 or not offset_families:
+            parser.error("--candidate-coupled-perturbations requires exactly one orientation family and at least one object-axis offset family")
+    elif orientation_family_count + len(offset_families) > 1:
+        parser.error("combine orientation and multiple contact-offset families only with --candidate-coupled-perturbations")
+    if (
+        args.candidate_tilt_degrees or args.candidate_roll_degrees
+        or offset_families
+    ):
+        if not args.strict_grasp_screen_only:
+            parser.error("candidate orientation perturbations require --strict-grasp-screen-only")
+        if not args.candidate_id:
+            parser.error("candidate orientation perturbations require one or more --candidate-id base poses")
+        orientation_count = len(args.candidate_tilt_degrees or args.candidate_roll_degrees)
+        offset_count = 1
+        for values in offset_families.values():
+            offset_count *= len(values)
+        perturbation_count = orientation_count * offset_count if args.candidate_coupled_perturbations else (orientation_count or offset_count)
+        if len(args.candidate_id) * perturbation_count > MAX_OFFLINE_GEOMETRY_SCREEN_BATCH:
+            parser.error("selected base candidates and perturbations must fit one 24-candidate screen batch")
+    if args.historical_grasp_pose_priors_json is not None:
+        if not args.strict_grasp_screen_only:
+            parser.error("--historical-grasp-pose-priors-json requires --strict-grasp-screen-only")
+        if args.candidate_id or args.candidate_start_index != 0:
+            parser.error("historical pose priors cannot be combined with candidate ID/window filters")
+        if perturbation_flags:
+            parser.error("historical pose priors cannot be combined with orientation/contact perturbations")
     if not 1 <= args.maximum_physical_branches <= MAX_PHYSICAL_BRANCHES:
         parser.error(f"--maximum-physical-branches must be in 1..{MAX_PHYSICAL_BRANCHES}")
     if not 0.5 <= args.rrt_time_budget_s <= 60.0:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
+    if args.strict_grasp_screen_only and args.strict_screen_reference_report is None:
+        parser.error("--strict-grasp-screen-only requires --strict-screen-reference-report")
+    if args.strict_screen_reference_report is not None and not args.strict_grasp_screen_only:
+        parser.error("--strict-screen-reference-report requires --strict-grasp-screen-only")
     if not 1000 <= args.demonstration_horizon <= 1800:
         parser.error("--demonstration-horizon must be in 1000..1800")
     if args.target_predicate is not None and len(args.target_predicate) != 3:
@@ -2326,16 +3672,21 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     report = run(_parse_args())
+    candidate_count = report.get("artifacts", {}).get("candidate_count")
+    if candidate_count is None:
+        candidate_count = len(report.get("candidates", []))
     print(json.dumps({
         "status": report.get("status"),
         "archive": report.get("archive"),
         "target": report.get("active_target"),
-        "candidate_count": len(report.get("candidates", [])),
+        "candidate_count": candidate_count,
         "physical_branch_count": len(report.get("physical_branches", [])),
         "success": report.get("success"),
         "failure_classification": report.get("failure_classification"),
         "snapshot_recovery_verification": report.get("snapshot_recovery_verification"),
     }, ensure_ascii=False, indent=2), flush=True)
+    if report.get("strict_grasp_screen_only"):
+        return 0 if report.get("strict_grasp_geometry_screen") else 3
     if report.get("success") is None:
         return 2
     return 0 if report.get("snapshot_recovery_verification", {}).get("status") == "pass" else 3

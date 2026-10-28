@@ -141,6 +141,178 @@ def _unexpected_contact_events(
     return unexpected
 
 
+def _execute_pre_route_hold(
+    connection: Any,
+    carried: dict[str, Any],
+    carried_geometry: dict[str, Any],
+    expected_instruction: str,
+    *,
+    action_count: int,
+    start_step_index: int,
+    action_index_offset: int,
+    trace_writer: Any,
+    chunk_index: int,
+    video_frames: list[Any] | None,
+    video_frame_encoder: Callable[[dict[str, Any]], np.ndarray] | None,
+) -> dict[str, Any]:
+    """Damp post-grasp motion with monitored zero-delta OSC actions."""
+    result: dict[str, Any] = {
+        "steps": [],
+        "failure_reason": None,
+        "latest_bridge_data": None,
+    }
+    body_id = int(carried["body_id"])
+    finger_geom_ids: set[int] = set()
+    inventory = _request(connection, {"op": "gripper_geometry_inventory"})
+    if inventory.get("status") != "complete":
+        raise ValueError("active_Panda_gripper_geometry_inventory_is_incomplete_before_hold")
+    finger_geom_ids = {
+        int(geometry["geom_id"])
+        for gripper in inventory.get("grippers", [])
+        for geometry in gripper.get("geometries", [])
+    }
+    carried_geom_ids = {int(item) for item in carried_geometry.get("geom_ids", [])}
+    carried_body_ids = {int(item) for item in carried_geometry.get("body_ids", [])}
+    if not finger_geom_ids or not carried_geom_ids:
+        raise ValueError("pre_route_hold_contact_geometry_is_unavailable")
+    controller = _request(connection, {"op": "repair_context"})
+    controller_fields = _controller_fields(controller)
+    snapshot_response = _request(connection, {"op": "snapshot"})
+    snapshot = snapshot_response.get("snapshot_state")
+    if not isinstance(snapshot, dict):
+        raise ValueError("pre_route_hold_start_snapshot_is_unavailable")
+    eef_pos, eef_quat, object_pos, object_quat = _pose(snapshot, body_id)
+    initial_rotation = quaternion_to_matrix(object_quat)
+    initial_grasp_position = initial_rotation.T @ (eef_pos - object_pos)
+    initial_grasp_quaternion = quaternion_multiply(
+        quaternion_conjugate(object_quat), eef_quat
+    )
+    limits = TrackingConfig()
+
+    def velocity_record(state: dict[str, Any]) -> dict[str, Any]:
+        object_state = _named_object_state(state, body_id)
+        qvel = np.asarray(object_state.get("joint_qvel", []), dtype=np.float64)
+        robot_states = state.get("robot_states", [])
+        robot_qvel = np.asarray(
+            robot_states[0].get("joint_qvel", [])
+            if isinstance(robot_states, list) and robot_states
+            and isinstance(robot_states[0], dict) else [],
+            dtype=np.float64,
+        )
+        linear = qvel[:3] if qvel.size >= 3 else None
+        angular = qvel[3:6] if qvel.size >= 6 else None
+        return {
+            "object_linear_velocity_world_m_s": linear.tolist() if linear is not None else None,
+            "object_angular_velocity_world_rad_s": angular.tolist() if angular is not None else None,
+            "object_linear_speed_m_s": float(np.linalg.norm(linear)) if linear is not None else None,
+            "object_angular_speed_rad_s": float(np.linalg.norm(angular)) if angular is not None else None,
+            "robot_max_joint_speed_rad_s": float(np.max(np.abs(robot_qvel))) if robot_qvel.size else None,
+        }
+
+    result["initial_velocity"] = velocity_record(snapshot)
+    direct_chunk = 1_000_000 + chunk_index
+    for hold_index in range(action_count):
+        action = world_pose_tracking_action(
+            eef_pos,
+            eef_quat,
+            eef_pos,
+            eef_quat,
+            controller_fields,
+            gripper_action=1.0,
+        )
+        response = _request(
+            connection,
+            {
+                "op": "step_monitored",
+                "action": action.tolist(),
+                "action_index": action_index_offset + hold_index,
+            },
+        )
+        result["latest_bridge_data"] = response
+        next_snapshot = response.get("snapshot_state")
+        if not isinstance(next_snapshot, dict):
+            raise RuntimeError("pre_route_hold_did_not_return_live_MuJoCo_state")
+        next_eef_pos, next_eef_quat, next_object_pos, next_object_quat = _pose(
+            next_snapshot, body_id
+        )
+        object_rotation = quaternion_to_matrix(next_object_quat)
+        grasp_position = object_rotation.T @ (next_eef_pos - next_object_pos)
+        grasp_position_error = float(np.linalg.norm(grasp_position - initial_grasp_position))
+        grasp_quaternion = quaternion_multiply(
+            quaternion_conjugate(next_object_quat), next_eef_quat
+        )
+        rotation_delta = quaternion_multiply(
+            grasp_quaternion, quaternion_conjugate(initial_grasp_quaternion)
+        )
+        grasp_rotation_error = float(np.linalg.norm(quaternion_to_rotation_vector(rotation_delta)))
+        grasp_state = _request(connection, {
+            "op": "grasp_state",
+            "carried_binding": carried,
+            "expected_instruction": expected_instruction,
+        })
+        monitoring = response.get("contact_monitoring", {})
+        if not isinstance(monitoring, dict):
+            monitoring = {}
+        unexpected_contacts = _unexpected_contact_events(
+            monitoring,
+            response.get("start_contacts", {})
+            if isinstance(response.get("start_contacts"), dict) else {},
+            finger_geom_ids,
+            carried_geom_ids,
+            carried_body_ids,
+        )
+        velocity = velocity_record(next_snapshot)
+        step_record = {
+            "phase": "pre_route_hold",
+            "step_index": start_step_index + hold_index,
+            "hold_action_index": hold_index,
+            "osc_action_7d": np.asarray(action, dtype=np.float32).tolist(),
+            "actual_eef_position_world_m": next_eef_pos.tolist(),
+            "actual_eef_quaternion_world_wxyz": next_eef_quat.tolist(),
+            "grasp_relative_position_error_m": grasp_position_error,
+            "grasp_relative_rotation_error_rad": grasp_rotation_error,
+            "object_velocity": velocity,
+            "grasp_state": grasp_state,
+            "contact_monitoring_status": monitoring.get("status"),
+            "contact_monitoring_control_step": (monitoring.get("control_steps") or [None])[0],
+            "unexpected_contact_events": unexpected_contacts,
+            "reward": float(response.get("reward", 0.0)),
+            "done": bool(response.get("done", False)),
+        }
+        result["steps"].append(step_record)
+        if trace_writer is not None:
+            trace_writer.add_step(
+                step_index=step_record["step_index"],
+                chunk_index=direct_chunk,
+                action_index=action_index_offset + hold_index,
+                action=action,
+                bridge_data=response,
+            )
+        if video_frames is not None and video_frame_encoder is not None:
+            video_frames.append(video_frame_encoder(response))
+        if monitoring.get("status") != "complete":
+            result["failure_reason"] = "pre_route_hold_MuJoCo_substep_monitoring_incomplete"
+        elif unexpected_contacts:
+            result["failure_reason"] = "unexpected_physical_contact_during_pre_route_hold"
+        elif grasp_state.get("status") != "pass" or grasp_state.get("grasp_confirmed") is not True:
+            result["failure_reason"] = "bilateral_grasp_or_gripper_closure_lost_during_pre_route_hold"
+        elif grasp_position_error > limits.maximum_grasp_relative_position_error_m:
+            result["failure_reason"] = "grasp_relative_position_error_exceeded_existing_limit_during_pre_route_hold"
+        elif grasp_rotation_error > limits.maximum_grasp_relative_rotation_error_rad:
+            result["failure_reason"] = "grasp_relative_rotation_error_exceeded_existing_0.20_rad_limit_during_pre_route_hold"
+        elif response.get("done"):
+            result["failure_reason"] = "MuJoCo_environment_terminated_during_pre_route_hold"
+        if result["failure_reason"]:
+            break
+        eef_pos, eef_quat = next_eef_pos, next_eef_quat
+    result["final_velocity"] = velocity_record(
+        result["latest_bridge_data"]["snapshot_state"]
+        if result["latest_bridge_data"] else snapshot
+    )
+    result["executed_actions"] = len(result["steps"])
+    return result
+
+
 def _write_execution_svg(path: Path, planned: np.ndarray, actual: list[list[float]]) -> None:
     actual_array = np.asarray(actual, dtype=np.float64)
     traces = [("B-Spline sphere reference", planned, "#2166ac")]
@@ -244,6 +416,7 @@ def run_live_direct_bspline_osc_smoke(
     video_frames: list[Any] | None,
     video_frame_encoder: Callable[[dict[str, Any]], np.ndarray] | None,
     candidate_id: str | None = None,
+    pre_route_hold_actions: int = 0,
     interpolate_left_001_to_004_fraction: float | None = None,
     interpolate_left_001_to_004_10pct: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -280,6 +453,17 @@ def run_live_direct_bspline_osc_smoke(
     }
     if candidate_id is not None:
         report["requested_candidate_id"] = candidate_id
+    if not isinstance(pre_route_hold_actions, int) or isinstance(pre_route_hold_actions, bool):
+        raise ValueError("pre_route_hold_actions_must_be_an_integer")
+    if not 0 <= pre_route_hold_actions <= 100:
+        raise ValueError("pre_route_hold_actions_must_be_in_0_100")
+    report["pre_route_hold"] = {
+        "status": "not_requested" if pre_route_hold_actions == 0 else "pending",
+        "requested_actions": pre_route_hold_actions,
+        "executed_actions": 0,
+        "action_source": "native_OSC_POSE_zero_delta_closed_gripper",
+        "training_label_valid": False,
+    }
     latest_bridge_data = initial_bridge_data
     try:
         if (
@@ -313,6 +497,100 @@ def run_live_direct_bspline_osc_smoke(
         carried = payload["carried_binding"]
         bundle_path = scene_dir / "trajectory_bundle.json"
         bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        if pre_route_hold_actions:
+            carried_geometry = query.get("objects", {}).get(carried["object_id"])
+            if not isinstance(carried_geometry, dict):
+                raise ValueError("carried_semantic_object_missing_before_pre_route_hold")
+            hold_result = _execute_pre_route_hold(
+                connection,
+                carried,
+                carried_geometry,
+                context["instruction"],
+                action_count=pre_route_hold_actions,
+                start_step_index=step_index,
+                action_index_offset=report["real_execution_steps"],
+                trace_writer=trace_writer,
+                chunk_index=chunk_index,
+                video_frames=video_frames,
+                video_frame_encoder=video_frame_encoder,
+            )
+            report["steps"].extend(hold_result["steps"])
+            report["real_execution_steps"] += hold_result["executed_actions"]
+            if hold_result["latest_bridge_data"] is not None:
+                latest_bridge_data = hold_result["latest_bridge_data"]
+            report["pre_route_hold"].update({
+                "status": "stopped_on_failure" if hold_result["failure_reason"] else "complete",
+                "executed_actions": hold_result["executed_actions"],
+                "initial_velocity": hold_result["initial_velocity"],
+                "final_velocity": hold_result["final_velocity"],
+                "failure_reason": hold_result["failure_reason"],
+                "velocity_change": {
+                    "linear_speed_delta_m_s": (
+                        hold_result["final_velocity"]["object_linear_speed_m_s"]
+                        - hold_result["initial_velocity"]["object_linear_speed_m_s"]
+                        if hold_result["final_velocity"]["object_linear_speed_m_s"] is not None
+                        and hold_result["initial_velocity"]["object_linear_speed_m_s"] is not None else None
+                    ),
+                    "angular_speed_delta_rad_s": (
+                        hold_result["final_velocity"]["object_angular_speed_rad_s"]
+                        - hold_result["initial_velocity"]["object_angular_speed_rad_s"]
+                        if hold_result["final_velocity"]["object_angular_speed_rad_s"] is not None
+                        and hold_result["initial_velocity"]["object_angular_speed_rad_s"] is not None else None
+                    ),
+                },
+                "tracking_limits": {
+                    "grasp_relative_position_error_m": TrackingConfig().maximum_grasp_relative_position_error_m,
+                    "grasp_relative_rotation_error_rad": TrackingConfig().maximum_grasp_relative_rotation_error_rad,
+                },
+            })
+            if hold_result["failure_reason"]:
+                report["status"] = "stopped_on_first_physical_or_tracking_failure"
+                report["failure_reason"] = hold_result["failure_reason"]
+                report["artifacts"]["pre_hold_trajectory_bundle"] = str(bundle_path)
+                report["execution_summary"] = {
+                    "actual_osc_steps": report["real_execution_steps"],
+                    "pre_route_hold_steps": hold_result["executed_actions"],
+                    "route_osc_steps": 0,
+                    "first_failure_reason": hold_result["failure_reason"],
+                    "maximum_grasp_relative_position_error_m": max(
+                        (item["grasp_relative_position_error_m"] for item in hold_result["steps"]),
+                        default=None,
+                    ),
+                    "maximum_grasp_relative_rotation_error_rad": max(
+                        (item["grasp_relative_rotation_error_rad"] for item in hold_result["steps"]),
+                        default=None,
+                    ),
+                    "final_dual_finger_grasp_status": (
+                        hold_result["steps"][-1]["grasp_state"].get("status")
+                        if hold_result["steps"] else None
+                    ),
+                }
+                _json_write(output_path, report)
+                return report, latest_bridge_data
+
+            report["artifacts"]["pre_hold_trajectory_bundle"] = str(bundle_path)
+            report["scene_smoke_before_pre_route_hold"] = scene_report
+            scene_dir = out_dir / "post_hold_current_state_scene"
+            scene_report = run_scene_smoke(
+                connection,
+                teacher,
+                semantic_results,
+                scene_dir,
+                subject_id=context.get("subject_id"),
+                expected_instruction=context.get("instruction"),
+            )
+            report["scene_smoke"] = scene_report
+            if scene_report.get("status") != "complete" or scene_report.get("geometry_query_succeeded") is not True:
+                raise ValueError(
+                    "post_hold_current_state_B_Spline_geometry_unavailable:"
+                    + str(scene_report.get("error") or scene_report.get("reason"))
+                )
+            query = scene_report["planning_geometry"]
+            payload = scene_report["query_payload"]
+            carried = payload["carried_binding"]
+            bundle_path = scene_dir / "trajectory_bundle.json"
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            report["pre_route_hold"]["post_hold_geometry_status"] = "requeried_and_screened"
         interpolation_fraction = interpolate_left_001_to_004_fraction
         if interpolate_left_001_to_004_10pct:
             if interpolation_fraction is not None:
@@ -436,10 +714,15 @@ def run_live_direct_bspline_osc_smoke(
             connection,
             {"op": "grasp_state", "carried_binding": carried, "expected_instruction": context["instruction"]},
         )
+        expected_live_grasp_state_id = (
+            report["steps"][-1]["grasp_state"].get("state_id")
+            if pre_route_hold_actions and report["steps"]
+            else trigger_grasp_state.get("state_id")
+        )
         if (
             live_grasp.get("status") != "pass"
             or live_grasp.get("grasp_confirmed") is not True
-            or live_grasp.get("state_id") != trigger_grasp_state.get("state_id")
+            or live_grasp.get("state_id") != expected_live_grasp_state_id
         ):
             raise ValueError("stable_dual_finger_grasp_changed_before_direct_execution")
         controller = _request(connection, {"op": "repair_context"})
@@ -516,11 +799,13 @@ def run_live_direct_bspline_osc_smoke(
                 "reference_speed_m_s": REFERENCE_SPEED_M_S,
                 "control_timestep_s": CONTROL_TIMESTEP_S,
                 "route_interpolation": report.get("route_interpolation"),
+                "pre_route_hold_actions": report["pre_route_hold"]["executed_actions"],
+                "pre_route_hold_action_source": report["pre_route_hold"]["action_source"],
             }
             trace_writer.add_decision(
                 direct_trace_chunk_index,
-                step_index,
-                initial_bridge_data,
+                step_index + report["pre_route_hold"]["executed_actions"],
+                latest_bridge_data,
                 np.empty((0, 7), dtype=np.float32),
                 safety_record={
                     "source": "direct_b_spline_closed_loop_native_osc_pose",
@@ -534,11 +819,11 @@ def run_live_direct_bspline_osc_smoke(
 
         current_snapshot = snapshot_state
         current_eef_pos, current_eef_quat = eef_pos, eef_quat
+        initial_eef_target_quat = eef_quat.copy()
         object_state = _named_object_state(current_snapshot, body_id)
         current_sphere = np.asarray(object_state["root_pos"], dtype=np.float64) + quaternion_to_matrix(
             _unit_quaternion(object_state["root_quat"], "carried_object_quaternion")
         ) @ sphere_local
-        initial_eef_target_quat = eef_quat.copy()
         actual_sphere_trace: list[list[float]] = [current_sphere.tolist()]
         exit_region = bundle.get("local_exit_region")
         if bundle.get("goal_type") != "local_bypass_goal" or not isinstance(exit_region, dict):
@@ -554,10 +839,11 @@ def run_live_direct_bspline_osc_smoke(
         catchup_steps_at_waypoint = 0
         total_catchup_steps = 0
         waypoint_advances = 0
+        route_steps_executed = 0
 
         while (
             reference_index < len(reference)
-            and report["real_execution_steps"] < execution_step_budget
+            and route_steps_executed < execution_step_budget
         ):
             target_sphere = reference[reference_index]
             object_state = _named_object_state(current_snapshot, body_id)
@@ -584,6 +870,7 @@ def run_live_direct_bspline_osc_smoke(
                 },
             )
             report["real_execution_steps"] += 1
+            route_steps_executed += 1
             latest_bridge_data = response
             current_snapshot = response.get("snapshot_state")
             if not isinstance(current_snapshot, dict):
@@ -637,6 +924,7 @@ def run_live_direct_bspline_osc_smoke(
                     ],
                 }
             record = {
+                "phase": "route",
                 "step_index": step_index + report["real_execution_steps"] - 1,
                 "route_reference_index": reference_index,
                 "waypoint_advanced": False,
@@ -726,9 +1014,9 @@ def run_live_direct_bspline_osc_smoke(
             if total_catchup_steps >= MAX_CATCHUP_STEPS_TOTAL:
                 report["failure_reason"] = "total_catchup_budget_exhausted"
                 break
-            if report["real_execution_steps"] % 50 == 0:
+            if route_steps_executed % 50 == 0:
                 print(
-                    "DIRECT B-SPLINE→OSC:", report["real_execution_steps"], "/", execution_step_budget,
+                    "DIRECT B-SPLINE→OSC:", route_steps_executed, "/", execution_step_budget,
                     "sphere_err_m=", round(sphere_center_error, 4),
                     "reference=", reference_index,
                     "catchup=", total_catchup_steps,
@@ -738,7 +1026,7 @@ def run_live_direct_bspline_osc_smoke(
                 )
 
         if report["failure_reason"] is None and not report["route_completed"]:
-            if report["real_execution_steps"] >= execution_step_budget:
+            if route_steps_executed >= execution_step_budget:
                 report["failure_reason"] = "total_execution_budget_exhausted_before_safe_exit_region"
             elif reference_index >= len(reference):
                 report["failure_reason"] = (
@@ -757,14 +1045,20 @@ def run_live_direct_bspline_osc_smoke(
         report["catchup_steps_total"] = total_catchup_steps
         report["waypoint_advances"] = waypoint_advances
 
+        route_records = [
+            item for item in report["steps"]
+            if item.get("phase", "route") == "route"
+        ]
         report["execution_summary"] = {
             "actual_osc_steps": report["real_execution_steps"],
+            "pre_route_hold_steps": report["pre_route_hold"]["executed_actions"],
+            "route_osc_steps": route_steps_executed,
             "first_failure_reason": report["failure_reason"],
-            "maximum_sphere_center_tracking_error_m": max((item["sphere_center_tracking_error_m"] for item in report["steps"]), default=None),
-            "maximum_eef_position_tracking_error_m": max((item["eef_position_tracking_error_m"] for item in report["steps"]), default=None),
-            "maximum_eef_orientation_tracking_error_rad": max((item["eef_orientation_tracking_error_rad"] for item in report["steps"]), default=None),
-            "maximum_grasp_relative_position_error_m": max((item["grasp_relative_position_error_m"] for item in report["steps"]), default=None),
-            "maximum_grasp_relative_rotation_error_rad": max((item["grasp_relative_rotation_error_rad"] for item in report["steps"]), default=None),
+            "maximum_sphere_center_tracking_error_m": max((item["sphere_center_tracking_error_m"] for item in route_records), default=None),
+            "maximum_eef_position_tracking_error_m": max((item["eef_position_tracking_error_m"] for item in route_records), default=None),
+            "maximum_eef_orientation_tracking_error_rad": max((item["eef_orientation_tracking_error_rad"] for item in route_records), default=None),
+            "maximum_grasp_relative_position_error_m": max((item["grasp_relative_position_error_m"] for item in route_records), default=None),
+            "maximum_grasp_relative_rotation_error_rad": max((item["grasp_relative_rotation_error_rad"] for item in route_records), default=None),
             "final_dual_finger_grasp_status": report["steps"][-1]["grasp_state"].get("status") if report["steps"] else live_grasp.get("status"),
         }
         execution_svg = out_dir / "direct_bspline_osc_execution.svg"

@@ -118,14 +118,19 @@ def route_control_action_budget(
     return min(maximum_actions, max(minimum_actions, requested))
 
 
-def unilateral_target_contact_sides(grasp_state: dict[str, Any]) -> tuple[str, ...]:
-    """Return the one Panda finger side with measured target contact, if any."""
+def target_finger_contact_sides(grasp_state: dict[str, Any]) -> tuple[str, ...]:
+    """Return Panda finger sides with measured contact on the active target."""
     if not isinstance(grasp_state, dict):
         return ()
     contacts = grasp_state.get("finger_contacts", {})
     if not isinstance(contacts, dict):
         return ()
-    sides = tuple(side for side in ("left", "right") if contacts.get(side) is True)
+    return tuple(side for side in ("left", "right") if contacts.get(side) is True)
+
+
+def unilateral_target_contact_sides(grasp_state: dict[str, Any]) -> tuple[str, ...]:
+    """Return the one Panda finger side with measured target contact, if any."""
+    sides = target_finger_contact_sides(grasp_state)
     return sides if len(sides) == 1 else ()
 
 
@@ -502,6 +507,7 @@ __all__ = [
     "native_goal_counts",
     "planner_seed",
     "route_control_action_budget",
+    "target_finger_contact_sides",
     "unilateral_target_contact_sides",
     "pending_object_goals",
     "progress_label",

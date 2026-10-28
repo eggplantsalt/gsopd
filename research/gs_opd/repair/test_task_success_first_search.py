@@ -7,9 +7,33 @@
 
 from __future__ import annotations
 
+import json
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+
+import research.gs_opd.repair.task_success_first_grasp_search as grasp_search
+from research.gs_opd.repair.task_success_first_grasp_search import (
+    MAX_GEOMETRY_CANDIDATES,
+    MAX_OFFLINE_GEOMETRY_GENERATION,
+    MAX_OFFLINE_GEOMETRY_SCREEN_BATCH,
+    _build_bddl_grasp_screen_policy,
+    _candidate_generation_limit,
+    _candidate_window,
+    _combine_candidate_sources,
+    _parse_args,
+    generate_geometry_candidates,
+    generate_grasp_roll_variants,
+    generate_grasp_coupled_tilt_offset_variants,
+    generate_grasp_coupled_pose_grid_variants,
+    generate_grasp_surface_offset_variants,
+    generate_grasp_tilt_variants,
+    load_historical_grasp_pose_prior_candidates,
+)
 
 from research.gs_opd.repair.task_success_first_search import (
     SearchFailureMemory,
@@ -27,11 +51,686 @@ from research.gs_opd.repair.task_success_first_search import (
     route_control_action_budget,
     route_signature,
     robot_contact_escape_direction,
+    target_finger_contact_sides,
     unilateral_target_contact_sides,
 )
 
 
 class TaskSuccessFirstSearchTests(unittest.TestCase):
+    def test_pinned_candidate_ids_reach_full_geometry_pool_with_experience_templates(self):
+        from argparse import Namespace
+
+        args = Namespace(
+            candidate_id=["geom46", "geom47"],
+            strict_grasp_screen_only=True,
+            candidate_start_index=40,
+            maximum_candidates=8,
+        )
+        self.assertEqual(_candidate_generation_limit(args), MAX_OFFLINE_GEOMETRY_GENERATION)
+
+        geometry = [{"candidate_id": f"geom{index}"} for index in range(48)]
+        experience = [{"candidate_id": f"experience{index}"} for index in range(9)]
+        selected_geometry = _combine_candidate_sources(
+            geometry,
+            experience,
+            generation_limit=48,
+            requested_candidate_ids=args.candidate_id,
+        )
+        self.assertEqual(
+            [candidate["candidate_id"] for candidate in selected_geometry],
+            ["geom46", "geom47"],
+        )
+        selected_experience = _combine_candidate_sources(
+            geometry,
+            experience,
+            generation_limit=48,
+            requested_candidate_ids=["experience8"],
+        )
+        self.assertEqual(
+            [candidate["candidate_id"] for candidate in selected_experience],
+            ["experience8"],
+        )
+
+    def test_unpinned_candidate_pool_retains_experience_first_budget(self):
+        geometry = [{"candidate_id": f"geom{index}"} for index in range(48)]
+        experience = [{"candidate_id": f"experience{index}"} for index in range(9)]
+        combined = _combine_candidate_sources(
+            geometry,
+            experience,
+            generation_limit=48,
+            requested_candidate_ids=[],
+        )
+        self.assertEqual(len(combined), 48)
+        self.assertEqual(combined[:9], experience)
+        self.assertEqual(combined[-1]["candidate_id"], "geom38")
+
+    def test_jaw_axis_tilt_variants_keep_the_pad_center_anchor(self):
+        base = {
+            "candidate_id": "geom110_jaw0_approach2_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": np.eye(4).tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_tilt_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.0, 0.0, 0.2]),
+            tilt_degrees=[-20.0, -15.0, -10.0, 10.0, 15.0, 20.0],
+        )
+        self.assertEqual(len(variants), 6)
+        original_pad_center = np.asarray(base["object_to_eef"])[:3, 3] + np.array([0.0, 0.0, 0.1])
+        for variant in variants:
+            transform = np.asarray(variant["object_to_eef"])
+            rotated_pad_center = transform[:3, 3] + transform[:3, :3] @ np.array([0.0, 0.0, 0.1])
+            np.testing.assert_allclose(rotated_pad_center, original_pad_center, atol=1e-12)
+            np.testing.assert_allclose(transform[:3, 1], [0.0, 1.0, 0.0], atol=1e-12)
+            self.assertNotEqual(variant["candidate_id"], base["candidate_id"])
+            self.assertTrue(variant["orientation_perturbation"]["pad_center_anchor_preserved"])
+        with self.assertRaisesRegex(ValueError, "grasp_tilt_angles"):
+            generate_grasp_tilt_variants(
+                [base], target_pose_world=np.eye(4), eef_position_world=np.zeros(3),
+                tilt_degrees=[0.0],
+            )
+
+    def test_approach_axis_roll_variants_keep_approach_and_pad_center(self):
+        base = {
+            "candidate_id": "geom110_jaw0_approach2_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": np.eye(4).tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_roll_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.0, 0.0, 0.2]),
+            roll_degrees=[-30.0, -20.0, -10.0, 10.0, 20.0, 30.0],
+        )
+        self.assertEqual(len(variants), 6)
+        for variant in variants:
+            transform = np.asarray(variant["object_to_eef"])
+            np.testing.assert_allclose(transform[:3, 2], [0.0, 0.0, 1.0], atol=1e-12)
+            pad_center = transform[:3, 3] + transform[:3, :3] @ np.array([0.0, 0.0, 0.1])
+            np.testing.assert_allclose(pad_center, [0.0, 0.0, 0.1], atol=1e-12)
+            self.assertNotEqual(variant["candidate_id"], base["candidate_id"])
+
+    def test_object_z_surface_offsets_move_contact_height_and_preserve_orientation(self):
+        base_transform = np.eye(4)
+        base_transform[:3, 3] = [0.01, -0.02, 0.03]
+        base = {
+            "candidate_id": "geom110_jaw0_approach2_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": base_transform.tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_surface_offset_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.2, 0.0, 0.2]),
+            offset_object_mm=[-15.0, -5.0, 5.0, 15.0],
+            offset_object_axis="z",
+        )
+        self.assertEqual(len(variants), 4)
+        for variant, offset in zip(variants, [-15.0, -5.0, 5.0, 15.0]):
+            transform = np.asarray(variant["object_to_eef"])
+            np.testing.assert_allclose(transform[:3, :3], base_transform[:3, :3], atol=1e-12)
+            np.testing.assert_allclose(
+                transform[:3, 3] - base_transform[:3, 3],
+                [0.0, 0.0, offset / 1000.0],
+                atol=1e-12,
+            )
+            self.assertEqual(variant["surface_contact_offset"]["offset_mm"], offset)
+            self.assertEqual(variant["surface_contact_offset"]["object_axis"], "z")
+
+    def test_object_y_contact_patch_offsets_move_pad_center_along_measured_face_axis(self):
+        base_transform = np.eye(4)
+        base_transform[:3, 3] = [0.01, -0.02, 0.03]
+        base = {
+            "candidate_id": "geom115_jaw0_approach1_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": base_transform.tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_surface_offset_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.2, 0.0, 0.2]),
+            offset_object_mm=[4.0, 8.0, 11.0],
+            offset_object_axis="y",
+        )
+        self.assertEqual(len(variants), 3)
+        for variant, offset in zip(variants, [4.0, 8.0, 11.0]):
+            transform = np.asarray(variant["object_to_eef"])
+            np.testing.assert_allclose(transform[:3, :3], base_transform[:3, :3], atol=1e-12)
+            np.testing.assert_allclose(
+                transform[:3, 3] - base_transform[:3, 3],
+                [0.0, offset / 1000.0, 0.0],
+                atol=1e-12,
+            )
+            self.assertEqual(variant["surface_contact_offset"]["object_axis"], "y")
+            self.assertIn("__object_y_", variant["candidate_id"])
+
+    def test_coupled_grasp_variants_apply_rotation_then_object_frame_offset(self):
+        base = {
+            "candidate_id": "geom110_jaw0_approach2_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": np.eye(4).tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_coupled_tilt_offset_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.0, 0.0, 0.2]),
+            tilt_degrees=[-10.0, 10.0],
+            rotation_axis="jaw",
+            offset_object_mm=[-4.0, 4.0],
+            offset_object_axis="y",
+        )
+        self.assertEqual(len(variants), 4)
+        self.assertEqual(len({item["candidate_id"] for item in variants}), 4)
+        for variant in variants:
+            transform = np.asarray(variant["object_to_eef"])
+            angle = variant["orientation_perturbation"]["angle_degrees"]
+            offset = variant["surface_contact_offset"]["offset_mm"]
+            expected_rotation = np.asarray(base["object_to_eef"])[:3, :3] @ \
+                grasp_search.Rotation.from_euler("y", angle, degrees=True).as_matrix()
+            np.testing.assert_allclose(transform[:3, :3], expected_rotation, atol=1e-12)
+            pad_center = np.asarray(base["pad_center_eef_m_from_active_open_pose"])
+            expected_position = (
+                np.asarray(base["object_to_eef"])[:3, 3]
+                + np.asarray(base["object_to_eef"])[:3, :3] @ pad_center
+                - expected_rotation @ pad_center
+                + np.array([0.0, offset / 1000.0, 0.0])
+            )
+            np.testing.assert_allclose(transform[:3, 3], expected_position, atol=1e-12)
+            self.assertEqual(
+                variant["source_candidate_id"], base["candidate_id"]
+            )
+            self.assertEqual(
+                variant["coupled_pose_perturbation"]["composition_order"],
+                "rotate_about_gripper_axis_then_translate_in_object_frame_axes",
+            )
+            self.assertIn("__jaw_tilt_", variant["candidate_id"])
+            self.assertIn("__object_y_", variant["candidate_id"])
+
+    def test_coupled_pose_grid_composes_two_object_axes_and_records_provenance(self):
+        base = {
+            "candidate_id": "geom110_jaw0_approach2_+1_flip+1",
+            "candidate_source": "compiled_geometry",
+            "object_to_eef": np.eye(4).tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.06,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.1],
+        }
+        variants = generate_grasp_coupled_pose_grid_variants(
+            [base],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.array([0.0, 0.0, 0.2]),
+            tilt_degrees=[10.0],
+            rotation_axis="approach",
+            offsets_by_object_axis={"y": [-4.0, 4.0], "z": [6.0, 10.0]},
+        )
+        self.assertEqual(len(variants), 4)
+        for variant in variants:
+            offsets = variant["coupled_surface_contact_offsets"]["object_axes_mm"]
+            self.assertEqual(set(offsets), {"y", "z"})
+            delta = np.array([0.0, offsets["y"] / 1000.0, offsets["z"] / 1000.0])
+            rotation = np.asarray(variant["object_to_eef"])[:3, :3]
+            expected_position = np.array([0.0, 0.0, 0.1]) - rotation @ np.array([0.0, 0.0, 0.1]) + delta
+            np.testing.assert_allclose(
+                np.asarray(variant["object_to_eef"])[:3, 3],
+                expected_position,
+                atol=1e-12,
+            )
+            self.assertEqual(variant["source_candidate_id"], base["candidate_id"])
+            self.assertIn("__object_y_", variant["candidate_id"])
+            self.assertIn("__object_z_", variant["candidate_id"])
+
+    def test_coupled_pose_cli_requires_explicit_screen_only_mode_and_bounds_product(self):
+        common = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "4",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+            "--candidate-id", "base-a",
+        ]
+        coupled = [
+            *common,
+            "--candidate-tilt-degrees", "-10",
+            "--candidate-tilt-degrees", "10",
+            "--candidate-offset-object-y-mm", "-4",
+            "--candidate-offset-object-y-mm", "4",
+            "--candidate-coupled-perturbations",
+        ]
+        with patch.object(sys, "argv", coupled):
+            parsed = _parse_args()
+        self.assertTrue(parsed.candidate_coupled_perturbations)
+        with patch.object(sys, "argv", [
+            *common,
+            "--candidate-tilt-degrees", "-10",
+            "--candidate-offset-object-y-mm", "-4",
+        ]), self.assertRaises(SystemExit):
+            _parse_args()
+        over_budget = [
+            *common,
+            "--maximum-candidates", "24",
+            "--candidate-coupled-perturbations",
+        ]
+        for angle in ("-10", "-5", "5", "10", "15"):
+            over_budget.extend(["--candidate-tilt-degrees", angle])
+        for offset in ("-8", "-4", "2", "4", "8"):
+            over_budget.extend(["--candidate-offset-object-y-mm", offset])
+        with patch.object(sys, "argv", over_budget):
+            with self.assertRaises(SystemExit):
+                _parse_args()
+
+    def test_coupled_pose_cli_allows_multiple_offset_axes_with_product_budget(self):
+        args = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "8",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+            "--candidate-id", "base-a",
+            "--candidate-roll-degrees", "5",
+            "--candidate-offset-object-y-mm", "-4",
+            "--candidate-offset-object-y-mm", "4",
+            "--candidate-offset-object-z-mm", "6",
+            "--candidate-offset-object-z-mm", "10",
+            "--candidate-coupled-perturbations",
+        ]
+        with patch.object(sys, "argv", args):
+            parsed = _parse_args()
+        self.assertTrue(parsed.candidate_coupled_perturbations)
+        multi_axis = [
+            *args,
+            "--candidate-offset-object-x-mm", "2",
+            "--candidate-offset-object-x-mm", "4",
+        ]
+        with patch.object(sys, "argv", multi_axis):
+            parsed = _parse_args()
+        self.assertEqual(parsed.candidate_offset_object_x_mm, [2.0, 4.0])
+        self.assertTrue(parsed.candidate_coupled_perturbations)
+        over_budget = [
+            *multi_axis,
+            "--maximum-candidates", "24",
+        ]
+        for offset in ("-7", "-5", "-3", "3", "5", "7", "9"):
+            over_budget.extend(["--candidate-offset-object-x-mm", offset])
+        with patch.object(sys, "argv", over_budget), self.assertRaises(SystemExit):
+            _parse_args()
+
+    def test_surface_offset_screen_budget_accepts_four_bases_and_six_heights(self):
+        args = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]
+        for candidate_id in ("base-a", "base-b", "base-c", "base-d"):
+            args.extend(["--candidate-id", candidate_id])
+        for offset in ("-15", "-10", "-5", "5", "10", "15"):
+            args.extend(["--candidate-offset-object-z-mm", offset])
+        with patch.object(sys, "argv", args):
+            parsed = _parse_args()
+        self.assertEqual(len(parsed.candidate_id) * len(parsed.candidate_offset_object_z_mm), 24)
+
+    def test_surface_contact_patch_budget_accepts_two_bases_and_three_y_offsets(self):
+        args = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]
+        for candidate_id in ("handle-a", "handle-b"):
+            args.extend(["--candidate-id", candidate_id])
+        for offset in ("4", "8", "11"):
+            args.extend(["--candidate-offset-object-y-mm", offset])
+        with patch.object(sys, "argv", args):
+            parsed = _parse_args()
+        self.assertEqual(
+            len(parsed.candidate_id) * len(parsed.candidate_offset_object_y_mm), 6
+        )
+
+    def test_surface_contact_offset_axes_are_mutually_exclusive(self):
+        args = [
+            "task_success_first_grasp_search.py",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+            "--candidate-id", "handle-a",
+            "--candidate-offset-object-y-mm", "8",
+            "--candidate-offset-object-z-mm", "5",
+        ]
+        with patch.object(sys, "argv", args), self.assertRaises(SystemExit):
+            _parse_args()
+
+    def test_historical_pose_prior_loader_recomputes_task_matched_physical_transforms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trajectory = root / "source.npz"
+            metadata = {
+                "suite": "obstacle_avoidance", "level": 0, "task_id": 0,
+                "initial_state_index": 0, "seed": 20261020, "env_seed": 0,
+                "action_dim": 7, "steps": 5,
+                "checkpoint_path": "/base", "lora_checkpoint_path": "/adapter",
+            }
+            np.savez(
+                trajectory,
+                metadata_json=np.asarray(json.dumps(metadata)),
+                step_dones=np.asarray([False, False, False, False, True]),
+            )
+            result_path = root / "result.json"
+            result_path.write_text(json.dumps({"success_once": True, "done": True, "steps": 5}))
+            evaluation_path = root / "evaluation.json"
+            evaluation_path.write_text(json.dumps({
+                "task": {
+                    "suite": "obstacle_avoidance", "level": 0,
+                    "task_id": 0, "initial_state_index": 0,
+                },
+                "model": {
+                    "base_checkpoint": "/base", "adapter_sha256": "abc",
+                    "adapter_loaded_during_rollout": True,
+                },
+            }))
+            contact_path = root / "contacts.json"
+            contact_path.write_text(json.dumps({"status": "complete"}))
+            pose = {
+                "control_step_index": 2,
+                "object_root_position_world_m": [0.0, 0.0, 0.03],
+                "object_root_quaternion_world_wxyz": [1.0, 0.0, 0.0, 0.0],
+                "eef_position_world_m": [0.03, 0.0, 0.02],
+                "eef_quaternion_world_wxyz": [1.0, 0.0, 0.0, 0.0],
+            }
+            start_pose = {
+                **pose, "control_step_index": 0,
+                "object_root_position_world_m": [0.0, 0.0, 0.0],
+                "eef_position_world_m": [0.10, 0.0, 0.03],
+            }
+            end_pose = {
+                **pose, "control_step_index": 1,
+                "object_root_position_world_m": [0.0, 0.0, 0.0],
+                "eef_position_world_m": [0.03, 0.0, 0.02],
+            }
+            prior_path = root / "priors.json"
+            from research.gs_opd.repair.task_success_first_grasp_search import _sha256_file
+            prior_path.write_text(json.dumps({
+                "schema_version": "gs_opd_historical_grasp_pose_priors.v1",
+                "task": {
+                    "benchmark": "obstacle_avoidance", "level": 0, "task_id": 0,
+                    "init_state": 0, "seed": 0, "target_object_id": "bowl",
+                },
+                "safety_qualification_inherited": False,
+                "source_episodes": [{
+                    "source_episode_id": "source-a",
+                    "trajectory_npz": str(trajectory),
+                    "trajectory_npz_sha256": _sha256_file(trajectory),
+                    "result_json": str(result_path),
+                    "result_json_sha256": _sha256_file(result_path),
+                    "evaluation_report_json": str(evaluation_path),
+                    "evaluation_report_json_sha256": _sha256_file(evaluation_path),
+                    "contact_evidence_report": str(contact_path),
+                    "contact_evidence_report_sha256": _sha256_file(contact_path),
+                    "base_checkpoint_path": "/base",
+                    "lora_adapter_path": "/adapter",
+                    "adapter_sha256": "abc",
+                    "steps": 5,
+                    "native_task_success": True,
+                    "strict_safety_qualified": False,
+                    "safety_qualification_inherited": False,
+                }],
+                "candidates": [{
+                    "candidate_id": "source-a-grasp",
+                    "source_episode_id": "source-a",
+                    "stable_grasp_window_control_steps": [2, 4],
+                    "physical_pose_samples": [pose, {**pose, "control_step_index": 3}, {**pose, "control_step_index": 4}],
+                    "bilateral_pad_contact_verified": True,
+                    "bilateral_pad_contact_evidence": {
+                        "left_pad_first_control_step": 2,
+                        "right_pad_first_control_step": 2,
+                    },
+                    "object_lift_verified": True,
+                    "object_lift_evidence": {
+                        "threshold_m": 0.03, "initial_object_root_z_m": 0.0,
+                    },
+                    "approach_direction_evidence": {
+                        "start_pose": start_pose, "end_pose": end_pose,
+                    },
+                    "first_gripper_target_contact_control_step": 2,
+                    "approach_direction_object": [-0.9899494937, 0.0, -0.1414213562],
+                    "approach_distance_m": 0.0606,
+                }],
+            }))
+            candidates, summary = load_historical_grasp_pose_prior_candidates(
+                prior_path,
+                benchmark="obstacle_avoidance", level=0, task_id=0, init_state=0, seed=0,
+                target_object_id="bowl", target_pose_world=np.eye(4),
+                eef_position_world=np.zeros(3), active_pad_center_eef_m=np.zeros(3),
+                maximum_candidates=2,
+            )
+            self.assertEqual(summary["candidate_count"], 1)
+            self.assertTrue(summary["task_identity_verified"])
+            self.assertFalse(summary["source_safety_qualification_inherited"])
+            np.testing.assert_allclose(
+                np.asarray(candidates[0]["object_to_eef"])[:3, 3], [0.03, 0.0, -0.01]
+            )
+            np.testing.assert_allclose(
+                candidates[0]["approach_direction_object"],
+                [-0.9899494937, 0.0, -0.1414213562], atol=1e-8,
+            )
+            with self.assertRaisesRegex(ValueError, "task_identity_mismatch"):
+                load_historical_grasp_pose_prior_candidates(
+                    prior_path,
+                    benchmark="obstacle_avoidance", level=0, task_id=1,
+                    init_state=0, seed=0, target_object_id="bowl",
+                    target_pose_world=np.eye(4), eef_position_world=np.zeros(3),
+                    active_pad_center_eef_m=np.zeros(3), maximum_candidates=2,
+                )
+
+    def test_offline_geometry_screen_can_extend_candidate_budget_without_expanding_physical_search(self):
+        context = {
+            "target_root_pose_world": {
+                "position_m": [0.0, 0.0, 0.0],
+                "rotation": np.eye(3).tolist(),
+            },
+            "symmetric_pad_center_eef_m": [0.0, 0.0, 0.0],
+            "maximum_pad_separation_m": 0.08,
+            "eef_pose_world": {"position_m": [0.4, 0.0, 0.4]},
+            "target_collision_geometries": [{
+                "geom_id": 7,
+                "geom_name": "target_box",
+                "geom_type_name": "box",
+                "size_m": [0.02, 0.03, 0.04],
+                "center_root_m": [0.0, 0.0, 0.0],
+                "rotation_root": np.eye(3).tolist(),
+            }],
+            "target_object_id": "target",
+            "native_goal_predicate": ["On", "target", "plate"],
+            "gripper_pad_separation_m": 0.04,
+        }
+        context["target_collision_geometries"].append({
+            "geom_id": 8,
+            "geom_name": "target_box_farther",
+            "geom_type_name": "box",
+            "size_m": [0.02, 0.03, 0.04],
+            "center_root_m": [0.1, 0.0, 0.0],
+            "rotation_root": np.eye(3).tolist(),
+        })
+        physical_candidates, _ = generate_geometry_candidates(
+            context, maximum_candidates=MAX_GEOMETRY_CANDIDATES
+        )
+        offline_candidates, metadata = generate_geometry_candidates(
+            context, maximum_candidates=MAX_OFFLINE_GEOMETRY_GENERATION
+        )
+        self.assertEqual(len(physical_candidates), MAX_GEOMETRY_CANDIDATES)
+        self.assertEqual(len(offline_candidates), MAX_OFFLINE_GEOMETRY_GENERATION)
+        self.assertEqual(metadata["maximum_candidate_budget"], MAX_OFFLINE_GEOMETRY_GENERATION)
+        with self.assertRaisesRegex(ValueError, "maximum_candidates_must_be_in_1..48"):
+            generate_geometry_candidates(context, maximum_candidates=49)
+        first_window = _candidate_window(offline_candidates, start=0, count=24)
+        second_window = _candidate_window(offline_candidates, start=24, count=24)
+        self.assertEqual(len(first_window), MAX_OFFLINE_GEOMETRY_SCREEN_BATCH)
+        self.assertEqual(len(second_window), MAX_OFFLINE_GEOMETRY_SCREEN_BATCH)
+        self.assertTrue(set(item["candidate_id"] for item in first_window).isdisjoint(
+            item["candidate_id"] for item in second_window
+        ))
+        first_diverse = diversify_candidates(first_window)
+        second_diverse = diversify_candidates(second_window)
+        self.assertTrue(set(item["candidate_id"] for item in first_diverse).isdisjoint(
+            item["candidate_id"] for item in second_diverse
+        ))
+
+    def test_candidate_budget_above_physical_limit_is_restricted_to_screen_only(self):
+        common = ["task_success_first_grasp_search.py", "--maximum-candidates", "24"]
+        with patch.object(sys, "argv", common):
+            with self.assertRaises(SystemExit):
+                _parse_args()
+        with patch.object(sys, "argv", [
+            *common,
+            "--strict-grasp-screen-only",
+            "--candidate-start-index", "24",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]):
+            args = _parse_args()
+        self.assertEqual(args.maximum_candidates, 24)
+        self.assertEqual(args.candidate_start_index, 24)
+        self.assertTrue(args.strict_grasp_screen_only)
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+            "--candidate-id", "geom115_jaw2_approach1_-1_flip-1",
+            "--candidate-id", "geom115_jaw0_approach1_-1_flip+1",
+        ]):
+            args = _parse_args()
+        self.assertEqual(len(args.candidate_id), 2)
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--candidate-start-index", "25",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]):
+            with self.assertRaises(SystemExit):
+                _parse_args()
+        tilt_args = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]
+        for candidate_id in ("base-a", "base-b", "base-c", "base-d"):
+            tilt_args.extend(["--candidate-id", candidate_id])
+        for angle in ("-20", "-15", "-10", "10", "15", "20"):
+            tilt_args.extend(["--candidate-tilt-degrees", angle])
+        with patch.object(sys, "argv", tilt_args):
+            args = _parse_args()
+        self.assertEqual(len(args.candidate_id) * len(args.candidate_tilt_degrees), 24)
+        roll_args = [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "24",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+        ]
+        for candidate_id in ("base-a", "base-b", "base-c", "base-d"):
+            roll_args.extend(["--candidate-id", candidate_id])
+        for angle in ("-30", "-20", "-10", "10", "20", "30"):
+            roll_args.extend(["--candidate-roll-degrees", angle])
+        with patch.object(sys, "argv", roll_args):
+            args = _parse_args()
+        self.assertEqual(len(args.candidate_id) * len(args.candidate_roll_degrees), 24)
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py",
+            "--maximum-candidates", "2",
+            "--strict-grasp-screen-only",
+            "--strict-screen-reference-report", "prior-report.json",
+            "--historical-grasp-pose-priors-json", "historical-priors.json",
+        ]):
+            args = _parse_args()
+        self.assertEqual(args.historical_grasp_pose_priors_json, Path("historical-priors.json"))
+
+    def test_completed_screen_only_report_returns_successful_cli_exit(self):
+        report = {
+            "strict_grasp_screen_only": True,
+            "strict_grasp_geometry_screen": "/tmp/strict-screen.json",
+            "artifacts": {"candidate_count": 24},
+            "status": "no_strict_pad_only_grasp_candidate_in_generated_set",
+        }
+        with patch.object(grasp_search, "_parse_args", return_value=object()), \
+                patch.object(grasp_search, "run", return_value=report), \
+                patch("builtins.print"):
+            self.assertEqual(grasp_search.main(), 0)
+
+    def test_bddl_screen_policy_uses_declared_forbidden_objects_and_does_not_add_support_exceptions(self):
+        bddl = """(define (problem x)
+(:fixtures flat_stove_1 - flat_stove white_place_box_1 - place_box main_table - table)
+(:objects akita_black_bowl_1 - bowl bottle_of_perfume_1 - perfume plate_1 - plate)
+(:obj_of_interest akita_black_bowl_1 plate_1)
+(:init (On akita_black_bowl_1 flat_stove_1_cook_region))
+(:goal (And (On akita_black_bowl_1 plate_1)))
+(:constraints (And (CheckRobotContact bottle_of_perfume_1)
+(CheckRobotContact white_place_box_1)
+(CheckContact akita_black_bowl_1 bottle_of_perfume_1)
+(CheckContact akita_black_bowl_1 white_place_box_1)))
+)"""
+        names = [
+            "akita_black_bowl_1", "bottle_of_perfume_1", "white_place_box_1",
+            "plate_1", "flat_stove_1",
+        ]
+        bindings = {}
+        geometries = []
+        bodies = []
+        for index, name in enumerate(names, start=1):
+            body_id, geom_id = index, 100 + index
+            bindings[name] = {
+                "collision_body_ids": [body_id],
+                "collision_body_names": [f"{name}_main"],
+                "geom_ids": [geom_id],
+            }
+            geometries.append({
+                "body_id": body_id,
+                "geom_id": geom_id,
+                "category": "scene",
+                "collision_enabled": True,
+            })
+            bodies.append({"body_id": body_id, "body_name": f"{name}_main"})
+        policy, semantics = _build_bddl_grasp_screen_policy(
+            {
+                "target_object_id": "akita_black_bowl_1",
+                "fingertip_pad_geometries": {
+                    "left": [{"geom_id": 74}],
+                    "right": [{"geom_id": 77}],
+                },
+            },
+            {"bindings": bindings},
+            {"geometries": geometries, "bodies": bodies},
+            bddl,
+        )
+        self.assertEqual(
+            {item["object_id"] for item in policy["forbidden_objects"]},
+            {"bottle_of_perfume_1", "white_place_box_1"},
+        )
+        self.assertEqual(
+            {item["object_id"] for item in policy["allowed_target_objects"]},
+            {"akita_black_bowl_1"},
+        )
+        self.assertIn(
+            "flat_stove_1",
+            {item["object_id"] for item in policy["other_scene_objects"]},
+        )
+        self.assertEqual(len(policy["forbidden_object_pairs"]), 2)
+        self.assertEqual(policy["allowed_carried_support_contact_geom_ids"], [])
+        self.assertEqual(semantics["authorized_pad_target_penetration_m"], -0.002)
+        self.assertFalse(semantics["support_contacts_added_as_exceptions"])
+
     def test_task_search_admits_ik_checked_osc_fallback_without_rrt_safe_path(self):
         self.assertTrue(candidate_route_preflight_admitted(
             "no_safe_path", True, direct_osc_fallback_added=True,
@@ -53,6 +752,12 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
         self.assertEqual(unilateral_target_contact_sides({
             "finger_contacts": {"left": True, "right": True},
         }), ())
+        self.assertEqual(target_finger_contact_sides({
+            "finger_contacts": {"left": True, "right": True},
+        }), ("left", "right"))
+        self.assertEqual(target_finger_contact_sides({
+            "finger_contacts": {"left": False, "right": True},
+        }), ("right",))
         self.assertEqual(unilateral_target_contact_sides({
             "finger_contacts": {"left": False, "right": False},
         }), ())
