@@ -30,7 +30,10 @@ from typing import Any
 import numpy as np
 
 from research.gs_opd.repair.task_phase_controller import PhaseEvidence, TaskPhaseController
-from research.gs_opd.repair.task_success_first_search import pending_object_goals
+from research.gs_opd.repair.task_success_first_search import (
+    inspect_native_goal_coverage,
+    pending_object_goals,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -136,6 +139,8 @@ def _task_success_first_grasp_search_command(
             "--resume-from-keypose-preflight-report",
             str(args.resume_from_keypose_preflight_report.resolve()),
         ])
+    if getattr(args, "cold_start", False):
+        command.append("--cold-start")
     if args.experience_library is not None:
         command.extend(["--experience-library", str(args.experience_library)])
     previous_search_report = getattr(args, "previous_search_report", None)
@@ -154,6 +159,8 @@ def _task_success_collision_route_policy(policy: dict[str, Any]) -> dict[str, An
     """Keep verified geometry bindings, but remove safety margins for route search."""
     result = copy.deepcopy(policy)
     result["minimum_clearance_m"] = 0.0
+    if "measure_forbidden_object_pair_clearances" in result:
+        result["measure_forbidden_object_pair_clearances"] = False
     for group_name in ("forbidden_objects", "allowed_target_objects", "other_scene_objects"):
         groups = result.get(group_name, [])
         if not isinstance(groups, list):
@@ -840,11 +847,25 @@ def _select_active_target_predicate(
     native_status: dict[str, Any], requested: list[str] | None
 ) -> tuple[list[str] | None, str, list[list[str]]]:
     """Select an explicit goal or the first pending native object goal."""
+    coverage = inspect_native_goal_coverage(native_status)
     pending = pending_object_goals(native_status)
     if requested is not None:
-        return [str(token) for token in requested], "explicit_cli", pending
+        selected = [str(token) for token in requested]
+        match = next((row for row in coverage["goals"] if row["predicate"] == selected), None)
+        if match is None or not match["operation_supported"]:
+            raise ValueError("requested_native_goal_missing_or_operator_not_supported")
+        return selected, "explicit_cli", pending
     if pending:
         return pending[0], "first_pending_native_object_goal_bddl_order", pending
+    fixture = next((row["predicate"] for row in coverage["goals"]
+                    if not row["value"] and row["operator"] in {"open", "close", "turnon", "turnoff"}), None)
+    if fixture is not None:
+        return fixture, "first_pending_supported_fixture_goal_bddl_order", pending
+    if coverage["pending_unsupported_goals"]:
+        raise ValueError("pending_native_goal_operator_not_supported:" + json.dumps(
+            [row["predicate"] for row in coverage["pending_unsupported_goals"]],
+            ensure_ascii=False,
+        ))
     return None, "no_pending_object_goal", pending
 
 
@@ -2017,7 +2038,7 @@ def _run_articulated_fixture_goal(
     waypoints.extend(point + contact_offset for point in path[1:])
     for waypoint in waypoints:
         _advance_pose(
-            bridge, waypoint, quaternion, "articulated_fixture_close",
+            bridge, waypoint, quaternion, f"articulated_fixture_{predicate[0].lower()}",
             f"native_{predicate[0].lower()}_{predicate[1]}", counter,
             max(1, 128 - counter[0]), target_binding, instruction, policy,
             monitor, records, frames,
@@ -2224,6 +2245,8 @@ def _native_place_single(
     start_snapshot_path = output_dir / "native_goal_transport_start_runtime_snapshot.pkl"
     start_snapshot_path.write_bytes(start_snapshot["payload"])
     planning_policy = copy.deepcopy(safety_policy)
+    if "measure_forbidden_object_pair_clearances" in planning_policy:
+        planning_policy["measure_forbidden_object_pair_clearances"] = False
     if not resume_at_release:
         planning_policy["carried_object"] = {
             "object_id": target_id,
@@ -3534,6 +3557,8 @@ def _screen_native_keypose_candidates(
                 ))
 
     planning_policy = dict(safety_policy)
+    if "measure_forbidden_object_pair_clearances" in planning_policy:
+        planning_policy["measure_forbidden_object_pair_clearances"] = False
     planning_policy["carried_object"] = {
         "object_id": target_id,
         "grasp_binding": target_binding,
@@ -4356,10 +4381,25 @@ def _native_place(
 def run(args: argparse.Namespace) -> dict[str, Any]:
     from research.gs_opd.repair.automatic_recovery_runtime import Pi05StudentPolicy
     from research.gs_opd.repair.task_success_first_grasp_search import (
-        BridgeSession, _PythonObjectState, _build_safety_policy, _restore_initial,
-        _snapshot_state_vector,
+        BridgeSession, _PythonObjectState, _build_safety_policy, _build_bddl_grasp_screen_policy, _restore_initial,
+        _snapshot_state_vector, _verify_cold_start_reset,
     )
 
+    cold_start = bool(getattr(args, "cold_start", False))
+    if cold_start and (
+        args.experience_library is not None
+        or args.keypose_experience
+        or args.previous_search_report
+        or args.resume_from_grasp_report is not None
+        or args.resume_from_placement_report is not None
+        or args.resume_from_runtime_snapshot is not None
+        or args.resume_from_keypose_preflight_report is not None
+        or args.recovery_fallback_runtime_snapshot is not None
+        or args.candidate_id is not None
+        or args.candidate_start_index != 0
+        or args.native_region_route_variant is not None
+    ):
+        raise ValueError("cold_start_cannot_use_historical_experience_or_partial_task_inputs")
     for dependency_path in (
         Path("/workspace/zy_workspace/LIBERO-Safety"),
         Path("/workspace/zy_workspace/LIBERO-Safety/third_party/robosuite-1.4"),
@@ -4409,6 +4449,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report: dict[str, Any] = {
         "schema_version": "gs_opd_task_success_first_execution.v1",
         "status": "in_progress",
+        "cold_start_protocol": (
+            {
+                "enabled": True,
+                "target_success_demonstration_used": False,
+                "target_success_keyposes_used": False,
+                "official_demonstration_used": False,
+                "historical_actions_replayed": False,
+                "initial_policy": "base_pi05",
+                "experience_library_loaded": False,
+                "success_reference_loaded": False,
+                "previous_search_reports_loaded": False,
+                "start_state": "identity_checked_legal_t0_snapshot",
+            }
+            if cold_start else {"enabled": False}
+        ),
         "scope": {
             "benchmark": args.benchmark, "level": args.level, "task_id": args.task_id,
             "init_state": args.init_state, "seed": args.seed,
@@ -4418,6 +4473,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "policy": {
             "student_first": True,
+            "initial_policy": "base_pi05" if cold_start else "base_pi05_or_verified_prior_skill",
             "student_checkpoint": str(args.checkpoint.resolve()),
             "student_weights_only_no_LoRA": True,
             "official_safety_demonstration_data_used": False,
@@ -4449,6 +4505,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         reset = bridge.request({"op": "reset"})
         if reset.get("scene_metadata", {}).get("model_geometry_sha256") != model_sha:
             raise RuntimeError("active_scene_model_fingerprint_differs_from_source_snapshot")
+        if cold_start:
+            if reset.get("scene_metadata", {}).get("bddl_sha256") != manifest.get("scene_metadata", {}).get("bddl_sha256"):
+                raise RuntimeError("cold_start_fresh_reset_BDDL_differs_from_source_snapshot")
+            report["cold_start_reset_verification"] = _verify_cold_start_reset(bridge, initial_state)
         initial = _restore_initial(bridge, payload, initial_state, model_sha)
         direct_resume = None
         if args.resume_from_runtime_snapshot is not None:
@@ -4493,11 +4553,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         values, success = _task_values(native)
         if success:
             raise RuntimeError("initial_t0_native_task_success_unexpectedly_true")
+        report["native_goal_coverage"] = inspect_native_goal_coverage(native)
         # Match the batch scheduler so direct Snapshot resumes remain task
         # agnostic for multi-object scenes.
         active_target_predicate, target_selection_source, pending_goals = (
             _select_active_target_predicate(native, args.target_predicate)
         )
+        if active_target_predicate is None:
+            raise RuntimeError("no_executable_pending_native_goal_while_task_unsuccessful")
         report["target_goal_selection"] = {
             "predicate": active_target_predicate,
             "source": target_selection_source,
@@ -4636,7 +4699,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "target_finger_contacts": live_grasp_state.get("finger_contacts"),
             "resume_source": "model_verified_initial_Runtime_Snapshot" if live_target_grasp_verified else None,
         }
-        policy = _build_safety_policy(context, semantic, geometry, gripper)
+        if cold_start:
+            bddl_text = (snapshot_root / "task.bddl").read_text(encoding="utf-8")
+            if args.benchmark.startswith("libero_") and ":constraints" not in bddl_text.lower():
+                policy = _build_safety_policy(context, semantic, geometry, gripper)
+                policy_semantics = {"source": "generic_diagnostic_only", "BDDL_safety_constraints_declared": False}
+                policy["source"] = "generic_scene_diagnostic_no_BDDL_safety_constraints_or_teacher_attestation"
+                policy_source = "generic_scene_diagnostic"
+            else:
+                policy, policy_semantics = _build_bddl_grasp_screen_policy(context, semantic, geometry, bddl_text)
+                policy["source"] = "active_BDDL_contact_constraints_no_teacher_attestation"
+                policy_source = "active_BDDL"
+            policy["measure_forbidden_object_pair_clearances"] = True
+            policy_path = output_dir / "cold_start_safety_policy.json"
+            _json(policy_path, policy)
+            report["safety_policy_provenance"] = {
+                "source": policy_source, "teacher_attested": False,
+                "semantics": policy_semantics, "safety_certified": False,
+                "policy_path": str(policy_path),
+            }
+        else:
+            policy = _build_safety_policy(context, semantic, geometry, gripper)
         initial_export = bridge.request({"op": "export_runtime_snapshot"})
         if initial_export.get("status") != "complete" or not isinstance(initial_export.get("payload"), bytes):
             raise RuntimeError("task_success_first_initial_snapshot_export_failed")
@@ -4921,6 +5004,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     None if articulated["native_goal_value"] is True
                     else "bounded_physical_OSC_fixture_push_did_not_satisfy_native_goal"
                 )
+            report["task_success"] = report["final_native_task_status"].get("task_success") is True
             report["archive"] = str(output_dir)
             _json(output_dir / "run_report.json", report)
             return report
@@ -5199,6 +5283,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--experience-library", type=Path, default=None)
     parser.add_argument("--keypose-experience", type=Path, action="append", default=[])
     parser.add_argument("--keypose-start-after", default=None)
+    parser.add_argument(
+        "--cold-start", action="store_true",
+        help="forbid success experiences, keyposes, candidate pins, prior reports, and partial-task snapshots",
+    )
     args = parser.parse_args()
     resume_sources = [
         args.resume_from_grasp_report,
@@ -5224,6 +5312,18 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--candidate-start-index must select an index inside the candidate budget")
     if args.candidate_id is not None and args.candidate_start_index != 0:
         parser.error("--candidate-id requires --candidate-start-index 0")
+    if args.cold_start and (
+        args.experience_library is not None
+        or args.keypose_experience
+        or args.previous_search_report
+        or any(source is not None for source in resume_sources)
+        or args.resume_from_keypose_preflight_report is not None
+        or args.recovery_fallback_runtime_snapshot is not None
+        or args.candidate_id is not None
+        or args.candidate_start_index != 0
+        or args.native_region_route_variant is not None
+    ):
+        parser.error("--cold-start cannot use historical experience or partial-task inputs")
     if not 1 <= args.maximum_rrt_preflights <= 8:
         parser.error("--maximum-rrt-preflights must be in 1..8")
     if not 1 <= args.maximum_physical_branches <= 3:

@@ -39,6 +39,7 @@ from research.gs_opd.repair.task_success_first_search import (
     SearchFailureMemory,
     blocked_candidate_ids_from_report,
     candidate_route_preflight_admitted,
+    generated_geometry_high_approach_admitted,
     candidate_matches_failure_memory,
     diversify_candidates,
     high_approach_route,
@@ -990,6 +991,24 @@ def _snapshot_state_vector(value: dict[str, Any]) -> np.ndarray:
     return state
 
 
+def _verify_cold_start_reset(bridge: BridgeSession, expected_state: np.ndarray) -> dict[str, Any]:
+    """Compare a claimed t0 snapshot to the freshly reset live environment."""
+    observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+    if observed.get("timestep") != 0:
+        raise RuntimeError("cold_start_fresh_reset_timestep_is_not_zero")
+    actual = _snapshot_state_vector(observed.get("snapshot_state", {}))
+    if actual.shape != expected_state.shape or not np.array_equal(actual, expected_state):
+        raise RuntimeError("cold_start_snapshot_differs_from_fresh_reset_integration_state")
+    return {
+        "status": "pass",
+        "fresh_reset_timestep": 0,
+        "exact_integration_state_match": True,
+        "integration_state_sha256": hashlib.sha256(
+            np.ascontiguousarray(actual, dtype=np.float64).tobytes()
+        ).hexdigest(),
+    }
+
+
 def _restore_initial(bridge: BridgeSession, payload: bytes, expected_state: np.ndarray, model_sha: str) -> dict[str, Any]:
     result = bridge.request({"op": "restore_runtime_snapshot", "payload": payload})
     if result.get("status") != "restored" or result.get("model_geometry_sha256") != model_sha:
@@ -1778,6 +1797,7 @@ def _run_physical_branch(
     records: list[dict[str, Any]],
     frames: list[dict[str, Any]],
     output_dir: Path,
+    abort_target_displacement_m: float | None = None,
 ) -> tuple[dict[str, Any], bytes | None]:
     candidate_id = candidate["candidate_id"]
     _restore_initial(bridge, initial_payload, initial_state, model_sha)
@@ -2138,6 +2158,15 @@ def _run_physical_branch(
         relative_transform = np.asarray(object_to_target, dtype=np.float64)
 
         def provide(snapshot_state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+            if abort_target_displacement_m is not None:
+                obj = _object_state(snapshot_state, int(target_binding["body_id"]))
+                position = np.asarray(obj["root_pos"], dtype=np.float64)
+                initial = np.asarray(context["target_root_pose_world"]["position_m"], dtype=np.float64)
+                displacement = float(np.linalg.norm(position - initial))
+                if displacement > abort_target_displacement_m:
+                    raise RuntimeError(
+                        f"ungrasped_target_displaced_during_approach:{displacement:.6f}m"
+                    )
             return _object_relative_target_pose(
                 snapshot_state,
                 int(target_binding["body_id"]),
@@ -2346,10 +2375,31 @@ def _state_sha(value: np.ndarray) -> str:
     return _sha256_bytes(np.ascontiguousarray(value, dtype=np.float64).tobytes())
 
 
+def _cold_start_geometry_fallback_allowed(cold_start: bool, candidate: dict[str, Any], planner: dict[str, Any]) -> bool:
+    return bool(cold_start and generated_geometry_high_approach_admitted(candidate, planner))
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     run_started = time.monotonic()
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
 
+    cold_start = bool(getattr(args, "cold_start", False))
+    if cold_start and (
+        args.experience_library is not None
+        or args.previous_search_report
+        or args.historical_grasp_pose_priors_json is not None
+        or args.strict_grasp_screen_only
+        or args.strict_screen_reference_report is not None
+        or args.resume_from_runtime_snapshot is not None
+        or args.candidate_id
+        or args.candidate_start_index != 0
+        or args.candidate_tilt_degrees
+        or args.candidate_roll_degrees
+        or args.candidate_offset_object_x_mm
+        or args.candidate_offset_object_y_mm
+        or args.candidate_offset_object_z_mm
+    ):
+        raise ValueError("cold_start_cannot_use_historical_experience_or_partial_search_inputs")
     snapshot_root = args.snapshot_root.resolve()
     snapshot_path = snapshot_root / "snapshots/initial_runtime_snapshot.pkl"
     manifest_path = snapshot_root / "snapshots/runtime_snapshot_manifest.json"
@@ -2410,6 +2460,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report: dict[str, Any] = {
         "schema_version": "gs_opd_task_success_first_grasp_search.v1",
         "status": "preflight_in_progress",
+        "cold_start_protocol": (
+            {
+                "enabled": True,
+                "target_success_demonstration_used": False,
+                "target_success_keyposes_used": False,
+                "official_demonstration_used": False,
+                "historical_actions_replayed": False,
+                "initial_policy": "base_pi05",
+                "search_stage": "geometry_search_after_base_pi05_attempt",
+                "experience_library_loaded": False,
+                "previous_search_reports_loaded": False,
+                "historical_grasp_pose_priors_loaded": False,
+                "start_state": "identity_checked_legal_t0_snapshot",
+            }
+            if cold_start else {"enabled": False}
+        ),
         "scope": {
             "benchmark": args.benchmark,
             "level": args.level,
@@ -2439,6 +2505,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "training_or_LeRobot_conversion": False,
             "full_task_or_goal_region_execution": False,
             "official_safety_demonstrations_used": False,
+            "target_success_demonstration_used": False if cold_start else None,
+            "target_success_keyposes_used": False if cold_start else None,
+            "historical_actions_replayed": False,
             "cross_scene_experience_library_path": (
                 str(args.experience_library) if args.experience_library else None
             ),
@@ -2495,6 +2564,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("bridge_reset_model_does_not_match_archived_t0_snapshot")
         if reset.get("scene_metadata", {}).get("bddl_sha256") != manifest["scene_metadata"].get("bddl_sha256"):
             raise RuntimeError("bridge_reset_BDDL_does_not_match_archived_t0_snapshot")
+        if cold_start:
+            report["cold_start_reset_verification"] = _verify_cold_start_reset(bridge, initial_state)
         _restore_initial(bridge, search_start_payload, search_start_state, model_sha)
         initial = bridge.request({"op": "observe", "include_snapshot_state": True})
         instruction = str(manifest["instruction"])
@@ -2594,7 +2665,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "geom_ids": sorted(int(value) for value in target_semantic_binding["root_geom_ids"]),
             "geom_names": list(target_semantic_binding["root_geom_names"]),
         }
-        policy = _build_safety_policy(context, semantic, geometry, gripper)
+        if cold_start:
+            policy, policy_semantics = _build_bddl_grasp_screen_policy(
+                context, semantic, geometry, bddl_path.read_text(encoding="utf-8"),
+            )
+            policy["source"] = "active_BDDL_contact_constraints_no_teacher_attestation"
+            policy["measure_forbidden_object_pair_clearances"] = True
+            report["safety_policy_provenance"] = {
+                "source": "active_BDDL", "teacher_attested": False,
+                "semantics": policy_semantics, "safety_certified": False,
+            }
+        else:
+            policy = _build_safety_policy(context, semantic, geometry, gripper)
         initial_safety = bridge.request({"op": "safety_geometry_check", "safety_geometry_policy": policy})
         initial_contact_escape = robot_contact_escape_direction(
             initial_safety.get("contact_identities", []),
@@ -3100,7 +3182,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     and summary.get("ik_candidates")
                     and summary.get("rrt_live_state_unchanged") is True
                 )
-                if experience_route_available:
+                generated_geometry_route_available = _cold_start_geometry_fallback_allowed(
+                    cold_start, candidate, planner_response,
+                )
+                if experience_route_available or generated_geometry_route_available:
                     object_pose = _pose(
                         context["target_root_pose_world"]["position_m"],
                         context["target_root_pose_world"]["rotation"],
@@ -3113,18 +3198,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     pregrasp_pose_7d = np.r_[pregrasp_pose[:3, 3], _wxyz(pregrasp_pose[:3, :3])]
                     route_start = escape_pose if escape_pose is not None else start_pose
+                    if generated_geometry_route_available:
+                        route_source = "active_BDDL_geometry_high_OSC_approach_after_RRT_failure"
+                    else:
+                        route_source = (
+                            "contact_normal_escape_then_elevated_object_relative_approach"
+                            if escape_pose is not None
+                            else "object_relative_experience_high_OSC_approach_after_RRT_preflight_failure"
+                        )
                     routes = [{
-                        "route_index": "historical_high_approach",
+                        "route_index": "generated_geometry_high_approach" if generated_geometry_route_available else "historical_high_approach",
                         "eef_reference_poses_world": high_approach_route(
                             route_start,
                             pregrasp_pose_7d,
                             elevation_m=0.18 if escape_pose is not None else 0.10,
                         ),
-                        "route_source": (
-                            "contact_normal_escape_then_elevated_object_relative_approach"
-                            if escape_pose is not None
-                            else "object_relative_experience_high_OSC_approach_after_RRT_preflight_failure"
-                        ),
+                        "route_source": route_source,
                         "contact_escape_prepended": escape_pose is not None,
                     }]
                     if escape_pose is not None:
@@ -3132,7 +3221,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             start_pose.tolist(), escape_pose.tolist(),
                             *routes[0]["eef_reference_poses_world"][1:],
                         ]
-                    summary["historical_direct_OSC_fallback_added"] = True
+                    summary["historical_direct_OSC_fallback_added"] = experience_route_available
+                    summary["generated_geometry_high_approach_fallback_added"] = generated_geometry_route_available
                 else:
                     continue
             if escape_pose is not None:
@@ -3152,6 +3242,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     summary.get("rrt_live_state_unchanged"),
                     direct_osc_fallback_added=bool(
                         summary.get("historical_direct_OSC_fallback_added")
+                        or summary.get("generated_geometry_high_approach_fallback_added")
                     ),
                     live_contact_probe=any(
                         route.get("live_contact_sides") for route in routes
@@ -3260,6 +3351,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     records=records,
                     frames=frames,
                     output_dir=output_dir,
+                    abort_target_displacement_m=0.015 if cold_start else None,
                 )
                 branch.update(result)
                 final_snapshot_payload = candidate_snapshot
@@ -3535,6 +3627,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--experience-library", type=Path, default=None)
     parser.add_argument("--previous-search-report", type=Path, action="append", default=[])
     parser.add_argument(
+        "--cold-start", action="store_true",
+        help="forbid experience, keypose, prior-report, resume, and candidate-answer inputs",
+    )
+    parser.add_argument(
         "--candidate-id", action="append", default=[],
         help="limit a local retry to a previously generated candidate; repeat only in screen-only mode",
     )
@@ -3663,6 +3759,22 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--strict-grasp-screen-only requires --strict-screen-reference-report")
     if args.strict_screen_reference_report is not None and not args.strict_grasp_screen_only:
         parser.error("--strict-screen-reference-report requires --strict-grasp-screen-only")
+    if args.cold_start and (
+        args.experience_library is not None
+        or args.previous_search_report
+        or args.historical_grasp_pose_priors_json is not None
+        or args.strict_grasp_screen_only
+        or args.strict_screen_reference_report is not None
+        or args.resume_from_runtime_snapshot is not None
+        or args.candidate_id
+        or args.candidate_start_index != 0
+        or args.candidate_tilt_degrees
+        or args.candidate_roll_degrees
+        or args.candidate_offset_object_x_mm
+        or args.candidate_offset_object_y_mm
+        or args.candidate_offset_object_z_mm
+    ):
+        parser.error("--cold-start cannot use historical experience or partial search inputs")
     if not 1000 <= args.demonstration_horizon <= 1800:
         parser.error("--demonstration-horizon must be in 1000..1800")
     if args.target_predicate is not None and len(args.target_predicate) != 3:

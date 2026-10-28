@@ -20,9 +20,12 @@ from research.gs_opd.repair.trajectory_generator_v3 import (
     _classify_run_status,
     _classify_experience_run_status,
     _experience_task_success_command,
+    _parse_args as _parse_v3_args,
+    _select_backend,
     _experience_physical_action_audit,
     _outcome,
     _nested_contact_monitoring_complete,
+    _run_bounded_engine,
     _substep_monitoring,
     _student_bspline_command,
     _strict_grasp_screen_gate,
@@ -42,6 +45,22 @@ DIRECT_REPORT = DIRECT_REFERENCE.with_name("live_left_bspline_osc_report.json")
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_engine_wall_timeout_preserves_output_and_stops_process(tmp_path: Path) -> None:
+    log_path = tmp_path / "engine.log"
+    with log_path.open("wb") as log:
+        with pytest.raises(TimeoutError, match="engine_wall_time_budget_exhausted"):
+            _run_bounded_engine(
+                [sys.executable, "-u", "-c", "import time; print('started'); time.sleep(10)"],
+                log=log, wall_time_budget_s=0.5,
+            )
+    assert log_path.read_text().strip() == "started"
+    with log_path.open("wb") as log:
+        result = _run_bounded_engine(
+            [sys.executable, "-c", "raise SystemExit(7)"], log=log, wall_time_budget_s=5,
+        )
+    assert result.returncode == 7
 
 
 def _write_trace(path: Path, *, monitor_status: str) -> None:
@@ -210,6 +229,74 @@ def test_strict_screen_selected_candidate_is_forwarded_to_executor(tmp_path: Pat
         checkpoint_file=REPO_ROOT / "logs/gs_opd/mink_panda_physical_v3/live_left_bspline_osc_adaptive_20261019_attempt1/direct_bspline_osc_trajectory.npz",
     )
     assert argv[argv.index("--candidate-id") + 1] == "experience__moka_pot:stable_grasp:t248"
+
+
+def test_cold_start_command_omits_success_experience_inputs(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    snapshot_root = tmp_path / "snapshot_root"
+    snapshot_root.mkdir()
+    args = Namespace(
+        rlinf_python=Path("/workspace/zy_workspace/RLinf/.venv/bin/python"),
+        snapshot_root=snapshot_root,
+        experience_library=None,
+        cold_start=True,
+        benchmark="obstacle_avoidance", level=0, task_id=0, init_state=0, seed=0,
+        demonstration_horizon=1000, maximum_physical_branches=1,
+        maximum_rrt_preflights=1, rrt_time_budget_s=12.0,
+        candidate_start_index=0, transport_strategy="native_region_progress_osc",
+        target_predicate=None, keypose_experience=[], previous_search_report=[],
+        resume_from_runtime_snapshot=None, grasp_candidate_id=None,
+        strict_grasp_screen_report=None,
+        bridge_port=39420,
+    )
+    argv = _experience_task_success_command(
+        args,
+        output_dir=tmp_path / "cold_start",
+        checkpoint_file=tmp_path / "model.safetensors",
+    )
+    assert "--cold-start" in argv
+    assert "--experience-library" not in argv
+    assert "--keypose-experience" not in argv
+    assert "--previous-search-report" not in argv
+    assert "--candidate-id" not in argv
+    assert argv[argv.index("--port") + 1] == "39420"
+    assert argv[argv.index("--expert-port") + 1] == "39421"
+
+
+def test_cold_start_backend_selects_task_search_without_experience() -> None:
+    from argparse import Namespace
+
+    args = Namespace(
+        backend="auto", cold_start=True, snapshot_root=Path("/legal/t0"),
+    )
+    assert _select_backend(args, reference=None) == "experience_task_success"
+
+
+def test_cold_start_cli_rejects_success_experience_and_keeps_library_unset(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    with patch("sys.argv", [
+        "trajectory_generator_v3.py", "--output-dir", str(tmp_path / "out"),
+        "--level", "0", "--task-id", "0", "--init-state", "0", "--seed", "0",
+        "--instruction", "pick up the bowl and place it on the plate",
+        "--snapshot-root", str(tmp_path / "snapshot_root"), "--cold-start",
+    ]):
+        args = _parse_v3_args()
+    assert args.cold_start is True
+    assert args.experience_library is None
+    assert args.keypose_experience == []
+    assert args.previous_search_report == []
+    assert args.reference_trace is None
+
+    with patch("sys.argv", [
+        "trajectory_generator_v3.py", "--output-dir", str(tmp_path / "out"),
+        "--level", "0", "--task-id", "0", "--init-state", "0", "--seed", "0",
+        "--instruction", "pick up the bowl and place it on the plate",
+        "--snapshot-root", str(tmp_path / "snapshot_root"), "--cold-start",
+        "--experience-library", str(tmp_path / "experience.json"),
+    ]), pytest.raises(SystemExit):
+        _parse_v3_args()
 
 
 def test_strict_screen_gate_blocks_when_no_candidate_passes(tmp_path: Path) -> None:
@@ -843,6 +930,48 @@ def test_experience_audit_aggregates_grasp_and_native_placement_archives(tmp_pat
     assert audit["safety_certified"] is False
     assert audit["geometry_monitoring_status_counts"] == {"unsafe": 5}
     assert audit["record_source_summaries"][1]["durable_records_available"] is True
+
+
+def test_experience_audit_includes_retained_student_handoff_and_excludes_rolled_back_actions(tmp_path: Path) -> None:
+    import gzip
+
+    monitoring = {
+        "status": "complete", "expected_physics_substeps_per_control_step": 25,
+        "captured_physics_substeps": 25, "unobserved_expected_substeps": 0,
+        "unavailable_contact_substeps": 0,
+        "control_steps": [{"status": "complete", "expected_physics_substeps": 25,
+                           "captured_physics_substeps": 25, "capture_error": None}],
+        "geometry_monitoring": {"status": "unsafe", "substeps": [{"status": "unsafe"}] * 25},
+    }
+
+    def write(path: Path, timestep: int) -> None:
+        with gzip.open(path, "wt") as handle:
+            handle.write(json.dumps({"step_index": 0, "timestep": timestep,
+                "phase": "test", "action_7d": [0.0] * 7, "state": {},
+                "snapshot_state": {}, "reward": 0.0, "done": False,
+                "contact_monitoring": monitoring}) + "\n")
+
+    first = tmp_path / "student_first.gz"
+    handoff = tmp_path / "student_handoff.gz"
+    write(first, 1)
+    write(handoff, 1)
+    inner = {"segments": [
+        {"type": "student_first", "actions_executed": 1, "task_success": False,
+         "artifacts": {"records": str(first)}},
+        {"type": "student_handoff_after_stage_goal", "actions_executed": 1,
+         "artifacts": {"records": str(handoff)}},
+    ], "final_native_task_status": {"task_success": True, "timestep": 1}}
+    audit = _experience_physical_action_audit(inner)
+    assert audit["physical_actions_archived"] == 1
+    assert audit["captured_physics_substeps"] == 25
+    assert audit["discarded_student_segments"] == [{"kind": "student_first", "actions": 1}]
+    assert audit["success_episode_complete_substep_monitoring"] is True
+    inner["student_handoff_recovery"] = {"status": "exact_expert_grasp_snapshot_restored_after_Student_lost_grasp"}
+    rolled_back = _experience_physical_action_audit(inner)
+    assert rolled_back["status"] == "not_available"
+    assert {row["kind"] for row in rolled_back["discarded_student_segments"]} == {
+        "student_first", "student_handoff_after_stage_goal",
+    }
 
 
 def test_route_candidate_override_is_forwarded_to_physical_runner(tmp_path: Path) -> None:

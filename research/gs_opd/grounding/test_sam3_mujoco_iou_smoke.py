@@ -160,6 +160,27 @@ class Sam3MujocoIouSmokeTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not marked as the 180-degree"):
                 _load_inputs(sam_results, geom_ids, metadata)
 
+    def test_verified_identity_alignment_is_accepted_and_requires_unchanged_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sam_results, geom_ids, metadata, _ = self._make_fixture(root)
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+            rgb = payload.pop("rgb_rotated_180_file")
+            label = payload.pop("geom_ids_rotated_180_file")
+            payload.update({"rgb_forward_file": rgb, "geom_ids_forward_file": label,
+                            "pixel_alignment_transform": "identity",
+                            "rgb_segmentation_pixel_consistency": True,
+                            "physical_state_unchanged": True,
+                            "coordinate_directions": {rgb: "identity; forward", label: "identity; forward"}})
+            metadata.write_text(json.dumps(payload), encoding="utf-8")
+            _load_inputs(sam_results, geom_ids, metadata)
+            result = run_matching(sam_results, geom_ids, metadata, root / "identity_out")
+            self.assertEqual(result["coordinate_direction"], "identity forward orientation shared with SAM 3 input")
+            payload["physical_state_unchanged"] = False
+            metadata.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not marked as the 180-degree"):
+                _load_inputs(sam_results, geom_ids, metadata)
+
 
 if __name__ == "__main__":
     unittest.main()

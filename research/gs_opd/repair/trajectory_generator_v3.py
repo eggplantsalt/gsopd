@@ -15,6 +15,7 @@ import json
 import multiprocessing.connection
 import os
 import pickle
+import signal
 import socket
 import subprocess
 import sys
@@ -66,6 +67,10 @@ def _checkpoint_file(path: Path) -> Path:
 def _select_backend(args: argparse.Namespace, reference: SuccessReference | None) -> str:
     if args.backend != "auto":
         return args.backend
+    if getattr(args, "cold_start", False):
+        if reference is not None or args.snapshot_root is None:
+            raise ValueError("cold_start_requires_t0_snapshot_without_success_reference")
+        return "experience_task_success"
     if reference is not None and reference.route_prior is not None:
         return "student_bspline_osc"
     if args.experience_library is not None and args.keypose_experience:
@@ -105,6 +110,36 @@ def _environment_for_subprocess() -> dict[str, str]:
         paths.append(existing)
     env["PYTHONPATH"] = os.pathsep.join(paths)
     return env
+
+
+def _run_bounded_engine(command: list[str], *, log: Any, wall_time_budget_s: float) -> subprocess.CompletedProcess:
+    """Stop the engine and its bridge descendants if its wall budget expires."""
+    process = subprocess.Popen(
+        command, cwd=REPO_ROOT, env=_environment_for_subprocess(),
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    try:
+        return_code = process.wait(timeout=wall_time_budget_s)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        # The engine may exit before an uncooperative descendant does.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise TimeoutError(f"engine_wall_time_budget_exhausted:{wall_time_budget_s}s") from exc
+    return subprocess.CompletedProcess(command, return_code)
 
 
 def _bridge_request(connection: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -331,8 +366,18 @@ def _experience_task_success_command(
 ) -> list[str]:
     if args.snapshot_root is None:
         raise ValueError("experience_task_success_backend_requires_an_identity_checked_snapshot_root")
-    if args.experience_library is None:
+    cold_start = bool(getattr(args, "cold_start", False))
+    if args.experience_library is None and not cold_start:
         raise ValueError("experience_task_success_backend_requires_an_experience_library")
+    if cold_start and (
+        args.experience_library is not None
+        or getattr(args, "keypose_experience", [])
+        or getattr(args, "previous_search_report", [])
+        or getattr(args, "resume_from_runtime_snapshot", None) is not None
+        or getattr(args, "grasp_candidate_id", None) is not None
+        or getattr(args, "strict_grasp_screen_report", None) is not None
+    ):
+        raise ValueError("cold_start_cannot_use_historical_experience_or_partial_task_inputs")
     if not args.snapshot_root.is_dir():
         raise FileNotFoundError(f"snapshot_root_missing:{args.snapshot_root}")
     script = REPO_ROOT / "research/gs_opd/repair/task_success_first_executor.py"
@@ -347,13 +392,19 @@ def _experience_task_success_command(
         "--init-state", str(args.init_state),
         "--seed", str(args.seed),
         "--demonstration-horizon", str(args.demonstration_horizon),
-        "--experience-library", str(args.experience_library.resolve()),
         "--maximum-physical-branches", str(args.maximum_physical_branches),
         "--maximum-rrt-preflights", str(args.maximum_rrt_preflights),
         "--rrt-time-budget-s", str(args.rrt_time_budget_s),
         "--candidate-start-index", str(getattr(args, "candidate_start_index", 0)),
         "--transport-strategy", args.transport_strategy,
     ]
+    if cold_start:
+        port = int(getattr(args, "bridge_port", 38569))
+        if not 1 <= port <= 65532:
+            raise ValueError("cold_start_bridge_port_requires_three_following_ports")
+        argv.extend(["--cold-start", "--port", str(port), "--expert-port", str(port + 1)])
+    else:
+        argv.extend(["--experience-library", str(args.experience_library.resolve())])
     resume_snapshot = getattr(args, "resume_from_runtime_snapshot", None)
     if resume_snapshot is not None:
         if not resume_snapshot.is_file():
@@ -369,7 +420,7 @@ def _experience_task_success_command(
         argv.extend(["--candidate-id", grasp_candidate_id])
     if args.target_predicate:
         argv.extend(["--target-predicate", *args.target_predicate])
-    for path in args.keypose_experience:
+    for path in getattr(args, "keypose_experience", []) or []:
         argv.extend(["--keypose-experience", str(path.resolve())])
     for path in getattr(args, "previous_search_report", []) or []:
         if not path.is_file():
@@ -772,14 +823,120 @@ def _nested_contact_monitoring_complete(monitoring: Any) -> bool:
     )
 
 
+def _localize_cold_start_risks(
+    inner_report: dict[str, Any], audit: dict[str, Any], output_dir: Path,
+    initial_snapshot: Path | None = None,
+) -> dict[str, Any]:
+    """Localize the retained episode only; missing evidence never becomes a pass."""
+    provenance = inner_report.get("safety_policy_provenance", {})
+    policy_path = Path(provenance.get("policy_path") or "")
+    archives = [Path(path) for path in audit.get("source_action_record_archives", [])]
+    if (not audit.get("success_episode_timestep_continuous") or not archives
+            or not policy_path.is_file() or any(not path.is_file() for path in archives)):
+        return {"status": "unavailable", "reason": "continuous_episode_or_policy_evidence_missing"}
+    from research.gs_opd.repair.safety_risk_localization import localize_risks
+
+    def records():
+        for path in archives:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        yield json.loads(line)
+
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        snapshots = []
+        if initial_snapshot is not None and initial_snapshot.is_file():
+            snapshots.append({"timestep": 0, "path": str(initial_snapshot.resolve()),
+                              "payload_sha256": sha256_file(initial_snapshot),
+                              "safe_prefix_verified": False})
+        result = localize_risks(records(), policy, snapshots=snapshots, teacher_attested=False)
+        result["record_archives"] = [str(path.resolve()) for path in archives]
+        result["policy_path"] = str(policy_path.resolve())
+        result["policy_sha256"] = sha256_file(policy_path)
+        output = output_dir / "observed_safety_risk_windows.json"
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {"status": result["status"], "path": str(output), "sha256": sha256_file(output),
+                "first_observed_risk": result["first_observed_risk"],
+                "strict_safety_pass": result["strict_safety_pass"]}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return {"status": "unavailable", "reason": f"risk_localization_failed:{type(exc).__name__}:{exc}"}
+
+
+def _screen_current_episode_reconstruction(
+    args: argparse.Namespace, audit: dict[str, Any], output_dir: Path,
+) -> dict[str, Any]:
+    """Use only the just-generated grasp to screen bounded local alternatives."""
+    reports = audit.get("source_search_reports", [])
+    if len(reports) != 1:
+        return {"status": "unavailable", "reason": "current_episode_grasp_report_not_unique"}
+    source = Path(reports[0]).resolve()
+    engine_root = (output_dir / "task_success_engine").resolve()
+    if not source.is_file() or not source.is_relative_to(engine_root):
+        return {"status": "unavailable", "reason": "grasp_report_not_from_current_engine"}
+    try:
+        context = json.loads((source.parent / "active_target_context.json").read_text(encoding="utf-8"))
+        predicate = context["native_goal_predicate"]
+        if not isinstance(predicate, list) or len(predicate) != 3 or not all(isinstance(x, str) for x in predicate):
+            raise ValueError("current_grasp_native_predicate_invalid")
+        screen_dir = output_dir / "safety_reconstruction_screen"
+        command = [str(args.rlinf_python), "-m", "research.gs_opd.repair.task_success_first_grasp_search",
+                   "--snapshot-root", str(args.snapshot_root), "--output-root", str(screen_dir),
+                   "--benchmark", args.benchmark, "--level", str(args.level), "--task-id", str(args.task_id),
+                   "--init-state", str(args.init_state), "--seed", str(args.seed),
+                   "--port", str(args.bridge_port + 3), "--demonstration-horizon", str(args.demonstration_horizon),
+                   "--target-predicate", *predicate, "--strict-grasp-screen-only",
+                   "--strict-screen-reference-report", str(source), "--maximum-candidates", "24"]
+        with (output_dir / "safety_reconstruction_screen.log").open("wb") as log:
+            completed = _run_bounded_engine(command, log=log, wall_time_budget_s=min(args.wall_time_budget_s, 600.0))
+        screen_reports = sorted(screen_dir.glob("task_success_first_grasp_*/strict_grasp_geometry_screen.json"))
+        if completed.returncode != 0 or len(screen_reports) != 1:
+            return {"status": "unavailable", "reason": "bounded_grasp_screen_failed",
+                    "return_code": completed.returncode}
+        screen = json.loads(screen_reports[0].read_text(encoding="utf-8"))
+        return {"status": "screened_not_physically_reconstructed", "path": str(screen_reports[0]),
+                "sha256": sha256_file(screen_reports[0]), "source_current_episode_grasp": str(source),
+                "feasible_candidates": screen.get("screening", {}).get("feasible_count"),
+                "physical_actions": 0, "safety_certified": False}
+    except (OSError, ValueError, TypeError, KeyError, TimeoutError) as exc:
+        return {"status": "unavailable", "reason": f"reconstruction_screen_failed:{type(exc).__name__}:{exc}"}
+
+
 def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str, Any]:
     """Summarize archived physical action rows without upgrading safety labels."""
     search_report_paths = []
     record_sources: list[dict[str, Any]] = []
     missing_record_sources = 0
+    discarded_student_segments: list[dict[str, Any]] = []
     for segment in inner_report.get("segments", []):
         segment_type = segment.get("type")
-        if segment_type == "bounded_expert_grasp_search":
+        if segment_type in {"student_first", "student_handoff_after_stage_goal"}:
+            actions = int(segment.get("actions_executed", 0) or 0)
+            if not actions:
+                continue
+            discarded = (
+                segment_type == "student_first" and segment.get("task_success") is not True
+            ) or (
+                segment_type == "student_handoff_after_stage_goal"
+                and isinstance(inner_report.get("student_handoff_recovery"), dict)
+            )
+            if discarded:
+                discarded_student_segments.append({"kind": segment_type, "actions": actions})
+                continue
+            artifacts = segment.get("artifacts", {})
+            records_value = artifacts.get("records") if isinstance(artifacts, dict) else None
+            if not records_value:
+                missing_record_sources += 1
+                continue
+            record_sources.append({
+                "kind": segment_type,
+                "records_path": Path(records_value).resolve(),
+                "durable_records_path": None,
+                "physical_branches": 0,
+                "expected_actions": actions,
+                "reported_physics_substeps": None,
+            })
+        elif segment_type == "bounded_expert_grasp_search":
             report_value = segment.get("report")
             report_path = Path(report_value).resolve() if report_value else None
             if report_path is None or not report_path.is_file():
@@ -803,6 +960,23 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
                     for branch in branches
                 ),
                 "reported_physics_substeps": None,
+            })
+        elif segment_type == "expert_articulated_fixture_goal":
+            actions = int(segment.get("recorded_actions", 0) or 0)
+            if not actions:
+                continue
+            artifacts = segment.get("artifacts", {})
+            records_value = artifacts.get("records") if isinstance(artifacts, dict) else None
+            if not records_value:
+                missing_record_sources += 1
+                continue
+            record_sources.append({
+                "kind": segment_type,
+                "records_path": Path(records_value).resolve(),
+                "durable_records_path": None,
+                "physical_branches": 1,
+                "expected_actions": actions,
+                "reported_physics_substeps": segment.get("recorded_physics_substeps"),
             })
         elif segment_type == "expert_native_goal_stage_control":
             artifacts = segment.get("artifacts", {})
@@ -841,6 +1015,7 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
         ],
         "record_source_count": len(record_sources),
         "missing_record_sources": missing_record_sources,
+        "discarded_student_segments": discarded_student_segments,
         "record_source_summaries": [],
         "physical_branches": 0,
         "physical_actions_archived": 0,
@@ -875,6 +1050,8 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
     phase_counts: dict[str, int] = {}
     geometry_status_counts: dict[str, int] = {}
     source_summaries = []
+    timeline_valid = True
+    previous_timestep = 0
     for source in record_sources:
         source_branch_count = int(source["physical_branches"])
         expected_actions = int(source["expected_actions"])
@@ -904,6 +1081,11 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
                 row = json.loads(line)
                 recorded_actions += 1
                 source_rows += 1
+                timestep = row.get("timestep")
+                if type(timestep) is not int or timestep != previous_timestep + 1:
+                    timeline_valid = False
+                if type(timestep) is int:
+                    previous_timestep = timestep
                 action = np.asarray(row.get("action_7d", []), dtype=np.float64)
                 actions_ok = actions_ok and action.shape == (7,) and bool(np.isfinite(action).all())
                 state_action_ok = state_action_ok and (
@@ -959,10 +1141,19 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
             "status": "complete" if source_rows == expected_actions and source_indices_ok else "incomplete",
         })
 
-    all_monitored = recorded_actions > 0 and complete_monitor_rows == recorded_actions
+    all_monitored = (recorded_actions > 0 and complete_monitor_rows == recorded_actions
+                     and missing_record_sources == 0 and records_ok
+                     and recorded_actions == branch_action_total)
     count_matches = recorded_actions == branch_action_total and missing_record_sources == 0
     records_ok = records_ok and count_matches
     source_summaries_ok = all(source["status"] == "complete" for source in source_summaries)
+    final_native = inner_report.get("final_native_task_status", {})
+    success_timeline = bool(
+        isinstance(final_native, dict) and final_native.get("task_success") is True
+        and type(final_native.get("timestep")) is int
+        and timeline_valid and previous_timestep == final_native["timestep"]
+        and recorded_actions == final_native["timestep"]
+    )
     audit.update({
         "status": "complete" if (
             records_ok and actions_ok and state_action_ok and all_monitored
@@ -975,6 +1166,9 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
         "captured_physics_substeps": substep_total,
         "complete_substep_monitoring_actions": complete_monitor_rows,
         "complete_substep_monitoring": all_monitored,
+        "success_episode_timestep_continuous": success_timeline,
+        "success_episode_complete_substep_monitoring": bool(all_monitored and success_timeline),
+        "snapshot_boundary_continuity": "requires_independent_snapshot_identity_audit",
         "action_dim_7_valid": actions_ok,
         "state_action_rows_valid": state_action_ok,
         "branch_action_count_matches_record_rows": count_matches,
@@ -1037,7 +1231,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for path in args.additional_reference_trace
     ]
     backend = _select_backend(args, reference)
-    experience = _experience_match(args)
+    experience = None if getattr(args, "cold_start", False) else _experience_match(args)
     try:
         strict_preflight = _strict_grasp_screen_gate(args)
         if strict_preflight is not None and backend != "experience_task_success":
@@ -1173,6 +1367,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "pre_route_hold_actions": args.pre_route_hold_actions,
         },
         "backend": backend,
+        "cold_start_protocol": (
+            {
+                "enabled": True,
+                "no_target_demonstration": True,
+                "no_prior_experience": True,
+                "target_success_demonstration_used": False,
+                "target_success_keyposes_used": False,
+                "official_demonstration_used": False,
+                "historical_actions_replayed": False,
+                "initial_policy": "base_pi05",
+                "initial_policy_checkpoint_provenance": (
+                    "RLinf/RLinf-Pi05-LIBERO-SFT_revision_45ccfcc4e28634f1576ebf78cab0fbe2fd82432d"
+                    if checkpoint_hash == "4616e4c1966a5fb063b442ea5d69857f45e873222d839b794634d87d252ab9e7"
+                    else "unverified_by_checkpoint_hash"
+                ),
+                "unadapted_pretraining_checkpoint_verified": False,
+                "experience_library_loaded": False,
+                "success_reference_loaded": False,
+                "previous_search_reports_loaded": False,
+                "start_state": "identity_checked_legal_t0_snapshot",
+            }
+            if getattr(args, "cold_start", False) else {"enabled": False}
+        ),
         "inputs": {
             "checkpoint_file": str(checkpoint_file),
             "checkpoint_sha256": checkpoint_hash,
@@ -1211,6 +1428,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "active_BDDL_and_geom_binding_owner": "Safety_Bridge_and_existing_task_executor",
             "route_retargeting": "current_state_and_current_scene_only",
             "historical_action_replay": False,
+            "target_success_demonstration_used": False if getattr(args, "cold_start", False) else None,
+            "target_success_keyposes_used": False if getattr(args, "cold_start", False) else None,
+            "official_demonstration_used": False,
             "strict_safety_thresholds": {
                 "forbidden_clearance_m": STRICT_FORBIDDEN_CLEARANCE_M,
                 "authorized_finger_target_penetration_m": STRICT_FINGER_TARGET_PENETRATION_M,
@@ -1244,6 +1464,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     log_path = output_dir / "execution.log"
     bridge_process = None
     bridge_log = None
+    engine_launched = False
+    wall_time_budget_s = float(getattr(args, "wall_time_budget_s", 3600.0))
+    record["engine_wall_time_budget_s"] = wall_time_budget_s
+    manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         if backend == "student_bspline_osc":
             bridge_process, bridge_log, bridge_preflight = _launch_bridge_and_preflight(
@@ -1253,20 +1477,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             record["bridge_preflight"] = bridge_preflight
             manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         with log_path.open("wb") as log:
-            completed = subprocess.run(
-                command,
-                cwd=REPO_ROOT,
-                env=_environment_for_subprocess(),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
+            engine_launched = True
+            completed = _run_bounded_engine(command, log=log, wall_time_budget_s=wall_time_budget_s)
     except Exception as exc:
         record.update({
-            "status": "preflight_failed" if bridge_process is None else "executor_error",
+            "status": "engine_time_budget_exhausted" if isinstance(exc, TimeoutError)
+            else "executor_error" if engine_launched else "preflight_failed",
             "finished_unix_seconds": time.time(),
             "failure_reason": f"{type(exc).__name__}:{exc}",
-            "physical_actions_executed": 0 if bridge_process is None else None,
+            "physical_actions_executed": None if engine_launched else 0,
         })
         report_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1388,8 +1607,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "operational_safety_pass": "not_certified",
                 "strict_10mm_pass": False,
                 "strict_10mm_assessment": "not_evaluated_without_same_episode_strict_report",
-                "complete_substep_monitoring": physical_audit.get("complete_substep_monitoring"),
-                "physical_state_action_records_valid": physical_audit.get("state_action_rows_valid"),
+                "complete_substep_monitoring": physical_audit.get("success_episode_complete_substep_monitoring", False),
+                "physical_state_action_records_valid": bool(
+                    physical_audit.get("state_action_rows_valid")
+                    and physical_audit.get("success_episode_timestep_continuous")
+                ),
                 "observation_action_trace_valid": "not_emitted_by_this_backend",
                 "safe_training_eligible": False,
                 "source_safety_inherited": False,
@@ -1401,6 +1623,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 or ("native_task_success_not_reached" if inner_report else "executor_report_missing")
             ),
         })
+        if getattr(args, "cold_start", False) and native_success:
+            initial_snapshot = args.snapshot_root / "snapshots/initial_runtime_snapshot.pkl"
+            record["safety_risk_localization"] = _localize_cold_start_risks(
+                inner_report, physical_audit, output_dir, initial_snapshot=initial_snapshot,
+            )
+            report_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            if record["safety_risk_localization"].get("first_observed_risk"):
+                record["safety_reconstruction"] = _screen_current_episode_reconstruction(args, physical_audit, output_dir)
 
     report_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1429,9 +1659,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--additional-reference-trace", type=Path, action="append", default=[])
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--lora-checkpoint", type=Path, default=None)
-    parser.add_argument("--experience-library", type=Path, default=DEFAULT_EXPERIENCE_LIBRARY)
+    parser.add_argument("--experience-library", type=Path, default=None)
     parser.add_argument("--keypose-experience", type=Path, action="append", default=[])
     parser.add_argument("--previous-search-report", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--cold-start", action="store_true",
+        help="forbid successful-task experience, keyposes, references, resume states, and prior search reports",
+    )
     parser.add_argument("--snapshot-root", type=Path, default=None)
     parser.add_argument(
         "--resume-from-runtime-snapshot", type=Path, default=None,
@@ -1454,6 +1688,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-physical-branches", type=int, default=2)
     parser.add_argument("--maximum-rrt-preflights", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
+    parser.add_argument("--wall-time-budget-s", type=float, default=3600.0,
+                        help="wall-clock limit for the physical engine and its subprocesses")
     parser.add_argument(
         "--candidate-start-index", type=int, default=0,
         help="start experience grasp-search preflights at this generated candidate index",
@@ -1461,6 +1697,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge-port", type=int, default=38567)
     parser.add_argument("--transport-strategy", choices=("native_region_progress_osc", "legacy_rrt"), default="native_region_progress_osc")
     args = parser.parse_args()
+    if not 1.0 <= args.wall_time_budget_s <= 86400.0:
+        parser.error("--wall-time-budget-s must be in 1..86400 seconds")
+    if args.cold_start:
+        forbidden_inputs = (
+            args.experience_library,
+            args.keypose_experience,
+            args.previous_search_report,
+            args.reference_trace,
+            args.reference_report,
+            args.additional_reference_trace,
+            args.lora_checkpoint,
+            args.resume_from_runtime_snapshot,
+            args.grasp_candidate_id,
+            args.strict_grasp_screen_report,
+            args.route_candidate_id,
+        )
+        if any(value for value in forbidden_inputs):
+            parser.error("--cold-start cannot be combined with historical experience, success references, or partial-task inputs")
+        if args.backend == "student_bspline_osc":
+            parser.error("--cold-start requires task-success search, not a historical route backend")
+        if args.snapshot_root is None:
+            parser.error("--cold-start requires --snapshot-root for the legal task t0 state")
+        if args.candidate_start_index != 0:
+            parser.error("--cold-start must begin at generated candidate index 0")
+    elif args.experience_library is None:
+        args.experience_library = DEFAULT_EXPERIENCE_LIBRARY
     if args.max_steps < 1 or args.demonstration_horizon < 1000:
         parser.error("step budgets must be positive and horizon must be at least 1000")
     if not 0 <= args.pre_route_hold_actions <= 100:

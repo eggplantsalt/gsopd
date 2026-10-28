@@ -1,3 +1,39 @@
+## 2026-10-28：恢复无示范目标与冷启动物理实验
+
+最新定位：L0T0 505 步轨迹 t137 子步 9 首次观察到非授权手指与碗 9.941 mm；物体对距离全部缺失，Teacher 未核验，不能断定形式上的最早风险。V3 冷启动成功后调用定位器，缺少自接触、场景接触、关节限制的独立检查时强制 incomplete。40 项定位与 V3 聚焦回归通过。L0T1 新鲜初态的无先验物理验收与基于本次 L0T0 运行的事后安全抓姿筛查分别在新归档运行。旧 batch 的 L0T2 preflight 隐式访问历史部分任务 Snapshot，必须在无示范使用前隔离。
+
+增补自接触、严格关节限制和未解析接触处理后的 505 步重扫保留在 `l0t0_seed0_cold_start_02/observed_bddl_risk_windows_v2.json`，首次观测仍为 t137 子步 9，监测覆盖仍 incomplete。冷启动 V3 已传递独立的 Bridge 与 expert 端口，避免并行任务隐式使用同一默认端口。相关聚焦回归 52 项通过。
+
+L0T1 首轮物理失败记录：Student 32 动作回退后唯一专家分支 249 动作 / 6,225 子步，书被夹爪掌部推移约 23 mm，60 动作内未能达到动态接近目标；另两项预检为 IK 失败或 RRT 超时。冷启动加入目标物体位移超过 15 mm 时放弃该接近的保护，启动第二轮仅用相同合法 t0 和通用算法、8 次预检和最多 3 个真实分支；与历史数据隔离。测试 136 passed、15 subtests passed。Qwen 冻结 Teacher 服务就绪，第一次本地请求被代理返回 502；已绕过本地代理并重新请求，规则尚未验证。
+
+Teacher 重试成功：冻结 Qwen3.8-27B-FP8 使用实时 L0T0 新鲜双相机 RGB 与任务指令输出有效 `gs_opd.safety_teacher.v2`，0 物理动作。Teacher 提出夹爪禁止触碰圆柱障碍和炉灶、碗禁止触碰圆柱等规则；输出和图像在 `teacher_service/l0t0_fresh_t0_retry/`。语义对象 ID 和 MuJoCo 几何尚未通过 SAM/IoU 等绑定验证，Teacher 规则没有被计入 strict 认证。
+
+Teacher 初态与新鲜 reset 的 MuJoCo 分割图逐像素相同、真实转换为 identity，捕获时 MuJoCo integration state 不变。既有 IoU 和 VLM 消歧链只接受 180° 元数据，已增加显式 identity 路径，要求状态不变、RGB/分割对齐及实际 RGB 逐像素一致；旧 180° 路径保留，9 项测试通过。圆柱长提示的 SAM 候选数为 0；名称提示与 0.15 候选置信度得到 7 个候选，正交由当前 Teacher/VLM 消歧，未降低严格物理安全阈值。物理绑定仍未认证。
+
+identity IoU 中间结果最初错误标成 180°，已修正结果方向并要求与分割元数据一致，错误版本保留但不得作为证据。修正版 VLM 对圆柱障碍选中候选 5，SAM/Geom IoU 0.9793，关联 `glazed_rim_porcelain_ramekin_1_main`；活动 BDDL 指出的禁触物体还包括 perfume 与白盒，故不能把这个视觉选择冒充对香水瓶的绑定。此结果有真实语义歧义，完整 Teacher 物理绑定及严格安全认证仍未完成。
+
+`turnon/turnoff` 现在复用设施目标选择和已有铰接 OSC 算子，关节目标来自设施声明的 native articulation ranges，缺失时拒绝；未知谓词不静默转换。L0T2 新鲜 t0 只读探针显示两个 On 均 false、Turnon 已 true，未读取旧任务 Snapshot。单独查询当前炉灶开关得到 MuJoCo hinge `flat_stove_1_button`，当前 0.89846，原生 Turnon 范围 [0.5, 2.1]，关节实际范围 [-0.005, 2.1]，0 物理动作；不能当作执行成功。已在 `libero_90/L0T39` 另行准备 Turnoff 独立初态探针。综合测试 145 passed、15 subtests passed；开关物理及多阶段冷启动仍未验证。
+
+`libero_90/L0T39` 首次在 Bridge 资产加载发现无层级 LIBERO 资产被错误拼接 L0 目录；修复为仅在对应 unlevelled 文件存在时回退，不修改旧障碍路径。新鲜 t0 的原生 Turnoff=false，按钮 qpos=0.983596，关节范围 [-0.005,2.1]，原生目标范围 [-0.005,0]，scratch 目标 -0.0025。首轮 V3 在动作前因普通 BDDL 没有安全 constraints 失败；已加入通用场景诊断回退并明确标记未认证，第二轮在 `libero90_turnoff_no_prior_02/v3_run` 执行。不得把此回退输出当作 Teacher 规则或 Strict 安全。
+
+attempt41 隔离物理回归 `baseline_attempt41_regression_01` 失败，抓取 174 步成功后放置 490 步超时，原生目标 false。归因核查：原成功执行选择 `jointspace_rrt_connect.v1` / RRT0（12.0196 s、392 个配置），本次 12.0118 s 仅检查 267 配置便超时，随后新代码不应在非冷启动启用的几何高位兜底介入，导致实际路线改变；不能归因已证明的确定性物理回归。已修正只允许冷启动使用该兜底，待隔离负载后重新物理回归。原始 attempt41 文件及 669 步审计未更改。
+
+事后安全抓姿筛查 `l0t0_safety_reconstruction_screen_01` 已结束：只使用本轮自主产生的抓取状态作为夹爪闭合、姿态和 IK 初值，24/24 未通过（主类碰撞 11、抓持几何 13；全部同时有碰撞类证据），0 物理动作、live 状态不变。首个自主抓取候选在静态闭合检查中夹爪掌部距碗约 8.692 mm，低于 10 mm；改变夹持部位或接触机制需要保持指垫有效接触，不能仅凭平移认为已解决。`_capture_task_initial` 增加 no-prior 标志以屏蔽 L0T2 历史快照并拒绝部分状态恢复。当前启动本地冻结 Teacher 服务于 GPU 1、2；规则尚未生成。定位、V3 和批处理聚焦测试 50 项通过。
+
+最高优先级补充：保留已 push 的 V3 `1d63574e5ce1aa60b63f093da09665c4d8c741d5` 与 attempt41 为受保护基线。原 669 动作/16,725 子步审计通过；隔离经验库副本的新物理回归正在 `baseline_attempt41_regression_01/v3_run` 执行。无先验第二轮从合法初态取得 t=505 原生任务成功：163 抓取 + 32 Student 接续 + 310 放置，12,625 子步完整，分支 Snapshot 边界一致；初次失败的 32 Student 动作已回退且未计入成功路径。独立报告 `l0t0_seed0_cold_start_02/native_success_episode_audit.json`；V3 旧报告漏计接续的 32 步，新审计代码已修复，机器回归 `v3_baseline_and_cold_start_regression.json` 两条均通过。
+
+安装目录 16,405 个 BDDL 文件（含生成变体）已自动扫描，原生目标还包括 `CheckGripperContactPart` 和 `Turnoff`；15 个 affordance 文件含前者，8 个 reasoning_safety 文件没有 `:goal`，不能套用搬运验收。机器覆盖报告为 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/installed_bddl_goal_coverage.json`。
+
+继续审计发现 Stage A 的诊断规则将所有非目标物体当作禁触，因而把初始碗—炉灶支撑误列为禁触对；实际 BDDL 只约束香水瓶和白盒。逐子步目标物体—禁触对象的 10 mm 距离当前没有完整记录，故现有诊断不能作为正式风险定位或 Strict 验收。已为后续实验加入精确 t0 比对、谓词覆盖检查和 V3 子进程墙钟时限；聚焦测试 126 passed、15 subtests passed。官方 `pi05_base` 11.6 GiB 正以官方 GCS 客户端下载并核验，详情见[实验报告](GS_OPD_ZERO_SHOT_BOOTSTRAP.md)。
+
+新目标要求严格屏蔽目标任务成功经验。审计发现 attempt41 加载的经验库匹配同一 L0T0 成功抓取模板并跳过 Student，故虽然它有真实原生成功，不能作为无示范 Bootstrap 证据。历史先验筛查同样不能证明冷启动。新协议、30 个障碍任务的覆盖矩阵、精确复现命令及当前范围见 [无示范实验报告](GS_OPD_ZERO_SHOT_BOOTSTRAP.md)。
+
+`--cold-start` 入口禁用经验库、历史成功参考、Keypose、旧报告及部分任务恢复；同时记录无示范标志。第一轮 Student 执行 32 动作/800 子步，3 个通用几何候选的 RRT 均在 12 秒超时，旧实现没有通用路线兜底，专家实体分支 0。新增仅对当前几何来源、IK 成功且 scratch 未改变 live state 的候选采用有界高位 OSC 接近。相关三组测试共 81 项及 `py_compile` 通过。
+
+第二轮从同一合法 t0 在独立归档运行。截至抓取报告，第一通用候选经真实 MuJoCo 执行 163 动作/4,075 子步，稳定双指抓持并抬升 36.302 mm；监测子步计数完整，安全未认证。原生完整任务尚未确认。运行根目录为 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_seed0_cold_start_02/v3_run`；执行器正在核验抓持 Snapshot 并继续后续阶段。独立新鲜 reset 证明输入 t0 的完整 integration state 逐项一致；快照恢复核验通过且持抓保留。checkpoint 的本地缓存 revision 对应 RLinf LIBERO SFT 项目基座、没有本项目 LoRA；它不同于未经 LIBERO SFT 的预训练 `pi05_base`，严格预训练口径下需重新运行。
+
+本节取代以下历史条目的当前目标和验收口径；历史物理记录保留。
+
 ## 2026-10-28 11:23 Asia/Shanghai：耦合 XYZ 抓姿筛查无解；845步成功源的姿态迁移受模型身份阻塞
 
 围绕 attempt41 的真实成功抓姿 `geom113_jaw0_approach2_+1_flip+1`，完成16个耦合候选：接近轴roll为±5°，对象局部x偏移±0.5 mm、y/z偏移±4 mm。严格scratch screen结果为0/16可行，失败类为collision 7、grasp geometry 9。起始Snapshot SHA `bc86043308518e857703b319b2c309e4e9ca62b332fc939be20235991610cba7`，模型/BDDL分别为 `085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840` / `b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12`。screen [报告](/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_attempt41_coupled_xyz_pose_grid_screen/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_110033_783345572/strict_grasp_geometry_screen.json) SHA `b7da9a5ffe449e98c77ca2e85cc1848020fd43fb2b6335388581e0c8a037fee9`；0实体动作、0路线预检、live Integration State未变。该候选族停止，不扩大任意小网格。

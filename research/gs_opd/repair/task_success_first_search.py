@@ -15,6 +15,40 @@ from typing import Any, Iterable
 import numpy as np
 
 
+def inspect_native_goal_coverage(native_status: dict[str, Any]) -> dict[str, Any]:
+    """Classify every native conjunct without silently discarding operators."""
+    rows = native_status.get("native_goal_values")
+    if native_status.get("status") != "complete" or not isinstance(rows, list) or not rows:
+        raise ValueError("native_goal_values_are_required_for_task_scheduling")
+    arities = {"on": 3, "in": 3, "open": 2, "close": 2, "turnon": 2, "turnoff": 2}
+    executable = {"on", "in", "open", "close", "turnon", "turnoff"}
+    classified = []
+    for row in rows:
+        if not isinstance(row, dict) or type(row.get("value")) is not bool:
+            raise ValueError("native_goal_value_must_be_an_explicit_boolean")
+        predicate = row.get("predicate")
+        if (not isinstance(predicate, list) or not predicate
+                or not isinstance(predicate[0], str) or not predicate[0]):
+            raise ValueError("native_goal_predicate_must_have_an_operator")
+        operator = predicate[0].lower()
+        if operator in arities and len(predicate) != arities[operator]:
+            raise ValueError(f"native_goal_predicate_arity_mismatch:{operator}")
+        if operator in arities and any(not isinstance(token, str) or not token for token in predicate):
+            raise ValueError(f"native_goal_predicate_operand_invalid:{operator}")
+        classified.append({
+            "predicate": list(predicate),
+            "value": row["value"],
+            "operator": operator,
+            "operation_supported": operator in executable,
+            "unsupported_reason": None if operator in executable else "unrecognized_native_goal_operator",
+        })
+    return {
+        "goals": classified,
+        "pending_unsupported_goals": [row for row in classified
+                                      if not row["value"] and not row["operation_supported"]],
+    }
+
+
 def pending_object_goals(native_status: dict[str, Any]) -> list[list[str]]:
     """Return unsatisfied native object placement goals in their BDDL order."""
     rows = native_status.get("native_goal_values")
@@ -343,6 +377,19 @@ def candidate_route_preflight_admitted(
         rrt_status == "offline_feasible"
         or direct_osc_fallback_added
         or live_contact_probe
+    )
+
+
+def generated_geometry_high_approach_admitted(
+    candidate: dict[str, Any], planner_response: dict[str, Any]
+) -> bool:
+    """Admit one generic high-approach fallback after a failed scratch RRT."""
+    return bool(
+        candidate.get("candidate_source")
+        == "active_BDDL_target_compiled_collision_geom_and_live_Panda_pad_centers"
+        and planner_response.get("status") != "offline_feasible"
+        and planner_response.get("live_state_unchanged") is True
+        and planner_response.get("ik_candidates")
     )
 
 

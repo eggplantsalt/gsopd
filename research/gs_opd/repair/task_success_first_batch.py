@@ -122,6 +122,8 @@ def _verify_existing_t0_snapshot(root: Path, current_payload: bytes) -> None:
 def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int) -> tuple[Path, dict[str, Any]]:
     from research.gs_opd.repair.task_success_first_grasp_search import BridgeSession
 
+    if getattr(args, "no_prior_experience", False) and args.resume_from_runtime_snapshot is not None:
+        raise ValueError("no_prior_experience_forbids_partial_task_snapshot_resume")
     source_root = task_dir / "stage_snapshots" / "t0"
     bridge_args = argparse.Namespace(
         benchmark=args.suite, level=args.level, task_id=task_id,
@@ -207,7 +209,7 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
                 row.get("value") is False
                 and isinstance(predicate, list)
                 and len(predicate) == 2
-                and str(predicate[0]).lower() in {"close", "open"}
+                and str(predicate[0]).lower() in {"close", "open", "turnon", "turnoff"}
             ):
                 articulation_contexts.append(bridge.request({
                     "op": "task_success_first_articulation_context",
@@ -235,7 +237,8 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
         else:
             _snapshot_root_from_payload(
                 initial_snapshot_payload, source_root,
-                source=("verified_failed_stage_Runtime_Snapshot_resume" if resume_source else None)
+                source=("fresh_reset_no_prior_experience" if getattr(args, "no_prior_experience", False) else None)
+                or ("verified_failed_stage_Runtime_Snapshot_resume" if resume_source else None)
                 or "current_seed_init_state_or_verified_prior_task_stage_snapshot",
             )
         expected = args.expected_bddl_hashes.get(str(task_id))
@@ -245,7 +248,10 @@ def _capture_task_initial(args: argparse.Namespace, task_dir: Path, task_id: int
         if observed.get("instruction") != reset.get("scene_metadata", {}).get("instruction"):
             raise RuntimeError("reset_instruction_and_live_observation_do_not_match")
         historical_regression = None
-        if args.suite == "obstacle_avoidance" and args.level == 0 and task_id == 2:
+        # The legacy task-2 diagnostic restores a historical partial-task
+        # state. Explicit no-prior callers must never even read that archive.
+        if (not getattr(args, "no_prior_experience", False)
+                and args.suite == "obstacle_avoidance" and args.level == 0 and task_id == 2):
             historical_regression = {
                 "source_snapshot": str(L0T2_HISTORICAL_POT2_SNAPSHOT),
                 "source": "GS-OPD-owned physical Pot-2 placement subgoal snapshot",
@@ -349,7 +355,7 @@ def _next_goal(native: dict[str, Any]) -> list[str] | None:
                  if row.get("value") is False
                  and isinstance(row.get("predicate"), list)
                  and len(row["predicate"]) == 2
-                 and str(row["predicate"][0]).lower() in {"close", "open"}), None)
+                 and str(row["predicate"][0]).lower() in {"close", "open", "turnon", "turnoff"}), None)
 
 
 def _next_distinct_goal(native: dict[str, Any], completed_goal: list[str]) -> list[str] | None:

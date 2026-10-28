@@ -26,6 +26,7 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
     _candidate_window,
     _combine_candidate_sources,
     _parse_args,
+    _verify_cold_start_reset,
     generate_geometry_candidates,
     generate_grasp_roll_variants,
     generate_grasp_coupled_tilt_offset_variants,
@@ -42,7 +43,9 @@ from research.gs_opd.repair.task_success_first_search import (
     candidate_matches_failure_memory,
     classify_failure,
     diversify_candidates,
+    generated_geometry_high_approach_admitted,
     high_approach_route,
+    inspect_native_goal_coverage,
     native_goal_counts,
     object_relative_grasp_targets,
     planner_seed,
@@ -57,6 +60,58 @@ from research.gs_opd.repair.task_success_first_search import (
 
 
 class TaskSuccessFirstSearchTests(unittest.TestCase):
+    def test_generated_fallback_never_changes_experience_baseline_path(self):
+        with patch.object(grasp_search, "generated_geometry_high_approach_admitted", return_value=True) as admit:
+            self.assertFalse(grasp_search._cold_start_geometry_fallback_allowed(False, {}, {}))
+            admit.assert_not_called()
+            self.assertTrue(grasp_search._cold_start_geometry_fallback_allowed(True, {}, {}))
+            admit.assert_called_once()
+
+    def test_cold_start_requires_exact_fresh_reset_state_and_zero_timestep(self):
+        class Bridge:
+            def __init__(self, state, timestep):
+                self.state = state
+                self.timestep = timestep
+
+            def request(self, request):
+                self_request = {"op": "observe", "include_snapshot_state": True}
+                if request != self_request:
+                    raise AssertionError(request)
+                return {"timestep": self.timestep, "snapshot_state": {
+                    "mujoco_integration_state": self.state,
+                }}
+
+        t0 = np.array([0.0, 1.0, -2.0])
+        verified = _verify_cold_start_reset(Bridge(t0.copy(), 0), t0)
+        self.assertTrue(verified["exact_integration_state_match"])
+        with self.assertRaisesRegex(RuntimeError, "snapshot_differs_from_fresh_reset"):
+            _verify_cold_start_reset(Bridge([0.0, 1.0, -1.0], 0), t0)
+        with self.assertRaisesRegex(RuntimeError, "timestep_is_not_zero"):
+            _verify_cold_start_reset(Bridge(t0.copy(), 1), t0)
+
+    def test_cold_start_cli_rejects_historical_priors_and_pinned_candidates(self):
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py", "--cold-start",
+        ]):
+            parsed = _parse_args()
+        self.assertTrue(parsed.cold_start)
+        self.assertIsNone(parsed.experience_library)
+        self.assertEqual(parsed.previous_search_report, [])
+        self.assertEqual(parsed.candidate_id, [])
+
+        forbidden_inputs = [
+            ["--experience-library", "experience.json"],
+            ["--previous-search-report", "previous.json"],
+            ["--historical-grasp-pose-priors-json", "successful-grasp.json"],
+            ["--candidate-id", "geom113_jaw0_approach2_+1_flip+1"],
+            ["--candidate-start-index", "2"],
+        ]
+        for extra in forbidden_inputs:
+            with self.subTest(extra=extra), patch.object(
+                sys, "argv", ["task_success_first_grasp_search.py", "--cold-start", *extra]
+            ), self.assertRaises(SystemExit):
+                _parse_args()
+
     def test_pinned_candidate_ids_reach_full_geometry_pool_with_experience_templates(self):
         from argparse import Namespace
 
@@ -745,6 +800,28 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
             "no_safe_path", False, direct_osc_fallback_added=True,
         ))
 
+    def test_generated_geometry_high_approach_requires_cold_geometry_ik_and_unchanged_state(self):
+        candidate = {
+            "candidate_source": "active_BDDL_target_compiled_collision_geom_and_live_Panda_pad_centers",
+        }
+        response = {
+            "status": "planning_time_budget_exhausted",
+            "live_state_unchanged": True,
+            "ik_candidates": [{"joint_positions": [0.0] * 7}],
+        }
+        self.assertTrue(generated_geometry_high_approach_admitted(candidate, response))
+
+        for bad_candidate, bad_response in (
+            (candidate, {**response, "status": "offline_feasible"}),
+            ({"candidate_source": "historical_experience_library"}, response),
+            (candidate, {**response, "ik_candidates": []}),
+            (candidate, {**response, "live_state_unchanged": False}),
+        ):
+            with self.subTest(candidate=bad_candidate, response=bad_response):
+                self.assertFalse(generated_geometry_high_approach_admitted(
+                    bad_candidate, bad_response,
+                ))
+
     def test_unilateral_live_target_contact_identifies_only_single_contact_side(self):
         self.assertEqual(unilateral_target_contact_sides({
             "finger_contacts": {"left": False, "right": True},
@@ -820,6 +897,29 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
             pending_object_goals(status), [["In", "cream_cheese_1", "basket_1_contain_region"]]
         )
         self.assertEqual(native_goal_counts(status), (3, 1))
+
+    def test_native_goal_coverage_exposes_switches_and_unknown_operators(self):
+        status = {"status": "complete", "native_goal_values": [
+            {"predicate": ["On", "pot", "region"], "value": False},
+            {"predicate": ["Turnon", "stove"], "value": False},
+            {"predicate": ["Unknown", "fixture"], "value": False},
+            {"predicate": ["CheckGripperContactPart", "tool", [2, 3]], "value": False},
+            {"predicate": ["Close", "door"], "value": True},
+        ]}
+        result = inspect_native_goal_coverage(status)
+        self.assertEqual([row["unsupported_reason"] for row in result["pending_unsupported_goals"]],
+                         ["unrecognized_native_goal_operator", "unrecognized_native_goal_operator"])
+        self.assertTrue(result["goals"][1]["operation_supported"])
+        self.assertEqual(result["pending_unsupported_goals"][1]["predicate"][2], [2, 3])
+        self.assertEqual(result["goals"][0]["predicate"], ["On", "pot", "region"])
+        with self.assertRaisesRegex(ValueError, "arity_mismatch"):
+            inspect_native_goal_coverage({"status": "complete", "native_goal_values": [
+                {"predicate": ["On", "pot"], "value": False},
+            ]})
+        with self.assertRaisesRegex(ValueError, "explicit_boolean"):
+            inspect_native_goal_coverage({"status": "complete", "native_goal_values": [
+                {"predicate": ["Close", "door"], "value": None},
+            ]})
 
     def test_route_signature_ignores_vertex_density_but_distinguishes_route(self):
         direct = np.asarray([[0, 0, 0, 1, 0, 0, 0], [0.1, 0, 0, 1, 0, 0, 0]])

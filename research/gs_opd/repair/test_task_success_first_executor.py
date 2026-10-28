@@ -82,6 +82,15 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         self.assertEqual(args.resume_from_runtime_snapshot, Path("failed.pkl"))
         self.assertEqual(args.candidate_id, "geom111_jaw1_approach2_-1_flip+1")
 
+    def test_cold_start_cli_rejects_resume_snapshots(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--cold-start",
+            "--resume-from-runtime-snapshot", "partial.pkl",
+        ]), self.assertRaises(SystemExit):
+            _parse_task_success_executor_args()
+
     def test_native_region_route_variant_cli(self):
         from unittest.mock import patch
 
@@ -133,10 +142,38 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             [str(path.resolve()) for path in previous_reports],
         )
 
+    def test_cold_start_grasp_search_has_no_experience_or_candidate_answer(self):
+        from argparse import Namespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = Namespace(
+                benchmark="obstacle_avoidance", level=0, task_id=0,
+                init_state=0, seed=0, camera_resolution=256, expert_port=38570,
+                maximum_candidates=16, candidate_start_index=0,
+                maximum_rrt_preflights=1, maximum_physical_branches=1,
+                rrt_time_budget_s=12.0, demonstration_horizon=1000,
+                resume_from_keypose_preflight_report=None,
+                experience_library=None, previous_search_report=[],
+                candidate_id=None, cold_start=True,
+            )
+            command = _task_success_first_grasp_search_command(
+                args,
+                snapshot_root=root / "snapshots",
+                expert_root=root / "attempt1",
+                predicate=["on", "akita_black_bowl_1", "plate_1"],
+            )
+
+        self.assertIn("--cold-start", command)
+        self.assertNotIn("--experience-library", command)
+        self.assertNotIn("--previous-search-report", command)
+        self.assertNotIn("--candidate-id", command)
+
     def test_collision_route_policy_removes_only_extra_clearance_margin(self):
         strict = {
             "source": "strict",
             "minimum_clearance_m": 0.010,
+            "measure_forbidden_object_pair_clearances": True,
             "forbidden_objects": [{"object_id": "bottle", "minimum_clearance_m": 0.010}],
             "allowed_target_objects": [{"object_id": "pot", "minimum_clearance_m": 0.010}],
             "other_scene_objects": [{"object_id": "world", "minimum_clearance_m": 0.0}],
@@ -145,6 +182,8 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         }
         route_policy = _task_success_collision_route_policy(strict)
         self.assertEqual(route_policy["minimum_clearance_m"], 0.0)
+        self.assertFalse(route_policy["measure_forbidden_object_pair_clearances"])
+        self.assertTrue(strict["measure_forbidden_object_pair_clearances"])
         self.assertEqual(route_policy["forbidden_objects"][0]["minimum_clearance_m"], 0.0)
         self.assertEqual(route_policy["allowed_target_objects"][0]["minimum_clearance_m"], 0.0)
         self.assertEqual(route_policy["other_scene_objects"][0]["minimum_clearance_m"], 0.0)
@@ -907,6 +946,21 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             native, ["on", "object_c", "region_c"]
         )
         self.assertEqual(selected, ["on", "object_c", "region_c"])
+        self.assertEqual(source, "explicit_cli")
+
+    def test_target_selection_handles_fixture_and_switch(self):
+        native = {"status": "complete", "native_goal_values": [
+            {"predicate": ["on", "pot", "stove"], "value": True},
+            {"predicate": ["close", "door"], "value": False},
+            {"predicate": ["turnon", "stove"], "value": False},
+        ]}
+        selected, source, _ = _select_active_target_predicate(native, None)
+        self.assertEqual(selected, ["close", "door"])
+        self.assertEqual(source, "first_pending_supported_fixture_goal_bddl_order")
+        native["native_goal_values"][1]["value"] = True
+        selected, source, _ = _select_active_target_predicate(native, None)
+        self.assertEqual(selected, ["turnon", "stove"])
+        selected, source, _ = _select_active_target_predicate(native, ["turnon", "stove"])
         self.assertEqual(source, "explicit_cli")
 
     def _report(self, snapshot: Path) -> dict:

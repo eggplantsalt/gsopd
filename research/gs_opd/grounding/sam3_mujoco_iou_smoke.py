@@ -42,7 +42,15 @@ def _check_forward_direction(metadata: dict, filename_field: str) -> str:
             f"Geom metadata has no coordinate direction for {filename!r}"
         )
     normalized = direction.lower()
-    if "180" not in normalized or "forward" not in normalized:
+    identity_alignment = (
+        metadata.get("pixel_alignment_transform") == "identity"
+        and metadata.get("rgb_segmentation_pixel_consistency") is True
+        and metadata.get("physical_state_unchanged") is True
+        and "identity" in normalized and "forward" in normalized
+    )
+    rotated_alignment = (metadata.get("pixel_alignment_transform") != "identity"
+                         and "180" in normalized and "forward" in normalized)
+    if not rotated_alignment and not identity_alignment:
         raise RuntimeError(
             f"{filename!r} is not marked as the 180-degree forward orientation: "
             f"{direction!r}"
@@ -66,12 +74,13 @@ def _load_inputs(
     sam_results = _load_json(sam3_results_path, "SAM 3 results")
     geom_metadata = _load_json(geom_metadata_path, "Geom metadata")
 
-    rgb_filename = _check_forward_direction(
-        geom_metadata, "rgb_rotated_180_file"
-    )
-    _check_forward_direction(geom_metadata, "geom_ids_rotated_180_file")
+    identity = geom_metadata.get("pixel_alignment_transform") == "identity"
+    rgb_field = "rgb_forward_file" if identity else "rgb_rotated_180_file"
+    geom_field = "geom_ids_forward_file" if identity else "geom_ids_rotated_180_file"
+    rgb_filename = _check_forward_direction(geom_metadata, rgb_field)
+    _check_forward_direction(geom_metadata, geom_field)
     recorded_geom_ids_path = _resolve_recorded_file(
-        geom_metadata_path.parent, geom_metadata, "geom_ids_rotated_180_file"
+        geom_metadata_path.parent, geom_metadata, geom_field
     ).resolve()
     if geom_ids_path.resolve() != recorded_geom_ids_path:
         raise RuntimeError(
@@ -80,7 +89,7 @@ def _load_inputs(
         )
 
     rgb_path = _resolve_recorded_file(
-        geom_metadata_path.parent, geom_metadata, "rgb_rotated_180_file"
+        geom_metadata_path.parent, geom_metadata, rgb_field
     )
     geom_rgb = _load_rgb(rgb_path, "forward Geom capture RGB")
     sam_image_value = sam_results.get("image")
@@ -411,7 +420,11 @@ def run_matching(
             "Capture metadata does not include Body parent links, so Geoms on distinct "
             "Bodies are not merged into articulated multi-Body assemblies."
         ),
-        "coordinate_direction": "180-degree forward orientation shared with SAM 3 input",
+        "coordinate_direction": (
+            "identity forward orientation shared with SAM 3 input"
+            if _load_json(geom_metadata_path, "Geom metadata").get("pixel_alignment_transform") == "identity"
+            else "180-degree forward orientation shared with SAM 3 input"
+        ),
         "image_width": int(rgb.shape[1]),
         "image_height": int(rgb.shape[0]),
         "min_iou": min_iou,

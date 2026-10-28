@@ -82,9 +82,10 @@ def _load_case(
     iou_results = _load_json(iou_results_path, "MuJoCo IoU results")
     if iou_results.get("status") not in ("ok", "no_candidates"):
         raise RuntimeError(f"IoU results have unsupported status: {iou_results.get('status')!r}")
-    if iou_results.get("coordinate_direction") != (
-        "180-degree forward orientation shared with SAM 3 input"
-    ):
+    if iou_results.get("coordinate_direction") not in {
+        "180-degree forward orientation shared with SAM 3 input",
+        "identity forward orientation shared with SAM 3 input",
+    }:
         raise RuntimeError("IoU results do not confirm the SAM 3 forward image orientation")
     if "sam3_results" in iou_results:
         recorded_sam_results = Path(iou_results["sam3_results"]).resolve()
@@ -109,14 +110,22 @@ def _load_case(
         raise RuntimeError("IoU results are missing their source Geom metadata path")
     geom_metadata_path = Path(geom_metadata_value).resolve()
     geom_metadata = _load_json(geom_metadata_path, "Geom metadata")
-    rgb_filename = geom_metadata.get("rgb_rotated_180_file")
+    identity = geom_metadata.get("pixel_alignment_transform") == "identity"
+    if identity != (iou_results.get("coordinate_direction") == "identity forward orientation shared with SAM 3 input"):
+        raise RuntimeError("IoU coordinate direction disagrees with source Geom metadata")
+    rgb_filename = geom_metadata.get("rgb_forward_file" if identity else "rgb_rotated_180_file")
     directions = geom_metadata.get("coordinate_directions")
     direction = directions.get(rgb_filename) if isinstance(directions, dict) else None
     if (
         not isinstance(rgb_filename, str)
         or not isinstance(direction, str)
-        or "180" not in direction.lower()
         or "forward" not in direction.lower()
+        or not (
+            (not identity and "180" in direction.lower())
+            or (identity and "identity" in direction.lower()
+                and geom_metadata.get("physical_state_unchanged") is True
+                and geom_metadata.get("rgb_segmentation_pixel_consistency") is True)
+        )
     ):
         raise RuntimeError("Source Geom RGB is not marked as 180-degree forward orientation")
     geom_rgb_path = Path(rgb_filename)

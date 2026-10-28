@@ -23,6 +23,7 @@ from research.gs_opd.smoke.joint_limit_policy import (
     joint_type_name,
     normalize_joint_limit_tolerance_policy,
 )
+from research.gs_opd.smoke.object_pair_clearance import measure_forbidden_object_pairs
 
 
 JOINT_LIMIT_TOLERANCE_POLICY = DEFAULT_JOINT_LIMIT_TOLERANCE_POLICY
@@ -187,9 +188,23 @@ if task is None:
         f"level={scene_args.level}, task_id={scene_args.task_id}"
     )
 bddl = suite.get_task_bddl_file_path_by_level_id(scene_args.level, scene_args.task_id)
+unlevelled_libero_assets = False
+if bddl and not Path(bddl).is_file() and scene_args.benchmark.startswith("libero_"):
+    candidate = Path(bddl).parent.parent / Path(bddl).name
+    if candidate.is_file():
+        bddl = str(candidate)
+        unlevelled_libero_assets = True
 if not bddl or not Path(bddl).is_file():
     raise FileNotFoundError(f"LIBERO BDDL file is unavailable: {bddl!r}")
-states = suite.get_task_init_states_by_level_id(scene_args.level, scene_args.task_id)
+if unlevelled_libero_assets:
+    import torch
+    expected_init = suite._get_task_file_path(scene_args.level, scene_args.task_id, "init_states", ".pruned_init")
+    init_path = Path(expected_init).parent.parent / Path(expected_init).name
+    if not init_path.is_file():
+        raise FileNotFoundError(f"unlevelled_LIBERO_init_states_missing:{init_path}")
+    states = torch.load(init_path, weights_only=False)
+else:
+    states = suite.get_task_init_states_by_level_id(scene_args.level, scene_args.task_id)
 if states is None or not 0 <= scene_args.init_state < len(states):
     state_count = 0 if states is None else len(states)
     raise IndexError(
@@ -217,6 +232,8 @@ scene_metadata = {
         else "demonstration_only_extension"
     ),
 }
+if unlevelled_libero_assets:
+    scene_metadata["asset_layout"] = "unlevelled_libero"
 
 print("LOADING SAFETY ENV...", flush=True)
 env = OffScreenRenderEnv(
@@ -4287,7 +4304,7 @@ def _task_success_first_grasp_context(request):
             and str(predicate[0]).lower() in ("in", "on")
             and predicate[1] in bindings
             or len(predicate) == 2
-            and str(predicate[0]).lower() in ("close", "open")
+            and str(predicate[0]).lower() in ("close", "open", "turnon", "turnoff")
             and predicate[1] in bindings
         )
     ]
@@ -4454,8 +4471,8 @@ def _task_success_first_articulation_context(request):
     if not isinstance(predicate, (list, tuple)) or len(predicate) != 2:
         raise ValueError("articulation_context_requires_a_native_unary_fixture_goal")
     predicate = [str(item) for item in predicate]
-    if predicate[0].lower() not in {"close", "open"}:
-        raise ValueError("articulation_context_supports_only_native_Close_or_Open_goals")
+    if predicate[0].lower() not in {"close", "open", "turnon", "turnoff"}:
+        raise ValueError("articulation_context_requires_supported_native_fixture_goal")
     if predicate not in env.env.parsed_problem.get("goal_state", []):
         raise ValueError("requested_fixture_predicate_is_not_an_active_BDDL_goal")
     fixture_id = predicate[1]
@@ -4497,6 +4514,8 @@ def _task_success_first_articulation_context(request):
         target_ranges = [0.0, 0.0]
     if predicate[0].lower() == "open" and not target_ranges:
         target_ranges = [joint_rows[0]["range"][0], joint_rows[0]["range"][0]]
+    if predicate[0].lower() in {"turnon", "turnoff"} and not target_ranges:
+        raise ValueError("fixture_switch_goal_requires_explicit_native_articulation_range")
 
     selected = None
     target_position = None
@@ -5119,6 +5138,9 @@ def _normalize_safety_geometry_policy(raw_policy):
     forbidden_pairs = raw_policy.get("forbidden_object_pairs", [])
     if not isinstance(forbidden_pairs, list):
         raise ValueError("forbidden_object_pairs_must_be_an_array")
+    measure_pair_clearances = raw_policy.get("measure_forbidden_object_pair_clearances", False)
+    if type(measure_pair_clearances) is not bool:
+        raise ValueError("measure_forbidden_object_pair_clearances_must_be_boolean")
     normalized_forbidden_pairs = []
     seen_forbidden_body_pairs = set()
     for index, pair in enumerate(forbidden_pairs):
@@ -5292,6 +5314,7 @@ def _normalize_safety_geometry_policy(raw_policy):
         "other_scene_body_ids": set().union(*(item["body_ids"] for item in other_groups)) if other_groups else set(),
         "allowed_carried_support_contact_geom_ids": set(support_geom_ids),
         "forbidden_object_pairs": normalized_forbidden_pairs,
+        "measure_forbidden_object_pair_clearances": measure_pair_clearances,
         "carried_object": carried_object,
         "joint_limit_tolerance_policy": joint_limit_tolerance_policy,
         "source": raw_policy.get("source"),
@@ -5395,6 +5418,27 @@ def _substep_safety_geometry(monitor, contact_result):
     try:
         if contact_result.get("status") not in ("contact", "no_contact"):
             item["status"] = "incomplete"
+        if policy.get("measure_forbidden_object_pair_clearances"):
+            pair_result = measure_forbidden_object_pairs(
+                policy["forbidden_object_pairs"],
+                lambda a, b: _minimum_geom_clearance(model, sim.data._data, a, b),
+                minimum_clearance_m=max(0.010, float(policy["minimum_clearance_m"])),
+            )
+            item["forbidden_object_pair_clearances"] = pair_result
+            if pair_result["status"] == "unsafe":
+                item["status"] = "unsafe"
+                for pair in pair_result["pairs"]:
+                    if pair["verdict"] == "violation":
+                        item["forbidden_contacts"].append({
+                            "forbidden_object_pair_clearance_requirement_violated": True,
+                            "object_id_a": pair["object_id_a"],
+                            "object_id_b": pair["object_id_b"],
+                            "distance_m": pair["measurement"].get("minimum_distance_m"),
+                            "minimum_required_m": pair["minimum_required_m"],
+                            "geometry_pair": pair["geometry_pair"],
+                        })
+            elif pair_result["status"] == "incomplete":
+                item["status"] = "incomplete"
         for group in policy["checked_objects"]:
             allowed_pairs = {
                 pair for pair in policy["allowed_contact_pair_ids"]
