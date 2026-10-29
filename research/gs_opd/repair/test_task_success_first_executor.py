@@ -19,6 +19,27 @@ from multiprocessing.connection import Client, Listener
 import numpy as np
 
 from research.gs_opd.repair.task_success_first_executor import (
+    _run_articulated_fixture_goal,
+    ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET,
+    ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET,
+    ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
+    ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M,
+    ARTICULATED_FIXTURE_FOLLOW_POSITION_TOLERANCE_M,
+    ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD,
+    ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M,
+    ARTICULATED_FIXTURE_SLIDE_HANDLE_APPROACH_OUTWARD_M,
+    ARTICULATED_FIXTURE_SLIDE_HANDLE_EEF_HEIGHT_OFFSET_M,
+    ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M,
+    ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD,
+    ARTICULATED_FIXTURE_SLIDE_UNDER_TOP_HEIGHT_OFFSET_M,
+    _articulated_fixture_follow_pose,
+    _articulated_fixture_press_quaternion,
+    _articulated_fixture_slide_approach_waypoints,
+    _articulated_fixture_slide_grasp_quaternion,
+    _articulated_fixture_robot_contact_pairs,
+    _articulated_fixture_terminal_outcome,
+    _thin_articulated_fixture_rrt_route,
+    MAX_NATIVE_PLACEMENT_ACTIONS,
     _make_precomputed_rrt_route_cache,
     _validate_precomputed_rrt_route,
     _joint_limit_diagnostics,
@@ -30,6 +51,7 @@ from research.gs_opd.repair.task_success_first_executor import (
     _generate_native_region_placement_candidates,
     _native_region_progress_route,
     _native_region_corridor_obstacle_clearance,
+    _native_region_progress_tracking_tolerances,
     _keypose_rrt_call_count,
     _native_region_entry_offset_m,
     _native_placement_planner_target,
@@ -63,6 +85,531 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
 
 
 class TaskSuccessFirstExecutorTests(unittest.TestCase):
+    def test_articulated_success_done_is_recorded_as_termination_not_failure(self):
+        failure, stop = _articulated_fixture_terminal_outcome(
+            "RuntimeError: environment_done_during_grasp_only_branch",
+            {"task_success": True},
+        )
+        self.assertIsNone(failure)
+        self.assertEqual(stop, "native_task_success_terminated_environment")
+
+        failure, stop = _articulated_fixture_terminal_outcome(
+            "RuntimeError: articulated_fixture_live_follow_joint_progress_stalled",
+            {"task_success": False},
+        )
+        self.assertEqual(failure, "RuntimeError: articulated_fixture_live_follow_joint_progress_stalled")
+        self.assertIsNone(stop)
+
+    def test_articulated_live_follow_can_close_the_gripper_after_switch_contact(self):
+        from unittest.mock import patch
+
+        captured = {"gripper_actions": []}
+
+        class FakeBridge:
+            def request(self, request):
+                if request.get("op") == "observe":
+                    return {"snapshot_state": {"robot_states": [{
+                        "eef_pos": [0.2, 0.0, 1.0],
+                        "eef_quat": [1.0, 0.0, 0.0, 0.0],
+                        "joint_qpos": [0.0] * 7,
+                    }]}}
+                raise AssertionError(f"unexpected Bridge operation: {request.get('op')}")
+
+        def fake_tracking_action(*_args, gripper_action=0.0, **_kwargs):
+            captured["gripper_actions"].append(gripper_action)
+            return np.zeros(7, dtype=np.float32)
+
+        def fake_record_step(_bridge, _action, *_args, **_kwargs):
+            records.append({"done": False, "snapshot_state": {"robot_states": [{
+                "eef_pos": [0.2, 0.0, 1.0],
+            }]}})
+            frames.append({})
+
+        from research.gs_opd.repair.task_success_first_grasp_search import _advance_pose
+
+        records, frames = [], []
+        _advance_pose.controller_fields = {}
+        with patch("research.gs_opd.repair.trajectory_tracking.world_pose_tracking_action",
+                   fake_tracking_action), \
+             patch("research.gs_opd.repair.task_success_first_grasp_search._record_step",
+                   fake_record_step):
+            with self.assertRaisesRegex(TimeoutError, "test_pinch_follow_did_not_reach_pose"):
+                _advance_pose(
+                    FakeBridge(), np.asarray([0.19, 0.0, 1.0]),
+                    np.asarray([1.0, 0.0, 0.0, 0.0]),
+                    "test_pinch_follow", "test-switch", [0], 1,
+                    {"body_id": 1}, "turn off switch", {}, None,
+                    records, frames, gripper_action=1.0,
+                )
+        self.assertEqual(captured["gripper_actions"], [1.0])
+
+    def test_articulated_fixture_press_orientation_aligns_fingers_with_hinge_contact(self):
+        from scipy.spatial.transform import Rotation
+
+        outward = np.asarray([-0.6, -0.8, 0.0])
+        quaternion = _articulated_fixture_press_quaternion(
+            np.asarray([1.0, 0.0, 0.0, 0.0]), outward,
+        )
+        rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
+        inward = -outward / np.linalg.norm(outward)
+        self.assertTrue(np.allclose(rotation[:, 2], inward, atol=1e-8))
+        self.assertAlmostEqual(float(np.dot(rotation[:, 0], inward)), 0.0, places=8)
+        self.assertAlmostEqual(float(rotation[:, 0][2]), 0.0, places=8)
+        self.assertGreater(float(np.linalg.det(rotation)), 0.999999)
+
+    def test_articulated_fixture_slide_orientation_faces_handle_and_closes_across_bar(self):
+        from scipy.spatial.transform import Rotation
+
+        outward = np.asarray([0.0, 1.0, 0.0])
+        quaternion = _articulated_fixture_slide_grasp_quaternion(outward)
+        rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
+        expected_down = float(np.sin(ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD))
+        expected_inward = float(np.cos(ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD))
+        np.testing.assert_allclose(rotation[:, 0], [-1.0, 0.0, 0.0], atol=1e-8)
+        np.testing.assert_allclose(
+            rotation[:, 2], [0.0, -expected_inward, -expected_down], atol=1e-8,
+        )
+        self.assertGreater(float(np.linalg.det(rotation)), 0.999999)
+
+    def test_articulated_slide_approach_enters_below_top_before_handle_height(self):
+        contact = np.asarray([0.008558, -0.211354, 0.946140])
+        outside, inward, handle_height = _articulated_fixture_slide_approach_waypoints(
+            contact, np.asarray([0.0, 4.0, 0.0]),
+        )
+        under_top_height = contact[2] + ARTICULATED_FIXTURE_SLIDE_UNDER_TOP_HEIGHT_OFFSET_M
+        self.assertAlmostEqual(outside[1], contact[1] + ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M)
+        self.assertAlmostEqual(inward[1], contact[1] + ARTICULATED_FIXTURE_SLIDE_HANDLE_APPROACH_OUTWARD_M)
+        self.assertAlmostEqual(handle_height[1], inward[1])
+        self.assertAlmostEqual(outside[2], under_top_height)
+        self.assertAlmostEqual(inward[2], under_top_height)
+        self.assertAlmostEqual(
+            handle_height[2], contact[2] + ARTICULATED_FIXTURE_SLIDE_HANDLE_EEF_HEIGHT_OFFSET_M,
+        )
+        self.assertAlmostEqual(
+            contact[1] + ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M,
+            contact[1] + 0.010,
+        )
+        self.assertGreater(outside[1], inward[1])
+
+    def test_articulated_fixture_follow_pose_keeps_a_bounded_contact_side_offset(self):
+        target_position, target_quaternion = _articulated_fixture_follow_pose(
+            np.asarray([1.0, 0.0, 0.0]),
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            {
+                "joint": {"joint_type": "hinge", "position": np.pi / 2, "target_position": 0.0},
+                "joint_axis_world": [0.0, 0.0, 1.0],
+                "joint_origin_world_m": [0.0, 0.0, 0.0],
+            },
+            joint_position_at_anchor=np.pi / 2,
+            follow_lead=0.1,
+        )
+        self.assertTrue(np.allclose(target_position, [np.cos(-0.1), np.sin(-0.1), 0.0], atol=1e-8))
+        self.assertTrue(np.allclose(
+            target_quaternion, [np.cos(0.05), 0.0, 0.0, -np.sin(0.05)], atol=1e-8,
+        ))
+
+    def test_articulated_fixture_follow_pose_uses_fixed_contact_anchor_with_bounded_lead(self):
+        target_position, _target_quaternion = _articulated_fixture_follow_pose(
+            np.asarray([1.0, 0.0, 0.0]),
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            {
+                "joint": {"joint_type": "hinge", "position": 0.8, "target_position": 0.0},
+                "joint_axis_world": [0.0, 0.0, 1.0],
+                "joint_origin_world_m": [0.0, 0.0, 0.0],
+            },
+            joint_position_at_anchor=1.0,
+            follow_lead=0.1,
+        )
+        self.assertTrue(np.allclose(target_position, [np.cos(-0.3), np.sin(-0.3), 0.0], atol=1e-8))
+
+    def test_turnoff_follow_can_track_the_native_closed_hinge_stop(self):
+        target_position, _target_quaternion = _articulated_fixture_follow_pose(
+            np.asarray([1.0, 0.0, 0.0]),
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            {
+                "joint": {
+                    "joint_type": "hinge", "position": 0.0325,
+                    "target_position": -0.0025, "range": [-0.005, 2.1],
+                },
+                "joint_axis_world": [0.0, 0.0, 1.0],
+                "joint_origin_world_m": [0.0, 0.0, 0.0],
+            },
+            joint_position_at_anchor=1.0,
+            follow_lead=0.04,
+            allow_terminal_stop_follow=True,
+        )
+        self.assertTrue(np.allclose(
+            target_position, [np.cos(-1.005), np.sin(-1.005), 0.0], atol=1e-8,
+        ))
+
+    def test_articulated_fixture_contact_requires_moving_fixture_geometry(self):
+        record = {"contacts": {"contacts": [
+            {
+                "geom1": {"name": "gripper0_finger2_collision"},
+                "geom2": {"name": "flat_stove_1_g19"},
+                "body1": {"name": "gripper0_right_inner_finger"},
+                "body2": {"name": "flat_stove_1_button"},
+            },
+            {
+                "geom1": {"name": "robot0_link6_collision"},
+                "geom2": {"name": "flat_stove_1_g2"},
+                "body1": {"name": "robot0_link6"},
+                "body2": {"name": "flat_stove_1_main"},
+            },
+        ]}}
+        pairs = _articulated_fixture_robot_contact_pairs(
+            record, "flat_stove_1", ["flat_stove_1_g19"],
+        )
+        self.assertEqual(pairs, [{
+            "robot_geom": "gripper0_finger2_collision",
+            "fixture_geom": "flat_stove_1_g19",
+        }])
+
+    def test_articulated_fixture_rrt_route_thinning_preserves_endpoint(self):
+        route = np.column_stack([
+            np.arange(5, dtype=np.float64),
+            np.zeros((5, 6), dtype=np.float64),
+        ])
+        thinned, indices = _thin_articulated_fixture_rrt_route(route, stride=2)
+        self.assertEqual(indices, [0, 2, 4])
+        np.testing.assert_array_equal(thinned, route[[0, 2, 4]])
+
+    def test_articulated_fixture_rrt_route_thinning_rejects_invalid_stride(self):
+        with self.assertRaisesRegex(ValueError, "stride_must_be_a_positive_integer"):
+            _thin_articulated_fixture_rrt_route(np.zeros((3, 7)), stride=0)
+
+    def test_articulated_fixture_timeout_persists_actions_and_qpos_feedback(self):
+        from unittest.mock import patch
+
+        saved = {}
+        context = {
+            "status": "complete", "read_only": True,
+            "fixture_id_from_active_BDDL": "flat_stove_1",
+            "contact_point_path_world_m": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.01]],
+            "outward_direction_world": [0.0, -1.0, 0.0],
+            "joint": {"joint_name": "stove_button", "position": 0.98,
+                      "target_position": 0.0, "range": [-0.005, 2.1]},
+        }
+        native = {"status": "complete", "task_success": False,
+                  "native_goal_values": [{"predicate": ["turnoff", "flat_stove_1"], "value": False}]}
+        rrt_requests = []
+
+        class FakeBridge:
+            def request(self, request):
+                operation = request["op"]
+                if operation == "observe":
+                    return {"snapshot_state": {
+                        "mujoco_integration_state": [0.0, 1.0, 2.0],
+                        "robot_states": [{
+                            "eef_pos": [0.2, 0.0, 1.0],
+                            "eef_quat": [1.0, 0.0, 0.0, 0.0],
+                            "joint_qpos": [0.0] * 7,
+                        }],
+                    }}
+                if operation == "task_success_first_rrt":
+                    rrt_requests.append(request)
+                    return {
+                        "status": "offline_feasible", "live_state_unchanged": True,
+                        "planner_source": "test_rrt",
+                        "require_safe_configurations": True,
+                        "planner_minimum_clearance_m": 0.0,
+                        "minimum_forbidden_clearance_m": 0.015,
+                        "config_checks": 42,
+                        "qpos_path": [[0.0] * 7, [0.1] * 7],
+                        "eef_reference_poses_world": [
+                            [0.2, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                            [0.0, -0.05, 0.04, 1.0, 0.0, 0.0, 0.0],
+                        ],
+                    }
+                if operation == "task_success_first_articulation_context":
+                    return {**context, "native_goal_value": False}
+                if operation == "native_task_status":
+                    return native
+                if operation == "export_runtime_snapshot":
+                    return {"status": "complete", "payload": b"terminal-snapshot"}
+                raise AssertionError(f"unexpected Bridge operation: {operation}")
+
+        def fake_advance_pose(*args, **kwargs):
+            records, frames = args[-2], args[-1]
+            saved["absolute_action_limit"] = kwargs.get("absolute_action_limit")
+            saved["position_tolerance_m"] = kwargs.get("position_tolerance_m")
+            record = {"snapshot_state": {}, "planning_tracking": kwargs["planning_tracking"]}
+            records.append(record)
+            frames.append({})
+            kwargs["step_callback"](record, frames[-1])
+            raise TimeoutError("fixture pose budget exhausted")
+
+        def fake_write_recording(_output_dir, records, _frames):
+            saved["records"] = records
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            with patch("research.gs_opd.repair.task_success_first_grasp_search._advance_pose", fake_advance_pose), \
+                 patch("research.gs_opd.repair.task_success_first_grasp_search._write_recording", fake_write_recording):
+                result = _run_articulated_fixture_goal(
+                    FakeBridge(), predicate=["turnoff", "flat_stove_1"],
+                    target_binding={"body_id": 25}, instruction="turn off the stove",
+                    policy={
+                        "source": "unit_test",
+                        "minimum_clearance_m": 0.0,
+                        "forbidden_objects": [],
+                        "allowed_target_objects": [
+                            {"object_id": "flat_stove_1", "minimum_clearance_m": 0.0},
+                        ],
+                        "other_scene_objects": [],
+                    }, articulation_context=context, controller_fields={},
+                    output_dir=output_dir,
+                    model_sha="test-model-sha", rrt_time_budget_s=2.0,
+                )
+
+            self.assertEqual(result["status"], "articulated_fixture_goal_incomplete")
+            self.assertEqual(result["failure_reason"], "TimeoutError: fixture pose budget exhausted")
+            self.assertEqual(result["recorded_actions"], 1)
+            self.assertEqual(
+                saved["absolute_action_limit"],
+                ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
+            )
+            self.assertEqual(
+                saved["position_tolerance_m"],
+                ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M,
+            )
+            self.assertEqual(result["precontact_route"]["route_source"],
+                             "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC")
+            self.assertEqual(len(rrt_requests), 1)
+            self.assertEqual(
+                rrt_requests[0]["goal_pose_world"]["position_world_m"],
+                [0.0, -0.180, 0.0],
+            )
+            self.assertEqual(
+                rrt_requests[0]["safety_geometry_policy"]["allowed_target_objects"][0]["minimum_clearance_m"],
+                0.010,
+            )
+            self.assertIs(rrt_requests[0]["planner_config"]["require_safe_configurations"], True)
+            self.assertEqual(result["precontact_route"]["config_checks"], 42)
+            self.assertEqual(result["precontact_route"]["qpos_path_rad"], [[0.0] * 7, [0.1] * 7])
+            self.assertEqual(saved["records"][0]["articulation_tracking"]["joint_position_after"], 0.98)
+            self.assertTrue((output_dir / "articulated_fixture_terminal_runtime_snapshot.pkl").is_file())
+
+    def test_articulated_fixture_rejects_route_below_forbidden_clearance_before_motion(self):
+        from unittest.mock import patch
+
+        context = {
+            "status": "complete", "read_only": True,
+            "fixture_id_from_active_BDDL": "cabinet_1",
+            "contact_point_path_world_m": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.01]],
+            "outward_direction_world": [0.0, -1.0, 0.0],
+            "joint": {"joint_name": "bottom_slide", "joint_type": "slide",
+                      "position": 0.0, "target_position": -0.15, "range": [-0.16, 0.01]},
+        }
+        native = {"status": "complete", "task_success": False,
+                  "native_goal_values": [{"predicate": ["open", "cabinet_1"], "value": False}]}
+        advance_calls = []
+
+        class FakeBridge:
+            def request(self, request):
+                operation = request["op"]
+                if operation == "observe":
+                    return {"snapshot_state": {
+                        "mujoco_integration_state": [0.0, 1.0, 2.0],
+                        "robot_states": [{
+                            "eef_pos": [0.2, 0.0, 1.0],
+                            "eef_quat": [1.0, 0.0, 0.0, 0.0],
+                            "joint_qpos": [0.0] * 7,
+                        }],
+                    }}
+                if operation == "task_success_first_rrt":
+                    self.planner_config = request["planner_config"]
+                    return {
+                        "status": "offline_feasible", "live_state_unchanged": True,
+                        "planner_source": "test_rrt",
+                        "require_safe_configurations": True,
+                        "planner_minimum_clearance_m": 0.0,
+                        "minimum_forbidden_clearance_m": 0.005,
+                        "config_checks": 12,
+                        "qpos_path": [[0.0] * 7, [0.1] * 7],
+                        "eef_reference_poses_world": [
+                            [0.2, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                            [0.0, -0.05, 0.04, 1.0, 0.0, 0.0, 0.0],
+                        ],
+                    }
+                if operation == "task_success_first_articulation_context":
+                    return {**context, "native_goal_value": False}
+                if operation == "native_task_status":
+                    return native
+                if operation == "export_runtime_snapshot":
+                    return {"status": "complete", "payload": b"terminal-snapshot"}
+                raise AssertionError(f"unexpected Bridge operation: {operation}")
+
+        def forbidden_advance(*_args, **_kwargs):
+            advance_calls.append(True)
+            raise AssertionError("physical OSC motion must not run after a rejected RRT route")
+
+        policy = {
+            "source": "unit_test", "minimum_clearance_m": 0.010,
+            "forbidden_objects": [{"object_id": "bowl_1", "minimum_clearance_m": 0.010}],
+            "allowed_target_objects": [{"object_id": "cabinet_1", "minimum_clearance_m": 0.010}],
+            "other_scene_objects": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            with patch("research.gs_opd.repair.task_success_first_grasp_search._advance_pose", forbidden_advance), \
+                 patch("research.gs_opd.repair.task_success_first_grasp_search._write_recording"):
+                result = _run_articulated_fixture_goal(
+                    FakeBridge(), predicate=["open", "cabinet_1"],
+                    target_binding={"body_id": 25}, instruction="open the bottom drawer",
+                    policy=policy, articulation_context=context, controller_fields={},
+                    output_dir=output_dir, model_sha="test-model-sha", rrt_time_budget_s=2.0,
+                )
+
+        self.assertEqual(result["status"], "articulated_fixture_goal_incomplete")
+        self.assertIn("forbidden_clearance_below_policy", result["failure_reason"])
+        self.assertEqual(result["recorded_actions"], 0)
+        self.assertEqual(advance_calls, [])
+
+    def test_articulated_fixture_follow_retargets_in_chunks_until_native_goal(self):
+        from unittest.mock import patch
+
+        saved = {"dynamic_tolerances": [], "dynamic_targets": [], "dynamic_gripper_actions": []}
+
+        class FakeBridge:
+            def __init__(self):
+                self.joint_position = 0.98
+
+            def context(self):
+                reached = self.joint_position <= 0.5
+                return {
+                    "status": "complete", "read_only": True,
+                    "fixture_id_from_active_BDDL": "flat_stove_1",
+                    "contact_point_path_world_m": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.01]],
+                    "outward_direction_world": [0.0, -1.0, 0.0],
+                    "joint": {"joint_name": "stove_button", "joint_type": "hinge",
+                              "position": self.joint_position, "target_position": 0.0,
+                              "range": [-0.005, 2.1]},
+                    "joint_axis_world": [0.0, 0.0, 1.0],
+                    "joint_origin_world_m": [0.0, 0.0, 0.0],
+                    "articulated_moving_collision_geom_names": ["flat_stove_1_g1"],
+                    "native_goal_value": reached,
+                }
+
+            def request(self, request):
+                operation = request["op"]
+                if operation == "observe":
+                    return {"snapshot_state": {
+                        "mujoco_integration_state": [0.0, 1.0, 2.0],
+                        "robot_states": [{
+                            "eef_pos": [0.2, 0.0, 1.0],
+                            "eef_quat": [1.0, 0.0, 0.0, 0.0],
+                            "joint_qpos": [0.0] * 7,
+                        }],
+                    }}
+                if operation == "task_success_first_rrt":
+                    return {
+                        "status": "offline_feasible", "live_state_unchanged": True,
+                        "planner_source": "test_rrt",
+                        "require_safe_configurations": True,
+                        "planner_minimum_clearance_m": 0.0,
+                        "minimum_forbidden_clearance_m": 10.0,
+                        "config_checks": 24,
+                        "qpos_path": [[0.0] * 7, [0.1] * 7],
+                        "eef_reference_poses_world": [
+                            [0.2, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                            [0.0, -0.05, 0.04, 1.0, 0.0, 0.0, 0.0],
+                        ],
+                    }
+                if operation == "task_success_first_articulation_context":
+                    return self.context()
+                if operation == "native_task_status":
+                    reached = self.joint_position <= 0.5
+                    return {
+                        "status": "complete", "task_success": reached,
+                        "native_goal_values": [{"predicate": ["turnoff", "flat_stove_1"], "value": reached}],
+                    }
+                if operation == "export_runtime_snapshot":
+                    return {"status": "complete", "payload": b"terminal-snapshot"}
+                raise AssertionError(f"unexpected Bridge operation: {operation}")
+
+        bridge = FakeBridge()
+        initial_context = bridge.context()
+
+        def fake_advance_pose(*args, **kwargs):
+            counter = args[5]
+            records, frames = args[-2], args[-1]
+            phase = args[3]
+            snapshot_state = {
+                "robot_states": [{
+                    "eef_pos": [0.2, 0.0, 1.0],
+                    "eef_quat": [1.0, 0.0, 0.0, 0.0],
+                    "joint_qpos": [0.0] * 7,
+                }],
+            }
+            contacts = []
+            if "live_contact_follow" not in phase:
+                bridge.joint_position = 0.98
+                contacts = [{
+                    "geom1": {"name": "gripper0_finger2_collision"},
+                    "geom2": {"name": "flat_stove_1_g1"},
+                    "body1": {"name": "gripper0_finger2"},
+                    "body2": {"name": "flat_stove_1_button"},
+                }]
+            else:
+                saved["dynamic_tolerances"].append(kwargs.get("position_tolerance_m"))
+                saved["dynamic_gripper_actions"].append(kwargs.get("gripper_action"))
+                saved["dynamic_targets"].append(
+                    kwargs["target_pose_provider"](snapshot_state)[0].tolist()
+                )
+                bridge.joint_position = 0.65 if len(saved["dynamic_targets"]) == 1 else 0.4
+            record = {
+                "snapshot_state": snapshot_state,
+                "contacts": {"status": "contact" if contacts else "clear", "contacts": contacts},
+                "planning_tracking": kwargs["planning_tracking"],
+            }
+            records.append(record)
+            frames.append({})
+            counter[0] += 1
+            kwargs["step_callback"](record, frames[-1])
+            return False
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            with patch("research.gs_opd.repair.task_success_first_grasp_search._advance_pose", fake_advance_pose), \
+                 patch("research.gs_opd.repair.task_success_first_grasp_search._write_recording", lambda *_args: None):
+                result = _run_articulated_fixture_goal(
+                    bridge, predicate=["turnoff", "flat_stove_1"],
+                    target_binding={"body_id": 25}, instruction="turn off the stove",
+                    policy={
+                        "source": "unit_test", "minimum_clearance_m": 0.0,
+                        "forbidden_objects": [],
+                        "allowed_target_objects": [{"object_id": "flat_stove_1", "minimum_clearance_m": 0.0}],
+                        "other_scene_objects": [],
+                    }, articulation_context=initial_context, controller_fields={},
+                    output_dir=output_dir, model_sha="test-model-sha", rrt_time_budget_s=2.0,
+                )
+
+        self.assertEqual(result["status"], "complete_task_success")
+        self.assertEqual(result["recorded_actions"], 3)
+        self.assertEqual(saved["dynamic_tolerances"], [ARTICULATED_FIXTURE_FOLLOW_POSITION_TOLERANCE_M] * 2)
+        self.assertEqual(saved["dynamic_gripper_actions"], [1.0, 1.0])
+        self.assertEqual(len(result["fixture_contact_tracking"]["follow_chunks"]), 2)
+        self.assertTrue(result["fixture_contact_tracking"]["switch_gripper_close_commanded"])
+        self.assertEqual(
+            result["fixture_contact_tracking"]["switch_bilateral_contact_observed"], False,
+        )
+        self.assertEqual(
+            [chunk["follow_lead"] for chunk in result["fixture_contact_tracking"]["follow_chunks"]],
+            [ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD,
+             ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD - 0.015],
+        )
+        self.assertTrue(all(np.isfinite(target).all() for target in saved["dynamic_targets"]))
+
+    def test_executor_cli_accepts_extended_demonstration_horizon_for_multigoal_episode(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--demonstration-horizon", "5000",
+        ]):
+            args = _parse_task_success_executor_args()
+        self.assertEqual(args.demonstration_horizon, 5000)
+
     def test_candidate_start_index_is_validated_by_executor_cli(self):
         from unittest.mock import patch
 
@@ -91,11 +638,38 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         ]), self.assertRaises(SystemExit):
             _parse_task_success_executor_args()
 
+    def test_cold_start_continuation_cli_requires_and_accepts_its_exact_resume_input(self):
+        from unittest.mock import patch
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--cold-start", "--cold-start-continuation",
+            "--resume-from-runtime-snapshot", "same-run-stage.pkl",
+            "--cold-start-continuation-root", ".",
+        ]):
+            args = _parse_task_success_executor_args()
+        self.assertTrue(args.cold_start)
+        self.assertTrue(args.cold_start_continuation)
+        self.assertEqual(args.resume_from_runtime_snapshot, Path("same-run-stage.pkl"))
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--cold-start-continuation",
+            "--resume-from-runtime-snapshot", "same-run-stage.pkl",
+        ]), self.assertRaises(SystemExit):
+            _parse_task_success_executor_args()
+
+        with patch("sys.argv", [
+            "task_success_first_executor.py", "--cold-start", "--cold-start-continuation",
+            "--resume-from-placement-report", "same-run-source-report.json",
+            "--cold-start-continuation-root", ".",
+        ]):
+            args = _parse_task_success_executor_args()
+        self.assertEqual(args.resume_from_placement_report, Path("same-run-source-report.json"))
+
     def test_native_region_route_variant_cli(self):
         from unittest.mock import patch
 
         with patch("sys.argv", [
-            "task_success_first_executor.py",
+            "task_success_first_executor.py", "--cold-start",
             "--native-region-route-variant", "keypose_side_region_progress",
         ]):
             args = _parse_task_success_executor_args()
@@ -218,8 +792,13 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             start, goal, region=region,
             route_variant="keypose_side_region_progress_reverse",
         )
+        in_region = _native_region_progress_route(
+            start, goal, region=region,
+            route_variant="keypose_side_region_progress",
+            enable_entry_alignment=True,
+        )
         self.assertTrue(direct["no_fixed_preplace_pose"])
-        self.assertGreater(direct["adaptive_transit_height_region_m"], goal[2, 3] - 0.90)
+        self.assertGreater(direct["adaptive_transit_height_world_m"], goal[2, 3])
         self.assertEqual(direct["waypoints"][0]["role"], "adaptive_clearance")
         self.assertEqual(
             side["waypoints"][0]["role"],
@@ -235,6 +814,37 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         self.assertGreater(positive_cross, 0.0)
         self.assertLess(reverse_cross, 0.0)
         np.testing.assert_allclose(direct["waypoints"][-1]["object_pose_world"], goal)
+        self.assertEqual(in_region["waypoints"][-2]["role"], "native_region_entry_alignment")
+        self.assertEqual(in_region["waypoints"][-1]["role"], "native_region_placement")
+        entry_pose = np.asarray(in_region["waypoints"][-2]["object_pose_world"])
+        np.testing.assert_allclose(entry_pose[:2, 3], goal[:2, 3])
+        self.assertGreater(entry_pose[2, 3], goal[2, 3])
+
+    def test_final_native_region_alignment_uses_tight_tracking_tolerances(self):
+        self.assertEqual(
+            _native_region_progress_tracking_tolerances(
+                "region_progress", 0.095, native_goal_operator="in"
+            ),
+            (0.006, 0.05),
+        )
+        self.assertEqual(
+            _native_region_progress_tracking_tolerances(
+                "region_progress", 0.12, native_goal_operator="in"
+            ),
+            (0.015, 0.12),
+        )
+        self.assertEqual(
+            _native_region_progress_tracking_tolerances(
+                "native_region_placement", 0.02, native_goal_operator="in"
+            ),
+            (0.015, 0.12),
+        )
+        self.assertEqual(
+            _native_region_progress_tracking_tolerances(
+                "region_progress", 0.02, native_goal_operator="on"
+            ),
+            (0.015, 0.12),
+        )
 
     def test_joint_limit_diagnostic_reports_the_measured_small_overage(self):
         ranges = np.asarray([[-2.9, 2.9]] * 6 + [[-2.8973, 2.8973]], dtype=np.float64)
@@ -298,6 +908,30 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             - result["future_goal_reserve_each"],
         )
         self.assertLessEqual(result["actions"], result["available_after_reserves"])
+
+    def test_single_terminal_region_goal_reserves_only_post_route_placement(self):
+        route = np.asarray([
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ])
+        native = {
+            "status": "complete",
+            "timestep": 246,
+            "native_goal_values": [
+                {"predicate": ["in", "book", "caddy"], "value": False},
+            ],
+        }
+        result = _native_transport_action_budget(
+            route, native, predicate=["in", "book", "caddy"],
+            demonstration_horizon=1000,
+            native_region_route_includes_final_placement=True,
+        )
+        self.assertEqual(result["current_goal_completion_reserve"], MAX_NATIVE_PLACEMENT_ACTIONS)
+        self.assertEqual(
+            result["available_after_reserves"],
+            1000 - 246 - MAX_NATIVE_PLACEMENT_ACTIONS,
+        )
+        self.assertTrue(result["native_region_route_includes_final_placement"])
 
     def test_task_success_search_can_physically_try_valid_ik_after_rrt_timeout(self):
         row = {
@@ -569,6 +1203,48 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             ["jointspace_rrt", "elevated_osc_waypoints", "jointspace_rrt", "elevated_osc_waypoints"],
         )
 
+    def test_native_in_candidates_align_compiled_footprint_and_keep_root_inside_inverted_site(self):
+        from scipy.spatial.transform import Rotation
+
+        region_rotation = np.diag([1.0, -1.0, -1.0])
+        target_rotation = Rotation.from_euler("z", 60.0, degrees=True).as_matrix()
+        target = {
+            "target_object_id": "book",
+            "target_root_pose_world": {
+                "position_m": [0.1, 0.0, 0.9],
+                "rotation": target_rotation.tolist(),
+            },
+            "target_collision_geometries": [{
+                "center_root_m": [-0.00047, -0.01215, 0.06937],
+                "rotation_root": np.diag([-1.0, -1.0, 1.0]).tolist(),
+                "size_m": [0.01434, 0.05519, 0.0672],
+            }],
+        }
+        region = {
+            "site_position_world_m": [-0.4, -0.1, 0.97],
+            "site_rotation_world": region_rotation.tolist(),
+            "site_size_m": [0.02775, 0.06216, 0.06046],
+        }
+        candidates = _generate_native_region_placement_candidates(
+            predicate=["in", "book", "caddy_region"],
+            region=region,
+            target_context=target,
+            occupied_contexts=[],
+            maximum_candidates=2,
+        )
+        self.assertEqual(len(candidates), 2)
+        candidate = candidates[0]
+        self.assertEqual(candidate["orientation_source"], "region_collision_envelope_fit_yaw_search")
+        np.testing.assert_allclose(candidate["rotation_world"], np.eye(3), atol=1e-7)
+        np.testing.assert_allclose(candidate["footprint_half_extents_region_m"], [0.01434, 0.05519], atol=1e-7)
+        self.assertLess(candidate["estimated_region_fit_cost"], 1.2)
+        local_root = region_rotation.T @ (
+            np.asarray(candidate["position_world_m"]) - np.asarray(region["site_position_world_m"])
+        )
+        self.assertLess(abs(local_root[0]), region["site_size_m"][0])
+        self.assertLess(abs(local_root[1]), region["site_size_m"][1])
+        self.assertLess(abs(local_root[2]), region["site_size_m"][2])
+
     def test_native_region_placement_reuses_orientation_for_similar_compiled_envelopes(self):
         occupied = self._placement_context("object_a", [-0.03, 0.01, 0.997])
         occupied["target_root_pose_world"]["rotation"] = [
@@ -644,15 +1320,38 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         )
         self.assertEqual([row["object_id"] for row in clearance["intersecting_objects"]], ["bottle"])
         self.assertAlmostEqual(clearance["maximum_intersecting_obstacle_top_world_m"], 0.5)
-        self.assertAlmostEqual(clearance["required_transit_height_region_m"], 0.6)
+        self.assertAlmostEqual(clearance["required_transit_height_world_m"], 0.6)
         route = _native_region_progress_route(
             start,
             goal,
             region=region,
             route_variant="direct_region_progress",
-            obstacle_clearance_height_region_m=clearance["required_transit_height_region_m"],
+            obstacle_clearance_height_world_m=clearance["required_transit_height_world_m"],
         )
-        self.assertGreaterEqual(route["adaptive_transit_height_region_m"], 0.6)
+        self.assertGreaterEqual(route["adaptive_transit_height_world_m"], 0.6)
+
+    def test_native_region_route_uses_world_up_when_region_z_axis_is_inverted(self):
+        start = np.eye(4, dtype=np.float64)
+        start[:3, 3] = [-0.0104, 0.0008, 1.1244]
+        goal = np.eye(4, dtype=np.float64)
+        goal[:3, 3] = [-0.4036, -0.1181, 0.7729]
+        region = {
+            "site_position_world_m": [-0.4253, -0.1424, 0.9726],
+            "site_rotation_world": np.diag([1.0, -1.0, -1.0]).tolist(),
+            "site_size_m": [0.16, 0.12, 0.01],
+        }
+        route = _native_region_progress_route(
+            start,
+            goal,
+            region=region,
+            route_variant="keypose_side_region_progress",
+            obstacle_clearance_height_world_m=1.4438,
+        )
+        self.assertGreaterEqual(route["adaptive_transit_height_world_m"], 1.4438)
+        for waypoint in route["waypoints"][:-1]:
+            pose = np.asarray(waypoint["object_pose_world"], dtype=np.float64)
+            self.assertAlmostEqual(pose[2, 3], route["adaptive_transit_height_world_m"], places=8)
+        np.testing.assert_allclose(route["waypoints"][-1]["object_pose_world"], goal)
 
     def test_placement_waypoint_stagnation_detection_keeps_progressing_routes(self):
         self.assertFalse(_pose_tracking_window_stagnated(

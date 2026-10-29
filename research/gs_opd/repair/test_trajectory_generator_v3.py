@@ -19,11 +19,15 @@ from research.gs_opd.repair.l0t0_success_reference import load_success_reference
 from research.gs_opd.repair.trajectory_generator_v3 import (
     _classify_run_status,
     _classify_experience_run_status,
+    _experience_failure_reasons,
     _experience_task_success_command,
+    _load_v3_continuation_history,
+    _native_goal_stage_boundary_matches,
     _parse_args as _parse_v3_args,
     _select_backend,
     _experience_physical_action_audit,
     _outcome,
+    _report_native_goal_contact_snapshot,
     _nested_contact_monitoring_complete,
     _run_bounded_engine,
     _substep_monitoring,
@@ -41,6 +45,16 @@ DIRECT_REFERENCE = (
     "direct_bspline_osc_trajectory.npz"
 )
 DIRECT_REPORT = DIRECT_REFERENCE.with_name("live_left_bspline_osc_report.json")
+
+
+def test_experience_failure_reason_prefers_recorded_terminal_transport_failure() -> None:
+    reasons = _experience_failure_reasons({
+        "segments": [{
+            "failure_reasons": ["planning_time_budget_exhausted"],
+            "failure_reason": "RuntimeError: transport_region_progress_waypoint_stagnated_for_24_actions",
+        }],
+    })
+    assert reasons[-1] == "RuntimeError: transport_region_progress_waypoint_stagnated_for_24_actions"
 
 
 def _sha(path: Path) -> str:
@@ -245,10 +259,12 @@ def test_cold_start_command_omits_success_experience_inputs(tmp_path: Path) -> N
         demonstration_horizon=1000, maximum_physical_branches=1,
         maximum_rrt_preflights=1, rrt_time_budget_s=12.0,
         candidate_start_index=0, transport_strategy="native_region_progress_osc",
+        native_region_route_variant="keypose_side_region_progress",
         target_predicate=None, keypose_experience=[], previous_search_report=[],
         resume_from_runtime_snapshot=None, grasp_candidate_id=None,
         strict_grasp_screen_report=None,
         bridge_port=39420,
+        output_dir=tmp_path / "cold_start",
     )
     argv = _experience_task_success_command(
         args,
@@ -260,8 +276,286 @@ def test_cold_start_command_omits_success_experience_inputs(tmp_path: Path) -> N
     assert "--keypose-experience" not in argv
     assert "--previous-search-report" not in argv
     assert "--candidate-id" not in argv
+    assert argv[argv.index("--native-region-route-variant") + 1] == "keypose_side_region_progress"
+
+
+def test_cold_start_multigoal_cli_keeps_experience_library_unset(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", [
+        "trajectory_generator_v3.py", "--backend", "experience_task_success",
+        "--output-dir", str(tmp_path / "run"), "--benchmark", "obstacle_avoidance",
+        "--level", "0", "--task-id", "2", "--init-state", "0", "--seed", "0",
+        "--instruction", "put both moka pots on the stove",
+        "--snapshot-root", str(tmp_path / "legal_t0"),
+        "--rlinf-python", "/workspace/zy_workspace/RLinf/.venv/bin/python",
+        "--cold-start", "--continue-pending-native-goals",
+        "--demonstration-horizon", "1800",
+    ])
+    args = _parse_v3_args()
+    assert args.cold_start is True
+    assert args.continue_pending_native_goals is True
+    assert args.experience_library is None
+
+
+def test_v3_cli_allows_continuation_from_its_own_archived_report(tmp_path: Path, monkeypatch) -> None:
+    run_root = tmp_path / "run"
+    monkeypatch.setattr(sys, "argv", [
+        "trajectory_generator_v3.py", "--backend", "experience_task_success",
+        "--output-dir", str(run_root), "--benchmark", "obstacle_avoidance",
+        "--level", "0", "--task-id", "2", "--init-state", "0", "--seed", "0",
+        "--instruction", "put both moka pots on the stove",
+        "--snapshot-root", str(tmp_path / "legal_t0"),
+        "--rlinf-python", "/workspace/zy_workspace/RLinf/.venv/bin/python",
+        "--cold-start", "--continue-pending-native-goals",
+        "--continue-from-v3-report", str(run_root / "v3_report.json"),
+        "--geometry-candidate-pool-offset", "16",
+    ])
+    args = _parse_v3_args()
+    assert args.continue_from_v3_report == run_root / "v3_report.json"
+    assert args.geometry_candidate_pool_offset == 16
+
+
+def test_v3_resume_history_requires_same_run_archived_executor_reports(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    run_root = tmp_path / "run"
+    executor_dir = run_root / "task_success_engine/executor"
+    executor_dir.mkdir(parents=True)
+    snapshot_root = tmp_path / "legal_t0"
+    snapshot_root.mkdir()
+    predicate = ["on", "moka_pot_1", "flat_stove_1_cook_region"]
+    native = {"task_success": False, "timestep": 721, "native_goal_values": [
+        {"predicate": predicate, "value": True},
+        {"predicate": ["on", "moka_pot_2", "flat_stove_1_cook_region"], "value": False},
+    ]}
+    executor_report = executor_dir / "run_report.json"
+    executor_report.write_text(json.dumps({
+        "scope": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 2,
+                  "init_state": 0, "seed": 0, "model_geometry_sha256": "model-sha"},
+        "task_success": False, "final_native_task_status": native,
+    }))
+    stage = {"stage_index": 1, "executor_report": str(executor_report), "engine_return_code": 2}
+    report_path = run_root / "v3_report.json"
+    prior = {
+        "status": "task_incomplete", "backend": "experience_task_success",
+        "cold_start_protocol": {"enabled": True},
+        "task": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 2,
+                 "init_state": 0, "seed": 0, "instruction": "put both moka pots on the stove"},
+        "inputs": {"snapshot_root": str(snapshot_root)},
+        "multi_goal_episode": {"native_task_success": False, "stages": [stage],
+                               "executor_report_paths": [str(executor_report)]},
+    }
+    report_path.write_text(json.dumps(prior))
+    args = Namespace(
+        continue_from_v3_report=report_path, benchmark="obstacle_avoidance", level=0,
+        task_id=2, init_state=0, seed=0, instruction="put both moka pots on the stove",
+        snapshot_root=snapshot_root,
+    )
+    history = _load_v3_continuation_history(args, run_root)
+    assert history["history_report_paths"] == [executor_report]
+    assert history["last_return_code"] == 2
+
+    prior["multi_goal_episode"]["executor_report_paths"] = [str(tmp_path / "external.json")]
+    report_path.write_text(json.dumps(prior))
+    with pytest.raises(ValueError, match="escaped_current_archive"):
+        _load_v3_continuation_history(args, run_root)
+
+
+def test_v3_resume_skips_a_failed_attempt_only_after_exact_prior_snapshot_restore(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    run_root = tmp_path / "run"
+    snapshot_root = tmp_path / "legal_t0"
+    snapshot_root.mkdir()
+    base_native = {"task_success": False, "timestep": 776, "native_goal_values": [
+        {"predicate": ["on", "moka_pot_1", "flat_stove_1_cook_region"], "value": True},
+        {"predicate": ["on", "moka_pot_2", "flat_stove_1_cook_region"], "value": False},
+    ]}
+    committed_dir = run_root / "stage_02"
+    committed_dir.mkdir(parents=True)
+    committed_path = committed_dir / "run_report.json"
+    committed_path.write_text(json.dumps({
+        "scope": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 2,
+                  "init_state": 0, "seed": 0, "model_geometry_sha256": "model-sha"},
+        "task": {"initial_native_task_status": {"task_success": False, "timestep": 0,
+                "native_goal_values": base_native["native_goal_values"]}},
+        "task_success": False, "final_native_task_status": base_native,
+    }))
+    snapshot = run_root / "stage_02/settled.pkl"
+    snapshot.write_bytes(b"settled-stage-snapshot")
+    grasp_archive = run_root / "stage_03/grasp_search"
+    grasp_archive.mkdir(parents=True)
+    (grasp_archive / "run_report.json").write_text(json.dumps({
+        "scope": {"search_start_runtime_snapshot": str(snapshot),
+                  "search_start_runtime_snapshot_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest()},
+    }))
+    failed_dir = run_root / "stage_03"
+    failed_dir.mkdir(exist_ok=True)
+    failed_path = failed_dir / "run_report.json"
+    failed_path.write_text(json.dumps({
+        "scope": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 2,
+                  "init_state": 0, "seed": 0, "model_geometry_sha256": "model-sha"},
+        "status": "bounded_expert_search_exhausted", "task_success": False,
+        "task": {"initial_native_task_status": base_native},
+        "resumed_from_runtime_snapshot": {
+            "path": str(snapshot), "payload_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            "status": "verified_exact",
+        },
+        "segments": [{"type": "bounded_expert_grasp_search", "archive": str(grasp_archive)}],
+    }))
+    stages = [
+        {"stage_index": 1, "executor_report": str(committed_path), "engine_return_code": 0},
+        {"stage_index": 2, "executor_report": str(failed_path), "engine_return_code": 2,
+         "exact_stage_boundary_verified": True},
+    ]
+    report_path = run_root / "v3_report.json"
+    report_path.write_text(json.dumps({
+        "status": "task_incomplete", "backend": "experience_task_success",
+        "cold_start_protocol": {"enabled": True},
+        "task": {"benchmark": "obstacle_avoidance", "level": 0, "task_id": 2,
+                 "init_state": 0, "seed": 0, "instruction": "put both moka pots on the stove"},
+        "inputs": {"snapshot_root": str(snapshot_root)},
+        "multi_goal_episode": {"native_task_success": False, "stages": stages,
+                               "executor_report_paths": [str(committed_path), str(failed_path)]},
+    }))
+    args = Namespace(
+        continue_from_v3_report=report_path, benchmark="obstacle_avoidance", level=0,
+        task_id=2, init_state=0, seed=0, instruction="put both moka pots on the stove",
+        snapshot_root=snapshot_root,
+    )
+    history = _load_v3_continuation_history(args, run_root)
+    assert history["history_report_paths"] == [committed_path]
+    assert len(history["history_stage_records"]) == 2
+    assert history["history_stage_records"][-1]["episode_state_committed"] is False
+    assert history["last_return_code"] == 0
+
+    prior = json.loads(report_path.read_text())
+    prior["multi_goal_episode"]["stages"] = [stages[0]]
+    prior["multi_goal_episode"]["executor_report_paths"] = [str(committed_path)]
+    prior["multi_goal_episode"]["discarded_attempt_reports"] = [{
+        "stage_index": 2, "executor_report": str(failed_path),
+        "failure_reason": "no_candidate_passed_screen",
+    }]
+    report_path.write_text(json.dumps(prior))
+    normalized = _load_v3_continuation_history(args, run_root)
+    assert [row["stage_index"] for row in normalized["history_stage_records"]] == [1, 2]
+    assert normalized["history_stage_records"][-1]["episode_state_committed"] is False
+
+
+def test_cold_start_continuation_accepts_only_same_run_snapshot_and_no_prior_inputs(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    run_root = tmp_path / "cold_start_run"
+    snapshot = run_root / "continuation_stages/stage_02/native_goal_placement_terminal_runtime_snapshot.pkl"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"same-run-stage-snapshot")
+    snapshot_root = tmp_path / "legal_t0"
+    snapshot_root.mkdir()
+    args = Namespace(
+        rlinf_python=Path("/workspace/zy_workspace/RLinf/.venv/bin/python"),
+        output_dir=run_root,
+        snapshot_root=snapshot_root,
+        experience_library=None,
+        cold_start=True,
+        benchmark="obstacle_avoidance", level=0, task_id=2, init_state=0, seed=0,
+        demonstration_horizon=1800, maximum_physical_branches=2,
+        maximum_rrt_preflights=3, rrt_time_budget_s=12.0,
+        candidate_start_index=0, transport_strategy="native_region_progress_osc",
+        native_region_route_variant=None,
+        target_predicate=None, keypose_experience=[], previous_search_report=[],
+        resume_from_runtime_snapshot=None, grasp_candidate_id=None,
+        strict_grasp_screen_report=None,
+        bridge_port=39420,
+    )
+    argv = _experience_task_success_command(
+        args,
+        output_dir=run_root / "continuation_stages/stage_02",
+        checkpoint_file=tmp_path / "model.safetensors",
+        continuation_snapshot=snapshot,
+    )
+    assert "--cold-start" in argv
+    assert "--cold-start-continuation" in argv
+    assert argv[argv.index("--resume-from-runtime-snapshot") + 1] == str(snapshot.resolve())
+    assert argv[argv.index("--cold-start-continuation-root") + 1] == str(run_root.resolve())
+    assert "--experience-library" not in argv
+    assert "--keypose-experience" not in argv
+    assert "--previous-search-report" not in argv
+
+    outside_snapshot = tmp_path / "old_partial_snapshot.pkl"
+    outside_snapshot.write_bytes(b"historical")
+    with pytest.raises(ValueError, match="generated_inside_the_current_V3_run"):
+        _experience_task_success_command(
+            args,
+            output_dir=run_root / "continuation_stages/stage_03",
+            checkpoint_file=tmp_path / "model.safetensors",
+            continuation_snapshot=outside_snapshot,
+        )
+
+
+def test_cold_start_continuation_accepts_same_run_contact_report_for_release(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    run_root = tmp_path / "cold_start_run"
+    snapshot = run_root / "task_success_engine/contact.pkl"
+    report_path = run_root / "continuation_stages/stage_02/continuation_source_placement_report.json"
+    snapshot.parent.mkdir(parents=True)
+    report_path.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"same-run-contact-snapshot")
+    report_path.write_text("{}")
+    predicate = ["on", "moka_pot_1", "flat_stove_1_cook_region"]
+    report = {"segments": [{
+        "type": "expert_native_goal_stage_control",
+        "placement_search": {"candidate_attempts": [{
+            "candidate": {"predicate": predicate},
+            "target_predicate_value": True,
+            "terminal_snapshot": str(snapshot),
+        }]},
+    }]}
+    assert _report_native_goal_contact_snapshot(report, predicate) == snapshot.resolve()
+
+    snapshot_root = tmp_path / "legal_t0"
+    snapshot_root.mkdir()
+    args = Namespace(
+        rlinf_python=Path("/workspace/zy_workspace/RLinf/.venv/bin/python"),
+        output_dir=run_root, snapshot_root=snapshot_root, experience_library=None,
+        cold_start=True, benchmark="obstacle_avoidance", level=0, task_id=2,
+        init_state=0, seed=0, demonstration_horizon=5000,
+        maximum_physical_branches=2, maximum_rrt_preflights=8,
+        rrt_time_budget_s=20.0, candidate_start_index=0,
+        transport_strategy="native_region_progress_osc", native_region_route_variant=None,
+        geometry_candidate_pool_offset=16,
+        target_predicate=None, keypose_experience=[], previous_search_report=[],
+        resume_from_runtime_snapshot=None, grasp_candidate_id=None,
+        strict_grasp_screen_report=None, bridge_port=39420,
+    )
+    argv = _experience_task_success_command(
+        args, output_dir=run_root / "continuation_stages/stage_02",
+        checkpoint_file=tmp_path / "model.safetensors",
+        continuation_placement_report=report_path,
+        continuation_target_predicate=predicate,
+    )
+    assert argv[argv.index("--resume-from-placement-report") + 1] == str(report_path.resolve())
+    assert argv[argv.index("--target-predicate") + 1:argv.index("--target-predicate") + 4] == predicate
+    assert argv[argv.index("--cold-start-continuation-root") + 1] == str(run_root.resolve())
+    assert argv[argv.index("--geometry-candidate-pool-offset") + 1] == "16"
     assert argv[argv.index("--port") + 1] == "39420"
     assert argv[argv.index("--expert-port") + 1] == "39421"
+
+
+def test_native_goal_stage_boundary_requires_same_predicates_and_timestep() -> None:
+    before = {
+        "timestep": 492,
+        "task_success": False,
+        "native_goal_values": [
+            {"predicate": ["on", "moka_pot_1", "flat_stove_1_cook_region"], "value": True},
+            {"predicate": ["on", "moka_pot_2", "flat_stove_1_cook_region"], "value": False},
+            {"predicate": ["turnon", "flat_stove_1"], "value": True},
+        ],
+    }
+    exact = json.loads(json.dumps(before))
+    changed = json.loads(json.dumps(before))
+    changed["timestep"] += 1
+    assert _native_goal_stage_boundary_matches(before, exact)
+    assert not _native_goal_stage_boundary_matches(before, changed)
 
 
 def test_cold_start_backend_selects_task_search_without_experience() -> None:
@@ -972,6 +1266,53 @@ def test_experience_audit_includes_retained_student_handoff_and_excludes_rolled_
     assert {row["kind"] for row in rolled_back["discarded_student_segments"]} == {
         "student_first", "student_handoff_after_stage_goal",
     }
+
+
+def test_experience_audit_includes_resumed_native_goal_release_actions(tmp_path: Path) -> None:
+    import gzip
+
+    records_path = tmp_path / "release_records.jsonl.gz"
+    monitoring = {
+        "status": "complete",
+        "expected_physics_substeps_per_control_step": 25,
+        "captured_physics_substeps": 25,
+        "unobserved_expected_substeps": 0,
+        "unavailable_contact_substeps": 0,
+        "control_steps": [{
+            "status": "complete", "expected_physics_substeps": 25,
+            "captured_physics_substeps": 25, "capture_error": None,
+        }],
+        "geometry_monitoring": {"status": "unsafe", "substeps": [{"status": "unsafe"}] * 25},
+    }
+    with gzip.open(records_path, "wt", encoding="utf-8") as handle:
+        for index, timestep in enumerate((1, 2)):
+            handle.write(json.dumps({
+                "step_index": index, "timestep": timestep, "phase": "release",
+                "action_7d": [0.0] * 7, "state": {}, "snapshot_state": {},
+                "reward": 0.0, "done": False, "contact_monitoring": monitoring,
+            }) + "\n")
+    durable_path = tmp_path / "durable_release_records.jsonl"
+    durable_path.write_text("durable copy present\n", encoding="utf-8")
+    inner_report = {
+        "segments": [{
+            "type": "resumed_expert_release_withdrawal",
+            "recorded_actions": 2,
+            "recorded_physics_substeps": 50,
+            "artifacts": {"records": str(records_path), "durable_records": str(durable_path)},
+        }],
+        "final_native_task_status": {"task_success": True, "timestep": 2},
+        "multi_goal_episode": {"enabled": True, "stage_snapshot_boundaries_verified": True},
+    }
+
+    audit = _experience_physical_action_audit(inner_report)
+
+    assert audit["status"] == "complete"
+    assert audit["physical_actions_archived"] == 2
+    assert audit["captured_physics_substeps"] == 50
+    assert audit["success_episode_timestep_continuous"] is True
+    assert audit["success_episode_complete_substep_monitoring"] is True
+    assert audit["snapshot_boundaries_verified"] is True
+    assert audit["snapshot_boundary_continuity"] == "verified_by_native_goal_stage_scheduler"
 
 
 def test_route_candidate_override_is_forwarded_to_physical_runner(tmp_path: Path) -> None:

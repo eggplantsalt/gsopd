@@ -1,3 +1,46 @@
+# L1T0公共能力进展（2026-10-29）
+
+L1T0当前24个task-approach候选中有11个通过，V3经8次RRT预检后真实执行一个候选，稳定抓住黑碗并抬升36.864 mm。145/145动作记录、3,625/3,625子步连续完整；完整Native `On`尚未达成，任务仍运行。该结果说明L0T3/L0T4零可行是场景候选覆盖问题而非当前算法普遍没有抓姿；继续完成覆盖扫描，暂不据两个失败场景盲目改公共筛选器。
+
+# L1T0覆盖扫描在途（2026-10-29）
+
+L0T3/L0T4首轮均在候选筛查阶段失败后，当前正测试 `obstacle_avoidance/L1T0`。合法t0由现有batch模块的reset/export薄流程新鲜生成，明确 `no_prior_experience=True`；之后以现有V3做Standard冷启动。矩阵记录t0身份和运行状态。
+
+# L0T3/L0T4完成首轮扫描（2026-10-29）
+
+两项均从identity-checked合法t0独立运行现有V3后，在抓姿/开口接近筛选阶段耗尽：L0T3 24候选0可行（21碰撞、3 IK）；L0T4 24候选0可行（24碰撞）。两轮RRT和专家物理动作均为0；被回滚的Student分支分别31/775与32/800，记录完整。两份报告的V3 `physical_action_audit` 标记incomplete，是因为没有专家动作源；这不代表存在未监测的成功动作。下一步先对 `obstacle_avoidance/L1T0` 做覆盖扫描，再根据多任务证据修复共享候选能力。
+
+# L0T4在途更新（2026-10-29）
+
+按覆盖优先策略，L0T3无物理候选后已启动 `obstacle_avoidance/L0T4` 的标准1000步冷启动。L0T4 init-state 0/seed 0 t0 Snapshot的BDDL、模型、payload和integration-state哈希已核实；当前运行仅使用该初始状态。具体状态、运行路径与下一动作以机器矩阵为准。
+
+# 当前执行状态（2026-10-29）
+
+`obstacle_avoidance/L0T3` 的首次标准冷启动在抓姿可行性搜索阶段停止：24个候选、0个通过（21碰撞约束、3 IK不可达），无RRT路线尝试、无专家物理分支、无接受动作。Student 31动作分支精确回滚且完整审计。当前证据定位到抓姿/开口接近候选不足，不支持延长Horizon；下一项先覆盖 `obstacle_avoidance/L0T4`。
+
+`libero_90/L0T6` attempt14终态为t=519、native `Open=false`、`task_success=false`，原因为 `articulated_fixture_live_follow_joint_progress_stalled`；该支线已关闭。三项基线仍为L0T0/L0T1 Standard、L0T2 Extended。逐项状态唯一见 [GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv](GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv)。
+
+# 当前执行次序校正（2026-10-29）
+
+- 已核实本地注册的30个避障任务配置；状态唯一来源为 [GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv](GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv)。
+- `obstacle_avoidance/L0T3` 的标准1000步、init-state 0、seed 0冷启动正在运行；t0 Snapshot的BDDL、模型、payload和integration-state身份均已记录。等待完成后审计并更新矩阵。
+- `libero_90/L0T6` attempt14已在t=519以原生 `Open=false` 结束，`articulated_fixture_live_follow_joint_progress_stalled`；保留为额外失败诊断并关闭后续轮次。
+- 下一步为L0T3审计、`obstacle_avoidance/L0T4`冷启动，然后按覆盖优先顺序完成其余23项。既有L0T0/L0T1 Standard和L0T2 Extended成功基线保持不变。
+
+# 当前总体路线：SafeTRAIL Stage A LIBERO-Safety 避障轨迹生成（2026-10-29）
+
+目标是在合法任务初始状态上自动搜索、真实执行并完成 LIBERO-Safety 原生 BDDL 任务，为 SafeTRAIL 安全避障轨迹生成建立物理可行数据。主实验范围是 `obstacle_avoidance` 和 `obstacle_avoidance_human` 两个 Suite，共30个 L0/L1/L2 × T0–T4 配置。每次成功要求完整连续的物理动作记录和原生 `task_success=true`；标准1000步与 demonstration-only 扩展分别统计。当前只推进 Stage A，不开展Near–Far、安全轨迹重构、Strict-10mm、LeRobot转换或Student训练。
+
+1. **L0T1 标准冷启动成功已达成**：标准 1000 步内 t=752 完成 `In(black_book_1, desk_caddy_1_back_contain_region)`；752 个成功路径动作及 18,800 个已监测子步可追溯。严格安全未通过。
+2. **L0T0 公共逻辑回归已通过**：第二轮合法 t0 `--cold-start` 在标准 horizon=1000 的 t=499 完成 `On(akita_black_bowl_1, plate_1)`；499 个成功路径动作和 12,475 个子步可追溯。修复将容器紧容差限制为 `In`，`On` 保持基准容差；RRT 预算用 8×20 秒，未回放既有 505 步答案。严格安全未通过。
+3. **L0T2 多目标原生成功已达成（demonstration-only）**：Pot1于t=776完成release/withdraw/settle；Stage 3/4抓姿窗口均筛查失败且回退排除。Stage 5从同一Snapshot真实抓起Pot2并于t=1390达成三项原生目标全true、reward=1、done=true。经审计修正后，成功Episode时间轴1390动作/34750子步完整连续，阶段Snapshot边界核验通过。标准1000步成功=false；最终稳定释放未验证。Strict-10mm、安全认证与训练资格均false。归档 `l0t2_native_multigoal_cold_start_04_h5000/v3_run`。
+4. **L0T39 原生 Turnoff 已达成**：第26轮由合法t0冷启动，t=356、356个连续动作和8,900个完整监测MuJoCo子步，原生 `Turnoff(flat_stove_1)=true`、reward=1、done=true、`task_success=true`；独立审计通过。未证明双指同时接触，安全认证仍false。
+5. **30项任务注册及矩阵已核实**：本地运行时 `get_benchmark()` 对 `obstacle_avoidance`、`obstacle_avoidance_human` 均注册15项，L0/L1/L2每级5项；30个BDDL和`.pruned_init`均存在。矩阵按用户指定优先级推进：先审计在途 `obstacle_avoidance/L0T3`，再运行 `L0T4`，接着同Suite L1/L2，最后覆盖`obstacle_avoidance_human`。每个配置记录合法t0及哈希、标准与扩展结果、动作数、候选搜索次数、失败原因、代码指纹和归档路径。完整矩阵见 [GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv](GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv)，注册核验见 [GS_OPD_SAFE_TRAIL_TASK_MATRIX_VERIFICATION.json](GS_OPD_SAFE_TRAIL_TASK_MATRIX_VERIFICATION.json)。
+6. **固定协议评测与额外成果管理**：覆盖积累后冻结代码指纹和统一候选/RRT/物理分支预算，开展跨场景评测；分开报告开发中定向调试配置与未经针对性调试配置。L0T0/L0T1标准成功和L0T2 demonstration-only成功作为既有基线；L0T39关灶成功作为矩阵外额外结果保留；L0T6抽屉失败诊断与姿态改进保留；attempt14已归档并关闭后续轮次，不计入30项分母。
+
+L0T1 最近修复的 `native_region_entry_alignment` 和L0T0紧容差作用域回归保持为历史通用能力与成功证据。现在按30项矩阵从 L0T3/L0T4 开始，通过失败归因补足通用几何搜索、物理执行或多阶段调度能力；已成功或失败结果都保留可追溯记录，不把少数任务推广成完整benchmark泛化。
+---
+
 # 当前总体路线：无示范任务搜索与安全重构（2026-10-28）
 
 1. 从合法 t0 以无目标成功示范的协议运行基础 π0.5 和通用物理任务搜索，获得真实完整原生 Task Success；区分 RLinf LIBERO SFT 项目基座与未经 LIBERO SFT 的 `pi05_base`，并审计全程记录。

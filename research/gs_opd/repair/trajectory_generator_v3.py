@@ -363,10 +363,29 @@ def _experience_task_success_command(
     *,
     output_dir: Path,
     checkpoint_file: Path,
+    continuation_snapshot: Path | None = None,
+    continuation_placement_report: Path | None = None,
+    continuation_target_predicate: list[str] | None = None,
 ) -> list[str]:
     if args.snapshot_root is None:
         raise ValueError("experience_task_success_backend_requires_an_identity_checked_snapshot_root")
     cold_start = bool(getattr(args, "cold_start", False))
+    if continuation_snapshot is not None and continuation_placement_report is not None:
+        raise ValueError("cold_start_continuation_accepts_only_one_same_run_resume_source")
+    if continuation_snapshot is not None:
+        continuation_snapshot = Path(continuation_snapshot).resolve()
+        run_root = Path(args.output_dir).resolve()
+        if not cold_start:
+            raise ValueError("cold_start_continuation_requires_the_cold_start_protocol")
+        if not continuation_snapshot.is_file() or not continuation_snapshot.is_relative_to(run_root):
+            raise ValueError("cold_start_continuation_snapshot_must_be_generated_inside_the_current_V3_run")
+    if continuation_placement_report is not None:
+        continuation_placement_report = Path(continuation_placement_report).resolve()
+        run_root = Path(args.output_dir).resolve()
+        if not cold_start:
+            raise ValueError("cold_start_placement_continuation_requires_the_cold_start_protocol")
+        if not continuation_placement_report.is_file() or not continuation_placement_report.is_relative_to(run_root):
+            raise ValueError("cold_start_placement_report_must_be_generated_inside_the_current_V3_run")
     if args.experience_library is None and not cold_start:
         raise ValueError("experience_task_success_backend_requires_an_experience_library")
     if cold_start and (
@@ -396,13 +415,27 @@ def _experience_task_success_command(
         "--maximum-rrt-preflights", str(args.maximum_rrt_preflights),
         "--rrt-time-budget-s", str(args.rrt_time_budget_s),
         "--candidate-start-index", str(getattr(args, "candidate_start_index", 0)),
+        "--geometry-candidate-pool-offset", str(getattr(args, "geometry_candidate_pool_offset", 0)),
         "--transport-strategy", args.transport_strategy,
     ]
+    native_region_route_variant = getattr(args, "native_region_route_variant", None)
+    if native_region_route_variant is not None:
+        argv.extend(["--native-region-route-variant", native_region_route_variant])
     if cold_start:
         port = int(getattr(args, "bridge_port", 38569))
         if not 1 <= port <= 65532:
             raise ValueError("cold_start_bridge_port_requires_three_following_ports")
         argv.extend(["--cold-start", "--port", str(port), "--expert-port", str(port + 1)])
+        if continuation_snapshot is not None:
+            argv.extend([
+                "--cold-start-continuation", "--resume-from-runtime-snapshot", str(continuation_snapshot),
+                "--cold-start-continuation-root", str(run_root),
+            ])
+        elif continuation_placement_report is not None:
+            argv.extend([
+                "--cold-start-continuation", "--resume-from-placement-report",
+                str(continuation_placement_report), "--cold-start-continuation-root", str(run_root),
+            ])
     else:
         argv.extend(["--experience-library", str(args.experience_library.resolve())])
     resume_snapshot = getattr(args, "resume_from_runtime_snapshot", None)
@@ -418,8 +451,9 @@ def _experience_task_success_command(
     grasp_candidate_id = getattr(args, "grasp_candidate_id", None)
     if grasp_candidate_id is not None:
         argv.extend(["--candidate-id", grasp_candidate_id])
-    if args.target_predicate:
-        argv.extend(["--target-predicate", *args.target_predicate])
+    selected_target_predicate = continuation_target_predicate or args.target_predicate
+    if selected_target_predicate:
+        argv.extend(["--target-predicate", *selected_target_predicate])
     for path in getattr(args, "keypose_experience", []) or []:
         argv.extend(["--keypose-experience", str(path.resolve())])
     for path in getattr(args, "previous_search_report", []) or []:
@@ -918,7 +952,10 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
                 segment_type == "student_first" and segment.get("task_success") is not True
             ) or (
                 segment_type == "student_handoff_after_stage_goal"
-                and isinstance(inner_report.get("student_handoff_recovery"), dict)
+                and isinstance(
+                    segment.get("student_handoff_recovery", inner_report.get("student_handoff_recovery")),
+                    dict,
+                )
             )
             if discarded:
                 discarded_student_segments.append({"kind": segment_type, "actions": actions})
@@ -974,6 +1011,24 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
                 "kind": segment_type,
                 "records_path": Path(records_value).resolve(),
                 "durable_records_path": None,
+                "physical_branches": 1,
+                "expected_actions": actions,
+                "reported_physics_substeps": segment.get("recorded_physics_substeps"),
+            })
+        elif segment_type == "resumed_expert_release_withdrawal":
+            actions = int(segment.get("recorded_actions", 0) or 0)
+            if not actions:
+                continue
+            artifacts = segment.get("artifacts", {})
+            records_value = artifacts.get("records") if isinstance(artifacts, dict) else None
+            durable_value = artifacts.get("durable_records") if isinstance(artifacts, dict) else None
+            if not records_value:
+                missing_record_sources += 1
+                continue
+            record_sources.append({
+                "kind": segment_type,
+                "records_path": Path(records_value).resolve(),
+                "durable_records_path": Path(durable_value).resolve() if durable_value else None,
                 "physical_branches": 1,
                 "expected_actions": actions,
                 "reported_physics_substeps": segment.get("recorded_physics_substeps"),
@@ -1154,6 +1209,12 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
         and timeline_valid and previous_timestep == final_native["timestep"]
         and recorded_actions == final_native["timestep"]
     )
+    multi_goal_episode = inner_report.get("multi_goal_episode", {})
+    snapshot_boundaries_verified = (
+        bool(multi_goal_episode.get("stage_snapshot_boundaries_verified"))
+        if isinstance(multi_goal_episode, dict) and multi_goal_episode.get("enabled") is True
+        else None
+    )
     audit.update({
         "status": "complete" if (
             records_ok and actions_ok and state_action_ok and all_monitored
@@ -1168,7 +1229,14 @@ def _experience_physical_action_audit(inner_report: dict[str, Any]) -> dict[str,
         "complete_substep_monitoring": all_monitored,
         "success_episode_timestep_continuous": success_timeline,
         "success_episode_complete_substep_monitoring": bool(all_monitored and success_timeline),
-        "snapshot_boundary_continuity": "requires_independent_snapshot_identity_audit",
+        "snapshot_boundary_continuity": (
+            "verified_by_native_goal_stage_scheduler"
+            if snapshot_boundaries_verified is True
+            else "failed_native_goal_stage_boundary_verification"
+            if snapshot_boundaries_verified is False
+            else "not_applicable_single_stage"
+        ),
+        "snapshot_boundaries_verified": snapshot_boundaries_verified,
         "action_dim_7_valid": actions_ok,
         "state_action_rows_valid": state_action_ok,
         "branch_action_count_matches_record_rows": count_matches,
@@ -1203,13 +1271,516 @@ def _experience_failure_reasons(inner_report: dict[str, Any]) -> list[str]:
         collect(segment.get("failure_reasons"))
         for branch in segment.get("physical_branches", []):
             collect(branch.get("failure_reason"))
+        collect(segment.get("failure_reason"))
+        collect(segment.get("transport_failure_reason"))
+        collect(segment.get("post_success_terminal_exception"))
     collect(inner_report.get("failure_reason"))
     return reasons
 
 
+def _native_goal_value_map(native_status: Any) -> dict[tuple[str, ...], bool | None]:
+    if not isinstance(native_status, dict):
+        return {}
+    rows = native_status.get("native_goal_values")
+    if not isinstance(rows, list):
+        return {}
+    result: dict[tuple[str, ...], bool | None] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("predicate"), list):
+            continue
+        predicate = tuple(str(token) for token in row["predicate"])
+        if predicate:
+            result[predicate] = row.get("value") if isinstance(row.get("value"), bool) else None
+    return result
+
+
+def _native_goal_stage_boundary_matches(
+    parent_status: Any,
+    child_status: Any,
+) -> bool:
+    """Require the resumed stage to observe the exact native prefix status."""
+    if not isinstance(parent_status, dict) or not isinstance(child_status, dict):
+        return False
+    return bool(
+        _native_goal_value_map(parent_status)
+        and _native_goal_value_map(parent_status) == _native_goal_value_map(child_status)
+        and parent_status.get("timestep") == child_status.get("timestep")
+        and parent_status.get("task_success") == child_status.get("task_success")
+    )
+
+
+def _report_terminal_runtime_snapshot(inner_report: dict[str, Any]) -> Path | None:
+    for segment in reversed(inner_report.get("segments", [])):
+        snapshot = segment.get("terminal_snapshot") if isinstance(segment, dict) else None
+        if snapshot and Path(snapshot).is_file():
+            return Path(snapshot).resolve()
+    return None
+
+
+def _report_native_goal_contact_snapshot(
+    inner_report: dict[str, Any], predicate: list[str] | None,
+) -> Path | None:
+    """Find an archived still-held contact Snapshot for a true, unsettled native goal."""
+    if not predicate:
+        return None
+    for parent in reversed(inner_report.get("segments", [])):
+        if not isinstance(parent, dict) or parent.get("type") != "expert_native_goal_stage_control":
+            continue
+        attempts = parent.get("placement_search", {}).get("candidate_attempts", [])
+        for attempt in reversed(attempts):
+            candidate = attempt.get("candidate", {})
+            snapshot = attempt.get("terminal_snapshot")
+            if (
+                candidate.get("predicate") == predicate
+                and attempt.get("target_predicate_value") is True
+                and snapshot
+                and Path(snapshot).is_file()
+            ):
+                return Path(snapshot).resolve()
+    return None
+
+
+def _run_cold_start_native_goal_continuations(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    checkpoint_file: Path,
+    first_report: dict[str, Any],
+    first_report_path: Path,
+    first_return_code: int,
+    wall_time_started: float,
+    wall_time_budget_s: float,
+    history_reports: list[dict[str, Any]] | None = None,
+    history_report_paths: list[Path] | None = None,
+    history_stage_records: list[dict[str, Any]] | None = None,
+    history_discarded_attempt_reports: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    """Run pending native goals from same-run exact Runtime Snapshots only."""
+    history_reports = history_reports or [first_report]
+    history_report_paths = history_report_paths or [first_report_path.resolve()]
+    stage_reports = list(history_reports)
+    stage_report_paths = [path.resolve() for path in history_report_paths]
+    stage_records = list(history_stage_records or [])
+    discarded_attempt_reports = list(history_discarded_attempt_reports or [])
+    initial_native = history_reports[0].get("task", {}).get("initial_native_task_status", {})
+    initial_goals = _native_goal_value_map(initial_native)
+    if not stage_records:
+        stage_records = [{
+            "stage_index": 1,
+            "executor_report": str(stage_report_paths[0]),
+            "target_predicate": history_reports[0].get("task", {}).get("native_goal_predicate"),
+            "input_snapshot": str(args.snapshot_root.resolve() / "snapshots/initial_runtime_snapshot.pkl"),
+            "input_snapshot_kind": "identity_checked_legal_t0",
+            "initial_native_task_status": initial_native,
+            "final_native_task_status": history_reports[0].get("final_native_task_status"),
+            "engine_return_code": first_return_code,
+        }]
+    last_return_code = first_return_code
+    stop_reason: str | None = None
+    maximum_stages = max(1, len(initial_goals) * 2)
+
+    current = history_reports[-1]
+    previous_stage_index = max(
+        (int(row.get("stage_index", 0)) for row in stage_records), default=len(stage_reports),
+    )
+    for stage_index in range(previous_stage_index + 1, maximum_stages + 1):
+        if current.get("task_success") is True:
+            break
+        parent_status = current.get("final_native_task_status")
+        parent_values = _native_goal_value_map(parent_status)
+        pending = [predicate for predicate, value in parent_values.items() if value is False]
+        if not pending:
+            stop_reason = "no_pending_supported_native_goal_before_task_success"
+            break
+        if last_return_code not in (0, 2):
+            stop_reason = f"previous_goal_stage_engine_exit_{last_return_code}"
+            break
+
+        partial_goal_segments = [
+            segment for segment in current.get("segments", [])
+            if isinstance(segment, dict) and segment.get("status") == "partial_predicate_completed"
+        ]
+        run_root = output_dir.resolve()
+        recovery_contact = False
+        continuation_report_path: Path | None = None
+        if partial_goal_segments:
+            snapshot_path = _report_terminal_runtime_snapshot(current)
+            if snapshot_path is None:
+                stop_reason = "same_run_native_goal_terminal_snapshot_missing"
+                break
+            if not snapshot_path.is_relative_to(run_root):
+                stop_reason = "continuation_snapshot_escaped_current_V3_run"
+                break
+        else:
+            active_predicate = current.get("task", {}).get("native_goal_predicate")
+            active_value = parent_values.get(tuple(active_predicate or []))
+            contact_snapshot = _report_native_goal_contact_snapshot(current, active_predicate)
+            continuation_report_path = stage_report_paths[-1]
+            if active_value is not True or contact_snapshot is None:
+                stop_reason = "previous_stage_did_not_reach_a_settled_native_goal_or_recoverable_contact"
+                break
+            if (
+                not continuation_report_path.is_file()
+                or not continuation_report_path.is_relative_to(run_root)
+                or not contact_snapshot.is_relative_to(run_root)
+            ):
+                stop_reason = "placement_contact_resume_source_escaped_current_V3_run"
+                break
+            snapshot_path = contact_snapshot
+            recovery_contact = True
+
+        stage_root = output_dir / "continuation_stages" / f"stage_{stage_index:02d}"
+        copied_report_path: Path | None = None
+        if recovery_contact:
+            copied_report_path = stage_root / "continuation_source_placement_report.json"
+            copied_report_path.parent.mkdir(parents=True, exist_ok=True)
+            copied_report_path.write_bytes(continuation_report_path.read_bytes())
+        command = _experience_task_success_command(
+            args,
+            output_dir=stage_root,
+            checkpoint_file=checkpoint_file,
+            continuation_snapshot=None if recovery_contact else snapshot_path,
+            continuation_placement_report=copied_report_path,
+            continuation_target_predicate=(
+                current.get("task", {}).get("native_goal_predicate") if recovery_contact else None
+            ),
+        )
+        remaining = wall_time_budget_s - (time.monotonic() - wall_time_started)
+        if remaining <= 1.0:
+            stop_reason = "V3_total_wall_time_budget_exhausted_before_native_goal_continuation"
+            break
+        log_path = stage_root / "execution.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("wb") as log:
+                completed = _run_bounded_engine(command, log=log, wall_time_budget_s=remaining)
+        except TimeoutError as exc:
+            stop_reason = f"{type(exc).__name__}:{exc}"
+            last_return_code = 124
+            break
+        last_return_code = completed.returncode
+        reports = sorted((stage_root / "task_success_engine").glob("task_success_first_executor_*/run_report.json"))
+        if len(reports) != 1:
+            stop_reason = "continuation_executor_report_missing_or_ambiguous"
+            break
+        stage_report_path = reports[0].resolve()
+        try:
+            next_report = json.loads(stage_report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            stop_reason = f"continuation_executor_report_unreadable:{type(exc).__name__}:{exc}"
+            break
+
+        resumed = next_report.get("resumed_from_runtime_snapshot", {})
+        resumed_contact = next_report.get("resumed_from_native_goal_contact_snapshot", {})
+        expected_start_status = next_report.get("task", {}).get("initial_native_task_status")
+        resumed_status = resumed.get("status") if resumed else resumed_contact.get("status")
+        resumed_sha = resumed.get("payload_sha256") if resumed else resumed_contact.get("snapshot_sha256")
+        boundary_ok = bool(
+            resumed_status == "verified_exact"
+            and resumed_sha == sha256_file(snapshot_path)
+            and _native_goal_stage_boundary_matches(parent_status, expected_start_status)
+        )
+        new_status = next_report.get("final_native_task_status")
+        new_values = _native_goal_value_map(new_status)
+        newly_satisfied = [
+            predicate for predicate, value in new_values.items()
+            if value is True and parent_values.get(predicate) is not True
+        ]
+        regressed = [
+            predicate for predicate, value in new_values.items()
+            if value is False and parent_values.get(predicate) is True
+        ]
+        stage_record = {
+            "stage_index": stage_index,
+            "executor_report": str(stage_report_path),
+            "target_predicate": next_report.get("task", {}).get("native_goal_predicate"),
+            "input_snapshot": str(snapshot_path),
+            "input_snapshot_sha256": sha256_file(snapshot_path),
+            "input_snapshot_kind": "same_run_native_goal_contact_for_release" if recovery_contact else "same_run_settled_native_goal",
+            "input_placement_report": str(copied_report_path) if copied_report_path else None,
+            "input_native_task_status": parent_status,
+            "restored_native_task_status": expected_start_status,
+            "exact_stage_boundary_verified": boundary_ok,
+            "final_native_task_status": new_status,
+            "newly_satisfied_predicates": [list(predicate) for predicate in newly_satisfied],
+            "previously_satisfied_predicates_regressed": [list(predicate) for predicate in regressed],
+            "engine_return_code": last_return_code,
+        }
+        recovery_settled = recovery_contact and any(
+            isinstance(segment, dict) and segment.get("status") == "partial_predicate_completed"
+            for segment in next_report.get("segments", [])
+        )
+        stage_failure = None
+        if not boundary_ok:
+            stage_failure = "continuation_stage_snapshot_or_native_boundary_verification_failed"
+        elif next_report.get("scope", {}).get("model_geometry_sha256") != first_report.get("scope", {}).get("model_geometry_sha256"):
+            stage_failure = "continuation_stage_model_identity_changed"
+        elif regressed:
+            stage_failure = "continuation_stage_regressed_a_previously_satisfied_native_goal"
+        elif not newly_satisfied and not recovery_settled and next_report.get("task_success") is not True:
+            stage_failure = "continuation_stage_made_no_native_goal_progress"
+        if stage_failure is not None:
+            stage_record["episode_state_committed"] = False
+            stage_record["attempt_failure_reason"] = stage_failure
+            stage_records.append(stage_record)
+            discarded_attempt_reports.append({
+                "stage_index": stage_index,
+                "executor_report": str(stage_report_path),
+                "archive": next_report.get("archive"),
+                "attempt_status": next_report.get("status"),
+                "failure_reason": stage_failure,
+                "executor_failure_reason": next_report.get("error") or next_report.get("failure_reason"),
+                "actions_excluded_from_continuous_episode": True,
+            })
+            stop_reason = stage_failure
+            break
+        stage_record["episode_state_committed"] = True
+        stage_records.append(stage_record)
+        stage_reports.append(next_report)
+        stage_report_paths.append(stage_report_path)
+        current = next_report
+    else:
+        stop_reason = "native_goal_continuation_stage_limit_reached"
+
+    final_report = dict(current)
+    flattened_segments: list[dict[str, Any]] = []
+    for stage_index, (stage_report_path, stage_report) in enumerate(zip(stage_report_paths, stage_reports), start=1):
+        matching_record = next((
+            row for row in stage_records
+            if Path(str(row.get("executor_report", ""))).resolve() == stage_report_path
+        ), {})
+        native_stage_index = int(matching_record.get("stage_index", stage_index))
+        for segment in stage_report.get("segments", []):
+            if isinstance(segment, dict):
+                flattened_segments.append({
+                    "native_goal_stage_index": native_stage_index,
+                    "student_handoff_recovery": stage_report.get("student_handoff_recovery"),
+                    **segment,
+                })
+    final_report["segments"] = flattened_segments
+    final_report["cold_start_protocol"] = stage_reports[0].get("cold_start_protocol", {})
+    if isinstance(first_report.get("task"), dict):
+        final_task = dict(final_report.get("task", {}))
+        final_task["initial_native_task_status"] = first_report["task"].get("initial_native_task_status")
+        final_task["initial_goal_predicate"] = first_report["task"].get("native_goal_predicate")
+        final_report["task"] = final_task
+    final_report["student_handoff_recovery"] = any(
+        isinstance(stage_report.get("student_handoff_recovery"), dict)
+        for stage_report in stage_reports
+    )
+    final_report["archive"] = str(output_dir)
+    episode_success = final_report.get("task_success") is True
+    committed_stage_records = [
+        row for row in stage_records if row.get("episode_state_committed", True) is True
+    ]
+    multi_goal_episode = {
+        "enabled": True,
+        "scheduler": "requery_all_native_BDDL_goals_after_each_settled_stage",
+        "initial_native_goals": [
+            {"predicate": list(predicate), "value": value}
+            for predicate, value in initial_goals.items()
+        ],
+        "stages": committed_stage_records,
+        "stage_count": len(committed_stage_records),
+        "stage_attempt_count": len(stage_records),
+        "discarded_attempt_reports": discarded_attempt_reports,
+        "stage_snapshot_boundaries_verified": all(
+            row.get("exact_stage_boundary_verified", True) is True for row in committed_stage_records
+        ),
+        "previously_completed_goals_rechecked_after_each_stage": True,
+        "same_run_snapshot_only": True,
+        "target_success_demonstrations_or_keyposes_used": False,
+        "official_demonstrations_used": False,
+        "historical_actions_replayed": False,
+        "native_task_success": episode_success,
+        "stop_reason": None if episode_success else stop_reason or "executor_stopped_with_pending_native_goals",
+        "executor_report_paths": [str(path) for path in stage_report_paths],
+    }
+    final_report["multi_goal_episode"] = multi_goal_episode
+    if not episode_success and stop_reason:
+        final_report["multi_goal_continuation_failure_reason"] = stop_reason
+    return final_report, last_return_code, multi_goal_episode
+
+
+def _load_v3_continuation_history(
+    args: argparse.Namespace, output_dir: Path,
+) -> dict[str, Any]:
+    """Load an incomplete cold-start V3 run for exact same-archive continuation."""
+    report_path = getattr(args, "continue_from_v3_report", None)
+    if report_path is None:
+        raise ValueError("continue_from_v3_report_is_required")
+    report_path = Path(report_path).resolve()
+    output_dir = output_dir.resolve()
+    if report_path != (output_dir / "v3_report.json").resolve():
+        raise ValueError("continue_from_v3_report_must_be_the_current_V3_archive_report")
+    if not output_dir.is_dir() or not report_path.is_file():
+        raise FileNotFoundError("V3_continuation_archive_or_report_is_missing")
+    prior = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        prior.get("status") not in {"task_incomplete", "incomplete"}
+        or prior.get("backend") != "experience_task_success"
+        or prior.get("cold_start_protocol", {}).get("enabled") is not True
+        or prior.get("multi_goal_episode", {}).get("native_task_success") is True
+    ):
+        raise ValueError("V3_continuation_requires_an_incomplete_cold_start_multigoal_archive")
+    task = prior.get("task", {})
+    expected = {
+        "benchmark": args.benchmark,
+        "level": args.level,
+        "task_id": args.task_id,
+        "init_state": args.init_state,
+        "seed": args.seed,
+        "instruction": args.instruction,
+    }
+    for key, value in expected.items():
+        if task.get(key) != value:
+            raise ValueError(f"V3_continuation_{key}_mismatch")
+    recorded_t0 = prior.get("inputs", {}).get("snapshot_root")
+    if not recorded_t0 or Path(recorded_t0).resolve() != args.snapshot_root.resolve():
+        raise ValueError("V3_continuation_legal_t0_snapshot_root_mismatch")
+    episode = prior.get("multi_goal_episode", {})
+    raw_paths = episode.get("executor_report_paths", [])
+    raw_stages = episode.get("stages", [])
+    if not raw_paths or len(raw_paths) != len(raw_stages):
+        raise ValueError("V3_continuation_executor_stage_history_is_incomplete")
+    paths: list[Path] = []
+    reports: list[dict[str, Any]] = []
+    stage_records: list[dict[str, Any]] = []
+    discarded_attempt_reports: list[dict[str, Any]] = []
+    model_sha: str | None = None
+    for index, (raw_path, raw_stage) in enumerate(zip(raw_paths, raw_stages)):
+        path = Path(raw_path).resolve()
+        if not path.is_relative_to(output_dir) or not path.is_file():
+            raise ValueError("V3_continuation_executor_report_escaped_current_archive")
+        report = json.loads(path.read_text(encoding="utf-8"))
+        scope = report.get("scope", {})
+        for key, value in {
+            "benchmark": args.benchmark, "level": args.level, "task_id": args.task_id,
+            "init_state": args.init_state, "seed": args.seed,
+        }.items():
+            if scope.get(key) != value:
+                raise ValueError(f"V3_continuation_executor_{key}_mismatch")
+        current_model = scope.get("model_geometry_sha256")
+        if model_sha is None:
+            model_sha = current_model
+        elif model_sha != current_model:
+            raise ValueError("V3_continuation_model_identity_changed_between_stages")
+        final_native = report.get("final_native_task_status")
+        stage_record = dict(raw_stage)
+        stage_record["executor_report"] = str(path)
+        if isinstance(final_native, dict):
+            stage_record["episode_state_committed"] = True
+            paths.append(path)
+            reports.append(report)
+            stage_records.append(stage_record)
+            continue
+
+        # Preserve a failed attempt as an archive, but resume scheduling from
+        # its exact prior settled state only when the attempt restored that
+        # same current-run Snapshot and left the native boundary unchanged.
+        if index != len(raw_paths) - 1 or not reports:
+            raise ValueError("V3_continuation_nonterminal_executor_report_is_not_a_trailing_retry")
+        restored = report.get("resumed_from_runtime_snapshot", {})
+        previous_native = reports[-1].get("final_native_task_status")
+        start_native = report.get("task", {}).get("initial_native_task_status")
+        snapshot_path = Path(str(restored.get("path") or "")).resolve()
+        if (
+            report.get("status") != "bounded_expert_search_exhausted"
+            or restored.get("status") != "verified_exact"
+            or not snapshot_path.is_file()
+            or not snapshot_path.is_relative_to(output_dir)
+            or restored.get("payload_sha256") != sha256_file(snapshot_path)
+            or not _native_goal_stage_boundary_matches(previous_native, start_native)
+        ):
+            raise ValueError("V3_continuation_failed_attempt_did_not_restore_its_exact_prior_stage")
+        attempt_segment = next((
+            row for row in report.get("segments", [])
+            if isinstance(row, dict) and row.get("type") == "bounded_expert_grasp_search"
+        ), None)
+        attempt_archive = Path(str((attempt_segment or {}).get("archive") or ""))
+        grasp_reports = sorted(attempt_archive.glob("run_report.json")) if attempt_archive.is_dir() else []
+        if len(grasp_reports) != 1:
+            raise ValueError("V3_continuation_failed_attempt_grasp_search_archive_is_missing")
+        grasp_report = json.loads(grasp_reports[0].read_text(encoding="utf-8"))
+        search_start = grasp_report.get("scope", {})
+        if (
+            Path(str(search_start.get("search_start_runtime_snapshot") or "")).resolve() != snapshot_path
+            or search_start.get("search_start_runtime_snapshot_sha256") != sha256_file(snapshot_path)
+        ):
+            raise ValueError("V3_continuation_failed_attempt_search_did_not_start_from_verified_prior_stage")
+        stage_record.update({
+            "episode_state_committed": False,
+            "attempt_status": report.get("status"),
+            "failure_reason": report.get("error"),
+            "restored_prior_stage_snapshot": str(snapshot_path),
+            "restored_prior_stage_snapshot_sha256": sha256_file(snapshot_path),
+        })
+        stage_records.append(stage_record)
+        discarded_attempt_reports.append({
+            "stage_index": raw_stage.get("stage_index"),
+            "executor_report": str(path),
+            "archive": report.get("archive"),
+            "attempt_status": report.get("status"),
+            "failure_reason": report.get("error"),
+            "actions_excluded_from_continuous_episode": True,
+            "exact_prior_stage_snapshot_restored_before_search": True,
+        })
+    for prior_attempt in episode.get("discarded_attempt_reports", []):
+        if not isinstance(prior_attempt, dict):
+            raise ValueError("V3_continuation_discarded_attempt_record_is_malformed")
+        attempt_path = Path(str(prior_attempt.get("executor_report") or "")).resolve()
+        if not attempt_path.is_relative_to(output_dir) or not attempt_path.is_file():
+            raise ValueError("V3_continuation_discarded_attempt_report_escaped_current_archive")
+        if any(row.get("executor_report") == str(attempt_path) for row in discarded_attempt_reports):
+            continue
+        attempt_report = json.loads(attempt_path.read_text(encoding="utf-8"))
+        attempt_scope = attempt_report.get("scope", {})
+        if (
+            attempt_scope.get("benchmark") != args.benchmark
+            or attempt_scope.get("level") != args.level
+            or attempt_scope.get("task_id") != args.task_id
+            or attempt_scope.get("init_state") != args.init_state
+            or attempt_scope.get("seed") != args.seed
+            or attempt_scope.get("model_geometry_sha256") != model_sha
+        ):
+            raise ValueError("V3_continuation_discarded_attempt_scene_or_model_mismatch")
+        discarded_attempt_reports.append(dict(prior_attempt))
+        if not any(Path(str(row.get("executor_report", ""))).resolve() == attempt_path for row in stage_records):
+            stage_records.append({
+                "stage_index": prior_attempt.get("stage_index"),
+                "executor_report": str(attempt_path),
+                "episode_state_committed": False,
+                "attempt_status": attempt_report.get("status"),
+                "attempt_failure_reason": prior_attempt.get("failure_reason"),
+            })
+    stage_records.sort(key=lambda row: int(row.get("stage_index", 0)))
+    if not reports:
+        raise ValueError("V3_continuation_has_no_committed_native_stage_to_resume")
+    if reports[-1].get("task_success") is True:
+        raise ValueError("V3_continuation_archive_already_has_native_task_success")
+    final_native = reports[-1].get("final_native_task_status", {})
+    if not isinstance(final_native, dict) or final_native.get("task_success") is True:
+        raise ValueError("V3_continuation_last_executor_native_status_is_not_incomplete")
+    return {
+        "source_report": prior,
+        "history_reports": reports,
+        "history_report_paths": paths,
+        "history_stage_records": stage_records,
+        "discarded_attempt_reports": discarded_attempt_reports,
+        "last_return_code": int(next(
+            row for row in stage_records
+            if Path(str(row.get("executor_report", ""))).resolve() == paths[-1]
+        ).get("engine_return_code", 2)),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=False)
+    continuation_history = None
+    if getattr(args, "continue_from_v3_report", None) is not None:
+        continuation_history = _load_v3_continuation_history(args, output_dir)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=False)
     reference: SuccessReference | None = None
     if args.reference_trace is not None:
         reference = load_success_reference(
@@ -1367,6 +1938,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "pre_route_hold_actions": args.pre_route_hold_actions,
         },
         "backend": backend,
+        "continuation_of_v3_report": (
+            str(args.continue_from_v3_report.resolve())
+            if getattr(args, "continue_from_v3_report", None) is not None else None
+        ),
         "cold_start_protocol": (
             {
                 "enabled": True,
@@ -1466,40 +2041,156 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     bridge_log = None
     engine_launched = False
     wall_time_budget_s = float(getattr(args, "wall_time_budget_s", 3600.0))
+    wall_time_started_monotonic = time.monotonic()
     record["engine_wall_time_budget_s"] = wall_time_budget_s
-    manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    try:
-        if backend == "student_bspline_osc":
-            bridge_process, bridge_log, bridge_preflight = _launch_bridge_and_preflight(
-                args,
-                output_dir=output_dir,
+    if continuation_history is not None:
+        suffix = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000_000:09d}"
+        source_report_path = output_dir / "v3_report.json"
+        source_manifest_path = output_dir / "run_manifest.json"
+        (output_dir / f"v3_report_before_continuation_{suffix}.json").write_bytes(
+            source_report_path.read_bytes()
+        )
+        if source_manifest_path.is_file():
+            (output_dir / f"run_manifest_before_continuation_{suffix}.json").write_bytes(
+                source_manifest_path.read_bytes()
             )
-            record["bridge_preflight"] = bridge_preflight
+    manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if continuation_history is not None:
+        completed = subprocess.CompletedProcess(
+            args=command, returncode=continuation_history["last_return_code"], stdout=b"", stderr=b"",
+        )
+        record["same_episode_resume"] = {
+            "status": "validated_existing_V3_archive",
+            "executor_report_paths": [str(path) for path in continuation_history["history_report_paths"]],
+            "previous_stage_records_preserved": True,
+            "legal_t0_and_model_identity_verified": True,
+        }
+    else:
+        try:
+            if backend == "student_bspline_osc":
+                bridge_process, bridge_log, bridge_preflight = _launch_bridge_and_preflight(
+                    args,
+                    output_dir=output_dir,
+                )
+                record["bridge_preflight"] = bridge_preflight
+                manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with log_path.open("wb") as log:
+                engine_launched = True
+                completed = _run_bounded_engine(command, log=log, wall_time_budget_s=wall_time_budget_s)
+        except Exception as exc:
+            record.update({
+                "status": "engine_time_budget_exhausted" if isinstance(exc, TimeoutError)
+                else "executor_error" if engine_launched else "preflight_failed",
+                "finished_unix_seconds": time.time(),
+                "failure_reason": f"{type(exc).__name__}:{exc}",
+                "physical_actions_executed": None if engine_launched else 0,
+            })
+            report_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        with log_path.open("wb") as log:
-            engine_launched = True
-            completed = _run_bounded_engine(command, log=log, wall_time_budget_s=wall_time_budget_s)
-    except Exception as exc:
-        record.update({
-            "status": "engine_time_budget_exhausted" if isinstance(exc, TimeoutError)
-            else "executor_error" if engine_launched else "preflight_failed",
-            "finished_unix_seconds": time.time(),
-            "failure_reason": f"{type(exc).__name__}:{exc}",
-            "physical_actions_executed": None if engine_launched else 0,
-        })
-        report_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return record
-    finally:
-        if bridge_process is not None:
-            bridge_process.terminate()
+            return record
+        finally:
+            if bridge_process is not None:
+                bridge_process.terminate()
+                try:
+                    bridge_process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    bridge_process.kill()
+                    bridge_process.wait(timeout=5)
+            if bridge_log is not None:
+                bridge_log.close()
+
+    aggregate_inner_report: dict[str, Any] | None = None
+    multi_goal_episode: dict[str, Any] | None = None
+    if backend == "experience_task_success" and getattr(args, "continue_pending_native_goals", False):
+        if continuation_history is not None:
+            prior = continuation_history["source_report"]
+            history_reports = continuation_history["history_reports"]
+            history_report_paths = continuation_history["history_report_paths"]
+            history_stage_records = continuation_history["history_stage_records"]
+            first_report_path = history_report_paths[0]
+            first_report = history_reports[0]
             try:
-                bridge_process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                bridge_process.kill()
-                bridge_process.wait(timeout=5)
-        if bridge_log is not None:
-            bridge_log.close()
+                aggregate_inner_report, final_return_code, multi_goal_episode = (
+                    _run_cold_start_native_goal_continuations(
+                        args,
+                        output_dir=output_dir,
+                        checkpoint_file=checkpoint_file,
+                        first_report=first_report,
+                        first_report_path=first_report_path,
+                        first_return_code=continuation_history["last_return_code"],
+                        wall_time_started=wall_time_started_monotonic,
+                        wall_time_budget_s=wall_time_budget_s,
+                        history_reports=history_reports,
+                        history_report_paths=history_report_paths,
+                        history_stage_records=history_stage_records,
+                        history_discarded_attempt_reports=continuation_history.get(
+                            "discarded_attempt_reports", []
+                        ),
+                    )
+                )
+                completed = subprocess.CompletedProcess(
+                    args=command, returncode=final_return_code, stdout=b"", stderr=b"",
+                )
+            except Exception as exc:
+                aggregate_inner_report = history_reports[-1]
+                multi_goal_episode = {
+                    "enabled": True,
+                    "stage_count": len(history_reports),
+                    "native_task_success": aggregate_inner_report.get("task_success") is True,
+                    "same_run_snapshot_only": True,
+                    "stop_reason": f"multi_goal_continuation_error:{type(exc).__name__}:{exc}",
+                    "stages": history_stage_records,
+                    "executor_report_paths": [str(path) for path in history_report_paths],
+                }
+                completed = subprocess.CompletedProcess(
+                    args=command, returncode=2, stdout=b"", stderr=b"",
+                )
+        else:
+            first_runs = sorted((output_dir / "task_success_engine").glob("task_success_first_executor_*/run_report.json"))
+            if len(first_runs) == 1:
+                try:
+                    first_report_path = first_runs[0].resolve()
+                    first_report = json.loads(first_report_path.read_text(encoding="utf-8"))
+                    aggregate_inner_report, final_return_code, multi_goal_episode = (
+                        _run_cold_start_native_goal_continuations(
+                            args,
+                            output_dir=output_dir,
+                            checkpoint_file=checkpoint_file,
+                            first_report=first_report,
+                            first_report_path=first_report_path,
+                            first_return_code=completed.returncode,
+                            wall_time_started=wall_time_started_monotonic,
+                            wall_time_budget_s=wall_time_budget_s,
+                        )
+                    )
+                    completed = subprocess.CompletedProcess(
+                        args=command, returncode=final_return_code, stdout=b"", stderr=b"",
+                    )
+                except Exception as exc:
+                    aggregate_inner_report = json.loads(first_runs[0].read_text(encoding="utf-8"))
+                    multi_goal_episode = {
+                        "enabled": True,
+                        "stage_count": 1,
+                        "native_task_success": aggregate_inner_report.get("task_success") is True,
+                        "same_run_snapshot_only": True,
+                        "stop_reason": f"multi_goal_continuation_error:{type(exc).__name__}:{exc}",
+                        "executor_report_paths": [str(first_runs[0].resolve())],
+                    }
+                    completed = subprocess.CompletedProcess(
+                        args=command, returncode=2, stdout=b"", stderr=b"",
+                    )
+            else:
+                multi_goal_episode = {
+                    "enabled": True,
+                    "stage_count": 0,
+                    "native_task_success": False,
+                    "same_run_snapshot_only": True,
+                    "stop_reason": "initial_executor_report_missing_or_ambiguous",
+                    "executor_report_paths": [str(path.resolve()) for path in first_runs],
+                }
+                completed = subprocess.CompletedProcess(
+                    args=command, returncode=2, stdout=b"", stderr=b"",
+                )
 
     if backend == "student_bspline_osc":
         inner_result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
@@ -1566,7 +2257,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             record["experience_update_candidate"] = str(candidate_path)
     else:
         inner_runs = sorted((output_dir / "task_success_engine").glob("task_success_first_executor_*/run_report.json"))
-        inner_report = json.loads(inner_runs[-1].read_text(encoding="utf-8")) if inner_runs else {}
+        inner_report = aggregate_inner_report or (
+            json.loads(inner_runs[-1].read_text(encoding="utf-8")) if inner_runs else {}
+        )
         native_success = inner_report.get("task_success") is True
         physical_audit = _experience_physical_action_audit(inner_report) if inner_report else {
             "status": "not_available",
@@ -1588,21 +2281,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             scene_matches=scene_matches,
             native_task_success=native_success,
         )
+        final_native = inner_report.get("final_native_task_status", {})
+        success_timestep = final_native.get("timestep") if isinstance(final_native, dict) else None
+        standard_1000_success = (
+            bool(native_success and isinstance(success_timestep, int) and success_timestep <= 1000)
+            if isinstance(success_timestep, int)
+            else native_success if args.demonstration_horizon == 1000 else None
+        )
+        demonstration_only_success = (
+            bool(native_success and isinstance(success_timestep, int) and success_timestep > 1000)
+            if args.demonstration_horizon > 1000 and isinstance(success_timestep, int)
+            else None
+        )
         record.update({
             "status": status,
             "finished_unix_seconds": time.time(),
             "engine_return_code": completed.returncode,
-            "engine_report": str(inner_runs[-1]) if inner_runs else None,
+            "engine_report": str(multi_goal_episode["executor_report_paths"][-1])
+            if multi_goal_episode and multi_goal_episode.get("executor_report_paths") else
+            str(inner_runs[-1]) if inner_runs else None,
             "scene_identity_verified": scene_matches,
             "physical_action_audit": physical_audit,
             "outcome": {
                 "native_task_success": native_success,
-                "standard_1000_step_success": (
-                    native_success if args.demonstration_horizon == 1000 else None
-                ),
-                "demonstration_only_success": (
-                    native_success if args.demonstration_horizon > 1000 else None
-                ),
+                "native_task_success_timestep": success_timestep,
+                "standard_1000_step_success": standard_1000_success,
+                "demonstration_only_success": demonstration_only_success,
                 "stable_release_verified": "not_evaluated",
                 "operational_safety_pass": "not_certified",
                 "strict_10mm_pass": False,
@@ -1619,11 +2323,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "failure_reasons": _experience_failure_reasons(inner_report),
             "failure_reason": None if native_success else (
                 (_experience_failure_reasons(inner_report) or [None])[-1]
+                or (multi_goal_episode or {}).get("stop_reason")
                 or inner_report.get("error")
                 or ("native_task_success_not_reached" if inner_report else "executor_report_missing")
             ),
         })
-        if getattr(args, "cold_start", False) and native_success:
+        if multi_goal_episode is not None:
+            record["multi_goal_episode"] = multi_goal_episode
+        if getattr(args, "cold_start", False) and native_success and not getattr(args, "continue_pending_native_goals", False):
             initial_snapshot = args.snapshot_root / "snapshots/initial_runtime_snapshot.pkl"
             record["safety_risk_localization"] = _localize_cold_start_risks(
                 inner_report, physical_audit, output_dir, initial_snapshot=initial_snapshot,
@@ -1666,6 +2373,14 @@ def _parse_args() -> argparse.Namespace:
         "--cold-start", action="store_true",
         help="forbid successful-task experience, keyposes, references, resume states, and prior search reports",
     )
+    parser.add_argument(
+        "--continue-pending-native-goals", action="store_true",
+        help="within this cold-start run, continue settled partial goals from same-run exact Runtime Snapshots",
+    )
+    parser.add_argument(
+        "--continue-from-v3-report", type=Path, default=None,
+        help="continue an incomplete cold-start V3 archive from its own exact saved stage history",
+    )
     parser.add_argument("--snapshot-root", type=Path, default=None)
     parser.add_argument(
         "--resume-from-runtime-snapshot", type=Path, default=None,
@@ -1694,8 +2409,22 @@ def _parse_args() -> argparse.Namespace:
         "--candidate-start-index", type=int, default=0,
         help="start experience grasp-search preflights at this generated candidate index",
     )
+    parser.add_argument(
+        "--geometry-candidate-pool-offset", type=int, default=0,
+        help="select a later window from deterministic active-scene grasp geometry candidates",
+    )
     parser.add_argument("--bridge-port", type=int, default=38567)
     parser.add_argument("--transport-strategy", choices=("native_region_progress_osc", "legacy_rrt"), default="native_region_progress_osc")
+    parser.add_argument(
+        "--native-region-route-variant",
+        choices=(
+            "direct_region_progress",
+            "keypose_side_region_progress",
+            "keypose_side_region_progress_reverse",
+        ),
+        default=None,
+        help="select a region-progress route variant for native-region OSC transport",
+    )
     args = parser.parse_args()
     if not 1.0 <= args.wall_time_budget_s <= 86400.0:
         parser.error("--wall-time-budget-s must be in 1..86400 seconds")
@@ -1721,7 +2450,25 @@ def _parse_args() -> argparse.Namespace:
             parser.error("--cold-start requires --snapshot-root for the legal task t0 state")
         if args.candidate_start_index != 0:
             parser.error("--cold-start must begin at generated candidate index 0")
-    elif args.experience_library is None:
+    if args.continue_pending_native_goals and (
+        not args.cold_start
+        or args.backend not in {"auto", "experience_task_success"}
+        or args.target_predicate is not None
+        or args.resume_from_runtime_snapshot is not None
+    ):
+        parser.error("--continue-pending-native-goals requires an unpinned cold-start task-success run")
+    if args.continue_from_v3_report is not None:
+        if (
+            not args.cold_start
+            or not args.continue_pending_native_goals
+            or args.backend not in {"auto", "experience_task_success"}
+            or args.continue_from_v3_report.resolve() != (args.output_dir.resolve() / "v3_report.json").resolve()
+        ):
+            parser.error(
+                "--continue-from-v3-report requires an existing archive, cold-start multigoal mode, "
+                "and that archive's own v3_report.json"
+            )
+    if not args.cold_start and args.experience_library is None:
         args.experience_library = DEFAULT_EXPERIENCE_LIBRARY
     if args.max_steps < 1 or args.demonstration_horizon < 1000:
         parser.error("step budgets must be positive and horizon must be at least 1000")
@@ -1731,8 +2478,12 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-physical-branches must be in 1..3")
     if not 1 <= args.maximum_rrt_preflights <= 8:
         parser.error("--maximum-rrt-preflights must be in 1..8")
+    if args.native_region_route_variant is not None and args.transport_strategy != "native_region_progress_osc":
+        parser.error("--native-region-route-variant requires --transport-strategy native_region_progress_osc")
     if args.candidate_start_index < 0:
         parser.error("--candidate-start-index must be nonnegative")
+    if not 0 <= args.geometry_candidate_pool_offset <= 32:
+        parser.error("--geometry-candidate-pool-offset must fit the 48-candidate active geometry pool")
     if args.grasp_candidate_id is not None and args.candidate_start_index != 0:
         parser.error("--grasp-candidate-id requires --candidate-start-index 0")
     if not 0.5 <= args.rrt_time_budget_s <= 60:

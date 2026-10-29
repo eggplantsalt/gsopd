@@ -24,6 +24,7 @@ from research.gs_opd.smoke.joint_limit_policy import (
     normalize_joint_limit_tolerance_policy,
 )
 from research.gs_opd.smoke.object_pair_clearance import measure_forbidden_object_pairs
+from research.gs_opd.repair.task_success_first_search import MAX_DEMONSTRATION_HORIZON
 
 
 JOINT_LIMIT_TOLERANCE_POLICY = DEFAULT_JOINT_LIMIT_TOLERANCE_POLICY
@@ -178,8 +179,11 @@ def _parse_scene_args():
 scene_args = _parse_scene_args()
 if scene_args.camera_resolution <= 0:
     raise ValueError("--camera-resolution must be positive")
-if not 1 <= scene_args.demonstration_horizon <= 3600:
-    raise ValueError("--demonstration-horizon must be in 1..3600; values over 1000 are demonstration-only")
+if not 1 <= scene_args.demonstration_horizon <= MAX_DEMONSTRATION_HORIZON:
+    raise ValueError(
+        f"--demonstration-horizon must be in 1..{MAX_DEMONSTRATION_HORIZON}; "
+        "values over 1000 are demonstration-only"
+    )
 suite = get_benchmark(scene_args.benchmark)()
 task = suite.get_task_by_level_id(scene_args.level, scene_args.task_id)
 if task is None:
@@ -4292,21 +4296,17 @@ def _task_success_first_grasp_context(request):
     data = env.sim.data._data
     bindings = _task_semantic_geometry_bindings()["bindings"]
     problem = getattr(env.env, "parsed_problem", {})
+    binding_problem = {
+        **problem,
+        "fixtures_dict": getattr(env.env, "fixtures_dict", {}),
+    }
     goals = problem.get("goal_state") if isinstance(problem, dict) else None
     if not isinstance(goals, (list, tuple)):
         raise ValueError("active_BDDL_goal_state_is_unavailable")
     candidates = [
         list(predicate)
         for predicate in goals
-        if isinstance(predicate, (list, tuple))
-        and (
-            len(predicate) == 3
-            and str(predicate[0]).lower() in ("in", "on")
-            and predicate[1] in bindings
-            or len(predicate) == 2
-            and str(predicate[0]).lower() in ("close", "open", "turnon", "turnoff")
-            and predicate[1] in bindings
-        )
+        if _active_goal_has_geometry_binding(predicate, bindings, binding_problem)
     ]
     requested = request.get("target_predicate")
     if requested is not None:
@@ -4319,8 +4319,9 @@ def _task_success_first_grasp_context(request):
     else:
         raise ValueError("active_BDDL_has_ambiguous_object_goals; pass_an_exact_active_target_predicate")
 
-    target_id = str(predicate[1])
-    binding = bindings[target_id]
+    target_id, binding, target_binding_source = _resolve_active_goal_geometry_binding(
+        predicate, bindings, binding_problem,
+    )
     root_id = int(binding["root_body_id"])
     if root_id <= 0 or root_id >= int(model.nbody):
         raise ValueError("active_BDDL_target_root_body_is_invalid")
@@ -4441,6 +4442,7 @@ def _task_success_first_grasp_context(request):
         "native_goal_predicate": predicate,
         "native_goal_value": bool(env.env._eval_predicate(predicate)),
         "target_object_id": target_id,
+        "target_geometry_binding_source": target_binding_source,
         "target_binding": binding,
         "target_root_pose_world": {
             "position_m": root_position.tolist(),
@@ -4475,7 +4477,12 @@ def _task_success_first_articulation_context(request):
         raise ValueError("articulation_context_requires_supported_native_fixture_goal")
     if predicate not in env.env.parsed_problem.get("goal_state", []):
         raise ValueError("requested_fixture_predicate_is_not_an_active_BDDL_goal")
-    fixture_id = predicate[1]
+    active_fixture_id = predicate[1]
+    fixture_id, fixture_binding_source = _resolve_articulation_fixture_binding(
+        active_fixture_id,
+        getattr(env.env, "fixtures_dict", {}),
+        env.env.parsed_problem.get("regions", {}),
+    )
     fixture = getattr(env.env, "fixtures_dict", {}).get(fixture_id)
     if fixture is None:
         raise ValueError(f"active_BDDL_fixture_binding_is_missing:{fixture_id}")
@@ -4517,18 +4524,17 @@ def _task_success_first_articulation_context(request):
     if predicate[0].lower() in {"turnon", "turnoff"} and not target_ranges:
         raise ValueError("fixture_switch_goal_requires_explicit_native_articulation_range")
 
-    selected = None
-    target_position = None
-    best_distance = -1.0
-    for row in joint_rows:
-        lo, hi = row["range"]
-        clipped = [float(np.clip(value, lo, hi)) for value in target_ranges]
-        candidate_target = float(np.mean(clipped))
-        current = row["position"]
-        distance = abs(current - candidate_target) / max(hi - lo, 1e-9)
-        if distance > best_distance:
-            selected, target_position, best_distance = row, candidate_target, distance
-    assert selected is not None and target_position is not None
+    selected, joint_selection_source = _select_articulation_joint(
+        joint_rows,
+        active_goal_target=active_fixture_id,
+        fixture_id=fixture_id,
+        is_region_goal=fixture_binding_source == "active_BDDL_region_target",
+        target_ranges=target_ranges,
+    )
+    lo, hi = (float(value) for value in selected["range"])
+    target_position = float(np.mean([
+        float(np.clip(value, lo, hi)) for value in target_ranges
+    ]))
 
     joint_body = int(selected["body_id"])
     moving_bodies = _planning_body_subtree(model, joint_body)
@@ -4539,42 +4545,98 @@ def _task_success_first_articulation_context(request):
     ]
     if not geom_ids:
         raise ValueError("active_articulated_link_has_no_collision_geometry")
+    joint_type_name = str(selected["joint_type"]).lower()
+    geom_candidates = []
+    for geom_id in geom_ids:
+        size = np.asarray(model.geom_size[int(geom_id)], dtype=np.float64).copy()
+        geom_candidates.append({
+            "geom_id": int(geom_id),
+            "geom_name": str(
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id))
+                or f"geom_{geom_id}"
+            ),
+            "body_id": int(model.geom_bodyid[int(geom_id)]),
+            "body_name": str(mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[int(geom_id)])
+            )),
+            "is_box": int(model.geom_type[int(geom_id)]) == int(mujoco.mjtGeom.mjGEOM_BOX),
+            "size_m": size.tolist(),
+            "center_world_m": np.asarray(live.geom_xpos[int(geom_id)], dtype=np.float64).tolist(),
+        })
+    if joint_type_name == "slide":
+        selected_handle_geometries = _select_slide_fixture_handle_geometries(geom_candidates)
+        contact_geom_ids = [int(row["geom_id"]) for row in selected_handle_geometries]
+        handle_geom = max(
+            selected_handle_geometries,
+            key=lambda row: float(np.prod(np.asarray(row["size_m"], dtype=np.float64))),
+        )["geom_id"]
+        contact_geometry_selection_source = "compact_connected_collision_geometry_cluster"
+    else:
+        selected_handle_geometries = geom_candidates
+        contact_geom_ids = [int(geom_id) for geom_id in geom_ids]
+        handle_geom = None
+        contact_geometry_selection_source = "farthest_collision_geom_from_hinge_origin"
     integration = _mujoco_integration_state(env.sim)
     scratch = mujoco.MjData(model)
     qadr, dofadr = int(selected["qpos_address"]), int(selected["dof_address"])
     samples = np.linspace(float(selected["position"]), target_position, 9)
-    path_by_geom = {int(geom_id): [] for geom_id in geom_ids}
-    hinge_origin = np.asarray(live.xpos[joint_body], dtype=np.float64)
+    path_by_geom = {int(geom_id): [] for geom_id in contact_geom_ids}
+    joint_body_origin_world = np.asarray(live.xpos[joint_body], dtype=np.float64).copy()
     radial_scores = {}
     for angle in samples:
         mujoco.mj_setState(model, scratch, integration, mujoco.mjtState.mjSTATE_INTEGRATION)
         scratch.qpos[qadr] = float(angle)
         scratch.qvel[dofadr] = 0.0
         mujoco.mj_forward(model, scratch)
-        hinge_origin = np.asarray(scratch.xpos[joint_body], dtype=np.float64)
-        for geom_id in geom_ids:
+        for geom_id in contact_geom_ids:
             center = np.asarray(scratch.geom_xpos[geom_id], dtype=np.float64)
             path_by_geom[int(geom_id)].append(center.tolist())
             if len(path_by_geom[int(geom_id)]) == 1:
-                radial_scores[int(geom_id)] = float(np.linalg.norm(center - hinge_origin))
-    handle_geom = max(geom_ids, key=lambda geom_id: radial_scores[int(geom_id)])
-    centers = np.asarray(path_by_geom[int(handle_geom)], dtype=np.float64)
-    axis_local = np.asarray(model.jnt_axis[int(selected["joint_id"])], dtype=np.float64)
-    axis_world = np.asarray(live.xmat[joint_body], dtype=np.float64).reshape(3, 3) @ axis_local
+                radial_scores[int(geom_id)] = float(
+                    np.linalg.norm(center - joint_body_origin_world)
+                )
+    if joint_type_name == "slide":
+        centers = np.mean(
+            np.asarray([path_by_geom[int(geom_id)] for geom_id in contact_geom_ids], dtype=np.float64),
+            axis=0,
+        )
+    else:
+        handle_geom = max(contact_geom_ids, key=lambda geom_id: radial_scores[int(geom_id)])
+        centers = np.asarray(path_by_geom[int(handle_geom)], dtype=np.float64)
+    axis_world = np.asarray(live.xaxis[int(selected["joint_id"])], dtype=np.float64)
     axis_world /= max(float(np.linalg.norm(axis_world)), 1e-12)
-    radial = centers[0] - np.asarray(live.xpos[joint_body], dtype=np.float64)
-    radial -= axis_world * float(np.dot(radial, axis_world))
-    radial /= max(float(np.linalg.norm(radial)), 1e-12)
+    joint_origin_world = np.asarray(live.xanchor[int(selected["joint_id"])], dtype=np.float64)
+    contact_offset = centers[0] - joint_body_origin_world
+    if joint_type_name == "slide":
+        radial = _slide_fixture_approach_direction_world(axis_world, contact_offset)
+    else:
+        radial = contact_offset - axis_world * float(np.dot(contact_offset, axis_world))
+    radial_norm = float(np.linalg.norm(radial))
+    if radial_norm <= 1e-8:
+        raise ValueError("articulated_fixture_contact_approach_direction_is_degenerate")
+    radial /= radial_norm
     geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(handle_geom))
     return {
         "operation": "task_success_first_articulation_context",
         "status": "complete", "read_only": True,
         "fixture_id_from_active_BDDL": fixture_id,
+        "native_goal_target_from_active_BDDL": active_fixture_id,
+        "fixture_binding_source": fixture_binding_source,
+        "joint_selection_source": joint_selection_source,
+        "fixture_articulation_joint_candidates": joint_rows,
+        "contact_geometry_selection_source": contact_geometry_selection_source,
+        "selected_contact_geometries": selected_handle_geometries,
         "fixture_root_body_id": root,
         "fixture_root_body_name": str(fixture.root_body),
         "native_goal_predicate": predicate,
         "native_goal_value": bool(env.env._eval_predicate(predicate)),
         "joint": {**selected, "target_position": target_position, "close_open_range": target_ranges},
+        "joint_axis_world": axis_world.tolist(),
+        "joint_origin_world_m": joint_origin_world.tolist(),
+        "articulated_moving_collision_geom_names": [
+            str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id)) or f"geom_{geom_id}")
+            for geom_id in geom_ids
+        ],
         "articulated_contact_geom_id": int(handle_geom),
         "articulated_contact_geom_name": str(geom_name or f"geom_{handle_geom}"),
         "contact_point_path_world_m": centers.tolist(),
@@ -4582,6 +4644,180 @@ def _task_success_first_articulation_context(request):
         "model_geometry_sha256": _planning_model_signature(model),
         "bddl_sha256": scene_metadata.get("bddl_sha256"),
     }
+
+
+def _resolve_articulation_fixture_binding(active_goal_target, fixtures_dict, regions):
+    """Resolve an active BDDL fixture goal or fixture-owned region to its fixture."""
+    target = str(active_goal_target)
+    if target in fixtures_dict:
+        return target, "active_BDDL_fixture"
+    region = regions.get(target) if isinstance(regions, dict) else None
+    fixture_id = region.get("target") if isinstance(region, dict) else None
+    if not isinstance(fixture_id, str) or not fixture_id:
+        raise ValueError(f"active_BDDL_fixture_binding_is_missing:{target}")
+    if fixture_id not in fixtures_dict:
+        raise ValueError(
+            f"active_BDDL_region_target_is_not_a_fixture:{target}:{fixture_id}"
+        )
+    return fixture_id, "active_BDDL_region_target"
+
+
+def _active_goal_has_geometry_binding(predicate, bindings, problem):
+    """Return whether an active native goal has a complete semantic geometry target."""
+    if not isinstance(predicate, (list, tuple)) or len(predicate) not in (2, 3):
+        return False
+    operator = str(predicate[0]).lower()
+    target = str(predicate[1])
+    if len(predicate) == 3:
+        return operator in {"in", "on"} and target in bindings
+    if operator not in {"close", "open", "turnon", "turnoff"}:
+        return False
+    if target in bindings:
+        return True
+    try:
+        fixture_id, _ = _resolve_articulation_fixture_binding(
+            target,
+            problem.get("fixtures_dict", {}),
+            problem.get("regions", {}),
+        )
+    except (TypeError, ValueError):
+        return False
+    binding = bindings.get(fixture_id)
+    return isinstance(binding, dict) and binding.get("mapping_name") == "fixtures_dict"
+
+
+def _resolve_active_goal_geometry_binding(predicate, bindings, problem):
+    """Return the compiled semantic binding for an object, fixture, or fixture region goal."""
+    if not isinstance(predicate, (list, tuple)) or len(predicate) not in (2, 3):
+        raise ValueError("active_BDDL_goal_does_not_have_a_supported_geometry_binding")
+    target = str(predicate[1])
+    if target in bindings:
+        return target, bindings[target], "active_BDDL_target"
+    if len(predicate) != 2 or str(predicate[0]).lower() not in {
+        "close", "open", "turnon", "turnoff",
+    }:
+        raise ValueError(f"active_BDDL_target_geometry_binding_is_missing:{target}")
+    fixture_id, source = _resolve_articulation_fixture_binding(
+        target,
+        problem.get("fixtures_dict", {}),
+        problem.get("regions", {}),
+    )
+    binding = bindings.get(fixture_id)
+    if not isinstance(binding, dict) or binding.get("mapping_name") != "fixtures_dict":
+        raise ValueError(f"active_BDDL_fixture_geometry_binding_is_missing:{fixture_id}")
+    return fixture_id, binding, source
+
+
+def _select_articulation_joint(
+    joint_rows, *, active_goal_target, fixture_id, is_region_goal, target_ranges,
+):
+    """Bind a fixture-region goal to its named moving link when possible."""
+    candidates = list(joint_rows)
+    if not candidates:
+        raise ValueError("active_fixture_has_no_limited_hinge_or_slide_joint")
+    if is_region_goal:
+        prefix = f"{fixture_id}_"
+        region_name = str(active_goal_target)
+        if region_name.startswith(prefix):
+            region_name = region_name[len(prefix):]
+        if region_name.endswith("_region"):
+            region_name = region_name[:-len("_region")]
+        semantic_tokens = {
+            token for token in region_name.lower().split("_")
+            if token and token not in {"region", "level", "area"}
+        }
+        named = [
+            row for row in candidates
+            if any(
+                token in f"{row.get('joint_name', '')} {row.get('body_name', '')}".lower()
+                for token in semantic_tokens
+            )
+        ]
+        if len(named) == 1:
+            return named[0], "active_BDDL_region_semantic_joint_name"
+        if len(named) > 1:
+            raise ValueError(
+                "active_BDDL_region_matches_multiple_articulated_links:"
+                f"{active_goal_target}:{[row.get('joint_name') for row in named]}"
+            )
+        if len(candidates) == 1:
+            return candidates[0], "single_articulated_link_on_active_BDDL_fixture"
+        raise ValueError(
+            "active_BDDL_region_does_not_identify_one_articulated_link:"
+            f"{active_goal_target}:{[row.get('joint_name') for row in candidates]}"
+        )
+
+    ranked = []
+    for row in candidates:
+        lower, upper = (float(value) for value in row["range"])
+        clipped = [float(np.clip(value, lower, upper)) for value in target_ranges]
+        candidate_target = float(np.mean(clipped))
+        distance = abs(float(row["position"]) - candidate_target) / max(upper - lower, 1e-9)
+        ranked.append((distance, row))
+    return max(ranked, key=lambda item: item[0])[1], "closest_native_articulation_target_range"
+
+
+def _select_slide_fixture_handle_geometries(geom_candidates, *, maximum_half_extent_m=0.05,
+                                            maximum_cluster_distance_m=0.08):
+    """Select the compact connected collision-geometry cluster that represents a drawer handle."""
+    compact = []
+    for row in geom_candidates:
+        size = np.asarray(row.get("size_m", []), dtype=np.float64)
+        center = np.asarray(row.get("center_world_m", []), dtype=np.float64)
+        if (
+            row.get("is_box") is True
+            and size.shape == (3,) and np.isfinite(size).all() and np.all(size > 0.0)
+            and float(np.max(size)) <= float(maximum_half_extent_m)
+            and center.shape == (3,) and np.isfinite(center).all()
+        ):
+            compact.append({**row, "_center": center, "_volume": float(np.prod(size))})
+    if not compact:
+        raise ValueError("sliding_fixture_has_no_compact_handle_collision_geometry")
+    remaining = set(range(len(compact)))
+    components = []
+    while remaining:
+        component = {remaining.pop()}
+        frontier = list(component)
+        while frontier:
+            current = frontier.pop()
+            neighbors = {
+                index for index in remaining
+                if float(np.linalg.norm(compact[current]["_center"] - compact[index]["_center"]))
+                <= float(maximum_cluster_distance_m)
+            }
+            remaining.difference_update(neighbors)
+            component.update(neighbors)
+            frontier.extend(neighbors)
+        components.append([compact[index] for index in sorted(component)])
+    components.sort(
+        key=lambda rows: (len(rows), sum(row["_volume"] for row in rows)), reverse=True,
+    )
+    if len(components) > 1:
+        first_score = (len(components[0]), sum(row["_volume"] for row in components[0]))
+        second_score = (len(components[1]), sum(row["_volume"] for row in components[1]))
+        if first_score == second_score:
+            raise ValueError("sliding_fixture_handle_geometry_cluster_is_ambiguous")
+    return [
+        {key: value for key, value in row.items() if not key.startswith("_")}
+        for row in components[0]
+    ]
+
+
+def _slide_fixture_approach_direction_world(joint_axis_world, contact_offset_world):
+    """Use the signed displacement axis from the moving link root to its handle center."""
+    axis = np.asarray(joint_axis_world, dtype=np.float64)
+    offset = np.asarray(contact_offset_world, dtype=np.float64)
+    if axis.shape != (3,) or offset.shape != (3,) or not np.isfinite(axis).all() or not np.isfinite(offset).all():
+        raise ValueError("sliding_fixture_approach_direction_requires_finite_world_vectors")
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1e-8:
+        raise ValueError("sliding_fixture_joint_axis_is_degenerate")
+    axis = axis / axis_norm
+    projected = axis * float(np.dot(offset, axis))
+    projected_norm = float(np.linalg.norm(projected))
+    if projected_norm <= 1e-8:
+        raise ValueError("sliding_fixture_handle_has_no_offset_along_its_joint_axis")
+    return projected / projected_norm
 
 
 def _validated_render_resolution(resolution):
@@ -7368,10 +7604,13 @@ try:
                         if request.get("start_state_sha256") != current_state_hash:
                             raise ValueError("active_7d_qpos_start_state_changed_before_planning")
                         planner_config = request.get("planner_config")
-                        if not isinstance(planner_config, dict) or planner_config.get(
-                            "require_safe_configurations"
-                        ) is not False:
-                            raise ValueError("task_success_first_RRT_requires_explicit_record_only_mode")
+                        if (
+                            not isinstance(planner_config, dict)
+                            or not isinstance(planner_config.get("require_safe_configurations"), bool)
+                        ):
+                            raise ValueError(
+                                "task_success_first_RRT_requires_explicit_boolean_configuration_gate"
+                            )
                         policy = _normalize_safety_geometry_policy(
                             request.get("safety_geometry_policy")
                         )
@@ -7386,7 +7625,17 @@ try:
                             planner_config=planner_config,
                         )
                         result["operation"] = "task_success_first_rrt"
-                        result["planning_mode"] = "kinematic_route_with_record_only_safety_diagnostics"
+                        result["planning_mode"] = (
+                            "kinematic_route_with_full_geometry_configuration_gate"
+                            if planner_config["require_safe_configurations"]
+                            else "kinematic_route_with_record_only_safety_diagnostics"
+                        )
+                        result["require_safe_configurations"] = planner_config[
+                            "require_safe_configurations"
+                        ]
+                        result["planner_minimum_clearance_m"] = planner_config.get(
+                            "minimum_clearance_m"
+                        )
                         result["safety_certified"] = False
                         result["start_state_sha256"] = current_state_hash
                         result["model_geometry_sha256"] = actual_model
@@ -7463,6 +7712,7 @@ try:
                             strict_target_contact_policy=request.get(
                                 "strict_target_contact_policy", False
                             ),
+                            task_approach_only=request.get("task_approach_only", False),
                         )
                         result["model_geometry_sha256"] = actual_model
                         result["safety_policy_source"] = request.get("safety_geometry_policy", {}).get("source")

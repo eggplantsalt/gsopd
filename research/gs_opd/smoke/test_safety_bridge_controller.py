@@ -48,6 +48,38 @@ def _load_action_bound_helpers():
     return namespace["_active_environment_action_bounds"], namespace["_validate_tracking_action"]
 
 
+def _load_articulation_binding_helper():
+    tree = ast.parse(BRIDGE_PATH.read_text(encoding="utf-8"))
+    wanted = {
+        "_resolve_articulation_fixture_binding",
+        "_active_goal_has_geometry_binding",
+        "_resolve_active_goal_geometry_binding",
+    }
+    nodes = [
+        item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name in wanted
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(BRIDGE_PATH), "exec"), namespace)
+    return namespace
+
+
+def _load_articulation_joint_selector():
+    tree = ast.parse(BRIDGE_PATH.read_text(encoding="utf-8"))
+    wanted = {
+        "_select_articulation_joint",
+        "_select_slide_fixture_handle_geometries",
+        "_slide_fixture_approach_direction_world",
+    }
+    nodes = [
+        item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name in wanted
+    ]
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(BRIDGE_PATH), "exec"), namespace)
+    return namespace
+
+
 class FakeOSCController:
     name = "OSC_POSE"
 
@@ -243,6 +275,162 @@ class SafetyBridgeActionBoundsTests(unittest.TestCase):
         bad[3] = 1.01
         with self.assertRaisesRegex(ValueError, "outside_active_environment_bounds"):
             self.validate_action(bad, low, high)
+
+
+class SafetyBridgeArticulationBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.helpers = _load_articulation_binding_helper()
+        self.resolve = self.helpers["_resolve_articulation_fixture_binding"]
+
+    def test_resolves_fixture_owned_bddl_goal_region_to_fixture(self):
+        fixtures = {"wooden_cabinet_1": object()}
+        regions = {
+            "wooden_cabinet_1_bottom_region": {"target": "wooden_cabinet_1"},
+        }
+
+        fixture_id, source = self.resolve(
+            "wooden_cabinet_1_bottom_region", fixtures, regions,
+        )
+
+        self.assertEqual(fixture_id, "wooden_cabinet_1")
+        self.assertEqual(source, "active_BDDL_region_target")
+
+    def test_keeps_direct_fixture_goal_binding(self):
+        fixture_id, source = self.resolve("flat_stove_1", {"flat_stove_1": object()}, {})
+
+        self.assertEqual(fixture_id, "flat_stove_1")
+        self.assertEqual(source, "active_BDDL_fixture")
+
+    def test_rejects_region_that_does_not_resolve_to_active_fixture(self):
+        regions = {"wooden_cabinet_1_bottom_region": {"target": "kitchen_table"}}
+
+        with self.assertRaisesRegex(ValueError, "region_target_is_not_a_fixture"):
+            self.resolve(
+                "wooden_cabinet_1_bottom_region", {"wooden_cabinet_1": object()}, regions,
+            )
+
+
+class SafetyBridgeArticulationJointSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.select = _load_articulation_joint_selector()["_select_articulation_joint"]
+
+    def test_region_semantics_select_the_matching_drawer_joint(self):
+        top = {"joint_name": "wooden_cabinet_1_top_level", "body_name": "cabinet_top",
+               "range": [-0.16, 0.01], "position": 0.0}
+        bottom = {"joint_name": "wooden_cabinet_1_bottom_level", "body_name": "cabinet_bottom",
+                  "range": [-0.16, 0.01], "position": 0.0}
+
+        selected, source = self.select(
+            [top, bottom], active_goal_target="wooden_cabinet_1_bottom_region",
+            fixture_id="wooden_cabinet_1", is_region_goal=True, target_ranges=[-0.16, -0.14],
+        )
+
+        self.assertIs(selected, bottom)
+        self.assertEqual(source, "active_BDDL_region_semantic_joint_name")
+
+    def test_ambiguous_region_joint_binding_fails_closed(self):
+        rows = [
+            {"joint_name": "joint_a", "body_name": "link_a", "range": [-1.0, 1.0], "position": 0.0},
+            {"joint_name": "joint_b", "body_name": "link_b", "range": [-1.0, 1.0], "position": 0.0},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "does_not_identify_one_articulated_link"):
+            self.select(
+                rows, active_goal_target="wooden_cabinet_1_bottom_region",
+                fixture_id="wooden_cabinet_1", is_region_goal=True, target_ranges=[-1.0, -0.8],
+            )
+
+    def test_direct_fixture_goal_keeps_native_range_selection(self):
+        top = {"joint_name": "top", "body_name": "top", "range": [-0.16, 0.01], "position": 0.0}
+        bottom = {"joint_name": "bottom", "body_name": "bottom", "range": [-0.16, 0.01], "position": 0.0}
+
+        selected, source = self.select(
+            [top, bottom], active_goal_target="wooden_cabinet_1",
+            fixture_id="wooden_cabinet_1", is_region_goal=False, target_ranges=[-0.16, -0.14],
+        )
+
+        self.assertIs(selected, top)
+        self.assertEqual(source, "closest_native_articulation_target_range")
+
+
+class SafetyBridgeActiveGoalGeometryBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.helpers = _load_articulation_binding_helper()
+        self.has_binding = self.helpers["_active_goal_has_geometry_binding"]
+        self.resolve = self.helpers["_resolve_active_goal_geometry_binding"]
+
+    def test_bottom_region_goal_resolves_to_fixture_collision_binding(self):
+        fixture = {"mapping_name": "fixtures_dict", "geom_ids": [1, 2]}
+        bindings = {"wooden_cabinet_1": fixture}
+        problem = {
+            "fixtures_dict": {"wooden_cabinet_1": object()},
+            "regions": {
+                "wooden_cabinet_1_bottom_region": {"target": "wooden_cabinet_1"},
+            },
+        }
+        predicate = ["open", "wooden_cabinet_1_bottom_region"]
+
+        self.assertTrue(self.has_binding(predicate, bindings, problem))
+        target_id, target_binding, source = self.resolve(predicate, bindings, problem)
+        self.assertEqual(target_id, "wooden_cabinet_1")
+        self.assertIs(target_binding, fixture)
+        self.assertEqual(source, "active_BDDL_region_target")
+
+    def test_region_goal_that_resolves_to_nonfixture_is_not_an_articulation_binding(self):
+        bindings = {"kitchen_table": {"mapping_name": "fixtures_dict"}}
+        problem = {
+            "fixtures_dict": {},
+            "regions": {"table_region": {"target": "kitchen_table"}},
+        }
+
+        self.assertFalse(
+            self.has_binding(["open", "table_region"], bindings, problem)
+        )
+
+
+class SafetyBridgeSlideHandleSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.helpers = _load_articulation_joint_selector()
+
+    def test_compact_connected_collision_geometries_select_drawer_handle(self):
+        candidates = [
+            {"geom_id": 36, "is_box": True, "size_m": [0.003, 0.034, 0.109],
+             "center_world_m": [0.0, 0.0, 0.0]},
+            {"geom_id": 42, "is_box": True, "size_m": [0.008, 0.008, 0.044],
+             "center_world_m": [0.10, 0.0, 0.0]},
+            {"geom_id": 43, "is_box": True, "size_m": [0.005, 0.006, 0.011],
+             "center_world_m": [0.13, 0.0, 0.0]},
+            {"geom_id": 44, "is_box": True, "size_m": [0.005, 0.006, 0.011],
+             "center_world_m": [0.07, 0.0, 0.0]},
+            {"geom_id": 50, "is_box": True, "size_m": [0.005, 0.005, 0.01],
+             "center_world_m": [0.5, 0.0, 0.0]},
+        ]
+
+        selected = self.helpers["_select_slide_fixture_handle_geometries"](candidates)
+
+        self.assertEqual([row["geom_id"] for row in selected], [42, 43, 44])
+
+    def test_ambiguous_handle_clusters_fail_closed(self):
+        candidates = [
+            {"geom_id": 1, "is_box": True, "size_m": [0.01, 0.01, 0.01],
+             "center_world_m": [0.0, 0.0, 0.0]},
+            {"geom_id": 2, "is_box": True, "size_m": [0.01, 0.01, 0.01],
+             "center_world_m": [0.02, 0.0, 0.0]},
+            {"geom_id": 3, "is_box": True, "size_m": [0.01, 0.01, 0.01],
+             "center_world_m": [1.0, 0.0, 0.0]},
+            {"geom_id": 4, "is_box": True, "size_m": [0.01, 0.01, 0.01],
+             "center_world_m": [1.02, 0.0, 0.0]},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "geometry_cluster_is_ambiguous"):
+            self.helpers["_select_slide_fixture_handle_geometries"](candidates)
+
+    def test_slide_approach_direction_follows_handle_offset_on_signed_axis(self):
+        direction = self.helpers["_slide_fixture_approach_direction_world"](
+            [0.0, -1.0, 0.0], [0.0, 0.1, 0.0],
+        )
+
+        np.testing.assert_allclose(direction, [0.0, 1.0, 0.0], atol=1e-12)
 
 
 if __name__ == "__main__":

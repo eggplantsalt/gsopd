@@ -31,6 +31,7 @@ import numpy as np
 
 from research.gs_opd.repair.task_phase_controller import PhaseEvidence, TaskPhaseController
 from research.gs_opd.repair.task_success_first_search import (
+    MAX_DEMONSTRATION_HORIZON,
     inspect_native_goal_coverage,
     pending_object_goals,
 )
@@ -56,6 +57,285 @@ MAX_JOINT_LIMIT_RECOVERY_ACTIONS = 8
 NATIVE_PLACEMENT_RRT_BUDGET_S = 12.0
 NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS = 8000
 NATIVE_PLACEMENT_RRT_MAX_ITERATIONS = 2000
+ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M = 0.010
+ARTICULATED_FIXTURE_PRECONTACT_APPROACH_DISTANCE_M = 0.180
+ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M = 0.140
+ARTICULATED_FIXTURE_SLIDE_PRECONTACT_HEIGHT_M = 0.220
+ARTICULATED_FIXTURE_SLIDE_UNDER_TOP_HEIGHT_OFFSET_M = 0.094
+ARTICULATED_FIXTURE_SLIDE_HANDLE_APPROACH_OUTWARD_M = 0.050
+ARTICULATED_FIXTURE_SLIDE_HANDLE_EEF_HEIGHT_OFFSET_M = 0.0
+ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M = 0.010
+ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD = float(np.deg2rad(25.0))
+ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET = 400
+ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET = 1000
+ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET = ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET
+ARTICULATED_FIXTURE_CONTACT_TRACKING_REGION_M = 0.065
+ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M = 0.006
+ARTICULATED_FIXTURE_ROUTE_POSITION_TOLERANCE_M = 0.004
+ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD = 0.03
+ARTICULATED_FIXTURE_HINGE_FOLLOW_MAX_LEAD_RAD = 0.04
+ARTICULATED_FIXTURE_HINGE_FOLLOW_RAMP_STEP_RAD = 0.005
+ARTICULATED_FIXTURE_SLIDE_FOLLOW_LEAD_M = 0.006
+ARTICULATED_FIXTURE_SLIDE_FOLLOW_RAMP_STEP_M = 0.0005
+ARTICULATED_FIXTURE_FOLLOW_POSITION_TOLERANCE_M = 0.00005
+ARTICULATED_FIXTURE_FOLLOW_ACTION_CHUNK = 32
+ARTICULATED_FIXTURE_SWITCH_TURN_GRIPPER_ACTION = 1.0
+
+
+def _articulated_fixture_rrt_policy(
+    policy: dict[str, Any], fixture_id: str,
+) -> dict[str, Any]:
+    """Keep a small route-following cushion from the articulated target fixture."""
+    result = copy.deepcopy(policy)
+    matches = []
+    for group_name in ("forbidden_objects", "allowed_target_objects", "other_scene_objects"):
+        groups = result.get(group_name, [])
+        if not isinstance(groups, list):
+            raise ValueError("articulated_fixture_route_policy_geometry_groups_must_be_lists")
+        for group in groups:
+            if isinstance(group, dict) and group.get("object_id") == fixture_id:
+                group["minimum_clearance_m"] = ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M
+                matches.append(group_name)
+    if len(matches) != 1:
+        raise ValueError(
+            "articulated_fixture_route_policy_must_contain_one_verified_fixture_binding:"
+            f"{fixture_id}:{matches}"
+        )
+    result["source"] = (
+        f"{policy.get('source', 'active_verified_geometry')}:"
+        "articulated_fixture_OSC_tracking_clearance"
+    )
+    return result
+
+
+def _articulated_fixture_press_quaternion(
+    current_quaternion_wxyz: np.ndarray,
+    outward_direction_world: np.ndarray,
+) -> np.ndarray:
+    """Aim the Panda finger axis inward and keep the finger pair tangent to a hinge path."""
+    from scipy.spatial.transform import Rotation
+
+    current = np.array(current_quaternion_wxyz, dtype=np.float64, copy=True)
+    outward = np.array(outward_direction_world, dtype=np.float64, copy=True)
+    if (
+        current.shape != (4,) or outward.shape != (3,)
+        or not np.isfinite(current).all() or not np.isfinite(outward).all()
+        or float(np.linalg.norm(current)) <= 1e-12
+        or float(np.linalg.norm(outward)) <= 1e-12
+    ):
+        raise ValueError("articulated_fixture_press_orientation_requires_finite_pose_and_direction")
+    outward /= np.linalg.norm(outward)
+    tool_z_world = -outward
+    finger_axis_world = np.cross([0.0, 0.0, 1.0], outward)
+    if float(np.linalg.norm(finger_axis_world)) <= 1e-8:
+        current_rotation = Rotation.from_quat(current[[1, 2, 3, 0]] / np.linalg.norm(current))
+        current_finger_axis = current_rotation.as_matrix()[:, 0]
+        finger_axis_world = current_finger_axis - tool_z_world * float(
+            np.dot(current_finger_axis, tool_z_world)
+        )
+    if float(np.linalg.norm(finger_axis_world)) <= 1e-8:
+        reference = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        finger_axis_world = reference - tool_z_world * float(np.dot(reference, tool_z_world))
+    finger_axis_world /= np.linalg.norm(finger_axis_world)
+    tool_y_world = np.cross(tool_z_world, finger_axis_world)
+    tool_y_world /= np.linalg.norm(tool_y_world)
+    rotation = Rotation.from_matrix(
+        np.column_stack([finger_axis_world, tool_y_world, tool_z_world])
+    )
+    quaternion_xyzw = rotation.as_quat()
+    result = quaternion_xyzw[[3, 0, 1, 2]]
+    result /= np.linalg.norm(result)
+    current_unit = current / np.linalg.norm(current)
+    if float(np.dot(result, current_unit)) < 0.0:
+        result = -result
+    return result
+
+
+def _articulated_fixture_slide_grasp_quaternion(
+    outward_direction_world: np.ndarray,
+) -> np.ndarray:
+    """Face down toward a slide handle while closing across its lateral bar."""
+    from scipy.spatial.transform import Rotation
+
+    outward = np.asarray(outward_direction_world, dtype=np.float64)
+    if outward.shape != (3,) or not np.isfinite(outward).all():
+        raise ValueError("slide_handle_outward_direction_must_be_finite_3d")
+    norm = float(np.linalg.norm(outward))
+    if norm < 1e-8:
+        raise ValueError("slide_handle_outward_direction_must_be_nonzero")
+    outward /= norm
+    tool_axis = (
+        -outward * float(np.cos(ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD))
+        + np.asarray([0.0, 0.0, -float(np.sin(ARTICULATED_FIXTURE_SLIDE_TOOL_DOWN_ANGLE_RAD))])
+    )
+    tool_axis /= np.linalg.norm(tool_axis)
+    closing_axis = np.cross(np.asarray([0.0, 0.0, 1.0]), outward)
+    closing_norm = float(np.linalg.norm(closing_axis))
+    if closing_norm < 1e-8:
+        raise ValueError("slide_handle_pull_axis_must_not_be_vertical")
+    closing_axis /= closing_norm
+    second_axis = np.cross(tool_axis, closing_axis)
+    second_axis /= np.linalg.norm(second_axis)
+    matrix = np.column_stack((closing_axis, second_axis, tool_axis))
+    quaternion_xyzw = Rotation.from_matrix(matrix).as_quat()
+    result = quaternion_xyzw[[3, 0, 1, 2]]
+    return result / np.linalg.norm(result)
+
+
+def _articulated_fixture_slide_approach_waypoints(
+    contact_point_world_m: np.ndarray,
+    outward_direction_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lower outside the cabinet top, enter below it, then descend at the handle."""
+    contact_point = np.asarray(contact_point_world_m, dtype=np.float64)
+    outward = np.asarray(outward_direction_world, dtype=np.float64)
+    if (
+        contact_point.shape != (3,) or outward.shape != (3,)
+        or not np.isfinite(contact_point).all() or not np.isfinite(outward).all()
+    ):
+        raise ValueError("slide_handle_approach_requires_finite_3d_points")
+    outward_norm = float(np.linalg.norm(outward))
+    if outward_norm < 1e-8:
+        raise ValueError("slide_handle_approach_outward_direction_must_be_nonzero")
+    outward = outward / outward_norm
+    under_top_height = float(
+        contact_point[2] + ARTICULATED_FIXTURE_SLIDE_UNDER_TOP_HEIGHT_OFFSET_M
+    )
+    outside = contact_point + outward * ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M
+    outside[2] = under_top_height
+    front = contact_point + outward * ARTICULATED_FIXTURE_SLIDE_HANDLE_APPROACH_OUTWARD_M
+    front[2] = under_top_height
+    handle_height = front.copy()
+    handle_height[2] = contact_point[2] + ARTICULATED_FIXTURE_SLIDE_HANDLE_EEF_HEIGHT_OFFSET_M
+    return outside, front, handle_height
+
+
+def _articulated_fixture_terminal_outcome(
+    failure_reason: str | None, final_native_task_status: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Classify environment termination caused by a native success as a stop, not failure."""
+    if (
+        final_native_task_status.get("task_success") is True
+        and failure_reason == "RuntimeError: environment_done_during_grasp_only_branch"
+    ):
+        return None, "native_task_success_terminated_environment"
+    return failure_reason, None
+
+
+def _articulated_fixture_follow_pose(
+    anchor_eef_position_world: np.ndarray,
+    anchor_eef_quaternion_wxyz: np.ndarray,
+    articulation_context: dict[str, Any],
+    *,
+    joint_position_at_anchor: float | None = None,
+    follow_lead: float | None = None,
+    allow_terminal_stop_follow: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Track a fixed contact anchor with a bounded lead toward the fixture goal."""
+    from scipy.spatial.transform import Rotation
+
+    position = np.asarray(anchor_eef_position_world, dtype=np.float64)
+    quaternion = np.asarray(anchor_eef_quaternion_wxyz, dtype=np.float64)
+    joint = articulation_context.get("joint", {})
+    axis = np.asarray(articulation_context.get("joint_axis_world"), dtype=np.float64)
+    if (
+        position.shape != (3,) or quaternion.shape != (4,) or axis.shape != (3,)
+        or not np.isfinite(position).all() or not np.isfinite(quaternion).all()
+        or not np.isfinite(axis).all() or float(np.linalg.norm(axis)) <= 1e-12
+    ):
+        raise ValueError("articulated_fixture_follow_pose_requires_finite_live_joint_geometry")
+    current = float(joint.get("position"))
+    target = float(joint.get("target_position"))
+    anchor = current if joint_position_at_anchor is None else float(joint_position_at_anchor)
+    if not np.isfinite([current, target, anchor]).all():
+        raise ValueError("articulated_fixture_follow_joint_positions_must_be_finite")
+    axis /= np.linalg.norm(axis)
+    eef_rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]])
+    joint_type = str(joint.get("joint_type", "")).lower()
+    if joint_type == "hinge":
+        origin = np.asarray(articulation_context.get("joint_origin_world_m"), dtype=np.float64)
+        if origin.shape != (3,) or not np.isfinite(origin).all():
+            raise ValueError("articulated_fixture_hinge_follow_requires_finite_world_origin")
+        lead = ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD if follow_lead is None else float(follow_lead)
+        if not np.isfinite(lead) or lead < 0.0:
+            raise ValueError("articulated_fixture_hinge_follow_lead_must_be_finite_and_nonnegative")
+        follow_target = target
+        joint_range = joint.get("range")
+        if allow_terminal_stop_follow and joint_range is not None:
+            bounds = np.asarray(joint_range, dtype=np.float64)
+            if bounds.shape == (2,) and np.isfinite(bounds).all():
+                lower = float(bounds[0])
+                if 0.0 <= target - lower <= 0.005:
+                    follow_target = lower
+        remaining = follow_target - current
+        joint_position_ahead = current + np.sign(remaining) * min(abs(remaining), lead)
+        fixture_delta = Rotation.from_rotvec(axis * (joint_position_ahead - anchor))
+        target_position = origin + fixture_delta.apply(position - origin)
+        target_rotation = fixture_delta * eef_rotation
+    elif joint_type == "slide":
+        lead = ARTICULATED_FIXTURE_SLIDE_FOLLOW_LEAD_M if follow_lead is None else float(follow_lead)
+        if not np.isfinite(lead) or lead < 0.0:
+            raise ValueError("articulated_fixture_slide_follow_lead_must_be_finite_and_nonnegative")
+        remaining = target - current
+        joint_position_ahead = current + np.sign(remaining) * min(abs(remaining), lead)
+        target_position = position + axis * (joint_position_ahead - anchor)
+        target_rotation = eef_rotation
+    else:
+        raise ValueError(f"articulated_fixture_follow_unsupported_joint_type:{joint_type}")
+    target_quaternion_xyzw = target_rotation.as_quat()
+    target_quaternion = target_quaternion_xyzw[[3, 0, 1, 2]]
+    if float(np.dot(target_quaternion, quaternion)) < 0.0:
+        target_quaternion = -target_quaternion
+    return target_position, target_quaternion
+
+
+def _articulated_fixture_robot_contact_pairs(
+    record: dict[str, Any], fixture_id: str, articulated_geom_names: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Return observed robot contacts with the active fixture's moving collision geometry."""
+    contact_report = record.get("contacts", {})
+    contacts = contact_report.get("contacts", []) if isinstance(contact_report, dict) else []
+    articulated_names = set(articulated_geom_names or [])
+    if not articulated_names:
+        return []
+    result = []
+    for contact in contacts:
+        if not isinstance(contact, dict):
+            continue
+        geom1 = contact.get("geom1", {})
+        geom2 = contact.get("geom2", {})
+        body1 = contact.get("body1", {})
+        body2 = contact.get("body2", {})
+        name1 = str(geom1.get("name", ""))
+        name2 = str(geom2.get("name", ""))
+        body_name1 = str(body1.get("name", ""))
+        body_name2 = str(body2.get("name", ""))
+        robot1 = "robot0" in name1 or "gripper0" in name1 or "robot0" in body_name1
+        robot2 = "robot0" in name2 or "gripper0" in name2 or "robot0" in body_name2
+        fixture1 = fixture_id in name1 or fixture_id in body_name1
+        fixture2 = fixture_id in name2 or fixture_id in body_name2
+        if robot1 and fixture2:
+            if not articulated_names or name2 in articulated_names:
+                result.append({"robot_geom": name1, "fixture_geom": name2})
+        elif robot2 and fixture1:
+            if not articulated_names or name1 in articulated_names:
+                result.append({"robot_geom": name2, "fixture_geom": name1})
+    return result
+
+
+def _thin_articulated_fixture_rrt_route(
+    route: Any, *, stride: int = 2,
+) -> tuple[np.ndarray, list[int]]:
+    """Retain regularly spaced RRT EEF poses and always preserve its endpoint."""
+    poses = np.asarray(route, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1] != 7 or len(poses) < 2 or not np.isfinite(poses).all():
+        raise ValueError("articulated_fixture_RRT_route_must_be_a_finite_N_by_7_pose_array")
+    if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+        raise ValueError("articulated_fixture_RRT_route_stride_must_be_a_positive_integer")
+    indices = list(range(0, len(poses), stride))
+    if indices[-1] != len(poses) - 1:
+        indices.append(len(poses) - 1)
+    return poses[indices], indices
 
 
 def _sha(value: bytes) -> str:
@@ -124,6 +404,7 @@ def _task_success_first_grasp_search_command(
         "--maximum-rrt-preflights", str(args.maximum_rrt_preflights),
         "--maximum-physical-branches", str(args.maximum_physical_branches),
         "--rrt-time-budget-s", str(args.rrt_time_budget_s),
+        "--geometry-candidate-pool-offset", str(getattr(args, "geometry_candidate_pool_offset", 0)),
         "--demonstration-horizon", str(args.demonstration_horizon),
         "--target-predicate", *predicate,
     ]
@@ -141,6 +422,8 @@ def _task_success_first_grasp_search_command(
         ])
     if getattr(args, "cold_start", False):
         command.append("--cold-start")
+    if getattr(args, "cold_start_continuation", False):
+        command.append("--cold-start-continuation")
     if args.experience_library is not None:
         command.extend(["--experience-library", str(args.experience_library)])
     previous_search_report = getattr(args, "previous_search_report", None)
@@ -578,6 +861,7 @@ def _native_transport_action_budget(
     predicate: list[str],
     demonstration_horizon: int,
     observed_speed_m_s: float = 0.012,
+    native_region_route_includes_final_placement: bool = False,
 ) -> dict[str, Any]:
     """Allocate transport actions from route length and the remaining demo horizon."""
     from research.gs_opd.repair.task_success_first_search import route_control_action_budget
@@ -598,6 +882,11 @@ def _native_transport_action_budget(
         + MAX_NATIVE_WITHDRAWAL_ACTIONS
         + MAX_NATIVE_SETTLE_ACTIONS
     )
+    if native_region_route_includes_final_placement and not future_goals:
+        # The region route already contains the final insertion waypoint. Keep
+        # only the remaining precise-placement reserve; a terminal BDDL success
+        # ends the episode before release, withdrawal, or settling can run.
+        completion_reserve = MAX_NATIVE_PLACEMENT_ACTIONS
     future_reserve = len(future_goals) * FUTURE_OBJECT_GOAL_ACTION_RESERVE
     available = max(0, demonstration_horizon - timestep - completion_reserve - future_reserve)
     if available == 0:
@@ -622,6 +911,7 @@ def _native_transport_action_budget(
         "demonstration_horizon": demonstration_horizon,
         "observed_speed_assumption_m_s": observed_speed_m_s,
         "termination_policy": "route_or_remaining_horizon_budget; no fixed per-transport action cap",
+        "native_region_route_includes_final_placement": native_region_route_includes_final_placement,
     }
 
 
@@ -1414,6 +1704,107 @@ def _placement_lowest_geometry_offset(
     return float(lowest)
 
 
+def _placement_collision_bounds_in_region(
+    context: dict[str, Any],
+    region_rotation: np.ndarray,
+    root_rotation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the compiled collision envelope in native-region coordinates."""
+    region_rotation = np.asarray(region_rotation, dtype=np.float64)
+    root_rotation = np.asarray(root_rotation, dtype=np.float64)
+    if (
+        region_rotation.shape != (3, 3) or root_rotation.shape != (3, 3)
+        or not np.isfinite(region_rotation).all() or not np.isfinite(root_rotation).all()
+    ):
+        raise ValueError("placement_collision_bounds_require_finite_region_and_root_rotations")
+    region_from_root = region_rotation.T @ root_rotation
+    lower = np.full(3, np.inf, dtype=np.float64)
+    upper = np.full(3, -np.inf, dtype=np.float64)
+    for geom in context.get("target_collision_geometries", []):
+        center = np.asarray(geom.get("center_root_m"), dtype=np.float64)
+        geom_rotation = np.asarray(geom.get("rotation_root"), dtype=np.float64)
+        size = np.asarray(geom.get("size_m"), dtype=np.float64)
+        if (
+            center.shape != (3,) or geom_rotation.shape != (3, 3) or size.shape != (3,)
+            or not np.isfinite(center).all() or not np.isfinite(geom_rotation).all()
+            or not np.isfinite(size).all() or np.any(size < 0.0)
+        ):
+            continue
+        center_region = region_from_root @ center
+        axes_region = region_from_root @ geom_rotation
+        extent = np.abs(axes_region) @ size
+        lower = np.minimum(lower, center_region - extent)
+        upper = np.maximum(upper, center_region + extent)
+    if not np.isfinite(lower).all() or not np.isfinite(upper).all():
+        raise ValueError("placement_collision_bounds_have_no_valid_compiled_geometry")
+    return lower, upper
+
+
+def _native_in_region_orientation_candidates(
+    *,
+    target_context: dict[str, Any],
+    region_rotation: np.ndarray,
+    target_rotation: np.ndarray,
+    region_size: np.ndarray,
+    maximum_candidates: int,
+) -> list[dict[str, Any]]:
+    """Search container-plane yaw poses using the target's compiled geometry."""
+    from scipy.spatial.transform import Rotation
+
+    axis = np.asarray(region_rotation, dtype=np.float64)[:, 2]
+    axis_norm = float(np.linalg.norm(axis))
+    target_rotation = np.asarray(target_rotation, dtype=np.float64)
+    region_size = np.asarray(region_size, dtype=np.float64)
+    if (
+        axis.shape != (3,) or target_rotation.shape != (3, 3)
+        or region_size.shape != (3,) or axis_norm <= 1e-8
+        or not np.isfinite(axis).all() or not np.isfinite(target_rotation).all()
+        or not np.isfinite(region_size).all() or np.any(region_size[:2] <= 0.0)
+    ):
+        raise ValueError("native_In_orientation_search_requires_valid_region_and_target_geometry")
+    axis /= axis_norm
+    rows = []
+    for angle_degrees in range(-180, 180, 5):
+        angle_radians = np.deg2rad(float(angle_degrees))
+        rotation = Rotation.from_rotvec(axis * angle_radians).as_matrix() @ target_rotation
+        lower, upper = _placement_collision_bounds_in_region(
+            target_context, region_rotation, rotation,
+        )
+        half_extent = 0.5 * (upper[:2] - lower[:2])
+        center_offset = 0.5 * (upper[:2] + lower[:2])
+        overflow = np.maximum(half_extent - region_size[:2], 0.0) / region_size[:2]
+        root_center_overflow = np.maximum(np.abs(center_offset) - region_size[:2], 0.0) / region_size[:2]
+        utilization = half_extent / region_size[:2]
+        fit_cost = float(
+            np.dot(utilization, utilization)
+            + 4.0 * np.dot(overflow, overflow)
+            + np.dot(root_center_overflow, root_center_overflow)
+        )
+        rows.append({
+            "rotation_world": rotation,
+            "yaw_delta_degrees": float(angle_degrees),
+            "collision_bounds_region_m": [lower.tolist(), upper.tolist()],
+            "footprint_half_extents_region_m": half_extent.tolist(),
+            "geometry_center_offset_region_m": center_offset.tolist(),
+            "fit_cost": fit_cost,
+        })
+    rows.sort(key=lambda row: (row["fit_cost"], abs(row["yaw_delta_degrees"]), row["yaw_delta_degrees"]))
+    selected = []
+    for row in rows:
+        angle = float(row["yaw_delta_degrees"])
+        if any(
+            abs((angle - float(prior["yaw_delta_degrees"]) + 180.0) % 360.0 - 180.0) < 120.0
+            for prior in selected
+        ):
+            continue
+        selected.append(row)
+        if len(selected) >= maximum_candidates:
+            break
+    if not selected:
+        raise ValueError("native_In_orientation_search_produced_no_yaw_candidates")
+    return selected
+
+
 def _placement_shape_signature(context: dict[str, Any]) -> tuple[tuple[float, ...], ...]:
     """Orientation-independent signature for recognizing matching compiled objects."""
     rows = []
@@ -1470,6 +1861,31 @@ def _native_region_entry_offset_m(predicate: list[str]) -> float:
     return 0.06
 
 
+def _native_region_local_z_for_world_height(
+    region: dict[str, Any], local_xy: np.ndarray, world_z: float,
+) -> float:
+    """Solve the region-local z coordinate that places a point at world height z."""
+    region_position = np.asarray(region.get("site_position_world_m"), dtype=np.float64)
+    region_rotation = np.asarray(region.get("site_rotation_world"), dtype=np.float64)
+    local_xy = np.asarray(local_xy, dtype=np.float64)
+    if (
+        region_position.shape != (3,) or region_rotation.shape != (3, 3)
+        or local_xy.shape != (2,) or not np.isfinite(region_position).all()
+        or not np.isfinite(region_rotation).all() or not np.isfinite(local_xy).all()
+        or not np.isfinite(world_z)
+    ):
+        raise ValueError("native_region_world_height_requires_valid_region_and_local_xy")
+    vertical_axis_projection = float(region_rotation[2, 2])
+    if abs(vertical_axis_projection) < 1e-5:
+        raise ValueError("native_region_progress_requires_region_z_axis_with_world_vertical_component")
+    return float(
+        (float(world_z) - region_position[2]
+         - region_rotation[2, 0] * float(local_xy[0])
+         - region_rotation[2, 1] * float(local_xy[1]))
+        / vertical_axis_projection
+    )
+
+
 def _placement_ik_seed_portfolio(robot_state: dict[str, Any]) -> list[list[float]]:
     """Create deterministic redundant-arm IK seeds around the live arm posture."""
     qpos = np.asarray(robot_state.get("joint_qpos"), dtype=np.float64)
@@ -1506,7 +1922,8 @@ def _native_region_progress_route(
     region: dict[str, Any],
     route_variant: str,
     keypose_side_region: np.ndarray | None = None,
-    obstacle_clearance_height_region_m: float | None = None,
+    obstacle_clearance_height_world_m: float | None = None,
+    enable_entry_alignment: bool = False,
 ) -> dict[str, Any]:
     """Build a task-equivalent object-space route from live and native goal poses."""
     from scipy.spatial.transform import Rotation
@@ -1537,9 +1954,9 @@ def _native_region_progress_route(
         max(0.35 * float(np.max(region_size[:2])), 0.20 * horizontal_distance),
         0.045, 0.16,
     ))
-    transit_height = max(float(local_start[2]), float(local_goal[2]) + clearance_delta)
-    if obstacle_clearance_height_region_m is not None:
-        obstacle_height = float(obstacle_clearance_height_region_m)
+    transit_height = max(float(start[2, 3]), float(goal[2, 3]) + clearance_delta)
+    if obstacle_clearance_height_world_m is not None:
+        obstacle_height = float(obstacle_clearance_height_world_m)
         if not np.isfinite(obstacle_height):
             raise ValueError("obstacle_clearance_height_must_be_finite")
         transit_height = max(transit_height, obstacle_height)
@@ -1567,7 +1984,7 @@ def _native_region_progress_route(
         midpoint_local = np.asarray([
             0.5 * (local_start[0] + local_goal[0]) + side[0] * offset,
             0.5 * (local_start[1] + local_goal[1]) + side[1] * offset,
-            transit_height,
+            0.0,
         ])
     else:
         midpoint_local = None
@@ -1575,15 +1992,19 @@ def _native_region_progress_route(
     rotation_start = Rotation.from_matrix(start[:3, :3])
     rotation_delta = (Rotation.from_matrix(goal[:3, :3]) * rotation_start.inv()).as_rotvec()
     points: list[tuple[np.ndarray, str]] = []
-    needs_clearance = transit_height - float(local_start[2]) > 0.012
+    needs_clearance = transit_height - float(start[2, 3]) > 0.012
     combined_side_lift = bool(needs_clearance and midpoint_local is not None)
     if needs_clearance and not combined_side_lift:
         lifted = start.copy()
         lifted[:3, 3] = region_position + rotation @ np.asarray([
-            local_start[0], local_start[1], transit_height,
+            local_start[0], local_start[1],
+            _native_region_local_z_for_world_height(region, local_start[:2], transit_height),
         ])
         points.append((lifted, "adaptive_clearance"))
     if midpoint_local is not None:
+        midpoint_local[2] = _native_region_local_z_for_world_height(
+            region, midpoint_local[:2], transit_height,
+        )
         midpoint = np.eye(4, dtype=np.float64)
         midpoint[:3, :3] = start[:3, :3]
         midpoint[:3, 3] = region_position + rotation @ midpoint_local
@@ -1595,25 +2016,41 @@ def _native_region_progress_route(
 
     transit_start = (midpoint_local if midpoint_local is not None else local_start.copy())
     transit_goal = local_goal.copy()
-    transit_start[2] = transit_height
-    transit_goal[2] = transit_height
+    transit_start[2] = _native_region_local_z_for_world_height(
+        region, transit_start[:2], transit_height,
+    )
+    transit_goal[2] = _native_region_local_z_for_world_height(
+        region, transit_goal[:2], transit_height,
+    )
     transit_distance = float(np.linalg.norm(transit_goal[:2] - transit_start[:2]))
     segment_count = max(1, int(np.ceil(transit_distance / 0.045)))
     for index in range(1, segment_count + 1):
         fraction = index / segment_count
         local = transit_start + fraction * (transit_goal - transit_start)
+        local[2] = _native_region_local_z_for_world_height(region, local[:2], transit_height)
         pose = np.eye(4, dtype=np.float64)
         pose[:3, 3] = region_position + rotation @ local
         pose[:3, :3] = (
             Rotation.from_rotvec(rotation_delta * fraction) * rotation_start
         ).as_matrix()
         points.append((pose, "region_progress"))
+    if enable_entry_alignment:
+        entry = goal.copy()
+        entry_local = local_goal.copy()
+        entry_local[2] = _native_region_local_z_for_world_height(
+            region, entry_local[:2], transit_height,
+        )
+        entry[:3, 3] = region_position + region_rotation @ entry_local
+        points.append((entry, "native_region_entry_alignment"))
     final = goal.copy()
     points.append((final, "native_region_placement"))
     deduplicated: list[dict[str, Any]] = []
     previous = start
     for pose, role in points:
-        if float(np.linalg.norm(pose[:3, 3] - previous[:3, 3])) < 0.006 and role != "native_region_placement":
+        if (
+            float(np.linalg.norm(pose[:3, 3] - previous[:3, 3])) < 0.006
+            and role not in {"native_region_placement", "native_region_entry_alignment"}
+        ):
             continue
         deduplicated.append({"object_pose_world": pose.tolist(), "role": role})
         previous = pose
@@ -1624,9 +2061,9 @@ def _native_region_progress_route(
         "goal_region_local_m": local_goal.tolist(),
         "goal_object_world": goal.tolist(),
         "horizontal_goal_distance_m": horizontal_distance,
-        "adaptive_transit_height_region_m": transit_height,
+        "adaptive_transit_height_world_m": transit_height,
         "adaptive_clearance_delta_m": clearance_delta,
-        "obstacle_clearance_height_region_m": obstacle_clearance_height_region_m,
+        "obstacle_clearance_height_world_m": obstacle_clearance_height_world_m,
         "keypose_side_reference_region": (
             np.asarray(keypose_side_region, dtype=np.float64).tolist()
             if keypose_side_region is not None else None
@@ -1634,6 +2071,24 @@ def _native_region_progress_route(
         "no_fixed_preplace_pose": True,
         "waypoint_frame": "target_object_world_pose_retargeted_from_live_object_to_EEF_transform",
     }
+
+
+def _native_region_progress_tracking_tolerances(
+    role: str,
+    distance_to_goal_m: float | None,
+    *,
+    native_goal_operator: str | None = None,
+) -> tuple[float, float]:
+    """Tighten the final high-clearance alignment before entering a container."""
+    if (
+        str(native_goal_operator or "").lower() == "in"
+        and role == "region_progress"
+        and distance_to_goal_m is not None
+        and np.isfinite(distance_to_goal_m)
+        and distance_to_goal_m <= 0.11
+    ):
+        return 0.006, 0.05
+    return 0.015, 0.12
 
 
 def _native_region_corridor_obstacle_clearance(
@@ -1723,14 +2178,6 @@ def _native_region_corridor_obstacle_clearance(
         maximum_obstacle_top + float(clearance_margin_m) - lowest_target_offset
         if np.isfinite(maximum_obstacle_top) else None
     )
-    required_region_height = None
-    if required_root_height_world is not None:
-        support_point_world = np.asarray([
-            region_position[0], region_position[1], required_root_height_world,
-        ], dtype=np.float64)
-        required_region_height = float(
-            (region_rotation.T @ (support_point_world - region_position))[2]
-        )
     return {
         "status": "complete",
         "geometry_source": "active_compiled_MuJoCo_object_and_fixture_collision_envelopes",
@@ -1744,7 +2191,7 @@ def _native_region_corridor_obstacle_clearance(
             maximum_obstacle_top if np.isfinite(maximum_obstacle_top) else None
         ),
         "required_carried_object_root_height_world_m": required_root_height_world,
-        "required_transit_height_region_m": required_region_height,
+        "required_transit_height_world_m": required_root_height_world,
         "safety_certified": False,
     }
 
@@ -1792,19 +2239,41 @@ def _generate_native_region_placement_candidates(
         matching_rotation = np.asarray(matching_pose.get("rotation"), dtype=np.float64)
         if matching_rotation.shape == (3, 3) and np.isfinite(matching_rotation).all():
             target_rotation = matching_rotation
-    target_radius = _placement_footprint_radius(target_context, region_rotation, target_rotation)
-    target_bottom = _placement_lowest_geometry_offset(target_context, region_rotation, target_rotation)
     verb = predicate[0].lower()
-    support_z = (
-        region_position[2] + region_size[2]
-        if verb == "on" else region_position[2] - region_size[2]
-    )
+    support_z = region_position[2] + region_size[2] if verb == "on" else region_position[2] - region_size[2]
     support_local_z = float((region_rotation.T @ (np.asarray([region_position[0], region_position[1], support_z]) - region_position))[2])
-    root_local_z = support_local_z - target_bottom
+    if verb == "in":
+        # Containment checks the object's body position against the native site
+        # box. For inverted site Z frames, the physical floor is at +local-Z;
+        # keep the root inside that boundary while placing collision geometry
+        # against the gravity-facing side when possible.
+        region_z_world_up = float(region_rotation[2, 2])
+        if abs(region_z_world_up) > 0.5:
+            support_local_z = -float(np.sign(region_z_world_up)) * float(region_size[2])
+        else:
+            support_local_z = 0.0
+    orientation_rows = (
+        _native_in_region_orientation_candidates(
+            target_context=target_context,
+            region_rotation=region_rotation,
+            target_rotation=target_rotation,
+            region_size=region_size,
+            maximum_candidates=min(maximum_candidates, 4),
+        )
+        if verb == "in" else [{
+            "rotation_world": target_rotation,
+            "yaw_delta_degrees": 0.0,
+            "collision_bounds_region_m": [None, None],
+            "footprint_half_extents_region_m": None,
+            "geometry_center_offset_region_m": [0.0, 0.0],
+            "fit_cost": 0.0,
+        }]
+    )
     matching_heights: list[float] = []
     if verb == "on":
         # Reuse a physically settled same-region height when available (for
         # example, the first member of a multi-object On goal).
+        target_radius = _placement_footprint_radius(target_context, region_rotation, target_rotation)
         for context in occupied_contexts:
             pose = context.get("target_root_pose_world", {})
             position = np.asarray(pose.get("position_m"), dtype=np.float64)
@@ -1812,8 +2281,7 @@ def _generate_native_region_placement_candidates(
                 occupied_radius = _placement_footprint_radius(context, region_rotation)
                 if abs(occupied_radius - target_radius) <= max(0.015, 0.30 * target_radius):
                     matching_heights.append(float((region_rotation.T @ (position - region_position))[2]))
-        if matching_heights:
-            root_local_z = float(np.median(matching_heights))
+    matching_height = float(np.median(matching_heights)) if matching_heights and verb == "on" else None
 
     target_half = np.minimum(region_size[:2] * 0.78, region_size[:2] - 1e-4)
     sample_x = np.linspace(-target_half[0], target_half[0], 5)
@@ -1832,50 +2300,107 @@ def _generate_native_region_placement_candidates(
 
     current_local = region_rotation.T @ (target_root - region_position)
     rows = []
-    for offset in sorted(offsets, key=lambda value: (value[0], value[1])):
-        local_xy = np.asarray(offset, dtype=np.float64)
-        position = region_position + region_rotation @ np.asarray([local_xy[0], local_xy[1], root_local_z])
-        clearances = [
-            float(np.linalg.norm(local_xy - other_xy) - target_radius - other_radius)
-            for other_xy, other_radius, _ in occupied
-        ]
-        limiting_clearance = min(clearances, default=float("inf"))
-        # Prefer more room from already completed objects, then the shortest
-        # physical transfer from the actual held-object pose.
-        travel = float(np.linalg.norm(position - target_root))
-        support_centering_penalty = (
-            2.0 * float(np.linalg.norm(local_xy))
-            if region.get("support_geometry_kind") == "compiled_object_collision_envelope"
-            else 0.0
+    for orientation in orientation_rows:
+        candidate_rotation = np.asarray(orientation["rotation_world"], dtype=np.float64)
+        target_radius = _placement_footprint_radius(
+            target_context, region_rotation, candidate_rotation,
         )
-        clearance_score = limiting_clearance if np.isfinite(limiting_clearance) else 0.0
-        score = clearance_score - 0.15 * travel - support_centering_penalty
-        if occupied:
-            nearest = min(occupied, key=lambda row: float(np.linalg.norm(local_xy - row[0])))
-            away_local = local_xy - nearest[0]
+        target_bottom = _placement_lowest_geometry_offset(
+            target_context, region_rotation, candidate_rotation,
+        )
+        bounds = orientation["collision_bounds_region_m"]
+        if verb == "in":
+            collision_lower = np.asarray(bounds[0], dtype=np.float64)
+            collision_upper = np.asarray(bounds[1], dtype=np.float64)
+            centered_root_xy = -0.5 * (collision_lower[:2] + collision_upper[:2])
+            orientation_fit_cost = float(orientation["fit_cost"])
+            layout_offsets = set(offsets)
+            layout_offsets.add((float(centered_root_xy[0]), float(centered_root_xy[1])))
+            if abs(region_z_world_up) > 0.5:
+                support_geometry_offset = (
+                    float(collision_upper[2]) if support_local_z > 0.0
+                    else float(collision_lower[2])
+                )
+                support_root_local_z = support_local_z - support_geometry_offset
+                region_interior_margin = min(0.005, 0.15 * float(region_size[2]))
+                root_local_z = float(np.clip(
+                    support_root_local_z,
+                    -float(region_size[2]) + region_interior_margin,
+                    float(region_size[2]) - region_interior_margin,
+                ))
+            else:
+                root_local_z = 0.0
         else:
-            away_local = local_xy - current_local[:2]
-        norm = float(np.linalg.norm(away_local))
-        if norm <= 1e-8:
-            away_local = np.asarray([0.0, 1.0])
-        else:
-            away_local = away_local / norm
-        entry = region_rotation @ np.asarray([away_local[0], away_local[1], 0.0])
-        rows.append({
-            "candidate_id": f"region_layout_{len(rows):02d}",
-            "predicate": list(predicate),
-            "position_world_m": position.tolist(),
-            "rotation_world": target_rotation.tolist(),
-            "region_local_xy_m": local_xy.tolist(),
-            "entry_direction_world": entry.tolist(),
-            "estimated_completed_object_clearance_m": limiting_clearance if np.isfinite(limiting_clearance) else None,
-            "support_centering_penalty_m": support_centering_penalty,
-            "travel_distance_m": travel,
-            "ranking_score": score,
-            "root_height_source": "settled_same_region_object" if matching_heights and verb == "on" else "compiled_collision_geometry_support_extent",
-            "orientation_source": "compatible_completed_object_pose" if verb == "on" and matching_occupants else "current_object_pose",
-            "geometry_candidate_only_not_safety_certified": True,
-        })
+            collision_lower = collision_upper = np.zeros(3, dtype=np.float64)
+            centered_root_xy = np.zeros(2, dtype=np.float64)
+            orientation_fit_cost = 0.0
+            layout_offsets = offsets
+            root_local_z = support_local_z - target_bottom
+            if matching_height is not None:
+                root_local_z = matching_height
+        for offset in sorted(layout_offsets, key=lambda value: (value[0], value[1])):
+            local_xy = np.asarray(offset, dtype=np.float64)
+            position = region_position + region_rotation @ np.asarray([local_xy[0], local_xy[1], root_local_z])
+            clearances = [
+                float(np.linalg.norm(local_xy - other_xy) - target_radius - other_radius)
+                for other_xy, other_radius, _ in occupied
+            ]
+            limiting_clearance = min(clearances, default=float("inf"))
+            # Prefer room from completed objects, a collision-envelope fit for
+            # In goals, and then the shortest physical transfer from the live pose.
+            travel = float(np.linalg.norm(position - target_root))
+            support_centering_penalty = (
+                2.0 * float(np.linalg.norm(local_xy))
+                if region.get("support_geometry_kind") == "compiled_object_collision_envelope"
+                else 0.0
+            )
+            clearance_score = limiting_clearance if np.isfinite(limiting_clearance) else 0.0
+            envelope_center_error = float(np.linalg.norm(local_xy - centered_root_xy)) if verb == "in" else 0.0
+            fit_penalty = 10.0 * orientation_fit_cost
+            if verb == "in":
+                translated_lower = collision_lower[:2] + local_xy
+                translated_upper = collision_upper[:2] + local_xy
+                outside = (
+                    np.maximum(-region_size[:2] - translated_lower, 0.0)
+                    + np.maximum(translated_upper - region_size[:2], 0.0)
+                ) / region_size[:2]
+                fit_penalty += 10.0 * float(np.dot(outside, outside))
+            score = clearance_score - 0.15 * travel - support_centering_penalty
+            if verb == "in":
+                score -= fit_penalty + 2.0 * envelope_center_error
+            if occupied:
+                nearest = min(occupied, key=lambda row: float(np.linalg.norm(local_xy - row[0])))
+                away_local = local_xy - nearest[0]
+            else:
+                away_local = local_xy - current_local[:2]
+            norm = float(np.linalg.norm(away_local))
+            if norm <= 1e-8:
+                away_local = np.asarray([0.0, 1.0])
+            else:
+                away_local = away_local / norm
+            entry = region_rotation @ np.asarray([away_local[0], away_local[1], 0.0])
+            rows.append({
+                "candidate_id": f"region_layout_{len(rows):02d}",
+                "predicate": list(predicate),
+                "position_world_m": position.tolist(),
+                "rotation_world": candidate_rotation.tolist(),
+                "region_local_xy_m": local_xy.tolist(),
+                "entry_direction_world": entry.tolist(),
+                "estimated_completed_object_clearance_m": limiting_clearance if np.isfinite(limiting_clearance) else None,
+                "support_centering_penalty_m": support_centering_penalty,
+                "travel_distance_m": travel,
+                "ranking_score": score,
+                "root_height_source": "settled_same_region_object" if matching_heights and verb == "on" else "compiled_collision_geometry_support_extent",
+                "orientation_source": (
+                    "region_collision_envelope_fit_yaw_search" if verb == "in"
+                    else "compatible_completed_object_pose" if verb == "on" and matching_occupants
+                    else "current_object_pose"
+                ),
+                "orientation_yaw_delta_degrees": orientation["yaw_delta_degrees"],
+                "footprint_half_extents_region_m": orientation["footprint_half_extents_region_m"],
+                "estimated_region_fit_cost": orientation_fit_cost,
+                "geometry_candidate_only_not_safety_certified": True,
+            })
     rows.sort(key=lambda row: (-float(row["ranking_score"]), float(row["travel_distance_m"]), row["candidate_id"]))
     selected = rows[:maximum_candidates]
     # Placement layouts and their entrances form one bounded search portfolio.
@@ -2010,10 +2535,14 @@ def _run_articulated_fixture_goal(
     articulation_context: dict[str, Any],
     controller_fields: dict[str, Any],
     output_dir: Path,
+    model_sha: str,
+    rrt_time_budget_s: float = NATIVE_PLACEMENT_RRT_BUDGET_S,
 ) -> dict[str, Any]:
     """Physically push a native articulated fixture goal through OSC_POSE."""
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _advance_pose,
+        _snapshot_state_vector,
+        _state_sha,
         _write_recording,
     )
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
@@ -2028,27 +2557,602 @@ def _run_articulated_fixture_goal(
     frames: list[dict[str, Any]] = []
     monitor = GraspStabilityMonitor(required_samples=3)
     observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+    start_state_sha = _state_sha(_snapshot_state_vector(observed.get("snapshot_state", {})))
     current = observed["snapshot_state"]["robot_states"][0]
-    quaternion = np.asarray(current["eef_quat"], dtype=np.float64)
+    joint = articulation_context.get("joint", {})
+    joint_type = str(joint.get("joint_type", "")).lower()
+    quaternion = (
+        _articulated_fixture_slide_grasp_quaternion(outward)
+        if joint_type == "slide"
+        else _articulated_fixture_press_quaternion(
+            np.asarray(current["eef_quat"], dtype=np.float64), outward,
+        )
+    )
     _advance_pose.controller_fields = controller_fields
     counter = [0]
-    precontact = path[0] + outward * 0.075
-    contact_offset = outward * 0.035
-    waypoints = [precontact, path[0] + contact_offset]
-    waypoints.extend(point + contact_offset for point in path[1:])
-    for waypoint in waypoints:
-        _advance_pose(
-            bridge, waypoint, quaternion, f"articulated_fixture_{predicate[0].lower()}",
-            f"native_{predicate[0].lower()}_{predicate[1]}", counter,
-            max(1, 128 - counter[0]), target_binding, instruction, policy,
-            monitor, records, frames,
+    contact_state: dict[str, Any] = {
+        "active": False,
+        "last_action_has_fixture_contact": False,
+        "first_action_index": None,
+        "contact_pairs": [],
+        "latest_context": articulation_context,
+        "anchor_eef_position_world_m": None,
+        "anchor_eef_quaternion_wxyz": None,
+        "anchor_joint_position": None,
+        "anchor_joint_axis_world": None,
+        "anchor_joint_origin_world_m": None,
+        "follow_chunks": [],
+        "switch_bilateral_contact_observed": False,
+        "switch_gripper_close_commanded": False,
+        "fixture_gripper_close_commanded": False,
+    }
+    contact_phase_start_action: int | None = None
+    precontact = path[0] + outward * (
+        ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M if joint_type == "slide"
+        else ARTICULATED_FIXTURE_PRECONTACT_APPROACH_DISTANCE_M
+    )
+    if joint_type == "slide":
+        precontact = precontact + np.asarray(
+            [0.0, 0.0, ARTICULATED_FIXTURE_SLIDE_PRECONTACT_HEIGHT_M], dtype=np.float64,
         )
+        slide_clearance_waypoints = list(
+            _articulated_fixture_slide_approach_waypoints(path[0], outward)
+        )
+        slide_clearance_phase_names = [
+            "slide_clearance_descent_outside_cabinet",
+            "slide_under_top_inward_approach",
+            "slide_handle_height_alignment",
+        ]
+        contact_offset = outward * ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M
+        contact_height_offset = np.asarray(
+            [0.0, 0.0, ARTICULATED_FIXTURE_SLIDE_HANDLE_EEF_HEIGHT_OFFSET_M],
+            dtype=np.float64,
+        )
+    else:
+        slide_clearance_waypoints = []
+        slide_clearance_phase_names = []
+        contact_offset = outward * 0.035
+        contact_height_offset = np.zeros(3, dtype=np.float64)
+    contact_waypoints = [
+        point + contact_offset + contact_height_offset for point in path
+    ]
+    failure_reason = None
+    failed_waypoint_index = None
+    route_tracking: dict[str, Any] = {
+        "status": "not_started",
+        "live_state_unchanged": None,
+        "route_source": None,
+        "fixture_target_clearance_m": ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M,
+        "approach_waypoints_world_m": [
+            precontact.tolist(),
+            *[point.tolist() for point in slide_clearance_waypoints],
+        ],
+        "plan_goal_role": (
+            "full_geometry_high_front_on_precontact_then_enter_below_cabinet_top_for_slide_handle_contact"
+            if joint_type == "slide"
+            else "full_geometry_low_precontact_before_fixture_contact"
+        ),
+        "press_orientation_quaternion_wxyz": quaternion.tolist(),
+        "press_orientation_tool_axis_world": None,
+        "press_orientation_finger_closing_axis_world": None,
+        "raw_pose_count": 0,
+        "tracked_pose_count": 0,
+        "eef_reference_poses_world": [],
+    }
+
+    def record_articulation_feedback(record, _frame):
+        nonlocal contact_phase_start_action
+        feedback = bridge.request({
+            "op": "task_success_first_articulation_context",
+            "expected_instruction": instruction,
+            "predicate": predicate,
+        })
+        if isinstance(feedback, dict) and feedback.get("status") == "complete":
+            contact_state["latest_context"] = feedback
+        contact_pairs = _articulated_fixture_robot_contact_pairs(
+            record, str(articulation_context.get("fixture_id_from_active_BDDL", "")),
+            list(feedback.get("articulated_moving_collision_geom_names", []))
+            if isinstance(feedback, dict) else None,
+        )
+        current_joint = feedback.get("joint", {}) if isinstance(feedback, dict) else {}
+        if contact_pairs:
+            if not contact_state["active"]:
+                contact_state["first_action_index"] = counter[0]
+                contact_phase_start_action = counter[0]
+                robot = record.get("snapshot_state", {}).get("robot_states", [{}])[0]
+                contact_state["anchor_eef_position_world_m"] = robot.get("eef_pos")
+                contact_state["anchor_eef_quaternion_wxyz"] = robot.get("eef_quat")
+                contact_state["anchor_joint_position"] = current_joint.get("position")
+                contact_state["anchor_joint_axis_world"] = feedback.get("joint_axis_world")
+                contact_state["anchor_joint_origin_world_m"] = feedback.get("joint_origin_world_m")
+            contact_state["active"] = True
+            contact_state["contact_pairs"] = contact_pairs
+        contact_state["last_action_has_fixture_contact"] = bool(contact_pairs)
+        contacting_fingers = {
+            pair.get("robot_geom", "") for pair in contact_pairs
+            if "finger1" in pair.get("robot_geom", "")
+            or "finger2" in pair.get("robot_geom", "")
+        }
+        finger_sides = {
+            "finger1" if "finger1" in name else "finger2"
+            for name in contacting_fingers
+        }
+        if {"finger1", "finger2"}.issubset(finger_sides):
+            contact_state["switch_bilateral_contact_observed"] = True
+        record["articulation_tracking"] = {
+            "joint_name": current_joint.get("joint_name", joint.get("joint_name")),
+            "joint_position_after": current_joint.get("position"),
+            "joint_target_position": current_joint.get("target_position", joint.get("target_position")),
+            "native_goal_value_after": feedback.get("native_goal_value") if isinstance(feedback, dict) else None,
+            "joint_axis_world": feedback.get("joint_axis_world") if isinstance(feedback, dict) else None,
+            "joint_origin_world_m": feedback.get("joint_origin_world_m") if isinstance(feedback, dict) else None,
+            "robot_fixture_contact": bool(contact_pairs),
+            "robot_fixture_contact_pairs": contact_pairs,
+            "contact_anchor_eef_position_world_m": contact_state.get("anchor_eef_position_world_m"),
+            "contact_anchor_joint_position": contact_state.get("anchor_joint_position"),
+            "fixture_follow_lead": record.get("planning_tracking", {}).get("fixture_follow_lead"),
+            "eef_target_position_world_m": record.get("planning_tracking", {}).get(
+                "active_subgoal_eef_pose_world", [None, None, None],
+            )[:3],
+        }
+
+    # Plan the complete route to the slide-specific elevated top-down approach
+    # or the established low precontact pose used for hinged fixtures.
+    goal_pose = {
+        "position_world_m": precontact.tolist(),
+        "quaternion_wxyz": quaternion.tolist(),
+    }
+    planner_config = _keypose_rrt_planner_config(
+        seed=74139,
+        search_time_budget_s=float(rrt_time_budget_s),
+        maximum_iterations=1200,
+        maximum_config_checks=12000,
+    )
+    # This route is executed directly around movable scene geometry. Require
+    # every sampled configuration to pass the active per-object policy before
+    # allowing OSC to follow it. This is a route feasibility gate, not a safety
+    # certification of the resulting physical episode.
+    planner_config["require_safe_configurations"] = True
+    planner_config["minimum_clearance_m"] = 0.0
+    route_policy = _articulated_fixture_rrt_policy(
+        policy, str(articulation_context.get("fixture_id_from_active_BDDL")),
+    )
+    route_forbidden_thresholds = [
+        float(item.get("minimum_clearance_m", 0.0))
+        for item in route_policy.get("forbidden_objects", [])
+        if isinstance(item, dict)
+    ]
+    reported_clearance_threshold_m = min(route_forbidden_thresholds, default=0.0)
+    from scipy.spatial.transform import Rotation
+
+    press_rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]])
+    route_tracking["press_orientation_tool_axis_world"] = (
+        press_rotation.as_matrix()[:, 2].tolist()
+    )
+    route_tracking["press_orientation_finger_closing_axis_world"] = (
+        press_rotation.as_matrix()[:, 0].tolist()
+    )
+    try:
+        planned = bridge.request({
+            "op": "task_success_first_rrt",
+            "expected_instruction": instruction,
+            "model_geometry_sha256": model_sha,
+            "start_state_sha256": start_state_sha,
+            "goal_pose_world": goal_pose,
+            "safety_geometry_policy": route_policy,
+            "planner_config": planner_config,
+            "ik_seed_qpos": _placement_ik_seed_portfolio(current),
+        })
+        after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
+        after_plan_sha = _state_sha(_snapshot_state_vector(after_plan.get("snapshot_state", {})))
+        unchanged = after_plan_sha == start_state_sha
+        route_tracking.update({
+            "status": planned.get("status"),
+            "failure_reason": planned.get("failure_reason"),
+            "live_state_unchanged": unchanged,
+            "reported_live_state_unchanged": planned.get("live_state_unchanged"),
+            "planner_source": planned.get("planner_source"),
+            "planning_seconds": planned.get("planning_seconds"),
+            "config_checks": planned.get("config_checks"),
+            "goal_ik_configuration_checks": planned.get("goal_ik_configuration_checks"),
+            "selected_ik_seed_index": planned.get("selected_ik_seed_index"),
+            "ik_candidates": planned.get("ik_candidates", []),
+            "route_candidates": planned.get("route_candidates", []),
+            "minimum_forbidden_clearance_m": planned.get(
+                "minimum_forbidden_clearance_m"
+            ),
+            "minimum_forbidden_clearance_required_m": reported_clearance_threshold_m,
+            "require_safe_configurations": planned.get("require_safe_configurations"),
+            "planner_minimum_clearance_m": planned.get("planner_minimum_clearance_m"),
+            "start_state_sha256": start_state_sha,
+            "goal_pose_world": goal_pose,
+        })
+        if not unchanged:
+            raise RuntimeError("articulated_fixture_RRT_changed_live_integration_state")
+        if planned.get("status") != "offline_feasible" or planned.get("live_state_unchanged") is not True:
+            raise RuntimeError(
+                "articulated_fixture_precontact_RRT_not_feasible:"
+                f"{planned.get('status')}:{planned.get('failure_reason')}"
+            )
+        if planned.get("require_safe_configurations") is not True:
+            raise RuntimeError("articulated_fixture_precontact_RRT_safe_configuration_gate_not_applied")
+        minimum_forbidden_clearance = planned.get("minimum_forbidden_clearance_m")
+        if (
+            isinstance(minimum_forbidden_clearance, bool)
+            or not isinstance(minimum_forbidden_clearance, (int, float))
+            or not np.isfinite(float(minimum_forbidden_clearance))
+            or float(minimum_forbidden_clearance) < reported_clearance_threshold_m
+        ):
+            raise RuntimeError(
+                "articulated_fixture_precontact_RRT_forbidden_clearance_below_policy:"
+                f"{minimum_forbidden_clearance}:{reported_clearance_threshold_m}"
+            )
+        planned_route = planned.get("eef_reference_poses_world")
+        raw_route = np.asarray(planned_route, dtype=np.float64)
+        if raw_route.ndim != 2 or raw_route.shape[1:] != (7,) or len(raw_route) < 2 or not np.isfinite(raw_route).all():
+            raise RuntimeError("articulated_fixture_precontact_RRT_returned_invalid_EEF_path")
+        raw_qpos_path = np.asarray(planned.get("qpos_path"), dtype=np.float64)
+        if (
+            raw_qpos_path.ndim != 2
+            or raw_qpos_path.shape[1:] != (7,)
+            or len(raw_qpos_path) != len(raw_route)
+            or not np.isfinite(raw_qpos_path).all()
+        ):
+            raise RuntimeError("articulated_fixture_precontact_RRT_returned_invalid_qpos_path")
+        route, route_raw_indices = _thin_articulated_fixture_rrt_route(raw_route, stride=2)
+        route_tracking.update({
+            "raw_pose_count": int(len(raw_route)),
+            "tracked_pose_count": int(len(route)),
+            "route_sampling_stride": 2,
+            "tracked_pose_raw_indices": route_raw_indices,
+            "qpos_path_rad": raw_qpos_path.tolist(),
+            "eef_reference_poses_world": route.tolist(),
+            "route_source": "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC",
+        })
+        precontact_waypoints = route[1:]
+    except Exception as exc:
+        failure_reason = f"{type(exc).__name__}: {exc}"
+        failed_waypoint_index = -1
+        precontact_waypoints = []
+
+    approach_route_waypoint_count = len(precontact_waypoints) + len(slide_clearance_waypoints)
+    waypoints = [*precontact_waypoints, *slide_clearance_waypoints, *contact_waypoints]
+    for waypoint_index, waypoint in enumerate(waypoints):
+        if failure_reason is not None:
+            break
+        if contact_state["active"]:
+            route_tracking["contact_transition"] = {
+                "first_contact_action_index": contact_state["first_action_index"],
+                "route_waypoint_index": waypoint_index,
+                "contact_pairs": contact_state["contact_pairs"],
+                "joint_position_at_transition": contact_state["latest_context"].get("joint", {}).get("position"),
+            }
+            break
+        is_rrt_waypoint = waypoint_index < len(precontact_waypoints)
+        is_slide_clearance_waypoint = (
+            len(precontact_waypoints) <= waypoint_index < approach_route_waypoint_count
+        )
+        is_approach_waypoint = waypoint_index < approach_route_waypoint_count
+        if not is_approach_waypoint and contact_phase_start_action is None:
+            contact_phase_start_action = counter[0]
+        if is_rrt_waypoint:
+            waypoint_phase = "RRT_low_precontact"
+            eef_outward_offset_m = None
+            contact_point_index = 0
+        elif is_slide_clearance_waypoint:
+            clearance_waypoint_index = waypoint_index - len(precontact_waypoints)
+            waypoint_phase = slide_clearance_phase_names[clearance_waypoint_index]
+            eef_outward_offset_m = (
+                ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M
+                if clearance_waypoint_index == 0
+                else ARTICULATED_FIXTURE_SLIDE_HANDLE_APPROACH_OUTWARD_M
+            )
+            contact_point_index = 0
+        else:
+            waypoint_phase = "fixture_contact"
+            eef_outward_offset_m = (
+                ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M
+                if joint_type == "slide" else 0.035
+            )
+            contact_point_index = waypoint_index - approach_route_waypoint_count
+        target_position = np.asarray(waypoint[:3] if is_rrt_waypoint else waypoint, dtype=np.float64)
+        target_quaternion = (
+            np.asarray(waypoint[3:], dtype=np.float64) if is_rrt_waypoint else quaternion
+        )
+        distance_to_articulation_path = float(np.min(np.linalg.norm(path - target_position, axis=1)))
+        position_tolerance_m = (
+            ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M
+            if is_rrt_waypoint
+            and distance_to_articulation_path <= ARTICULATED_FIXTURE_CONTACT_TRACKING_REGION_M
+            else ARTICULATED_FIXTURE_ROUTE_POSITION_TOLERANCE_M
+        )
+        tracking = {
+            "tracking_mode": (
+                "collision_aware_RRT_high_front_on_slide_precontact_then_under_top_handle_entry_OSC"
+                if joint_type == "slide"
+                else "collision_aware_RRT_low_precontact_then_outward_fixture_approach_OSC"
+            ),
+            "native_goal_predicate": list(predicate),
+            "fixture_id": articulation_context.get("fixture_id_from_active_BDDL"),
+            "joint_name": joint.get("joint_name"),
+            "joint_position_at_plan_start": joint.get("position"),
+            "joint_target_position": joint.get("target_position"),
+            "waypoint_index": waypoint_index,
+            "waypoint_count": len(waypoints),
+            "waypoint_phase": waypoint_phase,
+            "contact_point_world_m": path[min(max(contact_point_index, 0), len(path) - 1)].tolist(),
+            "outward_direction_world": outward.tolist(),
+            "eef_outward_offset_m": eef_outward_offset_m,
+            "eef_position_tolerance_m": position_tolerance_m,
+        }
+
+        def route_target_provider(_snapshot_state):
+            if not contact_state["active"]:
+                return target_position, target_quaternion
+            feedback = contact_state["latest_context"]
+            anchored_feedback = {
+                **feedback,
+                "joint_axis_world": contact_state["anchor_joint_axis_world"],
+                "joint_origin_world_m": contact_state["anchor_joint_origin_world_m"],
+            }
+            target = _articulated_fixture_follow_pose(
+                np.asarray(contact_state["anchor_eef_position_world_m"], dtype=np.float64),
+                np.asarray(contact_state["anchor_eef_quaternion_wxyz"], dtype=np.float64),
+                anchored_feedback,
+                joint_position_at_anchor=float(contact_state["anchor_joint_position"]),
+                allow_terminal_stop_follow=(str(predicate[0]).lower() == "turnoff"),
+            )
+            tracking["tracking_mode"] = "live_articulated_fixture_follow_after_contact"
+            tracking["fixture_joint_position_at_feedback"] = (
+                feedback.get("joint", {}).get("position")
+            )
+            tracking["fixture_contact_anchor_joint_position"] = contact_state["anchor_joint_position"]
+            return target
+
+        try:
+            remaining_actions = (
+                ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET - counter[0] if is_approach_waypoint
+                else ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET
+                - (counter[0] - int(contact_phase_start_action or 0))
+            )
+            if not is_approach_waypoint:
+                remaining_actions = min(
+                    remaining_actions, ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET - counter[0],
+                )
+            if remaining_actions <= 0:
+                raise TimeoutError("articulated_fixture_control_action_budget_exhausted")
+            reached_waypoint = _advance_pose(
+                bridge, target_position, target_quaternion, f"articulated_fixture_{predicate[0].lower()}",
+                f"native_{predicate[0].lower()}_{predicate[1]}", counter,
+                remaining_actions, target_binding, instruction, policy,
+                monitor, records, frames,
+                stop_condition=lambda: bool(contact_state["active"]),
+                planning_tracking=tracking,
+                step_callback=record_articulation_feedback,
+                position_tolerance_m=position_tolerance_m,
+                target_pose_provider=route_target_provider,
+                absolute_action_limit=ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
+            )
+        except Exception as exc:
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            failed_waypoint_index = waypoint_index
+            break
+        if contact_state["active"]:
+            route_tracking["contact_transition"] = {
+                "first_contact_action_index": contact_state["first_action_index"],
+                "route_waypoint_index": waypoint_index,
+                "contact_pairs": contact_state["contact_pairs"],
+                "joint_position_at_transition": contact_state["latest_context"].get("joint", {}).get("position"),
+                "static_waypoint_reached": bool(reached_waypoint),
+            }
+            break
         native = bridge.request({"op": "native_task_status"})
         if any(row.get("predicate") == predicate and row.get("value") is True
                for row in native.get("native_goal_values", [])):
             break
-        if counter[0] >= 128:
+        if counter[0] >= ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET:
+            failure_reason = "TimeoutError: articulated_fixture_control_action_budget_exhausted"
+            failed_waypoint_index = waypoint_index
             break
+    if (
+        failure_reason is None
+        and contact_state["active"]
+        and contact_state["latest_context"].get("native_goal_value") is not True
+    ):
+        contact_actions_used = counter[0] - int(contact_phase_start_action or counter[0])
+        remaining_contact_actions = min(
+            ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET - contact_actions_used,
+            ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET - counter[0],
+        )
+        if remaining_contact_actions <= 0:
+            failure_reason = "TimeoutError: articulated_fixture_control_action_budget_exhausted"
+        else:
+            last_robot = records[-1]["snapshot_state"]["robot_states"][0]
+            joint_type = str(joint.get("joint_type", "")).lower()
+            follow_lead = {
+                "value": (
+                    ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD
+                    if joint_type == "hinge" else ARTICULATED_FIXTURE_SLIDE_FOLLOW_LEAD_M
+                ),
+                "maximum": (
+                    ARTICULATED_FIXTURE_HINGE_FOLLOW_MAX_LEAD_RAD
+                    if joint_type == "hinge" else 0.009
+                ),
+            }
+            no_joint_progress_chunks = 0
+            dynamic_phase = f"articulated_fixture_{predicate[0].lower()}_live_contact_follow"
+            dynamic_tracking = {
+                "tracking_mode": "live_hinge_or_slide_follow_from_measured_robot_fixture_contact",
+                "native_goal_predicate": list(predicate),
+                "fixture_id": articulation_context.get("fixture_id_from_active_BDDL"),
+                "joint_name": joint.get("joint_name"),
+                "joint_target_position": joint.get("target_position"),
+                "first_contact_action_index": contact_state["first_action_index"],
+                "contact_pairs_at_transition": contact_state["contact_pairs"],
+                "contact_action_budget": remaining_contact_actions,
+                "contact_anchor_joint_position": contact_state["anchor_joint_position"],
+                "contact_anchor_eef_position_world_m": contact_state[
+                    "anchor_eef_position_world_m"
+                ],
+                "gripper_strategy": (
+                    "close_after_measured_fixture_contact_to_create_pinch"
+                    if (
+                        str(predicate[0]).lower() in {"turnon", "turnoff"}
+                        or joint_type == "slide"
+                    )
+                    else "neutral_hold"
+                ),
+                "gripper_action_command": (
+                    ARTICULATED_FIXTURE_SWITCH_TURN_GRIPPER_ACTION
+                    if (
+                        str(predicate[0]).lower() in {"turnon", "turnoff"}
+                        or joint_type == "slide"
+                    )
+                    else 0.0
+                ),
+            }
+            follow_gripper_action = float(dynamic_tracking["gripper_action_command"])
+            contact_state["fixture_gripper_close_commanded"] = follow_gripper_action > 0.5
+            contact_state["switch_gripper_close_commanded"] = (
+                str(predicate[0]).lower() in {"turnon", "turnoff"}
+                and follow_gripper_action > 0.5
+            )
+
+            def live_articulation_target_provider(snapshot_state):
+                feedback = contact_state["latest_context"]
+                current_joint = feedback.get("joint", {})
+                anchored_feedback = {
+                    **feedback,
+                    "joint_axis_world": contact_state["anchor_joint_axis_world"],
+                    "joint_origin_world_m": contact_state["anchor_joint_origin_world_m"],
+                }
+                dynamic_tracking.update({
+                    "fixture_joint_position_at_feedback": current_joint.get("position"),
+                    "fixture_joint_target_position": current_joint.get("target_position"),
+                    "fixture_contact_anchor_joint_position": contact_state["anchor_joint_position"],
+                    "fixture_contact_anchor_eef_position_world_m": contact_state[
+                        "anchor_eef_position_world_m"
+                    ],
+                    "fixture_follow_lead": follow_lead["value"],
+                    "joint_axis_world": contact_state["anchor_joint_axis_world"],
+                    "joint_origin_world_m": contact_state["anchor_joint_origin_world_m"],
+                })
+                return _articulated_fixture_follow_pose(
+                    np.asarray(contact_state["anchor_eef_position_world_m"], dtype=np.float64),
+                    np.asarray(contact_state["anchor_eef_quaternion_wxyz"], dtype=np.float64),
+                    anchored_feedback,
+                    joint_position_at_anchor=float(contact_state["anchor_joint_position"]),
+                    follow_lead=follow_lead["value"],
+                    allow_terminal_stop_follow=(str(predicate[0]).lower() == "turnoff"),
+                )
+
+            while contact_state["latest_context"].get("native_goal_value") is not True:
+                contact_actions_used = counter[0] - int(contact_phase_start_action or counter[0])
+                remaining_contact_actions = min(
+                    ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET - contact_actions_used,
+                    ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET - counter[0],
+                )
+                if remaining_contact_actions <= 0:
+                    failure_reason = (
+                        "TimeoutError: articulated_fixture_live_contact_follow_action_budget_exhausted"
+                    )
+                    break
+                chunk_actions = min(
+                    ARTICULATED_FIXTURE_FOLLOW_ACTION_CHUNK, remaining_contact_actions,
+                )
+                actions_before_chunk = counter[0]
+                joint_before_chunk = float(
+                    contact_state["latest_context"].get("joint", {}).get("position")
+                )
+                dynamic_tracking["fixture_follow_lead"] = follow_lead["value"]
+                dynamic_tracking["follow_chunk_index"] = len(contact_state["follow_chunks"])
+                chunk_timed_out = False
+                try:
+                    _advance_pose(
+                        bridge,
+                        np.asarray(last_robot["eef_pos"], dtype=np.float64),
+                        np.asarray(last_robot["eef_quat"], dtype=np.float64),
+                        dynamic_phase,
+                        f"native_{predicate[0].lower()}_{predicate[1]}",
+                        counter,
+                        chunk_actions,
+                        target_binding,
+                        instruction,
+                        policy,
+                        monitor,
+                        records,
+                        frames,
+                        stop_condition=lambda: (
+                            contact_state["latest_context"].get("native_goal_value") is True
+                        ),
+                        planning_tracking=dynamic_tracking,
+                        step_callback=record_articulation_feedback,
+                        position_tolerance_m=ARTICULATED_FIXTURE_FOLLOW_POSITION_TOLERANCE_M,
+                        target_pose_provider=live_articulation_target_provider,
+                        gripper_action=follow_gripper_action,
+                        absolute_action_limit=ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
+                    )
+                except TimeoutError as exc:
+                    expected_timeout = f"{dynamic_phase}_did_not_reach_pose_within_{chunk_actions}_actions"
+                    if str(exc) != expected_timeout:
+                        failure_reason = f"{type(exc).__name__}: {exc}"
+                        break
+                    chunk_timed_out = True
+                except Exception as exc:
+                    failure_reason = f"{type(exc).__name__}: {exc}"
+                    break
+                actions_in_chunk = counter[0] - actions_before_chunk
+                joint_after_chunk = float(
+                    contact_state["latest_context"].get("joint", {}).get("position")
+                )
+                joint_progress = abs(joint_after_chunk - joint_before_chunk)
+                contact_state["follow_chunks"].append({
+                    "chunk_index": len(contact_state["follow_chunks"]),
+                    "action_count": actions_in_chunk,
+                    "joint_position_before": joint_before_chunk,
+                    "joint_position_after": joint_after_chunk,
+                    "joint_progress_abs": joint_progress,
+                    "follow_lead": follow_lead["value"],
+                    "last_action_has_fixture_contact": contact_state[
+                        "last_action_has_fixture_contact"
+                    ],
+                    "chunk_timed_out_at_lead_pose": chunk_timed_out,
+                })
+                if contact_state["latest_context"].get("native_goal_value") is True:
+                    break
+                if actions_in_chunk == 0:
+                    no_joint_progress_chunks += 1
+                elif joint_progress < 0.003:
+                    no_joint_progress_chunks += 1
+                else:
+                    no_joint_progress_chunks = 0
+                step = 0.015 if joint_type == "hinge" else 0.0015
+                ramp_step = (
+                    ARTICULATED_FIXTURE_HINGE_FOLLOW_RAMP_STEP_RAD
+                    if joint_type == "hinge"
+                    else ARTICULATED_FIXTURE_SLIDE_FOLLOW_RAMP_STEP_M
+                )
+                if contact_state["last_action_has_fixture_contact"]:
+                    if no_joint_progress_chunks and follow_lead["value"] < follow_lead["maximum"]:
+                        follow_lead["value"] = min(
+                            follow_lead["maximum"], follow_lead["value"] + step,
+                        )
+                    elif no_joint_progress_chunks >= 3:
+                        failure_reason = (
+                            "RuntimeError: articulated_fixture_live_follow_joint_progress_stalled"
+                        )
+                        break
+                    elif joint_progress >= 0.003 and follow_lead["value"] < follow_lead["maximum"]:
+                        follow_lead["value"] = min(
+                            follow_lead["maximum"], follow_lead["value"] + ramp_step,
+                        )
+                elif follow_lead["value"] > 0.0:
+                    follow_lead["value"] = max(0.0, follow_lead["value"] - step)
+                elif no_joint_progress_chunks >= 3:
+                    failure_reason = (
+                        "RuntimeError: articulated_fixture_live_follow_joint_progress_stalled"
+                    )
+                    break
     final_native = bridge.request({"op": "native_task_status"})
     articulation_after = bridge.request({
         "op": "task_success_first_articulation_context",
@@ -2064,10 +3168,43 @@ def _run_articulated_fixture_goal(
         (row.get("value") for row in final_native.get("native_goal_values", [])
          if row.get("predicate") == predicate), None
     )
+    failure_reason, termination_reason = _articulated_fixture_terminal_outcome(
+        failure_reason, final_native,
+    )
     return {
         "status": "complete_task_success" if final_native.get("task_success") is True
         else "partial_predicate_completed" if predicate_value is True
         else "articulated_fixture_goal_incomplete",
+        "failure_reason": failure_reason,
+        "termination_reason": termination_reason,
+        "failed_waypoint_index": failed_waypoint_index,
+        "precontact_route": route_tracking,
+        "fixture_contact_tracking": {
+            "active": bool(contact_state["active"]),
+            "last_action_has_fixture_contact": bool(
+                contact_state["last_action_has_fixture_contact"]
+            ),
+            "first_contact_action_index": contact_state["first_action_index"],
+            "contact_pairs": contact_state["contact_pairs"],
+            "switch_gripper_close_commanded": contact_state[
+                "switch_gripper_close_commanded"
+            ],
+            "fixture_gripper_close_commanded": contact_state[
+                "fixture_gripper_close_commanded"
+            ],
+            "switch_bilateral_contact_observed": contact_state[
+                "switch_bilateral_contact_observed"
+            ],
+            "joint_position_after": contact_state["latest_context"].get("joint", {}).get("position"),
+            "joint_target_position": contact_state["latest_context"].get("joint", {}).get("target_position"),
+            "joint_axis_world": contact_state["latest_context"].get("joint_axis_world"),
+            "joint_origin_world_m": contact_state["latest_context"].get("joint_origin_world_m"),
+            "contact_anchor_joint_axis_world": contact_state["anchor_joint_axis_world"],
+            "contact_anchor_joint_origin_world_m": contact_state["anchor_joint_origin_world_m"],
+            "contact_anchor_joint_position": contact_state["anchor_joint_position"],
+            "contact_anchor_eef_position_world_m": contact_state["anchor_eef_position_world_m"],
+            "follow_chunks": contact_state["follow_chunks"],
+        },
         "native_goal_predicate": predicate,
         "native_goal_value": predicate_value,
         "native_task_success": final_native.get("task_success"),
@@ -2568,9 +3705,10 @@ def _native_place_single(
             region=region,
             route_variant=route_variant,
             keypose_side_region=keypose_side_reference_region,
-            obstacle_clearance_height_region_m=(
-                obstacle_clearance.get("required_transit_height_region_m")
+            obstacle_clearance_height_world_m=(
+                obstacle_clearance.get("required_transit_height_world_m")
             ),
+            enable_entry_alignment=predicate[0].lower() == "in",
         )
         region_progress_route["compiled_obstacle_clearance"] = obstacle_clearance
         route_rows = [
@@ -2655,6 +3793,9 @@ def _native_place_single(
             bridge.request({"op": "native_task_status"}),
             predicate=predicate,
             demonstration_horizon=demonstration_horizon,
+            native_region_route_includes_final_placement=(
+                route_strategy == "native_region_progress_osc"
+            ),
         )
     )
     transport_action_budget = int(transport_budget_details["actions"])
@@ -2692,6 +3833,96 @@ def _native_place_single(
                 ).copy()
                 role = str(waypoint_row["role"])
                 distance_before = flat_distance(live_object_world[:3, 3])
+                if role == "native_region_entry_alignment" and predicate[0].lower() == "in":
+                    # Align the carried object's real XY pose at clearance height
+                    # before the final descent into a tight container region.
+                    object_distance = distance_before
+                    for alignment_index in range(3):
+                        if object_distance <= 0.012:
+                            break
+                        entry_object_world = goal_object.copy()
+                        entry_local = np.asarray([
+                            goal_local[0], goal_local[1],
+                            _native_region_local_z_for_world_height(
+                                region, goal_local[:2],
+                                float(region_progress_route["adaptive_transit_height_world_m"]),
+                            ),
+                        ], dtype=np.float64)
+                        entry_object_world[:3, 3] = region_position + region_rotation @ entry_local
+                        entry_eef_world = entry_object_world @ live_object_to_eef
+                        action_budget_remaining = max(0, transport_action_budget - counter[0])
+                        if action_budget_remaining <= 0:
+                            raise RuntimeError("native_region_entry_alignment_transport_budget_exhausted")
+                        _advance_pose(
+                            bridge, entry_eef_world[:3, 3], _wxyz(entry_eef_world[:3, :3]),
+                            f"transport_native_region_entry_alignment_{alignment_index}",
+                            "native_region_progress", counter, action_budget_remaining,
+                            target_binding, instruction, safety_policy, monitor, records, frames,
+                            step_callback=persist_step,
+                            stagnation_window_actions=24,
+                            position_tolerance_m=0.004,
+                            rotation_tolerance_rad=0.04,
+                            planning_tracking={
+                                "tracking_mode": "native_region_entry_alignment_OSC_feedback",
+                                "route_variant": region_progress_route["route_variant"],
+                                "waypoint_role": "native_region_entry_alignment",
+                                "waypoint_index": alignment_index,
+                                "native_goal_predicate": predicate,
+                                "object_goal_world_pose": goal_object.tolist(),
+                                "object_goal_distance_before_m": object_distance,
+                                "object_goal_distance_metric": "actual_object_xy_distance_in_native_region_frame",
+                                "physical_collision_response_enabled": True,
+                                "safety_certified": False,
+                            },
+                            absolute_action_limit=None,
+                        )
+                        after = bridge.request({"op": "observe", "include_snapshot_state": True})
+                        after_state = after["snapshot_state"]
+                        after_object = _object_state(after_state, int(target_binding["body_id"]))
+                        distance_after = flat_distance(after_object["root_pos"])
+                        grasp = bridge.request({
+                            "op": "grasp_state",
+                            "carried_binding": target_binding,
+                            "expected_instruction": instruction,
+                        })
+                        bilateral = (
+                            grasp.get("grasp_confirmed") is True
+                            and grasp.get("finger_contacts", {}).get("left") is True
+                            and grasp.get("finger_contacts", {}).get("right") is True
+                        )
+                        region_progress_history.append({
+                            "waypoint_index": f"entry_alignment_{alignment_index}",
+                            "role": role,
+                            "action_count_after": counter[0],
+                            "object_position_world_before_m": live_object["root_pos"],
+                            "object_position_world_after_m": after_object["root_pos"],
+                            "goal_distance_before_m": object_distance,
+                            "goal_distance_after_m": distance_after,
+                            "goal_distance_progress_m": object_distance - distance_after,
+                            "bilateral_grasp_confirmed": bilateral,
+                            "native_goal_satisfied": native_goal_satisfied(),
+                        })
+                        if not bilateral:
+                            raise RuntimeError("native_region_entry_alignment_lost_bilateral_grasp")
+                        if distance_after > 0.012 and object_distance - distance_after < 0.003:
+                            raise RuntimeError("native_region_entry_alignment_object_goal_stagnated")
+                        live_state = after_state
+                        live_object = after_object
+                        live_robot = live_state["robot_states"][0]
+                        live_object_world[:3, 3] = live_object["root_pos"]
+                        live_object_world[:3, :3] = Rotation.from_quat(
+                            np.asarray(live_object["root_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+                        ).as_matrix()
+                        live_eef_world[:3, :3] = Rotation.from_quat(
+                            np.asarray(live_robot["eef_quat"], dtype=np.float64)[[1, 2, 3, 0]]
+                        ).as_matrix()
+                        live_eef_world[:3, 3] = live_robot["eef_pos"]
+                        live_object_to_eef = np.linalg.inv(live_object_world) @ live_eef_world
+                        object_distance = distance_after
+                    if object_distance > 0.012:
+                        raise RuntimeError("native_region_entry_alignment_did_not_reach_12mm_pose")
+                    continue
+                distance_to_goal = None
                 if role == "region_progress":
                     local_current = region_rotation.T @ (live_object_world[:3, 3] - region_position)
                     delta = goal_local[:2] - local_current[:2]
@@ -2701,8 +3932,19 @@ def _native_place_single(
                     segment_m = min(0.045, distance_to_goal)
                     next_local = local_current.copy()
                     next_local[:2] += delta * (segment_m / distance_to_goal)
-                    next_local[2] = float(region_progress_route["adaptive_transit_height_region_m"])
+                    next_local[2] = _native_region_local_z_for_world_height(
+                        region,
+                        next_local[:2],
+                        float(region_progress_route["adaptive_transit_height_world_m"]),
+                    )
                     target_object_world[:3, 3] = region_position + region_rotation @ next_local
+                position_tolerance_m, rotation_tolerance_rad = (
+                    _native_region_progress_tracking_tolerances(
+                        role,
+                        distance_to_goal,
+                        native_goal_operator=str(predicate[0]) if predicate else None,
+                    )
+                )
                 target_eef_world = target_object_world @ live_object_to_eef
                 action_budget_remaining = max(0, transport_action_budget - counter[0])
                 if action_budget_remaining <= 0:
@@ -2737,10 +3979,11 @@ def _native_place_single(
                     f"transport_region_progress_{role}", "native_region_progress",
                     counter, segment_steps, target_binding, instruction,
                     safety_policy, monitor, records, frames,
+                    stop_condition=native_goal_satisfied,
                     step_callback=persist_step,
                     stagnation_window_actions=24,
-                    position_tolerance_m=0.015,
-                    rotation_tolerance_rad=0.12,
+                    position_tolerance_m=position_tolerance_m,
+                    rotation_tolerance_rad=rotation_tolerance_rad,
                     planning_tracking=progress_context,
                     absolute_action_limit=None,
                 )
@@ -4385,19 +5628,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         _snapshot_state_vector, _verify_cold_start_reset,
     )
 
-    cold_start = bool(getattr(args, "cold_start", False))
+    cold_start_continuation = bool(getattr(args, "cold_start_continuation", False))
+    cold_start = bool(getattr(args, "cold_start", False) or cold_start_continuation)
+    continuation_root = getattr(args, "cold_start_continuation_root", None)
+    if cold_start_continuation:
+        sources = (args.resume_from_runtime_snapshot, args.resume_from_placement_report)
+        if sum(source is not None for source in sources) != 1:
+            raise ValueError("cold_start_continuation_requires_exactly_one_same_run_resume_source")
+        if continuation_root is None:
+            raise ValueError("cold_start_continuation_requires_its_V3_run_root")
+        continuation_root = Path(continuation_root).resolve()
+        source = Path(next(source for source in sources if source is not None)).resolve()
+        if not source.is_relative_to(continuation_root):
+            raise ValueError("cold_start_continuation_source_must_be_inside_its_V3_run")
     if cold_start and (
         args.experience_library is not None
         or args.keypose_experience
         or args.previous_search_report
         or args.resume_from_grasp_report is not None
-        or args.resume_from_placement_report is not None
-        or args.resume_from_runtime_snapshot is not None
+        or (args.resume_from_placement_report is not None and not cold_start_continuation)
+        or (args.resume_from_runtime_snapshot is not None and not cold_start_continuation)
         or args.resume_from_keypose_preflight_report is not None
         or args.recovery_fallback_runtime_snapshot is not None
         or args.candidate_id is not None
         or args.candidate_start_index != 0
-        or args.native_region_route_variant is not None
     ):
         raise ValueError("cold_start_cannot_use_historical_experience_or_partial_task_inputs")
     for dependency_path in (
@@ -4460,7 +5714,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "experience_library_loaded": False,
                 "success_reference_loaded": False,
                 "previous_search_reports_loaded": False,
-                "start_state": "identity_checked_legal_t0_snapshot",
+                "start_state": (
+                    "same_run_identity_checked_partial_task_snapshot"
+                    if cold_start_continuation else "identity_checked_legal_t0_snapshot"
+                ),
+                "continuation_snapshot": (
+                    str(args.resume_from_runtime_snapshot.resolve())
+                    if args.resume_from_runtime_snapshot is not None else None
+                ),
+                "continuation_snapshot_sha256": (
+                    _sha(args.resume_from_runtime_snapshot.read_bytes())
+                    if args.resume_from_runtime_snapshot is not None else None
+                ),
+                "continuation_placement_report": (
+                    str(args.resume_from_placement_report.resolve())
+                    if args.resume_from_placement_report is not None else None
+                ),
+                "continuation_placement_report_sha256": (
+                    _sha(args.resume_from_placement_report.read_bytes())
+                    if args.resume_from_placement_report is not None else None
+                ),
             }
             if cold_start else {"enabled": False}
         ),
@@ -4917,6 +6190,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "next_phase": controller.phase,
                 "safety_certified": False,
             }
+            # This executor's stage boundary is the exact contact Snapshot,
+            # after the legal t0 restore and identity-checked placement resume.
+            report["task"]["initial_native_task_status"] = resumed_native
             place_result = _native_place(
                 bridge, target_id=target_id, target_binding=target_binding,
                 predicate=predicate, instruction=observed["instruction"], model_sha=model_sha,
@@ -4996,13 +6272,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     articulation_context=articulation_context,
                     controller_fields=controller_inventory["robots"][0]["fields"],
                     output_dir=output_dir / "expert_articulated_fixture_goal",
+                    model_sha=model_sha,
+                    rrt_time_budget_s=args.rrt_time_budget_s,
                 )
                 report["segments"].append({"type": "expert_articulated_fixture_goal", **articulated})
                 report["status"] = articulated["status"]
                 report["final_native_task_status"] = articulated["final_native_task_status"]
                 report["fixture_goal_failure_reason"] = (
                     None if articulated["native_goal_value"] is True
-                    else "bounded_physical_OSC_fixture_push_did_not_satisfy_native_goal"
+                    else articulated.get("failure_reason")
+                    or "bounded_physical_OSC_fixture_push_did_not_satisfy_native_goal"
                 )
             report["task_success"] = report["final_native_task_status"].get("task_success") is True
             report["archive"] = str(output_dir)
@@ -5262,6 +6541,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--student-handoff-action-budget", type=int, default=32)
     parser.add_argument("--maximum-candidates", type=int, default=16)
     parser.add_argument("--candidate-start-index", type=int, default=0)
+    parser.add_argument("--geometry-candidate-pool-offset", type=int, default=0)
     parser.add_argument("--maximum-rrt-preflights", type=int, default=8)
     parser.add_argument("--maximum-physical-branches", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=20.0)
@@ -5287,6 +6567,14 @@ def _parse_args() -> argparse.Namespace:
         "--cold-start", action="store_true",
         help="forbid success experiences, keyposes, candidate pins, prior reports, and partial-task snapshots",
     )
+    parser.add_argument(
+        "--cold-start-continuation", action="store_true",
+        help="continue a cold-start Episode from its own V3-generated, identity-checked stage Snapshot or contact report",
+    )
+    parser.add_argument(
+        "--cold-start-continuation-root", type=Path, default=None,
+        help="V3 output root that must contain the same-run continuation source",
+    )
     args = parser.parse_args()
     resume_sources = [
         args.resume_from_grasp_report,
@@ -5310,18 +6598,35 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-candidates must be in 1..16")
     if not 0 <= args.candidate_start_index < args.maximum_candidates:
         parser.error("--candidate-start-index must select an index inside the candidate budget")
+    if (
+        args.geometry_candidate_pool_offset < 0
+        or args.geometry_candidate_pool_offset + args.maximum_candidates > 48
+    ):
+        parser.error("--geometry-candidate-pool-offset plus --maximum-candidates must fit the generated geometry pool")
     if args.candidate_id is not None and args.candidate_start_index != 0:
         parser.error("--candidate-id requires --candidate-start-index 0")
-    if args.cold_start and (
+    cold_start_mode = args.cold_start or args.cold_start_continuation
+    continuation_sources = (args.resume_from_runtime_snapshot, args.resume_from_placement_report)
+    if args.cold_start_continuation and (
+        not args.cold_start
+        or sum(source is not None for source in continuation_sources) != 1
+        or args.cold_start_continuation_root is None
+    ):
+        parser.error(
+            "--cold-start-continuation requires --cold-start, exactly one resume source, "
+            "and --cold-start-continuation-root"
+        )
+    if cold_start_mode and (
         args.experience_library is not None
         or args.keypose_experience
         or args.previous_search_report
-        or any(source is not None for source in resume_sources)
+        or args.resume_from_grasp_report is not None
+        or (args.resume_from_placement_report is not None and not args.cold_start_continuation)
+        or (args.resume_from_runtime_snapshot is not None and not args.cold_start_continuation)
         or args.resume_from_keypose_preflight_report is not None
         or args.recovery_fallback_runtime_snapshot is not None
         or args.candidate_id is not None
         or args.candidate_start_index != 0
-        or args.native_region_route_variant is not None
     ):
         parser.error("--cold-start cannot use historical experience or partial-task inputs")
     if not 1 <= args.maximum_rrt_preflights <= 8:
@@ -5330,8 +6635,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-physical-branches must be in 1..3")
     if not 0.5 <= args.rrt_time_budget_s <= 60:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
-    if not 1000 <= args.demonstration_horizon <= 3600:
-        parser.error("--demonstration-horizon must be in 1000..3600")
+    if not 1000 <= args.demonstration_horizon <= MAX_DEMONSTRATION_HORIZON:
+        parser.error(
+            f"--demonstration-horizon must be in 1000..{MAX_DEMONSTRATION_HORIZON}"
+        )
     if args.target_predicate is not None and len(args.target_predicate) not in (2, 3):
         parser.error("--target-predicate must contain two or three BDDL tokens")
     return args

@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+MAX_DEMONSTRATION_HORIZON = 5000
+
 
 def inspect_native_goal_coverage(native_status: dict[str, Any]) -> dict[str, Any]:
     """Classify every native conjunct without silently discarding operators."""
@@ -283,6 +285,83 @@ def object_relative_grasp_targets(
     pregrasp_pose_world = grasp_pose_world.copy()
     pregrasp_pose_world[:3, 3] -= approach_world * float(approach_distance_m)
     return grasp_pose_world, pregrasp_pose_world
+
+
+def filter_mechanically_infeasible_grasp_candidates(
+    candidates: Iterable[dict[str, Any]], *, tolerance_m: float = 1e-6
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove grasps whose required jaw opening exceeds the active gripper limit.
+
+    This is a task-feasibility check, not a safety clearance rule. Candidates
+    without width metadata remain eligible so older verified templates keep
+    their existing behavior.
+    """
+    if not np.isfinite(tolerance_m) or tolerance_m < 0.0:
+        raise ValueError("grasp_opening_tolerance_must_be_finite_and_non_negative")
+    feasible: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("grasp_candidate_must_be_a_mapping")
+        width = candidate.get("estimated_clamp_width_m")
+        maximum = candidate.get("maximum_opening_m")
+        if width is None or maximum is None:
+            feasible.append(candidate)
+            continue
+        try:
+            width_m, maximum_m = float(width), float(maximum)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("grasp_opening_metadata_must_be_numeric") from exc
+        if (
+            not np.isfinite([width_m, maximum_m]).all()
+            or width_m <= 0.0
+            or maximum_m <= 0.0
+        ):
+            raise ValueError("grasp_opening_metadata_must_be_positive_and_finite")
+        if width_m <= maximum_m + tolerance_m:
+            feasible.append(candidate)
+            continue
+        rejected.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "reason": "estimated_clamp_width_exceeds_maximum_pad_separation",
+            "estimated_clamp_width_m": width_m,
+            "maximum_opening_m": maximum_m,
+            "opening_overrun_m": width_m - maximum_m,
+        })
+    return feasible, rejected
+
+
+def task_approach_feasible_candidate_ids(screen_report: dict[str, Any]) -> set[str]:
+    """Validate and return candidates with a scratch-only task approach path.
+
+    The report must attest only its own screen scope and unchanged live state;
+    this helper makes no safety or physical-grasp claim.
+    """
+    if (
+        not isinstance(screen_report, dict)
+        or screen_report.get("operation") != "screen_grasp_candidates"
+        or screen_report.get("status") != "complete"
+        or screen_report.get("task_approach_only") is not True
+        or screen_report.get("live_state_unchanged") is not True
+    ):
+        raise ValueError("task_approach_screen_report_is_incomplete_or_out_of_scope")
+    rows = screen_report.get("candidates")
+    if not isinstance(rows, list):
+        raise ValueError("task_approach_screen_candidate_rows_are_missing")
+    seen: set[str] = set()
+    feasible: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("task_approach_screen_candidate_row_is_malformed")
+        candidate_id = row.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError("task_approach_screen_candidate_id_is_missing")
+        if candidate_id in seen:
+            raise ValueError("task_approach_screen_candidate_ids_are_not_unique")
+        seen.add(candidate_id)
+        if row.get("status") == "offline_feasible_candidate":
+            feasible.add(candidate_id)
+    return feasible
 
 
 def diversify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

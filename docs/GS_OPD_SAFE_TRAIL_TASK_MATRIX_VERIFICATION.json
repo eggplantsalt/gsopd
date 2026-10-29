@@ -1,0 +1,110 @@
+{
+  "verified_on": "2026-10-29",
+  "registry_file": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/benchmark/vla_safety_task_map.py",
+  "registry_sha256": "ea256e8aa8711615606eb19a713b7e3af2774af4320a23dde8b8b2f13681e006",
+  "registration_code_file": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/benchmark/__init__.py",
+  "registration_code_sha256": "5920d04f7a2155ef4d5eed108fdb52d2df131643195f9931d5f5c16f3b6e54b5",
+  "suites": {
+    "obstacle_avoidance": {
+      "0": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      },
+      "1": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      },
+      "2": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      }
+    },
+    "obstacle_avoidance_human": {
+      "0": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      },
+      "1": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      },
+      "2": {
+        "task_count": 5,
+        "task_ids": [
+          "T0",
+          "T1",
+          "T2",
+          "T3",
+          "T4"
+        ]
+      }
+    }
+  },
+  "verified_bddl_and_pruned_init_files": 30,
+  "verification": "Runtime-registered both local suites through benchmark/__init__.py from local vla_safety_task_map.py; checked each returned task identity and each local BDDL and pruned_init file exists; recorded BDDL SHA-256 and parsed full native goal expression.",
+  "repository_head": "9099c1979b000a8e632b4d94c56d9c397da31cc4",
+  "current_search_source_bundle_sha256": "d0ea082cf6d31e6c7b4e5f6a55a80a95a8efe8e3f8a157c634b3106e4ad12e2b",
+  "source_bundle_files": [
+    "research/gs_opd/repair/trajectory_generator_v3.py",
+    "research/gs_opd/repair/task_success_first_executor.py",
+    "research/gs_opd/repair/task_success_first_grasp_search.py",
+    "research/gs_opd/repair/mujoco_jointspace_planning.py",
+    "research/gs_opd/repair/jointspace_rrt.py",
+    "research/gs_opd/smoke/safety_bridge.py",
+    "research/gs_opd/repair/task_phase_controller.py"
+  ],
+  "runtime_path_note": "LIBERO_CONFIG_PATH in the installed RLinf environment points at a stale external install; registry validation used the local LIBERO-Safety source and file roots, without rewriting user config.",
+  "runtime_registration_check": {
+    "status": "passed",
+    "method": "Loaded local libero/libero/benchmark/__init__.py and vla_safety_task_map.py with a temporary LIBERO_CONFIG_PATH pointing to the local LIBERO-Safety assets/data; confirmed get_benchmark() registers both requested suites and returns 15 tasks per suite with {0:5,1:5,2:5}; resolved every runtime BDDL and .pruned_init path.",
+    "suites": {
+      "obstacle_avoidance": {
+        "registered_tasks": 15,
+        "level_distribution": {
+          "L0": 5,
+          "L1": 5,
+          "L2": 5
+        }
+      },
+      "obstacle_avoidance_human": {
+        "registered_tasks": 15,
+        "level_distribution": {
+          "L0": 5,
+          "L1": 5,
+          "L2": 5
+        }
+      }
+    },
+    "user_config_modified": false
+  }
+}

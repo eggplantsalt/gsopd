@@ -27,6 +27,7 @@ from research.gs_opd.repair.task_success_first_grasp_search import (
     _combine_candidate_sources,
     _parse_args,
     _verify_cold_start_reset,
+    expand_task_approach_depth_candidates,
     generate_geometry_candidates,
     generate_grasp_roll_variants,
     generate_grasp_coupled_tilt_offset_variants,
@@ -43,6 +44,7 @@ from research.gs_opd.repair.task_success_first_search import (
     candidate_matches_failure_memory,
     classify_failure,
     diversify_candidates,
+    filter_mechanically_infeasible_grasp_candidates,
     generated_geometry_high_approach_admitted,
     high_approach_route,
     inspect_native_goal_coverage,
@@ -54,18 +56,118 @@ from research.gs_opd.repair.task_success_first_search import (
     route_control_action_budget,
     route_signature,
     robot_contact_escape_direction,
+    task_approach_feasible_candidate_ids,
     target_finger_contact_sides,
     unilateral_target_contact_sides,
 )
 
 
 class TaskSuccessFirstSearchTests(unittest.TestCase):
+    def test_mechanical_opening_filter_rejects_only_widths_beyond_active_limit(self):
+        candidates = [
+            {"candidate_id": "fits", "estimated_clamp_width_m": 0.02868, "maximum_opening_m": 0.087},
+            {"candidate_id": "edge_tolerance", "estimated_clamp_width_m": 0.0870005, "maximum_opening_m": 0.087},
+            {"candidate_id": "too_wide", "estimated_clamp_width_m": 0.11038, "maximum_opening_m": 0.087},
+            {"candidate_id": "legacy_width_unknown"},
+        ]
+        feasible, rejected = filter_mechanically_infeasible_grasp_candidates(candidates)
+        self.assertEqual(
+            [row["candidate_id"] for row in feasible],
+            ["fits", "edge_tolerance", "legacy_width_unknown"],
+        )
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["candidate_id"], "too_wide")
+        self.assertEqual(
+            rejected[0]["reason"],
+            "estimated_clamp_width_exceeds_maximum_pad_separation",
+        )
+
+    def test_mechanical_opening_filter_rejects_invalid_width_metadata(self):
+        with self.assertRaisesRegex(ValueError, "positive_and_finite"):
+            filter_mechanically_infeasible_grasp_candidates([
+                {"candidate_id": "invalid", "estimated_clamp_width_m": -0.01, "maximum_opening_m": 0.08},
+            ])
+        with self.assertRaisesRegex(ValueError, "non_negative"):
+            filter_mechanically_infeasible_grasp_candidates([], tolerance_m=-1e-6)
+
+    def test_task_approach_admission_requires_complete_scratch_scope_and_unique_rows(self):
+        report = {
+            "operation": "screen_grasp_candidates",
+            "status": "complete",
+            "task_approach_only": True,
+            "live_state_unchanged": True,
+            "candidates": [
+                {"candidate_id": "feasible", "status": "offline_feasible_candidate"},
+                {"candidate_id": "blocked", "status": "rejected"},
+            ],
+        }
+        self.assertEqual(task_approach_feasible_candidate_ids(report), {"feasible"})
+        for invalid in (
+            {**report, "status": "unsafe"},
+            {**report, "task_approach_only": False},
+            {**report, "live_state_unchanged": False},
+            {**report, "candidates": [*report["candidates"], report["candidates"][0]]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                task_approach_feasible_candidate_ids(invalid)
+
     def test_generated_fallback_never_changes_experience_baseline_path(self):
         with patch.object(grasp_search, "generated_geometry_high_approach_admitted", return_value=True) as admit:
             self.assertFalse(grasp_search._cold_start_geometry_fallback_allowed(False, {}, {}))
             admit.assert_not_called()
             self.assertTrue(grasp_search._cold_start_geometry_fallback_allowed(True, {}, {}))
             admit.assert_called_once()
+
+    def test_task_approach_depth_expansion_offsets_approach_geom_axis_and_is_bounded(self):
+        candidate = {
+            "candidate_id": "base",
+            "target_geom_id": 5,
+            "object_to_eef": np.eye(4).tolist(),
+            "approach_direction_object": [0.0, 0.0, 1.0],
+            "approach_distance_m": 0.060,
+            "jaw_axis_index_in_geom": 0,
+            "approach_axis_index_in_geom": 2,
+            "pad_center_eef_m_from_active_open_pose": [0.0, 0.0, 0.0],
+        }
+        geometry = {
+            "geom_id": 5,
+            "geom_type_name": "box",
+            "size_m": [0.014, 0.055, 0.075],
+            "rotation_root": np.eye(3).tolist(),
+        }
+        expanded, metadata = expand_task_approach_depth_candidates(
+            [candidate],
+            target_pose_world=np.eye(4),
+            eef_position_world=np.zeros(3),
+            target_collision_geometries=[geometry],
+            screen_batch_limit=5,
+        )
+        self.assertEqual([row["candidate_id"] for row in expanded], [
+            "base",
+            "base__approach_axis2_-20.0mm",
+            "base__approach_axis2_+20.0mm",
+            "base__approach_axis2_-40.0mm",
+            "base__approach_axis2_+40.0mm",
+        ])
+        self.assertEqual(metadata["approach_depth_offset_variant_count"], 4)
+        self.assertTrue(metadata["grasp_orientation_preserved"])
+        self.assertFalse(metadata["historical_actions_or_success_pose_priors_used"])
+        self.assertAlmostEqual(expanded[1]["object_to_eef"][2][3], -0.02)
+        self.assertAlmostEqual(expanded[2]["object_to_eef"][2][3], 0.02)
+        self.assertAlmostEqual(expanded[3]["object_to_eef"][2][3], -0.04)
+        self.assertAlmostEqual(expanded[4]["object_to_eef"][2][3], 0.04)
+        for row in expanded[1:]:
+            transform = np.asarray(row["object_to_eef"], dtype=np.float64)
+            self.assertTrue(np.allclose(transform[:3, :3], np.eye(3)))
+            self.assertEqual(row["source_candidate_id"], "base")
+        with self.assertRaisesRegex(ValueError, "exceed_screen_batch_limit"):
+            expand_task_approach_depth_candidates(
+                [candidate, {**candidate, "candidate_id": "second"}],
+                target_pose_world=np.eye(4),
+                eef_position_world=np.zeros(3),
+                target_collision_geometries=[geometry],
+                screen_batch_limit=1,
+            )
 
     def test_cold_start_requires_exact_fresh_reset_state_and_zero_timestep(self):
         class Bridge:
@@ -99,6 +201,13 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
         self.assertEqual(parsed.previous_search_report, [])
         self.assertEqual(parsed.candidate_id, [])
 
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py", "--cold-start",
+            "--demonstration-horizon", "5000",
+        ]):
+            long_episode = _parse_args()
+        self.assertEqual(long_episode.demonstration_horizon, 5000)
+
         forbidden_inputs = [
             ["--experience-library", "experience.json"],
             ["--previous-search-report", "previous.json"],
@@ -112,6 +221,31 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
             ), self.assertRaises(SystemExit):
                 _parse_args()
 
+    def test_cold_start_continuation_cli_accepts_only_runtime_snapshot_resume(self):
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py", "--cold-start",
+            "--cold-start-continuation", "--resume-from-runtime-snapshot", "same-run-stage.pkl",
+        ]):
+            parsed = _parse_args()
+        self.assertTrue(parsed.cold_start)
+        self.assertTrue(parsed.cold_start_continuation)
+        self.assertEqual(parsed.resume_from_runtime_snapshot, Path("same-run-stage.pkl"))
+
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py", "--cold-start",
+            "--resume-from-runtime-snapshot", "same-run-stage.pkl",
+        ]), self.assertRaises(SystemExit):
+            _parse_args()
+
+    def test_cold_start_can_select_a_later_generated_geometry_pool_window(self):
+        with patch.object(sys, "argv", [
+            "task_success_first_grasp_search.py", "--cold-start",
+            "--cold-start-continuation", "--resume-from-runtime-snapshot", "same-run-stage.pkl",
+            "--geometry-candidate-pool-offset", "16",
+        ]):
+            parsed = _parse_args()
+        self.assertEqual(parsed.geometry_candidate_pool_offset, 16)
+
     def test_pinned_candidate_ids_reach_full_geometry_pool_with_experience_templates(self):
         from argparse import Namespace
 
@@ -122,6 +256,13 @@ class TaskSuccessFirstSearchTests(unittest.TestCase):
             maximum_candidates=8,
         )
         self.assertEqual(_candidate_generation_limit(args), MAX_OFFLINE_GEOMETRY_GENERATION)
+
+        offset_args = Namespace(
+            candidate_id=[], strict_grasp_screen_only=False,
+            candidate_start_index=0, maximum_candidates=16,
+            geometry_candidate_pool_offset=16,
+        )
+        self.assertEqual(_candidate_generation_limit(offset_args), 32)
 
         geometry = [{"candidate_id": f"geom{index}"} for index in range(48)]
         experience = [{"candidate_id": f"experience{index}"} for index in range(9)]

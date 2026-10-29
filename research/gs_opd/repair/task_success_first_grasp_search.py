@@ -36,9 +36,11 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 from research.gs_opd.repair.task_success_first_search import (
+    MAX_DEMONSTRATION_HORIZON,
     SearchFailureMemory,
     blocked_candidate_ids_from_report,
     candidate_route_preflight_admitted,
+    filter_mechanically_infeasible_grasp_candidates,
     generated_geometry_high_approach_admitted,
     candidate_matches_failure_memory,
     diversify_candidates,
@@ -48,6 +50,7 @@ from research.gs_opd.repair.task_success_first_search import (
     route_control_action_budget,
     route_signature,
     robot_contact_escape_direction,
+    task_approach_feasible_candidate_ids,
     target_finger_contact_sides,
 )
 from research.gs_opd.repair.task_skill_experience import (
@@ -300,7 +303,7 @@ def _candidate_generation_limit(args: argparse.Namespace) -> int:
         return MAX_OFFLINE_GEOMETRY_GENERATION
     if args.strict_grasp_screen_only:
         return int(args.candidate_start_index + args.maximum_candidates)
-    return int(args.maximum_candidates)
+    return int(getattr(args, "geometry_candidate_pool_offset", 0) + args.maximum_candidates)
 
 
 def _combine_candidate_sources(
@@ -392,6 +395,129 @@ def generate_grasp_tilt_variants(
             })
             variants.append(tilted)
     return variants
+
+
+def expand_task_approach_depth_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    target_pose_world: np.ndarray,
+    eef_position_world: np.ndarray,
+    target_collision_geometries: list[dict[str, Any]],
+    screen_batch_limit: int = MAX_OFFLINE_GEOMETRY_SCREEN_BATCH,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Shift candidate pad centers along the object-geom approach axis."""
+    if isinstance(screen_batch_limit, bool) or not 1 <= screen_batch_limit <= MAX_OFFLINE_GEOMETRY_SCREEN_BATCH:
+        raise ValueError("task_approach_screen_batch_limit_must_be_in_1_to_24")
+    if len(candidates) > screen_batch_limit:
+        raise ValueError("task_approach_base_candidates_exceed_screen_batch_limit")
+    target_pose = np.asarray(target_pose_world, dtype=np.float64)
+    eef_position = np.asarray(eef_position_world, dtype=np.float64)
+    if target_pose.shape != (4, 4) or not np.isfinite(target_pose).all():
+        raise ValueError("task_approach_target_pose_must_be_finite_4x4")
+    if eef_position.shape != (3,) or not np.isfinite(eef_position).all():
+        raise ValueError("task_approach_eef_position_must_be_finite_xyz")
+    base_ids = [str(candidate.get("candidate_id", "")) for candidate in candidates]
+    if any(not candidate_id for candidate_id in base_ids) or len(set(base_ids)) != len(base_ids):
+        raise ValueError("task_approach_base_candidate_ids_must_be_nonempty_and_unique")
+    capacity = screen_batch_limit - len(candidates)
+    geometry_by_id = {
+        int(geometry["geom_id"]): geometry for geometry in target_collision_geometries
+    }
+    variants = []
+    offset_records = []
+    prioritized_candidates = sorted(
+        enumerate(candidates),
+        key=lambda item: (
+            int(item[1].get("approach_sign", 0) != 1),
+            item[0],
+        ),
+    )
+    for _candidate_index, candidate in prioritized_candidates:
+        if len(variants) >= capacity:
+            break
+        geometry_id = int(candidate.get("target_geom_id", -1))
+        geometry = geometry_by_id.get(geometry_id)
+        if geometry is None:
+            raise ValueError(f"task_approach_candidate_target_geom_missing:{geometry_id}")
+        half_extents = _box_half_extents(geometry)
+        jaw_axis = int(candidate.get("jaw_axis_index_in_geom", -1))
+        approach_axis = int(candidate.get("approach_axis_index_in_geom", -1))
+        if jaw_axis not in (0, 1, 2) or approach_axis not in (0, 1, 2) or jaw_axis == approach_axis:
+            raise ValueError("task_approach_candidate_geom_axis_indices_are_invalid")
+        geometry_rotation = np.asarray(geometry["rotation_root"], dtype=np.float64)
+        if geometry_rotation.shape != (3, 3) or not np.isfinite(geometry_rotation).all():
+            raise ValueError("task_approach_target_geom_rotation_is_invalid")
+        half_extent = float(half_extents[approach_axis])
+        offset_magnitudes = [
+            min(0.30 * half_extent, 0.020),
+            min(0.60 * half_extent, 0.040),
+        ]
+        offset_magnitudes = list(dict.fromkeys(value for value in offset_magnitudes if value > 1e-6))
+        if not offset_magnitudes:
+            continue
+        transform = np.asarray(candidate.get("object_to_eef"), dtype=np.float64)
+        approach = np.asarray(candidate.get("approach_direction_object"), dtype=np.float64)
+        if transform.shape != (4, 4) or approach.shape != (3,) or not np.isfinite(transform).all() or not np.isfinite(approach).all():
+            raise ValueError("task_approach_base_candidate_pose_is_invalid")
+        axis_object = geometry_rotation[:, approach_axis]
+        signed_offsets = [
+            (sign * magnitude)
+            for magnitude in offset_magnitudes
+            for sign in (-1, 1)
+        ]
+        for signed_offset_m in signed_offsets:
+            if len(variants) >= capacity:
+                break
+            variant = dict(candidate)
+            shifted_transform = transform.copy()
+            shifted_transform[:3, 3] += axis_object * signed_offset_m
+            world_eef = target_pose @ shifted_transform
+            approach_world = target_pose[:3, :3] @ (approach / np.linalg.norm(approach))
+            pregrasp_world = world_eef[:3, 3] - approach_world * float(
+                candidate.get("approach_distance_m", 0.0606)
+            )
+            offset_mm = signed_offset_m * 1000.0
+            variant.update({
+                "candidate_id": (
+                    f"{candidate['candidate_id']}__approach_axis{approach_axis}_{offset_mm:+.1f}mm"
+                ),
+                "source_candidate_id": str(candidate["candidate_id"]),
+                "object_to_eef": shifted_transform.tolist(),
+                "pregrasp_eef_distance_m": float(np.linalg.norm(pregrasp_world - eef_position)),
+                "candidate_source": str(candidate.get("candidate_source", ""))
+                    + "+geometry_approach_depth_offset",
+                "approach_depth_offset": {
+                    "basis": "target_collision_geom_local_axis_in_object_root_frame",
+                    "geom_id": geometry_id,
+                    "axis_index": approach_axis,
+                    "offset_mm": offset_mm,
+                    "grasp_orientation_preserved": True,
+                },
+            })
+            variants.append(variant)
+            offset_records.append({
+                "candidate_id": variant["candidate_id"],
+                "source_candidate_id": str(candidate["candidate_id"]),
+                "geom_id": geometry_id,
+                "axis_index": approach_axis,
+                "offset_mm": offset_mm,
+            })
+    expanded = [*candidates, *variants]
+    ids = [str(candidate["candidate_id"]) for candidate in expanded]
+    if len(ids) != len(set(ids)):
+        raise ValueError("task_approach_expansion_produced_duplicate_candidate_ids")
+    return expanded, {
+        "applied": bool(variants),
+        "source": "active_BDDL_geometry_candidates_only",
+        "base_candidate_count": len(candidates),
+        "candidate_count_after_expansion": len(expanded),
+        "approach_depth_offset_variant_count": len(variants),
+        "offset_rule": "plus_or_minus_30pct_and_60pct_of_approach_axis_half_extent_capped_at_20mm_and_40mm",
+        "offsets_by_candidate": offset_records,
+        "grasp_orientation_preserved": True,
+        "screen_batch_limit": screen_batch_limit,
+        "historical_actions_or_success_pose_priors_used": False,
+    }
 
 
 def generate_grasp_roll_variants(
@@ -1602,6 +1728,7 @@ def _advance_pose(
     target_pose_provider: Callable[
         [dict[str, Any]], tuple[np.ndarray, np.ndarray]
     ] | None = None,
+    gripper_action: float = 0.0,
     absolute_action_limit: int | None = MAX_BRANCH_CONTROL_ACTIONS,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
@@ -1618,6 +1745,13 @@ def _advance_pose(
         or position_tolerance_m <= 0.0 or rotation_tolerance_rad <= 0.0
     ):
         raise ValueError("pose_tracking_tolerances_must_be_positive_and_finite")
+    if (
+        isinstance(gripper_action, bool)
+        or not isinstance(gripper_action, (int, float))
+        or not np.isfinite(float(gripper_action))
+        or not -1.0 <= float(gripper_action) <= 1.0
+    ):
+        raise ValueError("pose_tracking_gripper_action_must_be_finite_and_in_minus1_to_1")
     progress_history: list[tuple[float, float]] = []
     for _ in range(maximum_steps):
         if stop_condition is not None and stop_condition():
@@ -1676,7 +1810,7 @@ def _advance_pose(
             current_position + delta_position,
             next_quaternion,
             _advance_pose.controller_fields,
-            gripper_action=0.0,
+            gripper_action=float(gripper_action),
         )
         step_tracking = None
         if planning_tracking is not None:
@@ -1692,6 +1826,7 @@ def _advance_pose(
                 "actual_joint_qpos_before_rad": robot.get("joint_qpos"),
                 "requested_translation_delta_world_m": delta_position.tolist(),
                 "requested_rotation_delta_world_rad": delta_rotation.tolist(),
+                "gripper_action_command": float(gripper_action),
             }
         _record_step(
             bridge,
@@ -2383,14 +2518,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_started = time.monotonic()
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
 
-    cold_start = bool(getattr(args, "cold_start", False))
+    cold_start_continuation = bool(getattr(args, "cold_start_continuation", False))
+    cold_start = bool(getattr(args, "cold_start", False) or cold_start_continuation)
     if cold_start and (
         args.experience_library is not None
         or args.previous_search_report
         or args.historical_grasp_pose_priors_json is not None
         or args.strict_grasp_screen_only
         or args.strict_screen_reference_report is not None
-        or args.resume_from_runtime_snapshot is not None
+        or (args.resume_from_runtime_snapshot is not None and not cold_start_continuation)
         or args.candidate_id
         or args.candidate_start_index != 0
         or args.candidate_tilt_degrees
@@ -2400,6 +2536,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or args.candidate_offset_object_z_mm
     ):
         raise ValueError("cold_start_cannot_use_historical_experience_or_partial_search_inputs")
+    if cold_start_continuation and args.resume_from_runtime_snapshot is None:
+        raise ValueError("cold_start_continuation_requires_a_runtime_snapshot_from_the_active_episode")
     snapshot_root = args.snapshot_root.resolve()
     snapshot_path = snapshot_root / "snapshots/initial_runtime_snapshot.pkl"
     manifest_path = snapshot_root / "snapshots/runtime_snapshot_manifest.json"
@@ -2472,7 +2610,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "experience_library_loaded": False,
                 "previous_search_reports_loaded": False,
                 "historical_grasp_pose_priors_loaded": False,
-                "start_state": "identity_checked_legal_t0_snapshot",
+                "start_state": (
+                    "same_run_identity_checked_partial_task_snapshot"
+                    if cold_start_continuation else "identity_checked_legal_t0_snapshot"
+                ),
             }
             if cold_start else {"enabled": False}
         ),
@@ -2515,9 +2656,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "search_budget": {
             "geometry_candidates_max": args.maximum_candidates,
             "candidate_start_index": int(args.candidate_start_index),
+            "geometry_candidate_pool_offset": int(getattr(args, "geometry_candidate_pool_offset", 0)),
             "candidate_generation_limit": (
                 int(args.candidate_start_index + args.maximum_candidates)
-                if args.strict_grasp_screen_only else int(args.maximum_candidates)
+                if args.strict_grasp_screen_only else _candidate_generation_limit(args)
             ),
             "candidate_tilt_degrees": list(args.candidate_tilt_degrees),
             "candidate_roll_degrees": list(args.candidate_roll_degrees),
@@ -2568,6 +2710,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["cold_start_reset_verification"] = _verify_cold_start_reset(bridge, initial_state)
         _restore_initial(bridge, search_start_payload, search_start_state, model_sha)
         initial = bridge.request({"op": "observe", "include_snapshot_state": True})
+        restored_state = _snapshot_state_vector(initial.get("snapshot_state", {}))
+        if restored_state.shape != search_start_state.shape or not np.array_equal(restored_state, search_start_state):
+            raise RuntimeError("cold_start_search_runtime_snapshot_restore_not_exact")
+        if resume_descriptor is not None:
+            report["resumed_from_runtime_snapshot"] = {
+                "path": str(resume_descriptor["path"]),
+                "payload_sha256": resume_descriptor["payload_sha256"],
+                "integration_state_sha256": _state_sha(restored_state),
+                "status": "verified_exact",
+                "other_completed_native_predicates_preserved": True,
+                "safety_certified": False,
+            }
         instruction = str(manifest["instruction"])
         if initial.get("instruction") != instruction:
             raise RuntimeError("restored_snapshot_instruction_does_not_match_source_BDDL")
@@ -2684,9 +2838,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         report["initial_robot_contact_escape"] = initial_contact_escape
         candidate_generation_limit = _candidate_generation_limit(args)
-        candidates, generation = generate_geometry_candidates(
+        candidate_pool, generation = generate_geometry_candidates(
             context, maximum_candidates=candidate_generation_limit
         )
+        pool_offset = int(getattr(args, "geometry_candidate_pool_offset", 0))
+        candidates = candidate_pool[pool_offset:pool_offset + args.maximum_candidates]
+        generation["geometry_candidate_pool_window"] = {
+            "offset": pool_offset,
+            "count": len(candidates),
+            "generated_pool_count": len(candidate_pool),
+            "generation_limit": candidate_generation_limit,
+            "source": "active_scene_compiled_target_geometry",
+        }
         experience_use = {
             "library_path": str(args.experience_library) if args.experience_library else None,
             "library_loaded": False,
@@ -2842,6 +3005,87 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 offset_object_mm=offset_values,
                 offset_object_axis=offset_axis,
             )
+        if not args.strict_grasp_screen_only:
+            unfiltered_candidate_count = len(candidates)
+            candidates, mechanically_infeasible = filter_mechanically_infeasible_grasp_candidates(
+                candidates
+            )
+            generation["mechanical_opening_filter"] = {
+                "applied": True,
+                "source": "candidate_estimated_clamp_width_vs_active_maximum_pad_separation",
+                "unfiltered_candidate_count": unfiltered_candidate_count,
+                "feasible_candidate_count": len(candidates),
+                "rejected_candidate_count": len(mechanically_infeasible),
+                "rejected_candidates": mechanically_infeasible,
+                "is_strict_safety_gate": False,
+            }
+            if cold_start and not args.candidate_id:
+                candidates, generation["task_approach_depth_expansion"] = (
+                    expand_task_approach_depth_candidates(
+                        candidates,
+                        target_pose_world=target_pose_for_variants,
+                        eef_position_world=eef_position_for_variants,
+                        target_collision_geometries=context["target_collision_geometries"],
+                    )
+                )
+            task_approach_screen = bridge.request({
+                "op": "screen_grasp_candidates",
+                "expected_instruction": instruction,
+                "model_geometry_sha256": model_sha,
+                "start_state_sha256": _state_sha(search_start_state),
+                "safety_geometry_policy": policy,
+                "target_object_id": target_id,
+                "target_root_body_id": int(target_binding["body_id"]),
+                "clearance_m": 0.0,
+                "strict_target_contact_policy": False,
+                "task_approach_only": True,
+                "closed_gripper_qpos": context["active_open_gripper_qpos"],
+                "predicted_stable_object_pose_world": target_pose_for_variants.tolist(),
+                "candidates": candidates,
+            })
+            if (
+                task_approach_screen.get("screening_type")
+                != "offline_scratch_task_approach_feasibility_not_safety_certification"
+            ):
+                raise RuntimeError(
+                    "task_approach_feasibility_screen_unavailable_or_wrong_scope:"
+                    f"{task_approach_screen.get('failure_reason') or task_approach_screen.get('status')}"
+                )
+            feasible_ids = task_approach_feasible_candidate_ids(task_approach_screen)
+            approach_rows = {
+                row["candidate_id"]: row
+                for row in task_approach_screen.get("candidates", [])
+            }
+            screened_ids = {candidate["candidate_id"] for candidate in candidates}
+            if feasible_ids - screened_ids or set(approach_rows) != screened_ids:
+                raise RuntimeError("task_approach_screen_candidate_identity_set_mismatch")
+            approach_rejections = [
+                {
+                    "candidate_id": candidate_id,
+                    "failure_reasons": approach_rows[candidate_id].get("failure_reasons", []),
+                    "failure_class": approach_rows[candidate_id].get("failure_class"),
+                }
+                for candidate_id in sorted(screened_ids - feasible_ids)
+            ]
+            _write_json(output_dir / "task_approach_feasibility_screen.json", task_approach_screen)
+            generation["task_approach_feasibility_screen"] = {
+                "applied": True,
+                "scope": "open_gripper_pregrasp_to_grasp_cartesian_path_only",
+                "candidate_count_before_screen": len(candidates),
+                "candidate_count_after_screen": len(feasible_ids),
+                "rejected_candidates": approach_rejections,
+                "live_state_unchanged": task_approach_screen.get("live_state_unchanged"),
+                "strict_safety_gate_used": False,
+                "safety_certified": False,
+                "screen_report": str(output_dir / "task_approach_feasibility_screen.json"),
+            }
+            candidates = [candidate for candidate in candidates if candidate["candidate_id"] in feasible_ids]
+        else:
+            generation["mechanical_opening_filter"] = {
+                "applied": False,
+                "reason": "strict_screen_reports_all_candidates_including_impossible_widths",
+                "is_strict_safety_gate": False,
+            }
         if args.strict_grasp_screen_only:
             candidates = _candidate_window(
                 candidates,
@@ -2849,7 +3093,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 count=args.maximum_candidates,
             )
         candidates = diversify_candidates(candidates)
+        if not args.strict_grasp_screen_only:
+            candidates = candidates[:args.maximum_candidates]
         if not candidates:
+            if generation.get("task_approach_feasibility_screen", {}).get("applied"):
+                raise RuntimeError("no_task_feasible_grasp_candidate_passed_open_surface_approach_screen")
             raise RuntimeError("no_supported_collision_geometry_produced_a_pad_grasp_candidate")
         _write_json(output_dir / "geometry_candidates.json", candidates)
         _write_json(output_dir / "experience_transfer.json", experience_use)
@@ -3553,7 +3801,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         bridge.close()
 
     if final_snapshot_payload is not None:
-        recovery = BridgeSession(address, output_dir / "snapshot_recovery_bridge.log", args)
+        # Keep the cold-recovery verifier off the expert search port. Some
+        # environments retain the just-closed listener briefly; a separate
+        # port avoids colliding with that socket during immediate rebind.
+        recovery_address = (address[0], int(address[1]) + 2)
+        recovery = BridgeSession(
+            recovery_address, output_dir / "snapshot_recovery_bridge.log", args,
+        )
         try:
             recovery.start()
             recovery_reset = recovery.request({"op": "reset"})
@@ -3581,13 +3835,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             })
             report["snapshot_recovery_verification"] = {
                 "status": "pass",
+                "port": recovery_address[1],
                 "model_geometry_sha256": model_sha,
                 "integration_state_exact_match": True,
                 "restored_grasp_state": grasp,
             }
         except Exception as exc:
             report["snapshot_recovery_verification"] = {
-                "status": "fail", "error": f"{type(exc).__name__}: {exc}"
+                "status": "fail", "port": recovery_address[1],
+                "error": f"{type(exc).__name__}: {exc}"
             }
             report["status"] = "task_success_candidate_snapshot_recovery_failed"
         finally:
@@ -3631,6 +3887,10 @@ def _parse_args() -> argparse.Namespace:
         help="forbid experience, keypose, prior-report, resume, and candidate-answer inputs",
     )
     parser.add_argument(
+        "--cold-start-continuation", action="store_true",
+        help="continue a cold-start Episode from its own V3-generated, identity-checked stage Snapshot",
+    )
+    parser.add_argument(
         "--candidate-id", action="append", default=[],
         help="limit a local retry to a previously generated candidate; repeat only in screen-only mode",
     )
@@ -3670,6 +3930,10 @@ def _parse_args() -> argparse.Namespace:
         "--candidate-start-index", type=int, default=0,
         help="physical candidate start, or scratch-screen window offset",
     )
+    parser.add_argument(
+        "--geometry-candidate-pool-offset", type=int, default=0,
+        help="select a later window from the deterministic active-geometry candidate pool",
+    )
     parser.add_argument("--maximum-rrt-preflights", type=int, default=MAX_RRT_PREFLIGHTS)
     parser.add_argument("--maximum-physical-branches", type=int, default=MAX_PHYSICAL_BRANCHES)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
@@ -3688,6 +3952,15 @@ def _parse_args() -> argparse.Namespace:
     )
     if not 1 <= args.maximum_candidates <= maximum_batch:
         parser.error(f"--maximum-candidates must be in 1..{maximum_batch} for this mode")
+    if (
+        args.geometry_candidate_pool_offset < 0
+        or args.geometry_candidate_pool_offset + args.maximum_candidates > MAX_OFFLINE_GEOMETRY_GENERATION
+    ):
+        parser.error(
+            "--geometry-candidate-pool-offset plus --maximum-candidates must fit the generated geometry pool"
+        )
+    if args.strict_grasp_screen_only and args.geometry_candidate_pool_offset != 0:
+        parser.error("--geometry-candidate-pool-offset is available only for physical task-success search")
     if not 1 <= args.maximum_rrt_preflights <= MAX_RRT_PREFLIGHTS:
         parser.error(f"--maximum-rrt-preflights must be in 1..{MAX_RRT_PREFLIGHTS}")
     if args.strict_grasp_screen_only:
@@ -3759,13 +4032,18 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--strict-grasp-screen-only requires --strict-screen-reference-report")
     if args.strict_screen_reference_report is not None and not args.strict_grasp_screen_only:
         parser.error("--strict-screen-reference-report requires --strict-grasp-screen-only")
-    if args.cold_start and (
+    cold_start_mode = args.cold_start or args.cold_start_continuation
+    if args.cold_start_continuation and (
+        not args.cold_start or args.resume_from_runtime_snapshot is None
+    ):
+        parser.error("--cold-start-continuation requires --cold-start and --resume-from-runtime-snapshot")
+    if cold_start_mode and (
         args.experience_library is not None
         or args.previous_search_report
         or args.historical_grasp_pose_priors_json is not None
         or args.strict_grasp_screen_only
         or args.strict_screen_reference_report is not None
-        or args.resume_from_runtime_snapshot is not None
+        or (args.resume_from_runtime_snapshot is not None and not args.cold_start_continuation)
         or args.candidate_id
         or args.candidate_start_index != 0
         or args.candidate_tilt_degrees
@@ -3775,8 +4053,10 @@ def _parse_args() -> argparse.Namespace:
         or args.candidate_offset_object_z_mm
     ):
         parser.error("--cold-start cannot use historical experience or partial search inputs")
-    if not 1000 <= args.demonstration_horizon <= 1800:
-        parser.error("--demonstration-horizon must be in 1000..1800")
+    if not 1000 <= args.demonstration_horizon <= MAX_DEMONSTRATION_HORIZON:
+        parser.error(
+            f"--demonstration-horizon must be in 1000..{MAX_DEMONSTRATION_HORIZON}"
+        )
     if args.target_predicate is not None and len(args.target_predicate) != 3:
         parser.error("--target-predicate needs exactly three active BDDL predicate fields")
     return args

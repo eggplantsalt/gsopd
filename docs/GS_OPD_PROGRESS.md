@@ -1,3 +1,296 @@
+## 2026-10-29 L1T0 Standard 1000步原生成功，完整审计通过
+
+`obstacle_avoidance/L1T0` 从新鲜合法init-state 0、seed 0的t0开始；初始 `On(akita_black_bowl_1,plate_1)=false`。最终在t=402由原生BDDL报告 `On=true`、`task_success=true`、reward=1、done=true，属于Standard 1000步成功。成功Episode按连续timestep由专家抓取145步（t=1–145）、从已核验抓持抬升Snapshot继续的Student handoff 32步（t=146–177）、专家放置225步（t=178–402）组成。更早的Student首分支32步已精确恢复t0并丢弃，不计入成功轨迹；最终成功不是Student-only结果。
+
+V3审计为402/402动作行、10,050/10,050 MuJoCo子步，t=1–402连续，动作维度与状态—动作字段有效，所有动作子步监测完整，阶段Snapshot边界通过核验。24个抓姿候选中11个task-approach候选通过；8次RRT预检后使用 `geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm__rrt0`，随后真实双指抓持、抬升并以native region progress完成放置。285步几何监测为unsafe，Strict-10mm=false、安全认证=false、稳定释放未评估、`safe_training_eligible=false`。V3报告保留 `planning_time_budget_exhausted` 搜索诊断，但其最终原生任务和物理记录状态均通过。归档根目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T0_cold_start_dev_01/v3_run`。
+
+## 2026-10-29 Task-Feasible筛查边界复核与修正
+
+复核共享候选筛查实现发现，旧 `task_approach_only` 模式仍对BDDL禁触对象应用默认10mm clearance，可能把Strict余量误作任务搜索门槛。逐项复核L0T3/L0T4的24+24份候选记录，没有发现仅因正间隙小于10mm而被拒的候选：L0T3是21项实际碰撞和3项IK失败；L0T4的24项都含实际碰撞。故该实现偏差不是这两轮失败原因。现已修改 `mujoco_jointspace_planning.py`：task-approach仍拒绝实际碰撞/穿透，但不继承10mm安全余量；Strict-10mm和2mm授权抓持穿透规则定义保持不变。L1T0归档生成于此修正之前，其运行源码指纹仍为`d0ea082cf6d31e6c7b4e5f6a55a80a95a8efe8e3f8a157c634b3106e4ad12e2b`；后续运行使用当前指纹`6b75e613b78f6662ad650d3a51d892bfcbbe6150120847aeea927ee788706371`。
+
+## 2026-10-29 L1T0在线抓持与抬升阶段完成，完整On任务仍在运行
+
+V3从新鲜合法t0执行24个几何抓姿候选的scratch任务接近筛查，11个可行、13个碰撞约束失败；8次RRT预检后首个实体分支使用候选 `geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm__rrt0`，RRT状态 `offline_feasible`，最小诊断clearance约98.06 mm。候选由当前任务编译几何和实时夹爪pad中心构造，不使用历史成功姿态/动作。真实MuJoCo分支获得稳定双指抓持并抬升36.864 mm，145动作/3,625子步。独立压缩记录核对为145行，step_index连续、每动作25子步、0未观测子步。几何监测117步complete、28步unsafe；安全未认证。
+
+该段是同一运行在最终审计前的阶段性检查点：当时仅确认稳定抓持与抬升，后续同一连续Episode继续经过Student handoff与专家放置，并于t=402达成原生On；最终结果见本文件顶部记录。
+
+## 2026-10-29 L1T0标准V3冷启动启动记录
+
+此前没有找到可复用的L1T0 t0 Runtime Snapshot，因此调用现有 `task_success_first_batch._capture_task_initial` reset/export流程，以 `no_prior_experience=True` 只生成新鲜t0 Snapshot，没有执行动作、加载成功经验或运行batch执行器。init-state 0、seed 0，init-state count=50；BDDL SHA-256 `85f4396e3152c27323182ac2f2a0191371e917a412667e5123e53490b33f2e7b`，模型几何SHA-256 `9563488607b6d99838d870f1ff980ca6bfd7630595f5504662f26cd70233cc86`，Snapshot payload SHA-256 `959474a6b0ead1c2d9cd12694dfd0e80f02f12c6f176e42816ab41e7a5362185`。初始 `On(akita_black_bowl_1,plate_1)=false`，动作数0。
+
+随后基于该t0启动标准1000步现有V3 `--cold-start --continue-pending-native-goals`，不加载跨场景成功动作/姿态/报告。输出目录 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T0_cold_start_dev_01/v3_run`，Bridge port 38640。最终成功与审计结果见本文件顶部记录。
+
+## 2026-10-29 L0T4首轮有界冷启动结果：未成功，零专家物理分支
+
+标准1000步配置在专家动作前结束。合法t0复位核验通过，native `In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`。Student先行分支执行32动作/800子步，精确回到t0后丢弃；记录连续且完整。Task-approach scratch筛查生成24候选，0可行，全部24归类为碰撞约束失败，其中24次目标表面接近碰撞/指垫提前接触、8次预抓姿全几何/自碰撞（原因重叠）。RRT=0、专家物理分支=0、接受动作/子步=0；未达到原生成功。报告中的目标非pad clearance/pad penetration字段为null；后续源码复核发现该版本仍对禁触对象应用默认10mm clearance，但24项记录均含实际碰撞，没有仅因10mm余量被拒的候选。修正后的任务可行性筛查仅要求避免实际碰撞/穿透，Strict规则不变。
+
+归档根目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L0T4_cold_start_dev_01/v3_run`；拒绝项见其 `task_approach_feasibility_screen.json`。V3聚合物理审计标为incomplete，因为没有专家搜索动作文件；32步Student废弃分支另有完整的32/32动作和800/800子步证据。与L0T3相比，两种不同目标物/不同任务在无先验冷启动下都遇到同一候选门槛，但具体碰撞几何需后续跨任务证据再归纳。
+
+按覆盖优先策略，下一配置为 `obstacle_avoidance/L1T0`，检查同一黑碗任务在L1几何下是否复现该瓶颈；完成初次扫描后再决定公共修复，不为L0T3/T4立即手写路线。
+
+## 2026-10-29 L0T4标准冷启动已启动
+
+L0T4选择本地合法的init-state 0、seed 0，标准horizon=1000；t0 manifest确认50个初始化状态、BDDL SHA-256 `ce09c750b0cf03c09aa10f8e357847e8922256db5ab4a066abbf2a71f62b6ee1`、模型几何SHA-256 `02d9d341442eba7e0794720c1d7b5bdd6d1c8d97ac9c242885b5bfaecd12b744`、Snapshot payload SHA-256 `aceddaf001bde27c006d317c276c0f4cab82b6695926a2204cda86c7787c6e5c`、integration-state SHA-256 `efba821b9abadbda5bf9431d2c204871dd8035d24e07473d3ec0dd9b9b83db72`。仅把该任务的t0 Snapshot用于identity-checked cold-start，不提供旧动作、成功姿态或失败报告。首次命令误用系统Python并在导入阶段因缺numpy退出；Bridge未启动、MuJoCo未执行，之后使用项目RLinf venv重启正式尝试。正式run归档根目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L0T4_cold_start_dev_01/v3_run`。当前等候完整执行和原生成功检查。
+
+## 2026-10-29 L0T3首轮有界冷启动结果：未成功，零专家物理分支
+
+标准1000步配置在专家动作前结束。V3冷启动复位核验通过，timestep=0、BDDL/model/Snapshot身份匹配；两项原生目标 `In(alphabet_soup_1,basket_1_contain_region)` 与 `In(cream_cheese_1,basket_1_contain_region)` 初始均为false。Student先行分支执行31动作/775个MuJoCo子步后，报告确认精确回到t0并丢弃。该分支动作和子步记录均连续且完整，不进入后续Episode。
+
+Task-approach scratch feasibility筛查生成24个抓姿候选，0个通过：21个归类为碰撞约束失败，3个为IK不可达；拒绝细项中有21次“目标表面接近发生物理碰撞或指垫提前接触”、6次“预抓姿完整几何/自碰撞”、3次预抓姿IK不可达、3次开爪抓姿IK不可达（失败原因可在同一候选中重叠）。RRT候选路线尝试0、专家物理分支0、被接受动作0、被接受MuJoCo子步0；原生 `task_success=false`。报告的目标非pad clearance/pad penetration字段为null。源码复核发现该旧筛查版本对BDDL禁触对象仍沿用默认10mm clearance；逐项记录中没有仅因该余量而被拒的候选，21项均包含实际碰撞、其余3项为IK失败。现已去掉Task-Feasible模式对此安全余量的依赖，Strict阈值与安全认证规则保持不变。
+
+V3顶层报告 `physical_action_audit.status=incomplete`：聚合器期待bounded grasp search提供动作记录源，但该搜索零物理分支、零期望动作，没有生成该记录文件。Student分支记录单独核对为31/31动作、775/775子步完整。此为bounded search失败，不是失败的1000步物理Episode。报告归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L0T3_cold_start_dev_01/v3_run`；矩阵已将该项记为未解决，并保留失败类型、候选计数和下一步动作。
+
+下一任务按覆盖优先转至 `obstacle_avoidance/L0T4`，继续采用现有V3独立冷启动，不先为L0T3写固定抓姿或路线。当前机器可用GPU均空闲；L0T6 attempt14已封存并关闭。
+
+## 2026-10-29 当前状态校正：L0T6 attempt14封存，L0T3标准冷启动在途
+
+`obstacle_avoidance/L0T3` 已从 init-state 0、seed 0 启动标准1000步V3冷启动。t0 manifest核验init-state count=50、BDDL SHA-256 `b22d0fc993b595cd0cb82fd81cfed4a64ff66e5295fc6452425da0c2cd0398c3`、模型几何SHA-256 `f23541540c4f60acc719eb7b16b047ebb96bfc02c0c28d6aab7e82d6f38389eb`、Snapshot payload SHA-256 `bd786ca28eab33fe70e9a88798abf8a663dbb9f0b4a28ff8ed253135f8f16917`，以及MuJoCo state SHA-256 `bba82d202d3807a6f326efcc434cd69ac71c191cfd851c48416990ca08650c30`。运行目录为 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L0T3_cold_start_dev_01/v3_run`。π0.5已加载、Bridge已就绪；最终动作时间轴和原生成功审计仍待本轮结束，当前不可计成功。
+
+`libero_90/L0T6` attempt14已结束，不再是运行中任务。终态timestep=519，`Open(wooden_cabinet_1_bottom_region)=false`、reward=0、done=false、`task_success=false`；失败类型为 `articulated_fixture_live_follow_joint_progress_stalled`。报告：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_14/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_094420_649009989/run_report.json`。保留诊断，不继续投入该场景。
+
+30项逐配置状态唯一以 [GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv](GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv) 为准；本进度文档不维护独立状态副本。
+
+## 2026-10-29 研究方向纠偏：SafeTRAIL 主实验切换至30项 LIBERO-Safety 避障配置
+
+研究目标确认为 SafeTRAIL 的 Task-Feasible Bootstrap：在 `obstacle_avoidance` 和 `obstacle_avoidance_human` 两个Suite中，为 L0/L1/L2 × T0–T4 共30个配置自动搜索至少一条完整原生成功物理轨迹。目标是安全避障轨迹生成，不构建 LIBERO-90 通用操作系统；不重启现有工作，也不丢弃成功或失败证据。每条任务轨迹都从身份核验合法t0 cold-start，不输入目标场景成功轨迹/动作、不改BDDL和物理状态；标准1000步与 demonstration-only扩展分开统计。当前只做Stage A，不开展Near–Far、安全重构、Strict-10mm、LeRobot转换或Student训练。
+
+已用本地 `libero/libero/benchmark/vla_safety_task_map.py` 和 `benchmark/__init__.py` 做注册表核对，并用本地运行时 `get_benchmark()` 加载两个Suite：各15项，L0/L1/L2每级5项；所有30个 BDDL 与 `.pruned_init` 文件存在，逐项目标表达式和BDDL SHA-256已记录。矩阵：[GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv](GS_OPD_SAFE_TRAIL_TASK_MATRIX.csv)；注册和数据路径核验：[GS_OPD_SAFE_TRAIL_TASK_MATRIX_VERIFICATION.json](GS_OPD_SAFE_TRAIL_TASK_MATRIX_VERIFICATION.json)。RLinf环境中的`LIBERO_CONFIG_PATH`仍指向旧外部路径；核验使用临时本地配置，未改用户配置。
+
+既有基线保留：`obstacle_avoidance/L0T0`标准1000步t=499成功（499动作/12,475子步）；L0T1标准1000步t=752成功（752动作/18,800子步）；L0T2在demo-only horizon=5000下t=1390成功（1,390动作/34,750子步），标准1000步失败。L0T39关灶成功为30项之外的额外成果。L0T3/L0T4及human L0T2旧失败只记入历史诊断；不把跨场景经验或监测不完整的旧探测计入新主线结果。L0T6抽屉诊断与夹爪姿态代码改进及attempt14失败归档均保留；此任务已从主线关闭，不追加轮次。
+
+下一主实验顺序是 obstacle_avoidance/L0T3、L0T4，再覆盖 obstacle_avoidance L1/L2 与 obstacle_avoidance_human。当前代码基线记为仓库HEAD `9099c1979b000a8e632b4d94c56d9c397da31cc4` 加V3/几何候选/IK-RRT/OSC/阶段调度源码bundle SHA-256 `d0ea082cf6d31e6c7b4e5f6a55a80a95a8efe8e3f8a157c634b3106e4ad12e2b`；新矩阵结果将随代码变动更新指纹。覆盖积累后冻结代码与统一搜索预算，区分开发调通过的任务和未定向调试任务。
+
+## 2026-10-29 最新：L0T6 第13轮通过柜顶入口，末段下降撞黑碗
+
+第13轮从已核验的合法 t0 冷启动，Student 32 步前缀精确回退后执行一条专家分支。正面夹爪姿态下，单次高位 RRT 以 `offline_feasible` 完成：774 次配置检查、7 次 IK 检查、7.002 秒，路线最小禁触间距101.489 mm。RRT段执行181个动作；随后在柜外下降、柜顶下内移，并开始把手高度对齐。
+
+固定柜体已被绕开，但对齐阶段的腕部 link6 扫入黑碗：t=307 碗间距降至8.696 mm；t=312 首次发生 link6 与黑碗 g29–g31 接触。t=400 时 EEF 为 `[0.02001, -0.15829, 0.97759]`，目标为 `[0.00856, -0.16135, 0.94614]`；在400个专家动作、10,000个完整监测子步后超时。底部滑轨 qpos 保持0，活动把手g33–g42无接触，原生 `Open=false`。安全诊断306步complete、94步unsafe；本轮不具安全认证。
+
+证据归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_13/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_092949_779566291`。
+
+下一轮保留已通过柜顶的路线，只把正面夹爪工具轴向下倾斜25°，令末端后方的 link6 位于碗上方，再验证把手下降与接触。相关聚焦回归90项、6个subtests通过，`py_compile`通过；attempt14继续使用相同合法t0、标准1000步horizon、单次RRT与单条物理分支。L0T6尚未原生成功，安全认证仍false。
+
+## 2026-10-29 最新：L0T6 第12轮外移并降低后仍在内移阶段撞柜体
+
+第12轮继续从身份核验合法t0冷启动，Student32步前缀回滚后只执行一条专家分支。高位RRT以front位置 `[0.00856, -0.07135, 1.10614]`、顶向下姿态规划通过，317次配置检查、2.773秒、最小禁触间距74.833 mm。末段先在外侧下降至z=0.99114，再水平内移到y=−0.17635。
+
+下降阶段到t=208结束，EEF约 `[0.00854, -0.07086, 0.99488]`。开始向内移动后，t=217柜体clearance降至8.622 mm；t=223子步4首次碰到固定顶板g18与`gripper0_hand_collision`（signed distance−0.058 mm），t=224又碰到固定几何g29；接触持续到t=1000，分别记录19,446和19,418个机器人接触子步。EEF最终 `[0.00737, -0.09875, 0.99177]`，离目标y=−0.17635仍差约77.6 mm。活动把手g33..g42无接触，底部滑轨qpos全程为0，原生 `Open=false`。1000动作/25,000子步记录完整，几何状态784步为unsafe。
+
+第10–12轮结果说明顶向下掌部持续扫到柜体顶板和中隔板；继续只调高度与外移量不再是有效路线。本轮已转为正面夹爪姿态：工具轴朝柜体，指爪沿横向夹住把手竖杆；路线在柜体外侧先降到顶板下方，再内移至把手前方，随后降至把手高度并短距离接触。该策略保持原10 mm路线门槛、合法t0、模型及BDDL不变。相关聚焦测试90项、6个subtests通过，`py_compile`通过。attempt12归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_12/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_090926_862065220`。L0T6尚未成功，`safety_certified=false`。
+
+## 2026-10-29 最新：L0T6 第11轮分段下降仍被固定顶板挡住
+
+一次初始启动因命令行checkpoint路径错误在策略加载前退出，没有Bridge或物理动作，归档 `..._085110_393594827`。更正路径后从同一身份核验合法t0运行正式attempt11：32步Student前缀精确回滚；高位RRT单预检返回 `offline_feasible`，336次配置检查、2.898秒、选seed 4，最小禁触间距77.918 mm。
+
+按attempt10证据增加的“外侧垂直下降”阶段完成到EEF `[0.00910, -0.09096, 1.01020]`，把手目标高度设为z=1.00614；t=171柜体间距已低于10 mm，t=201降至2.235 mm。随后的水平内移刚开始时，t=204子步2首次再次接触固定顶板g18与`gripper0_hand_collision`，之后持续到t=1000，累计19,923个机器人—g18接触子步。EEF最终 `[0.00936, -0.09535, 1.00848]`，与水平目标y=−0.17635相差约81 mm。活动把手g33..g42无机器人接触，底部滑轨qpos全程为0，原生 `Open=false`。全1000个动作、25,000子步均有完整监测；830步几何状态为unsafe，不能据此声称安全。
+
+实际碰撞表明下降阶段不够外向，且水平内移开始时手掌仍高于顶板下沿。下一轮据此把高位RRT预接近再外移20 mm（相对attempt11，预接近外向距离140 mm），低位EEF目标从把手上方60 mm降为45 mm，再水平内移；这一调整保留原t0、模型、BDDL和10 mm策略门槛。attempt11归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_11/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_085134_286007751`。任务未成功，`safety_certified=false`。
+
+## 2026-10-29 最新：L0T6 第10轮严格RRT通过，但末端下降撞到固定柜体
+
+第10轮从身份核验的合法 L0T6 t0 冷启动，保持标准 horizon=1000、1次RRT预检、1条物理分支。高位预接近路线启用 `require_safe_configurations=true`，336次配置检查后以3.224秒返回 `offline_feasible`；选择冗余IK seed 4，规划路线最小禁触间距77.918 mm，高于10 mm路线策略门槛。RRT跟踪到t=152，末端EEF约 `[0.00646, -0.08972, 1.10737]`。
+
+随后执行器从高位预接近点同时向内、向下追踪把手目标。t=171固定柜体间距降到8.805 mm；t=176子步17首次接触固定几何 `wooden_cabinet_1_g18`（`cabinet_top`）与 `gripper0_hand_collision`，signed distance约−0.006 mm。接触持续到t=1000，累计20,602个机器人—柜体接触子步。记录共1000动作、25,000个MuJoCo子步；1000/1000动作的25子步监测完整。活动把手几何 `g33..g42` 没有机器人接触，抽屉滑轨qpos保持0，夹爪未执行闭合，原生 `Open=false`。t=1000以 `articulated_fixture_open_did_not_reach_pose_within_848_actions` 超时，失败waypoint 40。几何状态有830步为unsafe；这不是安全认证。
+
+尝试10说明末端路线必须先在柜体外侧下降，再沿把手法向内移。实现已据此把末段拆成外侧垂直下降和低位水平接近：保持高位RRT终点与10 mm策略不变，下降到把手上方60 mm后再内移至把手抓取位。聚焦测试90项、6个subtests通过，相关模块 `py_compile` 通过。下一轮从同一合法t0进行一次预检和一条物理分支，验证是否能避免固定顶板并触到活动把手。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_10/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_082206_652783847`。L0T6成功未达成，`safety_certified=false`。
+
+## 2026-10-29 最新：L0T6 第09轮柜体间距改善至4.63 mm，增加竖直预接近高度
+
+第09轮把手上方预接近外向偏移120 mm、抬高120 mm。7个冗余IK候选均避开盘（clearance约+202 mm）和黑碗（约+40.4 mm），但柜体最小间距约+4.63 mm，低于10 mm路线策略；每个候选仅有这一项柜体间距违规。7次端点检查约0.42秒，live状态不变，专家动作0、原生Open=false。
+
+保持120 mm外向偏移，将预接近高度增至160 mm，以抬高夹爪和手腕、维持对象侧余量。聚焦Bridge/RRT/executor回归89项通过，相关模块`py_compile`通过。第09轮归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_09/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_081928_060342028`。L0T6原生成功未达成，安全认证仍false。
+
+## 2026-10-29 最新：L0T6 第08轮顶向下终点仍略触柜体，外向间距增至120 mm
+
+第08轮将把手上方预接近点设为外向90 mm、上抬120 mm。全几何RRT确认盘clearance约+227 mm、黑碗约+61 mm，柜体最近距仅+0.078 mm；每个候选都存在1项柜体策略违规，低于10 mm门槛，因此拒绝规划。Student前缀回退后专家物理动作0，原生 Open=false，live状态未变。
+
+据实测柜体间距随外向移动改善，把手上方预接近外向间距增至120 mm、抬高仍为120 mm，预期仍与黑碗保持大于10 mm。相关89项聚焦测试和`py_compile`通过。第08轮归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_08/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_081637_091267898`。当前没有L0T6成功或安全认证。
+
+## 2026-10-29 最新：L0T6 第07轮顶向下姿态清开盘/碗，但仍碰柜体
+
+第07轮使用顶向下工具姿态（工具轴世界向下、闭合轴沿抽屉外向），目标放在把手上方120 mm、柜体外侧40 mm。RRT对7个冗余IK候选全部检查后拒绝：盘clearance约+271 mm、黑碗约+86.5 mm，但机器人与柜体仍有约30.8 mm穿透；柜体碰撞数每个候选均为5。候选预检约0.65秒，live状态未变；Student32动作被回退，专家物理动作0，原生 Open=false。
+
+新姿态消除了前两轮观察到的盘/碗遮挡，剩余问题是夹爪靠柜体过近。下一轮把把手上方预接近的柜体外向偏置从40 mm增至90 mm，抬高量仍120 mm，保持全几何安全门控。活动部件首次接触后闭合夹爪，再按当前slide qpos跟随。89项Bridge/RRT/executor聚焦测试及`py_compile`通过。第07轮归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_07/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_081400_094446126`。尚无L0T6原生成功或安全认证。
+
+## 2026-10-29 最新：L0T6 第06轮排除冗余肘部IK，转为把手上方竖直接近
+
+第06轮将安全模式改为逐一检查7个冗余IK候选后，全部候选在相同末端目标位姿处被拒绝：盘clearance约-51.8至-54.3 mm、黑碗约-1.23 mm，柜体clearance约+150.96 mm；候选间结果几乎一致。候选筛查7次、总规划约4.42秒，live Integration State保持不变；Student32步前缀回退、专家动作0、原生 Open=false。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_06/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_080915_560159866`。
+
+因此低位正面末端目标本身被台面盘和黑碗遮挡，换肘部姿态不足以解决。现对滑动抽屉使用独立的顶向下夹持姿态：EEF工具轴朝下、夹爪闭合轴沿滑轨外向；RRT终点放在把手上方120 mm并位于柜体外侧40 mm，完整规划到该高位终点后再竖直接近。确认与抽屉活动碰撞几何接触后闭合夹爪，并按实测滑动关节位置做实时跟随。铰链开关沿用既有侧向压动姿态。新增顶向下轴向回归；Bridge/RRT/executor聚焦共89项通过，涉及模块`py_compile`通过。下一轮仍限一个RRT预检及一个物理分支，门控不满足时不执行动作。L0T6尚未成功，安全认证仍false。
+
+## 2026-10-29 最新：L0T6 第05轮确认正面终点被碗/盘阻挡，改用碰撞筛选冗余IK
+
+第05轮仍从 probe06 的合法t0冷启动，reset恢复SHA与前几轮一致（`111af17cfaf2f5e5e37b1bc51c828445a0faebee517586f5cd1e3807aa43f2ee`），Student32步前缀已回退。预接触终点沿外向轴后移到把手外180 mm后，仍因终点本身穿入 `plate_1` 约53.18 mm、`akita_black_bowl_1` 约1.23 mm而被严格RRT拒绝；与柜体间距约150.96 mm。规划检查2个配置、约0.020秒，live状态未变，专家物理动作0，原生 Open=false。
+
+失败报告证明固定正面接近姿态被台面物体挡住，继续延长沿同一外向轴的预接近距离无效。检查代码发现IK候选目前按离当前关节姿态排序后只检查第一个；安全门控模式将改为逐个验证全部冗余IK候选，优先选择最近的全几何可行解，并在报告中保存每个候选的间距和接触摘要。若全部候选不安全，继续零动作拒绝，不放宽碰撞门槛。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_05/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_080348_869172821`。
+
+更新后Bridge/RRT/executor聚焦回归88项通过，涉及模块`py_compile`通过；下一轮仍从同一合法t0最多执行一个RRT预检和一个物理分支。L0T6原生成功未达成，Safety仍未认证。
+
+## 2026-10-29 最新：L0T6 第04轮严格路线门控拒绝低位终点，准备拉远预接触姿态
+
+第04轮从 probe06 导出的合法 L0T6 t0 冷启动；原生 `Open(wooden_cabinet_1_bottom_region)=false`，fresh reset 与导入 Snapshot 的 Integration State 精确匹配，SHA-256 `111af17cfaf2f5e5e37b1bc51c828445a0faebee517586f5cd1e3807aa43f2ee`。32个Student前缀动作在专家分支前按冷启动规则精确回退，未拼入专家路径。
+
+本轮首次将关节空间RRT设为 `require_safe_configurations=true`，同时保留 `safety_certified=false`。规划在2次配置检查、约0.016秒后以 `goal_configuration_is_unsafe` 拒绝预接触位姿；执行前后live状态SHA一致，专家物理动作0、原生目标仍false。终点位于 `[0.008558, -0.136354, 0.946140]`，即活动滑动把手外侧75 mm；失败结果说明先前只记录碰撞的RRT可把不可接受配置报告成 `offline_feasible`。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_open_bottom_drawer_articulation_04/task_success_engine/task_success_first_executor_libero_90_L0T6_20261029_075951_499237136`。
+
+现把终点沿真实抽屉外向轴后移到把手外180 mm，并在RRT拒绝端点时保留对象clearance、禁触接触和自接触摘要，便于区分柜体、碗盘、桌面或机器人自碰撞。桥接层接受显式安全配置门控；执行器只在规划响应确认门控启用、路线间距达标、Qpos与EEF路径等长有效且live状态不变时才允许OSC执行。新增负向回归确保未达策略间距时物理动作仍为0。聚焦Bridge/executor/RRT共88项通过，相关模块`py_compile`通过。下一轮从同一合法t0启动，最多一个RRT预检及一个物理分支；尚未取得L0T6原生成功，也没有安全认证。
+
+## 2026-10-29 最新：L0T39 第26轮首次达成原生 Turnoff；下一项扩展到抽屉滑动关节
+
+第26轮从身份核验合法 t0 冷启动，任务为 `libero_90` L0T39 `KITCHEN_SCENE8_turn_off_the_stove`。12步 Student 前缀未成功且在专家执行前精确恢复原始 t0；Expert 随后执行356动作、8,900个MuJoCo子步，于t=356完成 `Turnoff(flat_stove_1)=true`，原生 `reward=1.0`、`done=true`、`task_success=true`。全356动作的子步监测完整，步号连续，无成功后的动作；铰链qpos从0.983596变为-0.002916，进入原生关闭区间[-0.005, 0]。首次机器人—活动按钮接触发生在timestep222，实际夹爪间距由约40 mm降至约1 mm；接触记录未证明双指同时接触，因此不作双指抓持结论。
+
+冷启动协议确认未使用任务成功示范、关键点、官方示范、历史动作、经验库、参考或先前报告；fresh reset 与合法t0 Integration State 精确匹配，SHA-256 `d865ae10020c6863dd0aef657ef72f8285f79a14a0b1766058948218ca7d944b`。独立 `native_task_success_audit.json` 状态 `passed`，核对来源、连续动作/子步记录、最终原生成功、关节范围、首次接触、qpos变化、夹爪收窄及无后续动作。归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_close_corrected_26/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_070703_779822910`。原始分段把环境成功终止记录为 `environment_done_during_grasp_only_branch`；该终止与最终原生成功并存，独立审计保留原字段并核实成功，后续报告分类代码已修正。
+
+本次是 Task-Success 证据，不是安全认证：`safety_certified=false`，诊断规则未获得安全认证。下一步扩展到 `libero_90` L0T6 `KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet`，覆盖滑动抽屉操作；先生成并审计独立合法 t0，再以原生 `Open` 谓词及完整MuJoCo记录为验收。此前L0T39第25轮的夹爪符号失败继续保留为历史诊断，不与第26轮成功混写。
+
+## 2026-10-29 最新：L0T39 第25轮闭爪命令方向错误；第26轮修正方向
+
+第25轮使用同一合法t0独立冷启动，未输入任务成功历史答案，标准horizon=1000。Expert执行279动作、6,975个MuJoCo子步后因三段零关节进度停止；279/279动作的子步监测完整。原生`Turnoff(flat_stove_1)=false`、reward=0、done=false；qpos从0.983596降到0.893913。
+
+第222步首次接触活动按钮g19后，执行器发送`gripper_action=-1.0`，但该命令与实际夹爪运动方向相反：关节从约`[0.0202,-0.0198]`移到`[0.0400,-0.0397]`，夹爪间距增大；首次接触之后接触即丢失，全程未出现双指—按钮接触。关节随后仅由初始碰撞惯性继续下降，末端没有再推到关闭区间。这说明第25轮没有验证双指转动策略，失败根因是抓取命令符号，而非夹持力不足。归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_close_after_contact_25/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_065922_851809678`。
+
+第26轮仅把`turnon/turnoff`活动部件接触后的闭爪命令改为`+1.0`，其余stride=2路线、实时关节跟随、物理下限保护、冷启动输入和标准预算保持不变。通过实测夹爪qpos间距缩小和g19上双指接触核验命令方向与夹持；若仍无双指接触，再根据接触几何调整。107项聚焦回归及`py_compile`通过。第24轮归档仍保留作单指末段停滞证据：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_terminal_stop_follow_24/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_063358_850916619`。
+## 2026-10-29 最新：L0T39 第15轮证明加大目标侧偏置会使按钮失去摩擦接触
+
+第15轮仍由同一合法t0 `--cold-start`，标准horizon=1000；专家分支299动作、7475个MuJoCo子步后以 `articulated_fixture_live_follow_joint_progress_stalled` 结束。qpos从0.983596降至0.366938，原生Turnoff仍false。接触段按32步分块执行；第一个25步段中关节惯性把qpos推到0.584228，后续前置量从0.12增至0.15/0.18 rad，qpos继续因惯性下降，但指2与g19接触总共仅9个控制步，末端仍停在接触目标弧前方。
+
+实际接触记录中的 `normal_geom1_to_geom2` 为世界 `[0,0,1]`，穿透约0–10 µm，确认指2从按钮顶面按压，扭矩依赖切向摩擦。目标侧的大正向前置将指面带出接触区域。下一版把接触跟踪偏置改到关节运动反侧：初始0.03 rad、上限0.12；检测到末端动作没有按钮接触时递减偏置直到0，使固定锚点追踪回到实际按钮面；接触仍在但qpos不进展时才小幅增加偏置。其余接近/接触预算、标准时域、native目标保持不变。103项聚焦回归通过，执行器/桥接/测试py_compile通过。第16轮待从同一合法t0冷启动验证。
+
+第15轮归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_anchor_chunks_15/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_043121_500559206`。没有取得原生任务成功或安全认证。
+
+## 2026-10-29 最新：L0T39 第14轮锚点稳定；4 mm路点容差过早结束接触驱动
+
+第14轮合法t0冷启动，标准horizon=1000。低位全几何RRT与首次finger2—按钮g19接触重现；固定首次接触锚点后，动态目标没有再漂离按钮预测弧。专家阶段到总动作266时结束（6650个MuJoCo子步），按钮qpos从0.983596降至0.584228，原生Turnoff仍false。实际按钮只在首次接触的8步中受力；后续关节惯性使其继续转动，末端随后到达0.12rad前置目标，位置误差约0.68 mm，小于原4 mm通用容差，于是动态控制过早返回并失败。
+
+现在改为1 mm动态接触跟踪误差、每段最多32步循环；每段都使用固定接触锚点和最新qpos，目标始终在关节前方。若一段没有有效关节进度，则每次将前置量增加0.03 rad，上限0.18 rad；最多用完原580步接触预算，或直到native predicate为true。新增闭环分段单测，聚焦executor/search/V3回归103项通过，安全桥/执行器/测试py_compile通过。第15轮待从同一合法t0冷启动实测。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_live_anchor_follow_14/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_042132_277970254`。未获得原生任务成功或安全认证。
+
+## 2026-10-29 最新：L0T39 第13轮首次动态接触跟踪推动按钮，但末端锚点漂移
+
+第13轮从原合法t0按 `--cold-start` 运行，标准horizon=1000；Student32步按既有回退规则丢弃。专家分支在第241个动作首次接触活动按钮几何 `flat_stove_1_g19`，切换实时跟踪后执行580步动态阶段。按钮qpos从0.983596降至0.208984，专家共821动作、20,525个MuJoCo子步，原生 `Turnoff(flat_stove_1)=false`。在线轴、枢轴与关节读数有效。
+
+首次接触后前7步，手指接触仍在，qpos快速降至约0.868；随后接触消失。逐步记录显示目标末端随后绕行至远离按钮的区域，qpos在约0.209停滞。根因是目标每步都以当前末端位姿重新锚定，又套用当前关节到目标的整段旋转；旋转被反复累积。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_live_joint_follow_13/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_040452_996713644`。
+
+下一版在首次实测接触时固定EEF位姿、关节qpos、轴和枢轴，并只追踪实时qpos前方0.12 rad的弧上目标（滑动关节用6 mm前置量）；每步不会再把当前EEF误差累积进锚点。专项executor/search/V3回归102项通过，三个修改模块py_compile通过。下一轮仍从合法t0冷启动，标准horizon=1000，总执行预算980。尚未获得原生成功或安全认证。
+
+## 2026-10-29 最新：L0T39 第12轮证实静态路点在按钮转动后失配；实时铰链跟踪已就绪
+
+第12轮仍从同一合法t0冷启动，标准horizon=1000，执行800个专家动作、20,000个MuJoCo子步；qpos由0.983596降至0.949438，原生 `Turnoff(flat_stove_1)=false`。6 mm局部容差只让静态RRT路点从244推进至246。第240步 finger2首次与活动按钮几何体 `flat_stove_1_g19` 接触；按钮初始转动约0.03 rad后，固定空间目标使末端停滞，余下约560步几乎没有关节进展。该证据否定继续放大静态容差的策略。
+
+当前改为接触驱动：Safety Bridge只读机构上下文增加MuJoCo实时世界铰链轴、关节枢轴及18个活动碰撞几何名；执行器要求机器人与该活动几何有真实接触才切换策略。首次接触后中止旧静态RRT路点，按实时qpos将末端目标绕真实枢轴变换到原生关节目标，逐动作更新姿态并以原生谓词终止。总预算仍为980步（接近400、接触跟踪580），不超过标准1000步。101项executor/search/V3回归及两个模块py_compile通过。
+
+只读桥接预检确认目标轴为世界Z、枢轴 `[-0.1941655,-0.1994221,0.905]`，18个活动几何有效；起点Integration State SHA与合法t0一致（`d865ae…d944b`），调用前后不变，未执行物理动作。第13轮待用同一合法t0、原生冷启动条件验证实时跟踪。预检：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_live_follow_preflight_13/report.json`。原生成功、安全认证及Strict-10mm仍未达成。
+
+## 2026-10-29 最新：L0T39 机构接触姿态重构，准备下一次物理验证
+
+第09轮已越过通用440步上限，但原生Turnoff仍为false：合法t0冷启动专家阶段577动作、14,425个MuJoCo子步；第163接触路点用完192步仍差约22 mm，炉钮qpos仅从0.983596降至0.937070。末端在 `[-0.26984,-0.27938,0.91179]` 附近停滞，目标为 `[-0.25394,-0.26363,0.91157]`；逐子步监测看到 `gripper0_hand_collision` 接触按钮 `flat_stove_1_g19`，说明当前默认向下抓取姿态先由掌部顶住按钮，手指接触面未对准。
+
+针对真实几何进行8种手指轴朝向的只读RRT预检，起点为同一合法t0，前后Integration State SHA保持 `d865ae…d944b`；6种有路、1种IK不可达、1种RRT在8秒内无路。用按钮当前径向反向作为末端工具轴、切向作为夹爪开合轴的 `horizontal_inward_roll_0` 有路（304位姿，规划6.45秒），不触碰live状态。实现现从活动铰接体径向构造该姿态，并记录末端轴；接近/接触预算改为800/180步，总980，仍低于标准1000 horizon。聚焦executor/search/V3回归99项通过。代码和几何假设需由下一轮真实MuJoCo检验；当前尚无L0T39原生成功，安全标签仍未认证。预检归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_orientation_preflight_01/report.json`。
+
+## 2026-10-29 最新：L0T39 机构预算硬上限失配已定位，下一轮修正
+
+LIBERO-90/L0T39 `turn off the stove` 第08轮从身份核验的合法 t0 冷启动，未使用目标示范、历史动作、Keypose或经验库；标准 horizon=1000。抬高外侧RRT路线162个姿态可行，实时OSC依次完成RRT路线及外侧下降、预接触下降，并已开始沿按钮接触路径施力。炉钮 `flat_stove_1_button` qpos 从0.983596降到0.944983；原生 `Turnoff(flat_stove_1)` 仍为false。专家阶段记录441动作、11,025物理子步后失败，失败路点为接触路径第一个点；归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_raised_outer_approach_08/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_023922_958443689`。
+
+根因是机构控制预算与公共物理分支硬上限不一致：预接近/接触预算已设416/192（总608），但 `_advance_pose` 默认仍将总动作封顶在440，遂在第441步抛出 `physical_branch_control_action_budget_exceeded`，尚未用完接触预算。现已为机构执行调用显式传入其总608步上限，并加单测锁定这项契约。98项executor/search/V3聚焦测试通过。下一轮将从同一合法 t0 冷启动复验；标准 horizon仍1000，608只是该物理分支上限。原生成功尚未取得，Strict-10mm、安全认证和训练资格仍为false。
+
+## 2026-10-29 最新：L0T2 多目标原生成功；审计记录已修正
+
+`_04_h5000` 的 V3 多目标Episode最终在 t=1390 达成原生 `task_success=true`、reward=1、done=true。Pot1 `On=true`、Pot2 `On=true`、炉灶 `Turnon=true`；同一V3归档从合法 state0 t0 开始，Stage 2 于 t=776完成Pot1 release/withdraw/settle，Stage 5从经哈希核验的同run t=776 Snapshot恢复并完成Pot2目标。V3记录 Stage 1、2、5 为已提交，Stage 3、4作为精确回退的失败搜索排除。
+
+Stage 5使用几何池偏移32：24个候选中2个通过任务接近筛查；首个候选RRT预检20.03秒、1334次配置检查后为 `offline_feasible`，第二候选在20秒预算内无路。首候选真实执行稳定双侧抓持和35.95 mm抬升，再完成原生区域运输与精确放置。成功时域是5000步demonstration-only；标准1000步成功=false。成功前最终物理记录仍显示Pot2由夹爪抓持，环境在task success时done，因此稳定释放未验证。
+
+原始V3审计漏掉类型为 `resumed_expert_release_withdrawal` 的Stage 2记录（55动作），使审计误报时间轴不连续。已修复聚合器并新增回归测试；专项pytest 46 passed。按7类已提交动作来源重建归档审计：1390动作、34750个物理子步、1390步子步监测完整、时间步连续至t=1390，阶段Snapshot边界核验通过。原报告与manifest保存在 `v3_report_before_physical_audit_rebuild_20261028T174029Z.json` 和对应备份；当前报告的物理状态—动作审计现为有效。该修正不升级安全标签：Strict-10mm=false、`safety_certified=false`、`safe_training_eligible=false`，最终稳定释放未验证。归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_04_h5000/v3_run`。
+
+Stage A主线转向LIBERO-90 turnoff原生机构任务，检查场景绑定和真实接触反馈是否足以完成开关操作；随后继续扩展不同初始状态与任务类型。总体Stage A仍未完成，详见当前目标和路线图。
+
+## 较早：Stage 3 首轮接近候选失败，扩展几何窗口
+
+同一V3归档续接先验证了 Pot1 失败分支接触 Snapshot（native `On=true`、t=721、模型/BDDL指纹一致、双侧抓持）。55个真实动作完成 release/withdraw/settle，Stage 2 `partial_predicate_completed` 于 t=776 收尾；native 谓词为 Pot1 `On=true`、Pot2 `On=false`、Stove `Turnon=true`。该 settled Snapshot保存在 `continuation_stages/stage_02/.../native_goal_placement_terminal_runtime_snapshot.pkl`，作为Pot2阶段唯一输入。
+
+Pot2 Stage 3 已按该Snapshot精确恢复（SHA `02ef40f4fb4c05d5ea874d218098911bbc5511ad0d12cf0e3a9eb630b536f5b1`，t=776的原生谓词边界一致）。Student进行了32个动作后未完成抓取；抓姿搜索从原Snapshot恢复，并以当前Pot2活动编译碰撞几何生成24个开放接近候选。0个候选可行：12个同时报告Ginger Beer与机器人链节碰撞及目标路径/指垫接触问题、4个IK不可达，其余候选也未通过路径筛查。没有运行RRT或Pot2物理抓取。该attempt report仍归档；V3新增 `episode_state_committed=false` 和 discarded-attempt bookkeeping，32个动作不计入连续Episode动作链。Pot1 settled Snapshot未改变。
+
+为避免重复屏蔽同一候选窗口，抓姿搜索/executor/V3增加`--geometry-candidate-pool-offset`，只从当前场景编译几何候选池选择后续窗口，不输入历史候选ID、动作、示范或经验。V3 continuation现在允许从含已归档失败尝试的报告继续：只接受准确回退到前一settled Snapshot的失败尝试，并将其从成功Episode汇总中排除。聚焦suite 97项通过，相关模块`py_compile`通过；基于真实归档的只读continuation-history校验接受stage1/2为已提交、stage3为已丢弃，且恢复Snapshot位于同一V3目录。下一步使用池偏移16从 t=776 Snapshot 重试Pot2，再按模型、谓词与时间步边界复核。
+
+此前 waypoint 在 native predicate 满足时即停止的修复和接触报告释放恢复仍有效；Pot1 release/settle已由真实动作确认。Stage A总体目标尚未完成；5000步是demonstration-only，标准1000步另行统计；安全认证与训练资格仍为false。
+
+## 2026-10-29 较早：L0T2 接触后谓词已成立，但放置未释放；修复并从原归档续接
+
+`_04_h5000` 终态确认 Pot1 的原生 `On(moka_pot_1, flat_stove_1_cook_region)=true` 于 t=721 成立，Pot2仍为false、Stove Turnon=true、总体 `task_success=false`。抓持仍为双侧确认，物体未释放；transport waypoint在谓词已满足后仍继续执行，24步无进展报错。该状态不满足settle条件，所以V3没有启动Pot2。失败分支动作记录和 `native_goal_transport_failed_runtime_snapshot.pkl` 均保留，当前原生终态及同run接触Snapshot可由executor已有的身份核验释放恢复逻辑处理。
+
+已在`native_region_progress` waypoint调用上增加 `stop_condition=native_goal_satisfied`，目标谓词满足后立即离开运输控制，交给已有precise-placement、release、withdrawal和settle逻辑。扩展V3 continuation以接纳同一V3输出目录内的接触失败报告和对应Snapshot：恢复时强制Pot1原谓词、核对父子原生谓词值/timestep、Snapshot SHA、模型/BDDL及双侧持抓；只有完成释放/稳定并生成settled partial-goal Snapshot后才启动Pot2。增加`--continue-from-v3-report`，可在不重跑抓取和搬运的情况下从`_04_h5000/v3_run/v3_report.json`续接；开始续接前会备份旧V3报告与manifest。外部历史报告、经验、示范动作和Keypose仍不被接受。
+
+回归：三组聚焦suite共96项通过，含executor、grasp-search、V3；修改与测试模块`py_compile`通过。基于当前归档的只读检查确认V3有1个失败stage、source return code 2、原谓词Pot1 On与t=721、contact Snapshot存在且位于当前归档内。物理续接尚未启动。下一步从合法t0 reset后只恢复这个已归档精确接触状态，先释放/settle Pot1，再按同一run Runtime Snapshot执行Pot2；最终仍需timestep连续性和原生`task_success=true`。安全认证/训练资格不因恢复而继承。
+
+## 2026-10-29：L0T2 horizon=1800 冷启动运输预算不足；扩展运行时支持5000步并启动复验
+
+上一轮完整物理运行 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_02/v3_run` 已结束，最终为 `task_incomplete`，完整 L0T2 Episode 成功数为0。合法 state0 t0 初始谓词为 `On(moka_pot_1, flat_stove_1_cook_region)=false`、`On(moka_pot_2, flat_stove_1_cook_region)=false`、`Turnon(flat_stove_1)=true`。系统仅执行首个 Pot1 目标，未错误推进到Pot2阶段；最终 native status 在t=264仍为两项On=false、reward=0、done=false。标准1000步与1800步 demonstration-only 均未成功。
+
+失败原因由机器报告中的预算精确解释：抓取和handoff后 t=176，1800 horizon扣除当前目标完成预留336步及下一对象预留1200步，当前运输只剩88步。Pot1原生区域路线长0.9900147 m，按0.012 m/s与0.05 s控制步长估算需要1981步。直接路线和侧绕路线各自都在88步自适应抬升/clearance上限停止，均未进入region-progress或最终放置；双侧抓持在两分支末尾仍为真，Pot1没有达到目标谓词。已归档的失败Snapshot和动作/视频记录保留在上述目录。V3报告没有形成成功Episode；失败/被放弃分支不拼成连续成功链，严格安全与完整子步监测也未认证。
+
+据该路线估计，1800步不可能为此多目标Episode同时容纳Pot1运输、收尾、Pot2后续操作。6000步提案尝试归档于 `_03_h6000/v3_run`，但在物理启动前因executor CLI原有上限3600而拒绝；Bridge没有启动、物理动作和MuJoCo子步均为0，不计为物理任务运行。已将共享上限提升至5000，供V3 executor、抓取搜索和Safety Bridge一致使用，并分别增加executor/search CLI接受5000步horizon的回归。相关executor/search/V3聚焦测试96项通过，修改模块`py_compile`通过。新一轮已从同一身份核验合法t0独立启动，使用5000步demonstration-only horizon并单独报告标准1000步成功与否；不读取历史部分任务Snapshot、动作、示范、Keypose或经验库。当前多目标调度代码每阶段重读完整原生谓词，仅用本次运行目录内经身份与边界核验的Runtime Snapshot续接。为控制运行成本，新轮最多保留两条真实物理路线机会（直达及一条侧绕），wall-time上限6小时。归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_04_h5000/v3_run`。启动日志进入Hydra环境加载；物理结果待终态报告。完整成功仍必须同一Episode中两项Pot On=true且原生`task_success=true`。
+
+2026-10-29 00:09 (Asia/Shanghai) 状态：MuJoCo抓取搜索返回 `task_success_candidate_created`。本轮新生成的 `geom99_jaw0_approach1_-1_flip-1__rrtgenerated_geometry_high_approach` 候选在真实物理执行后验证双侧稳定抓持和至少30 mm抬升，177动作/4,425子步，子步监测177/177完整；不使用历史抓姿或动作。候选报告 `.../task_success_first_grasp_obstacle_avoidance_L0T2_20261029_000021_031928397/run_report.json`，首次验证抓持用时466.29秒。executor当前接续handoff及Pot1原生放置；尚未观测到Pot1 On=true、stage续接或总体任务成功。
+
+2026-10-29 00:14 (Asia/Shanghai) 状态：32动作Student handoff已保存且连续边界接续，最后状态t=209。原生Pot1直达运输分支已经执行到t=322（约113个运输动作），最新耐久记录阶段仍是 `transport_region_progress_adaptive_clearance`，尚无Pot1 On谓词成功或阶段终态报告。该运行使用5000步demonstration-only horizon；继续等待运输终态及多目标调度结果。
+
+2026-10-29 00:16 (Asia/Shanghai) 状态：直达运输最新持久记录达到t=382、约173个运输动作，仍由反馈控制推进adaptive-clearance。Pot1 root position约`[-0.1571, 0.2052, 1.3634] m`，EEF约`[-0.1635, 0.1261, 1.4084] m`；抓持确认仍为true。原生区域路线尚未到达、Pot1 On未成立，放置分支继续真实运行。
+
+2026-10-29 00:18 (Asia/Shanghai) 状态：直达路线已进入 `region_progress` 第3个路点，最后状态t=431（约222个运输动作），Pot1 root z≈1.3794 m，EEF z≈1.4225 m，双侧抓持仍确认。扩大horizon后执行器已越过旧88步截断位置并开始目标区域进展；尚无Pot1 On=true。
+
+2026-10-29 00:20 (Asia/Shanghai) 状态：直达路线推进到 `region_progress` 第6路点，最新记录t=479（约270个运输动作）。Pot1 root position约`[-0.1328, 0.0239, 1.3796] m`，EEF约`[-0.1395, -0.0561, 1.4229] m`，抓持确认true。仍未进入末端放置或触发原生On谓词。
+
+2026-10-29 00:21 (Asia/Shanghai) 状态：直达运输分支已进入 `native_region_placement` 第9路点，最新记录t=541（约332个运输动作）。Pot1根部约`[-0.1179, -0.0615, 1.3261] m`，EEF约`[-0.1243, -0.1415, 1.3695] m`，双侧抓持仍确认。路线已进入最终放置接近阶段；松爪、Pot1 On谓词及后续Pot2调度尚未报告。
+
+2026-10-29 00:22 (Asia/Shanghai) 状态：第9路点仍在真实下降接近，最新t=589（约380个运输动作）。Pot1根部z≈1.2244 m、EEF z≈1.2685 m，抓持确认true；该步native reward=0、done=false、task_success=false。未松爪，Pot1 On仍未确认。
+
+2026-10-29 00:23 (Asia/Shanghai) 状态：第9路点下降继续到t=656（约447个运输动作）。Pot1根部z≈1.0814 m、EEF z≈1.1264 m，抓持确认true；该步reward=0、done=false、task_success=false。末端区域放置与释放流程尚未完成。
+
+2026-10-29 00:24 (Asia/Shanghai) 状态：第9路点继续下降到t=721（约512个运输动作）。Pot1根部约`[-0.1094, -0.1442, 1.0030] m`，EEF约`[-0.1120, -0.2291, 1.0349] m`，抓持确认true；reward=0、done=false、task_success=false。释放及原生On判定仍待执行。
+
+本轮多目标V3/executor/search聚焦测试95项与相关模块`py_compile`均已通过。首次launcher `_01` 在Bridge启动前因默认经验库配置泄漏被预检拒绝，动作/子步0；已修复且作为失败预检保留，不作为物理任务失败或成功。
+
+## 2026-10-28：L0T2 多目标冷启动连续执行器已实现并启动物理验证
+
+为满足 Stage A 的同 Episode 多目标要求，在 V3 增加原生 BDDL pending-goal 调度：首阶段从 legal t0 cold-start；只有在当前目标 predicate 稳定完成、留下当前运行内的 terminal Runtime Snapshot 后，才启动 continuation。每个 continuation 重新 reset 到合法 t0 并按 Snapshot envelope 做精确场景恢复；V3 检查父阶段与子阶段的模型身份、全部 native predicate 值及 timestep 边界一致，然后重新读取 pending goals。若目标没有新增完成、Snapshot 越出当前 V3 输出目录、阶段边界不匹配或目标回退而无推进，则停止并记录原因。Continuation 及其冷启动抓取搜索子进程都不加载经验库、成功关键点、官方示范、历史动作或旧报告。最终审计合并阶段记录，并检查成功链 timestep 连续性。Stage A 不使用 Strict-10mm gate。
+
+相关 V3、executor、grasp-search 聚焦套件 95 项通过，六个修改/测试模块 `py_compile` 通过。实验 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_01/v3_run` 已从合法 `obstacle_avoidance/L0T2/state0/seed0` t0 Snapshot 启动，BDDL `put_both_moka_pots_on_the_stove`。初始 goals 是 Pot1 On=false、Pot2 On=false、Stove Turnon=true；首轮声明1800步 demonstration-only horizon（旧完整轨迹只用于界定该上限，不作为运行输入），标准1000步成功另行统计。V3 首次 launcher 配置预检因 cold-start 误带默认经验库而在command build阶段拒绝，Bridge和物理engine均未启动、动作0；独立记录于 `_01/v3_run/preflight_failure.json`。修正后95项聚焦回归通过；后续有效物理启动归档于 `_02/v3_run`，其最终预算失败另见本节最新记录。
+
+L0T2 物理阶段当前证据：合法t0抓取筛选24候选、4个接近可行、live state unchanged。`moka_pot_1`候选 `geom99_jaw0_approach1_-1_flip-1__rrt0` 在真实MuJoCo形成稳定双侧抓持并抬升36.0105 mm；物理抓取搜索报告归档在 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T2_20261028_233001_523978683/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T2_20261028_233220_039592967/run_report.json`，报告branch记录144个控制动作。Student handoff数据和terminal Snapshot已保存。
+
+Pot1放置直接路线 `region_layout_04_direct_region_progress` 与 `region_layout_09_keypose_side_region_progress` 侧绕路线各真实执行88步，均只到 `adaptive_clearance`，最终native goal values仍为两个On=false、Stove Turnon=true；任务没有开始Pot2阶段。报告显示每路预算88而当前路线估计1981步，故这次首先被1800总时域的静态阶段预留限制，不足以判定完整长路线在物理上不可行。历史结果使用只作诊断；新实验必须回到合法t0独立重跑。
+
+## 2026-10-28：L0T0 第二轮合法 t0 冷启动回归完成原生任务
+
+第一轮 L0T0 回归在 `region_progress` 阶段失败后，将 6 mm/0.05 rad 紧对齐容差限定于原生 `In` 目标，并把 `On` 目标恢复至 15 mm/0.12 rad 默认值。根据第一轮 RRT 预检预算耗尽证据，第二轮使用最多 8 次×20 秒预检；起点是原始 `obstacle_avoidance/L0T0/state0/seed0` 合法 t0 Snapshot `/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt8_snapshot_root`。V3 使用 `--cold-start`，标准 horizon=1000，没有读取先前 505 步成功动作、成功报告、候选报告或经验作为输入。
+
+新运行的 24 项 task-approach screen 中 11 项可行，t0 live state 未改变；8 次 RRT 预检中 6 次 `offline_feasible`。选用当次重新生成的 `geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm` 抓姿候选和 `jointspace_rrt_connect.v1` 路线。实际抓取 145 动作，稳定双指抓持并抬升 36.6215 mm；Student handoff 32 动作且精确恢复身份验证通过。随后同一 Episode 原生区域放置执行 322 动作：63 adaptive clearance、86 region progress、166 final placement、5 precise placement、2 release。t=499 原生 `On(akita_black_bowl_1, plate_1)=true`，reward=1、done=true、`task_success=true`；标准 1000 步内完成。
+
+V3 归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run`：`status=complete`、`standard_1000_step_success=true`，成功 Episode 含 499 个物理动作、12,475 个 MuJoCo 子步，子步监测完整、7D action/state 记录有效、成功路径来源连续。失败/丢弃分支没有拼入成功 Episode。executor `run_report.json` 终态为 `complete_task_success`，timestep 499。`strict_10mm_pass=false`、`safety_certified=false`、`safe_training_eligible=false`；安全未认证，也未验证初始 RLinf LIBERO-SFT π0.5 权重的未经 SFT 预训练 checkpoint 身份。L0T0、L0T1 两项标准冷启动成功均不构成安全数据。
+
+L0T0 第二轮后，Stage A 当前重点切换至同场景多目标 `obstacle_avoidance/L0T2`。合法 state0 t0 来源为 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_fresh_fixture_probe_01/stage_snapshots/t0`；只读探针的完整 BDDL 原生谓词为两个 `On(moka_pot_*, flat_stove_1_cook_region)=false`，`Turnon(flat_stove_1)=true`，模型 SHA `1a0c219cafe5ff4fa96429ca76e37e3885b2b0b390a8e76214a3e14f7ea9f752`，BDDL SHA `901feec9b1ade569500c06f738f07900cb0f1db0de8b91c467d860315e7d675c`。下一运行必须从该合法 t0 冷启动并同一物理 Episode 处理两个 pending `On` 目标；禁止读取历史部分成功/示范动作。详细 t0 位置和场景信息记录于 `fresh_t0_capture.json`。
+
+## 2026-10-28：L0T0 公共放置回归首轮失败；定位候选/RRT 差异并隔离容器容差
+
+L0T0/state0/seed0 从原始合法 t0 进行独立 `--cold-start` 标准 1000 步回归，归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_01/v3_run`。任务 screen 为24候选、11个 task-approach 可行，live t0 未变。抓取分支 `geom111_jaw0_approach2_-1_flip-1` 真实执行214步，三态稳定双指抓持并抬升36.367 mm；32步Student handoff后进入native `On(akita_black_bowl_1, plate_1)`放置。最终两条真实路线 `region_layout_12_direct_region_progress` 和 `region_layout_13_keypose_side_region_progress` 均在 `region_progress` 连续24动作停滞；执行器报告 `transport_region_progress_region_progress_waypoint_stagnated_for_24_actions`，原生谓词false，最终t=410、reward=0、done=false，故不能作为回归通过。
+
+抓取搜索前3个RRT预检均未得到可用路径：候选 `geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm` 在12秒内257次配置检查后预算耗尽，`geom111_jaw0_approach2_-1_flip-1` 在12秒内304次检查后预算耗尽，第三候选314次检查后无路。系统转用 `active_BDDL_geometry_high_OSC_approach_after_RRT_failure` 几何高位路线。对照此前L0T0成功冷启动：它使用同一第一几何候选并在约12秒做359次配置检查后获得RRT路线，随后用148抓取动作和345放置记录在t525成功。候选选择不同是本轮失败的已观测差异；RRT时间预算敏感是可证实原因，尚未完全隔离它与抓姿/路点跟踪的共同影响。
+
+同时代码复核发现，为L0T1容器入口加入的6 mm/0.05 rad `region_progress` 紧容差未按谓词限制，也作用于 L0T0 `On` 目标。已将该严格容差限定为 `native_goal_operator == "in"`，`On` 保留15 mm/0.12 rad 默认值，并加入跨谓词回归断言。修复后聚焦测试93项通过，相关模块 `py_compile` 和 `git diff --check` 通过。此作用范围修正尚待物理回归证明。
+
+基于三次RRT均明确预算耗尽/无路、且旧成功候选曾接近同一预算后找到路线，第二轮合理调整为最多8次预检、每次20秒；其他任务输入不变，仍从同一身份核验合法t0、标准1000步、无旧动作/经验，输出目录 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run`。该轮已启动，完整native结果待归档后复核。
+
+首轮V3 posthoc audit报告410条归档成功链动作、10,250个子步；记录行、7D维数和每步子步监测均有效，但因任务失败/分支恢复，`success_episode_timestep_continuous=false`，不构成完整成功Episode。几何诊断状态中187条complete、223条unsafe；unsafe是观察到的几何违规而非缺失监测。安全认证仍为false。
+
+## 2026-10-28：L0T1 标准 horizon 冷启动达成原生成功；L0T0 独立回归进行中
+
+在此前合法 L0T1/state0/seed0 t0 快照上启动全新 V3 `--cold-start`，标准 horizon=1000，未输入任何历史 task success 报告、目标成功关键点、目标场景历史经验或动作轨迹。新执行从几何 screen 选出当前场景抓姿，真实 MuJoCo 抓取搜索 214 动作并确认双指稳定抓持、抬升 36.886 mm；之后执行当前策略 32 步 Student handoff；native region 运输/放置成功分支真实执行 506 步，在 t=752 达到 `In(black_book_1, desk_caddy_1_back_contain_region)=true`，环境返回 reward=1、done=true、task_success=true。初始 12 步 Student-first 失败探索以及首条失败放置分支均排除在成功 Episode 外。
+
+归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run`。V3 outcome 的 `standard_1000_step_success=true`；物理审计汇总成功 Episode 752 条动作、18,800 个 MuJoCo 子步，动作维度和状态—动作行有效，全部动作子步监测完整，成功 Episode 时间连续。安全监测含 654 条 unsafe 几何观测；严格安全未评估/未通过，`safety_certified=false`、`safe_training_eligible=false`。这次结果只证明 Stage A 原生任务完成。
+
+冷启动协议核验：合法 t0 identity checked；未使用 target success demonstration/keyposes、official demonstration、historical actions、experience library、success reference 或 previous search reports。初始策略是 RLinf LIBERO-SFT π0.5 权重，报告没有验证未经 LIBERO-SFT 的原始预训练 checkpoint 身份；所以可声称无历史任务答案/动作输入，不可将权重口径扩大成“未在 LIBERO 数据上训练”。
+
+为改善先前 1400 步成功路线在标准 1000 horizon 下的复现条件，`native_region_entry_alignment` 已在最终下降前执行，并将单一终局放置的 post-route budget reserve 设为 96 动作。分支恢复仍做精确 Integration State identity check。修复后定向回归 93 项通过，相关 `py_compile` 与 `git diff --check` 通过。该预算改变是执行器规划保留量，不修改 BDDL、成功谓词或 horizon。
+
+随后启动 L0T0/state0/seed0 独立 cold-start 回归，归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_01/v3_run`，从原合法 t0 开始、标准 horizon=1000，不读取既有 505 步答案。Student-first 失败探索已单独落档并排除，执行器正运行抓取候选搜索；本记录更新时其 native outcome 尚未产生，待最终报告复核后补记。
+
 ## 2026-10-28：恢复无示范目标与冷启动物理实验
 
 最新定位：L0T0 505 步轨迹 t137 子步 9 首次观察到非授权手指与碗 9.941 mm；物体对距离全部缺失，Teacher 未核验，不能断定形式上的最早风险。V3 冷启动成功后调用定位器，缺少自接触、场景接触、关节限制的独立检查时强制 incomplete。40 项定位与 V3 聚焦回归通过。L0T1 新鲜初态的无先验物理验收与基于本次 L0T0 运行的事后安全抓姿筛查分别在新归档运行。旧 batch 的 L0T2 preflight 隐式访问历史部分任务 Snapshot，必须在无示范使用前隔离。
@@ -4464,3 +4757,79 @@ CuRobo随后拒绝从该真实接触状态规划撤爪：完整世界门禁报�
 - 代码验证：3个相关Python入口`py_compile`通过；代理盒分割通过全部角点包含验证；原生谓词进展条件及80步/2,000子步接触完整性离线断言通过；`git diff --check`通过。没有训练、官方示范、BDDL变更或物体/机器人状态写入。
 
 **结论：**真实瓶体几何不存在此前6.735 mm障碍，放置路线已实际执行且Pot1原生`On=true`。当前真实阻塞发生在松爪后的退出起点：Hand和指垫仍与Pot1接触，CuRobo门禁正确拒绝该配置。Pot1尚未达到完全脱离/稳定释放，Pot2未开始，完整任务失败；本轮在真实接触阻挡处停止。
+
+
+## 2026-10-28：L0T1 approach-axis 抓取深度 screen 与第八轮冷启动
+
+第七轮 `l0t1_contact_patch_extended_01/v3_run` 的 24 个基/偏移候选均未通过 scratch screen（16 collision、8 IK），live state 不变且无 RRT/物理动作。沿书本长轴 ±16.6/33.1 mm 偏移后 top-down `gripper0_hand_collision` 对 book 仍精确约 −9.098 mm；侧向 approach 沿局部垂直轴 +20 mm 时 Caddy 碰撞降至 −0.388 mm，+40 mm 则 link5 与桌面穿透约 −16.990 mm（hand/table −4.416 mm）。因此继续增大该侧高度偏移会触及桌面，不能解决现有接触关系。
+
+第八轮候选生成改为沿 target collision geom 的 approach 局部轴，对正向可达 approach 基姿态分别添加 ±30%/±60% 半尺寸偏移、最大 20/40 mm，其他抓姿矩阵、开口判定与全几何屏幕保持不变。此变化直接检查 gripper hand 与物体表面的相对深度；SCREEN 不通过时不进入 RRT/真实执行。算法调整依据上述实测距离，保持不使用历史失败 candidate ID、示范或成功姿态。
+
+测试 `test_task_success_first_search` 43 项通过，`py_compile` 与 `git diff --check` 通过。第八轮已从合法 t0 以 `--cold-start` 启动，运行路径 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_approach_depth_screen_01/v3_run`，结果待完整报告检查。
+
+## 2026-10-28：L0T1 扩展接触点偏移与第七轮冷启动
+
+第六轮 `l0t1_contact_patch_screen_01/v3_run` 将 8 个中心姿态与 16 个接触点偏移送入完整 scratch screen，报告 complete、live 状态不变、可行数 0；失败分类碰撞 9、IK 不可达 15。沿书本长边平移 ±20 mm 后，top-down 掌部—书本 −9.098 mm 接触完全不变。侧向抓姿沿垂直余轴抬高后，Caddy link5 接触由中心姿态约 −2.286 mm 减至 −0.388 mm，仍因真实穿透被拒绝；反向偏移约 −1.341 mm。第七轮扩大到 ±16.6/33.1 mm 的长轴偏移与 ±20/40 mm 的垂直偏移，侧向 +40 mm 又触发桌面接触，故第八轮改测 approach 轴抓取深度。
+
+第七轮把偏移规则从固定 20 mm cap 扩展为余轴半尺寸的 30%/60%，分别最高 20/40 mm；保持 jaw/approach 方向不变，余轴始终来自当前目标 collision geom 局部坐标。只对更可能到达的 approach_sign=+1 候选优先分配有限候选屏幕预算。候选直接依据几何扩展，不加载失败报告、历史候选或成功动作。`test_task_success_first_search` 43 项与相关 `py_compile`、`git diff --check` 通过。
+
+第七轮冷启动 V3 从同一合法 t0 启动，计划最多 8 次 RRT 预检、3 条物理分支；完整归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_contact_patch_extended_01/v3_run`，结果待 screen 与报告核验。
+
+## 2026-10-28：L0T1 接触点偏移筛选与第六轮冷启动
+
+第五轮归档 `l0t1_tilted_approach_screen_01/v3_run` 对 8 个中心候选和 ±15° jaw 轴倾斜候选共 24 个进行了 scratch screen：可行数 0，分类为碰撞 9、IK 不可达 15，live state 保持不变。倾斜在 alpha=0.3 即引入书本对手指几何约 5.146 mm 穿透，且一侧指垫穿透约 0.688 mm；侧向倾斜候选仍与 Caddy 碰撞（预抓取最深约 −52.754 mm）。结果说明当前平面书本与该夹爪不适合以 ±15° 改腕姿，下一步按证据调整候选的接触点位置，不放宽物理接触判定。
+
+第六轮候选扩展保持抓姿方向不变，对每个中心候选在剩余物体碰撞盒局部轴添加正/负接触点偏移；偏移幅度为几何半尺寸的一半，最高 20 mm。这样直接改变夹爪沿目标长边/高度的贴合位置，同时保留 jaw 宽度与接近朝向。算法通用化到活动 collision geom，偏移从当前场景尺寸自动派生，不读取历史成功姿态。新增扩展 helper 的有界性、轴选择、ID 唯一和姿态不变单测。
+
+搜索回归 `test_task_success_first_search` 43 项、MuJoCo grasp-screen 13 项通过；`py_compile` 与 `git diff --check` 通过。第六轮 cold-start V3 已从合法 t0 启动，路径 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_contact_patch_screen_01/v3_run`，等待 screen 与完整任务报告。
+
+## 2026-10-28：L0T1 夹爪倾角覆盖与第五轮冷启动
+
+第四轮归档 `l0t1_task_approach_screen_01/v3_run` 在 8 个中心候选上完成 scratch-only 检查，`status=complete`、`live_state_unchanged=true`、可行数 0；失败分类为真实碰撞 3、IK 不可达 5。两条 top-down 候选在路径 alpha=0.7 出现 `gripper0_hand_collision` 对书 geom 92 的 −9.098 mm 穿透；一条侧向候选在 alpha=0.4 出现 `robot0_link5_collision` 对 Caddy geoms 268/274 的 −1.459/−2.286 mm 穿透；其余 5 个方向预抓取或开爪抓取 IK 在关节限位内无解。该轮没有 RRT、控制动作或 MuJoCo 物理子步，故无危险近似物理执行。
+
+为覆盖平面盒几何中心抓姿无法表达的斜向接近，冷启动搜索器新增自动 jaw 轴 ±15° 方向变体，旋转绕真实双指垫中心锚定，来源仅为当前 BDDL 几何候选；候选在 RRT/执行前仍通过同一 scratch IK 与全几何物理接触筛选。变体集受 24 条 screen batch 限制，最终执行候选仍受原 16 条搜索预算约束。测试 `test_task_success_first_search` 43 项、`test_mujoco_jointspace_grasp_screen` 13 项通过；`py_compile`、`git diff --check` 通过。
+
+第五轮 V3 `--cold-start` 已从原始身份核验 t0 启动，未加载任何旧 report、候选 ID、成功轨迹或历史动作。候选通过 approach screen 后才可进入最多 8 次 RRT 预检和 3 条真实物理分支。运行归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_tilted_approach_screen_01/v3_run`；结果待完整报告核验。
+
+## 2026-10-28：L0T1 开夹爪表面接近筛选与第四轮冷启动
+
+第三轮归档 `l0t1_mechanical_opening_filter_01/v3_run` 已完成，报告状态 `task_incomplete`、原生 `task_success=false`。机械开口筛选将候选由 16 降为 8，剩余候选均为 28.7 mm 夹距；最多 3 条物理分支仍在开夹爪表面接近时推移未抓持书本 15.216–17.605 mm，未获得双指稳定抓持或抬升。具体根因包含 top-down 候选在约 35 mm 高处掌部接触黑书，以及侧向候选的指部/书本几何穿透；所有失败都发生在真实 MuJoCo 表面接近阶段。
+
+针对漏掉的动态笛卡尔表面接近，`mujoco_jointspace_planning.screen_grasp_candidates()` 新增独立 `task_approach_only` 模式：对每个候选保持开夹爪，逐段求笛卡尔路径 IK，并在 scratch `MjData` 中检查完整机器人几何与场景碰撞；目标只容许两枚指垫接触，且不容许指垫穿透。它检查物理任务可行性，不调用 Strict 10 mm clearance 门槛，不代表安全认证。Safety Bridge 显式传递该模式；搜索器验证 report scope、候选 ID 一一对应和 live integration state 未变化后，仅保留可行候选。新增候选 admission 单测。
+
+验证：`test_task_success_first_search` 42 项、`test_mujoco_jointspace_grasp_screen` 13 项通过，4 个相关模块 `py_compile` 和 `git diff --check` 通过。随后第四轮从同一身份核验 L0T1/state0/seed0 合法 t0 Snapshot 启动；cold-start 未接收历史搜索报告、候选 ID、先验动作或成功示范。运行目录 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_task_approach_screen_01/v3_run`；正在先执行 task-approach screen，再依据筛选结果决定是否有候选进入 RRT 和真实分支。结果尚待完整报告核验。
+
+## 2026-10-28：L0T1 物理失败归因与机械夹距候选过滤
+
+Git 分支 `gs-opd-overfit-recovery-08a0198`，提交基线 `9099c197`，初始工作区干净；实验开始时 GPU 空闲且无相关 Bridge/物理执行进程。已有 L0T1 两轮均从合法 t0、无目标历史成功输入启动，未获完整任务成功。
+
+第二轮归档 `l0t1_no_prior_02` 的 3 条专家物理分支、924 条动作记录中：候选 `geom92_jaw0_approach2_+1_flip-1` 的 RRT 预抓取执行 189 步后进入表面接近；t221 首次出现 `gripper0_hand_collision` 与书本 geom 92 的真实接触，EEF 距目标高度仍约 35 mm；随后书本在 6 个动作内从约 3.4 mm 移位升至 17.494 mm，分支被保护逻辑放弃。候选 `geom92_jaw1_approach2_+1_flip+1` 和 `geom92_jaw1_approach0_+1_flip-1` 所需夹距均为 110.4 mm，而活动夹爪最大开口 87.0 mm；前者表面接近 60 步未达目标，后者另受 `white_place_box_1` 接触影响，在 320 步预抓取加 120 步局部重规划后超时。首轮失败另见当轮 `v3_report.json`。
+
+据此确认两个可修复点：最终物体相对表面接近未纳入 RRT 前置规划；候选排序允许物理上无法闭合的抓姿占用预算。首轮只修第二点：新增 `filter_mechanically_infeasible_grasp_candidates`，按候选估计夹距与活动最大 pad separation 过滤；宽度未知的历史候选保持原兼容行为，Strict screen-only 流程仍显示所有候选。它是夹爪几何可行性判断，不是 Strict 安全阈值。
+
+定向测试 `research.gs_opd.repair.test_task_success_first_search`：41 项通过；相关模块 `py_compile`、`git diff --check` 通过。随后从 L0T1/state0/seed0 已身份核验的合法 t0 Snapshot，以 V3 `--cold-start` 入口启动第三轮，未加载此前 L0T1 报告、候选 ID、成功经验或历史动作；最多 8 次 RRT 预检、3 条真实物理分支、标准 1000 步 horizon。运行目录：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_mechanical_opening_filter_01/v3_run`。本条记录时物理运行仍在进行，native success 与失败归因均待最终 JSON 报告。
+## 2026-10-28：L0T1 清障坐标系修复与 1000 步原生放置预算阻塞
+
+第八轮 `l0t1_approach_depth_screen_01/v3_run` 从合法 t0、无历史成功输入启动。24 个 approach-axis 候选中 2 个通过 scratch screen；其中一个真实执行稳定双指抓持并抬升 36.886 mm。Student 接续 32 步将书移动 0.2419 m。专家 native `In(black_book_1, desk_caddy_1_back_contain_region)` 运输首个侧向清障路点连续 24 动作停滞，终态 t=321、task_success=false。
+
+第八轮根因：Caddy region 世界旋转 `diag(1,-1,-1)`，region-local Z 朝世界下方。障碍包络要求携物 root world Z 至少 1.4438 m；旧路由却取 local Z=0.2819 m，对应 world Z=0.6907 m。EEF 目标约 Z=0.798 m，实际停在约 Z=1.137 m；75/75 运输动作仍保持双侧抓持。将 transit/障碍清障高度统一改为 world Z，并按 region rotation 求 local Z；同时修复 V3 failure collector，把 executor terminal/transport failure 纳入原因列表。新增反向 region Z 回归。
+
+第九轮 `l0t1_world_up_transport_01/v3_run` 从相同合法 t0 独立 cold-start。Screen 2/24；稳定双侧抓持并抬升 36.886 mm。Direct 路线失败于 clearance waypoint；side-detour 路线成功绕过障碍并完成 7 段横向进展，native region 平面距离从 0.4125 m 减至 0.0466 m，期间 bilateral grasp 始终确认。该路线 1.294 m，在 transport budget 418 动作/10,450 子步中耗尽；末端 `native_region_placement` 另有 137 动作仍未达到 EEF 目标（当前 EEF Z=1.267 m，目标约 0.881 m）。最终 t=664、原生谓词 false、reward=0、done=false，故完整 Episode 失败。V3 外层现记录真实终态 `TimeoutError: transport_region_progress_native_region_placement_did_not_reach_pose_within_137_actions`，而非旧的泛化 planning-time 错误。
+
+验证：executor 47 项、search 43 项、executor+V3 pytest 85 passed / 6 subtests；相关模块 `py_compile`、`git diff --check` 通过。新阻塞是 1000 步 horizon 下长绕行和末端下降所需动作超过分配。
+
+共享放置逻辑的 L0T0 独立回归已从合法 t0 `--cold-start` 通过：V3 `status=complete`、原生 `On(akita_black_bowl_1, plate_1)=true`、t=525、reward=1、done=true，标准 1000 步内完成；完整 Episode 525 动作/13,125 子步，所有 525 步子步监测完整，物理状态—动作记录连续。初次 Student-first 32 步被标为丢弃分支，不在成功路径；没有使用旧 505 步动作作为输入。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_world_up_route_regression_01/v3_run`。随后对 L0T1 运行明确 `demonstration-only` 的 1400 步合法 t0 冷启动；L0T1 仍未完成 native success。
+
+## 2026-10-28：恢复无示范目标与冷启动物理实验
+## 2026-10-29 最新：L0T39 低位预接触需由RRT全程规划
+
+第10轮冷启动采用由实时按钮径向生成的水平手指朝内姿态，但规划器只到高位standoff，后续低位下降仍为直接OSC路径。执行800动作、20,000子步后停在低位外侧点上方约29.6 mm，炉钮qpos未变（0.983596），`Turnoff=false`。最后动作的完整几何记录显示 `robot0_link6_collision` 与桌面接触（约−29.6 μm），不是按钮受力；说明新朝向下高位路线可行并不保证直线下降可行。
+
+已对同一合法t0只读预检两条完整低位路线：外侧standoff 333位姿、低位预接触316位姿，均 `offline_feasible`，规划约7.05秒和5.83秒，前后Integration State保持不变。执行器现改为RRT直接到低位预接触，移除未规划的垂直下降；之后再沿最后40 mm按钮接触段物理跟踪。接近/接触预算为800/180（总980），聚焦测试99项通过。下一轮需要确认物理末端确实到达低位预接触并把接触转移至夹爪指面；目前仍无L0T39原生成功。低位RRT预检归档：`/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_low_goal_rrt_preflight_02/report.json`。
+
+## 2026-10-29 最新：L0T39 已进入目标手指接触，4 mm路点阈值阻断推进
+
+第11轮冷启动确实使用RRT规划到低位预接触（322个输出位姿，规划5.97秒），真实执行800动作/20,000子步；在RRT第244个路点由于跟踪超时结束，`Turnoff=false`。真实指2与按钮 `flat_stove_1_g19` 接触，炉钮qpos从0.983596向关闭方向变化到0.960601，证明切向开合轴+朝内工具轴把接触从掌部转移到了手指，但没有完成任务。最后一帧末端位置误差4.48 mm、姿态误差0.0020 rad；默认4 mm位置容差使控制器在同一路点持续553步，而实际接触和按钮变化已在发生。
+
+执行器现只在距铰接接触路径65 mm内的RRT目标上把OSC到点容差放到6 mm；远离接触路径处仍为4 mm，接触阶段仍依靠逐步动作和原生目标反馈。99项executor/search/V3聚焦回归通过。下轮从同一合法t0冷启动确认控制能否越过该接触点、跟随后续按钮路径并在标准1000步内达到原生Turnoff。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_low_precontact_rrt_11/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_032451_865521721`。
+

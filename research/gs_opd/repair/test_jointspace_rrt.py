@@ -126,6 +126,35 @@ class JointSpaceRRTTests(unittest.TestCase):
         self.assertGreater(metrics["forbidden_contact_samples"], 0)
         self.assertGreater(metrics["self_contact_samples"], 0)
 
+    def test_safe_mode_reports_why_an_endpoint_is_rejected(self):
+        def check(qpos):
+            blocked = float(qpos[0]) > 0.0
+            return ConfigurationCheck(
+                status="complete",
+                minimum_forbidden_clearance_m=0.005 if blocked else 0.02,
+                clearances_by_object_m={"bowl": 0.005 if blocked else 0.02},
+                forbidden_contacts=[{"object_id": "bowl", "distance_m": 0.005}]
+                if blocked else [],
+            )
+
+        def kinematics(qpos):
+            return KinematicSample(
+                eef_position_world_m=qpos[:3].copy(),
+                eef_quaternion_wxyz=np.asarray([1.0, 0.0, 0.0, 0.0]),
+                robot_geom_centers_world_m=np.asarray([qpos[:3]]),
+            )
+
+        planner = JointSpaceRRTConnect(
+            np.zeros(7), np.ones(7), check, kinematics,
+            config=JointSpacePlannerConfig(require_safe_configurations=True),
+        )
+        result = planner.plan(np.zeros(7), np.full(7, 0.01))
+
+        self.assertEqual(result.status, "planning_failed")
+        self.assertIn("goal_configuration_is_unsafe", result.failure_reason)
+        self.assertIn("clearances_by_object_m={'bowl': 0.005}", result.failure_reason)
+        self.assertIn("forbidden_contacts", result.failure_reason)
+
 
 if __name__ == "__main__":
     unittest.main()

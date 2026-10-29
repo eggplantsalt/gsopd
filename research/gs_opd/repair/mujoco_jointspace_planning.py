@@ -371,9 +371,11 @@ def plan_current_scene(
     """
     import hashlib
     import mujoco
+    import time
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
 
+    planning_started = time.monotonic()
     if expected_instruction != actual_instruction:
         raise ValueError("task_instruction_does_not_match_the_active_BDDL_task")
     if not start_state_sha256 or len(start_state_sha256) != 64:
@@ -663,6 +665,84 @@ def plan_current_scene(
         **planner_values,
         minimum_clearance_m=configured_margin,
     )
+    goal_ik_configuration_checks = 0
+    if planner_cfg.require_safe_configurations:
+        safe_ik_candidates = []
+        for item in ik_valid:
+            goal_check = check_configuration(item["qpos"])
+            goal_ik_configuration_checks += 1
+            safe = bool(
+                goal_check.status == "complete"
+                and goal_check.minimum_forbidden_clearance_m is not None
+                and np.isfinite(float(goal_check.minimum_forbidden_clearance_m))
+                and float(goal_check.minimum_forbidden_clearance_m)
+                >= planner_cfg.minimum_clearance_m
+                and not goal_check.forbidden_contacts
+                and not goal_check.self_contacts
+            )
+            item["goal_configuration_safe"] = safe
+            item["goal_configuration_minimum_forbidden_clearance_m"] = (
+                goal_check.minimum_forbidden_clearance_m
+            )
+            item["goal_configuration_clearances_by_object_m"] = (
+                goal_check.clearances_by_object_m
+            )
+            item["goal_configuration_forbidden_contacts"] = goal_check.forbidden_contacts
+            item["goal_configuration_self_contacts"] = goal_check.self_contacts
+            if safe:
+                safe_ik_candidates.append(item)
+        if not safe_ik_candidates:
+            live_state_after = np.zeros_like(integration_state)
+            mujoco.mj_getState(model, live_data, live_state_after, integration_spec)
+            unchanged = np.array_equal(integration_state, live_state_after)
+            if not unchanged:
+                raise RuntimeError("live_environment_mutated_during_scratch_planning")
+            candidate_diagnostics = [
+                {
+                    "seed_index": item["seed_index"],
+                    "selection_seed_distance_rad": item["selection_seed_distance_rad"],
+                    "minimum_forbidden_clearance_m": item.get(
+                        "goal_configuration_minimum_forbidden_clearance_m"
+                    ),
+                    "clearances_by_object_m": item.get(
+                        "goal_configuration_clearances_by_object_m", {}
+                    ),
+                    "forbidden_contact_count": len(
+                        item.get("goal_configuration_forbidden_contacts", [])
+                    ),
+                    "self_contact_count": len(
+                        item.get("goal_configuration_self_contacts", [])
+                    ),
+                }
+                for item in ik_valid
+            ]
+            return {
+                "status": "planning_failed",
+                "failure_reason": (
+                    "ValueError: goal_configuration_is_unsafe:no_collision_free_IK_candidate:"
+                    f"{candidate_diagnostics}"
+                ),
+                "planner_source": "jointspace_rrt_connect.v1",
+                "planning_seconds": time.monotonic() - planning_started,
+                "config_checks": 0,
+                "goal_ik_configuration_checks": goal_ik_configuration_checks,
+                "iterations": 0,
+                "selected_route_index": None,
+                "minimum_forbidden_clearance_m": None,
+                "ik_goal_qpos": None,
+                "selected_ik_seed_index": None,
+                "ik_candidates": [
+                    {key: value.tolist() if isinstance(value, np.ndarray) else value
+                     for key, value in item.items()}
+                    for item in ik_candidates
+                ],
+                "route_candidates": [],
+                "live_state_unchanged": unchanged,
+            }
+        q_goal = safe_ik_candidates[0]["qpos"]
+        selected_ik_seed_index = int(safe_ik_candidates[0]["seed_index"])
+    else:
+        selected_ik_seed_index = int(ik_valid[0]["seed_index"])
     planner = JointSpaceRRTConnect(lower, upper, check_configuration, kinematics, config=planner_cfg)
     result = planner.plan(q_start, q_goal)
     live_state_after = np.zeros_like(integration_state)
@@ -674,9 +754,11 @@ def plan_current_scene(
         return {
             "status": result.status,
             "failure_reason": result.failure_reason,
-            "planning_seconds": result.planning_seconds,
+            "planning_seconds": time.monotonic() - planning_started,
             "config_checks": result.config_checks,
+            "goal_ik_configuration_checks": goal_ik_configuration_checks,
             "iterations": result.iterations,
+            "selected_ik_seed_index": selected_ik_seed_index,
             "ik_candidates": [
                 {key: value.tolist() if isinstance(value, np.ndarray) else value for key, value in item.items()}
                 for item in ik_candidates
@@ -703,10 +785,12 @@ def plan_current_scene(
     return {
         "status": result.status,
         "planner_source": result.planner_source,
-        "planning_seconds": result.planning_seconds,
+        "planning_seconds": time.monotonic() - planning_started,
         "config_checks": result.config_checks,
+        "goal_ik_configuration_checks": goal_ik_configuration_checks,
         "iterations": result.iterations,
         "selected_route_index": result.selected_route_index,
+        "selected_ik_seed_index": selected_ik_seed_index,
         "minimum_forbidden_clearance_m": result.minimum_forbidden_clearance_m,
         "qpos_path": result.qpos_path.tolist(),
         "eef_reference_poses_world": eef_path,
@@ -737,6 +821,7 @@ def screen_grasp_candidates(
     actual_instruction: str,
     clearance_m: float = 0.010,
     strict_target_contact_policy: bool = False,
+    task_approach_only: bool = False,
 ) -> dict[str, Any]:
     """Offline scratch-only grasp, lift, and exit feasibility screening.
 
@@ -752,6 +837,10 @@ def screen_grasp_candidates(
         raise ValueError("task_instruction_does_not_match_the_active_BDDL_task")
     if not isinstance(strict_target_contact_policy, bool):
         raise ValueError("strict_target_contact_policy_must_be_boolean")
+    if not isinstance(task_approach_only, bool):
+        raise ValueError("task_approach_only_must_be_boolean")
+    if strict_target_contact_policy and task_approach_only:
+        raise ValueError("strict_safety_and_task_approach_screen_modes_are_mutually_exclusive")
     if strict_target_contact_policy and float(clearance_m) < 0.010:
         raise ValueError("strict_target_contact_policy_requires_at_least_10mm_nonpad_clearance")
     if (
@@ -925,7 +1014,11 @@ def screen_grasp_candidates(
         pad_geom_ids[side] = int(matches[0])
 
     pad_geom_id_set = set(pad_geom_ids.values())
-    target_contact_geom_ids = pad_geom_id_set if strict_target_contact_policy else gripper_geoms
+    target_contact_geom_ids = (
+        pad_geom_id_set
+        if strict_target_contact_policy or task_approach_only
+        else gripper_geoms
+    )
 
     def fingertip_distances():
         distances = {}
@@ -937,6 +1030,27 @@ def screen_grasp_candidates(
             valid = [float(value) for value in values if value is not None]
             distances[side] = min(valid) if valid else None
         return distances
+
+    def fingertip_target_distance_details():
+        details = {}
+        for side in ("left", "right"):
+            rows = [
+                (float(distance), int(target_geom))
+                for target_geom in sorted(target_geoms)
+                if (distance := _exact_pair_distance(
+                    mujoco, model, scratch, pad_geom_ids[side], target_geom,
+                )) is not None
+            ]
+            if rows:
+                distance, target_geom = min(rows, key=lambda row: row[0])
+                details[side] = {
+                    "distance_m": distance,
+                    "pad_geom_id": pad_geom_ids[side],
+                    "target_geom_id": target_geom,
+                }
+            else:
+                details[side] = None
+        return details
 
     def pad_opening_width():
         value = _exact_pair_distance(
@@ -980,7 +1094,10 @@ def screen_grasp_candidates(
                     sorted(set(int(value) for value in robot_geoms) - pad_geom_id_set),
                     dtype=np.int64,
                 )
-            record_pair = strict_target_contact_policy and group_id == target_object_id
+            record_pair = (
+                (strict_target_contact_policy or task_approach_only)
+                and group_id == target_object_id
+            )
             distance_result = _minimum_distance(
                 mujoco, model, scratch, clearance_robot_geoms,
                 np.asarray(sorted(group["geom_ids"]), dtype=np.int64), excluded_pairs,
@@ -998,8 +1115,15 @@ def screen_grasp_candidates(
                     "violations": ["geom_distance_unavailable"],
                 }
             distances[group_id] = distance
-            required = float(group["minimum_clearance_m"])
-            if group_id in {item["object_id"] for item in forbidden_groups}:
+            required = 0.0 if task_approach_only else float(group["minimum_clearance_m"])
+            # Task-feasibility approach screening rejects actual contact or
+            # penetration, but it must not inherit the Strict-10mm safety
+            # margin as a candidate-search gate. Keep that margin in the
+            # non-task-feasibility safety screening modes.
+            if (
+                group_id in {item["object_id"] for item in forbidden_groups}
+                and not task_approach_only
+            ):
                 required = max(required, clearance_m)
             if distance < required - 1e-9:
                 violations.append({"object_id": group_id, "distance_m": distance, "required_m": required})
@@ -1170,7 +1294,14 @@ def screen_grasp_candidates(
             "estimated_clamp_width_m": candidate.get("estimated_clamp_width_m"),
             "candidate_maximum_opening_m": candidate.get("maximum_opening_m"),
             "status": "rejected",
-            "screening_type": "offline_scratch_only",
+            "screening_type": (
+                "offline_scratch_task_approach_feasibility"
+                if task_approach_only else "offline_scratch_only"
+            ),
+            "feasibility_scope": (
+                "open_gripper_pregrasp_to_grasp_cartesian_path_only"
+                if task_approach_only else None
+            ),
             "closed_grasp_target_pose_world_source": "active_scene_target_pose_at_candidate_close",
             "historical_object_pose_prior_used_for": "target_layout_clearance_only",
             "finger_target_distance_m": {"left": None, "right": None},
@@ -1180,12 +1311,16 @@ def screen_grasp_candidates(
         try:
             mujoco.mj_setState(model, scratch, integration, integration_spec)
             mujoco.mj_forward(model, scratch)
-            candidate_closed_gripper, close_qpos_source = _candidate_closed_gripper_qpos(
-                candidate,
-                closed_gripper,
-                gripper_limits,
-                pad_gap_joint_offset_m=pad_gap_joint_offset_m,
-            )
+            if task_approach_only:
+                candidate_closed_gripper = open_gripper.copy()
+                close_qpos_source = "active_open_pose_task_approach_feasibility_only"
+            else:
+                candidate_closed_gripper, close_qpos_source = _candidate_closed_gripper_qpos(
+                    candidate,
+                    closed_gripper,
+                    gripper_limits,
+                    pad_gap_joint_offset_m=pad_gap_joint_offset_m,
+                )
             close_samples = _candidate_gripper_close_samples(
                 open_gripper,
                 candidate_closed_gripper,
@@ -1242,12 +1377,17 @@ def screen_grasp_candidates(
             set_gripper(candidate_closed_gripper)
             grasp_seeds = ([pre_ik[1]] if pre_ik is not None else []) + (seeds or []) + [live.qpos[qadr].copy()]
             grasp_ik = solve_ik(position, quaternion, grasp_seeds)
+            grasp_ik_key = "grasp_open_gripper" if task_approach_only else "grasp_closed_gripper"
             if grasp_ik is None:
-                entry["joint_reachability"]["grasp_closed_gripper"] = {"reachable": False}
-                stage_failures.append("closed_gripper_grasp_ik_not_found_within_joint_limits")
+                entry["joint_reachability"][grasp_ik_key] = {"reachable": False}
+                stage_failures.append(
+                    "open_gripper_grasp_ik_not_found_within_joint_limits"
+                    if task_approach_only
+                    else "closed_gripper_grasp_ik_not_found_within_joint_limits"
+                )
                 finish_entry()
                 continue
-            entry["joint_reachability"]["grasp_closed_gripper"] = {
+            entry["joint_reachability"][grasp_ik_key] = {
                 "reachable": True,
                 "qpos": grasp_ik[1].tolist(),
                 "position_error_m": grasp_ik[2],
@@ -1262,15 +1402,65 @@ def screen_grasp_candidates(
             approach_checks = []
             approach_failure = None
             if pre_ik is not None:
+                previous_approach_q = pre_ik[1].copy()
                 for alpha in np.linspace(0.1, 1.0, 10):
-                    q = pre_ik[1] + float(alpha) * (grasp_ik[1] - pre_ik[1])
-                    check = evaluate(q, allow_target_gripper=True)
+                    alpha = float(alpha)
+                    if task_approach_only:
+                        sample_position = (1.0 - alpha) * pregrasp_position + alpha * position
+                        sample_ik = solve_ik(
+                            sample_position,
+                            quaternion,
+                            [previous_approach_q, *(seeds or []), pre_ik[1]],
+                        )
+                        if sample_ik is None:
+                            check = {
+                                "status": "unreachable",
+                                "alpha": alpha,
+                                "distances_m": {},
+                                "violations": [{
+                                    "surface_approach_cartesian_ik_not_found_within_joint_limits": True,
+                                }],
+                            }
+                        else:
+                            previous_approach_q = sample_ik[1].copy()
+                            check = evaluate(sample_ik[1], allow_target_gripper=True)
+                            pad_distances = fingertip_target_distance_details()
+                            check["alpha"] = alpha
+                            check["pad_target_distances"] = pad_distances
+                            if any(
+                                item is not None and float(item["distance_m"]) < -1e-6
+                                for item in pad_distances.values()
+                            ):
+                                check["violations"].append({
+                                    "premature_fingertip_target_penetration": True,
+                                    "maximum_allowed_penetration_m": 0.0,
+                                    "pad_target_distances": pad_distances,
+                                })
+                                check["status"] = "unsafe"
+                    else:
+                        q = pre_ik[1] + alpha * (grasp_ik[1] - pre_ik[1])
+                        check = evaluate(q, allow_target_gripper=True)
                     approach_checks.append(check)
                     if check["status"] != "pass" and approach_failure is None:
-                        approach_failure = "approach_full_geom_or_contact_semantics_failed"
+                        if task_approach_only:
+                            approach_failure = (
+                                "surface_approach_cartesian_ik_not_found_within_joint_limits"
+                                if check.get("status") == "unreachable"
+                                else "task_surface_approach_physical_collision_or_premature_pad_contact"
+                            )
+                        else:
+                            approach_failure = "approach_full_geom_or_contact_semantics_failed"
                 entry["approach_path_checks"] = approach_checks
                 if approach_failure:
                     stage_failures.append(approach_failure)
+            if task_approach_only:
+                entry["feasibility_scope"] = "open_gripper_pregrasp_to_grasp_cartesian_path_only"
+                entry["status"] = (
+                    "offline_feasible_candidate" if not stage_failures else "rejected"
+                )
+                entry["safety_certified"] = False
+                finish_entry()
+                continue
             # The archived object moved during the successful bilateral close.
             # Reuse that object-seat pose only as a scratch hypothesis while all
             # obstacles remain at their verified t10 positions.
@@ -1469,10 +1659,21 @@ def screen_grasp_candidates(
     return {
         "operation": "screen_grasp_candidates",
         "status": "complete" if unchanged else "unsafe",
-        "screening_type": "offline_scratch_only_not_physical_execution",
+        "screening_type": (
+            "offline_scratch_task_approach_feasibility_not_safety_certification"
+            if task_approach_only else "offline_scratch_only_not_physical_execution"
+        ),
+        "task_approach_only": task_approach_only,
         "target_contact_policy": {
-            "mode": "pad_only_with_nonpad_clearance" if strict_target_contact_policy else "legacy_all_finger_geometries",
+            "mode": (
+                "pad_only_zero_penetration_task_feasibility"
+                if task_approach_only
+                else "pad_only_with_nonpad_clearance"
+                if strict_target_contact_policy
+                else "legacy_all_finger_geometries"
+            ),
             "strict_pad_only": bool(strict_target_contact_policy),
+            "task_approach_pad_only": task_approach_only,
             "allowed_target_contact_geom_ids": sorted(
                 int(value) for value in target_contact_geom_ids
             ),

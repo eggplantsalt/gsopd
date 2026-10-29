@@ -358,7 +358,13 @@ class JointSpaceRRTConnect:
                     raise ValueError(f"{endpoint_name}_outside_joint_limits")
                 check = self._check(endpoint)
                 if not self._configuration_admissible(check):
-                    raise ValueError(f"{endpoint_name}_configuration_is_unsafe")
+                    raise ValueError(
+                        f"{endpoint_name}_configuration_is_unsafe:"
+                        f"minimum_forbidden_clearance_m={check.minimum_forbidden_clearance_m};"
+                        f"clearances_by_object_m={check.clearances_by_object_m};"
+                        f"forbidden_contacts={check.forbidden_contacts};"
+                        f"self_contacts={check.self_contacts}"
+                    )
             rng = np.random.default_rng(self.config.seed)
             start_tree, goal_tree = _Tree(start, "start"), _Tree(goal, "goal")
             tree_a, tree_b = start_tree, goal_tree
