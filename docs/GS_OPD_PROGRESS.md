@@ -1,3 +1,511 @@
+## OAH/L1T1 Standard 原生成功：保留t798物理分支并解决末端预算饥饿（2026-10-30）
+
+`obstacle_avoidance_human/L1T1`现有完整t1–981成功Episode：981动作、24,525/24,525个接触子步，t981原生`In(black_book_1,desk_caddy_1_back_contain_region)=true`、task_success=true、reward=1、done=true，符合Standard 1000动作上限。t578、t798、t904 Snapshot边界均通过payload与MuJoCo integration-state精确匹配；完整终端Snapshot哈希对应t981最后物理记录。未用官方演示、历史动作回放或直接状态写入，Student动作数0。
+
+失败分析后从t798确切分支切换到offset1/yaw +120°，将joint7从−2.8974rad移到−0.9265rad；t904距目标仍0.126m，末端连续失败是96步固定precise-placement reserve把运输预算压成0。Stage A最终原生Region路线已经包含最终插入，修正该保守预留后，仅用77个动作从t904达到成功。完整审计清单：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04/v3_run/selected_success_episode_manifest.json`；完整动作记录SHA256 `71201c2f22665579cb011c10141093755f682b965bfd0e3c5d512a982bad27c0`。覆盖由11/30升至12/30（10项Standard、2项Extended）。
+
+## OAH/L0T1 Standard 原生成功：精确快照分支与替代放置朝向（2026-10-30）
+
+`obstacle_avoidance_human/L0T1` 已从合法 fresh t0 形成一条完整 Standard 成功 Episode。所选时间轴 t1–760 连续，共760动作、19,000/19,000接触子步；t760原生 `In(black_book_1, desk_caddy_1_back_contain_region)=true`、`task_success=true`、reward=1、done=true。t545持物Runtime Snapshot payload SHA `400ab4aa037257f047557e2414a203df789c193c80d3aae3ea6a816b96fb77ca` 与续跑起点integration state精确匹配；末端Snapshot integration state与t760物理记录相同。四段来源均逐行哈希、动作、时间步和25子步接触审计通过。未使用官方演示、Student动作或直接写入机器人/物体状态；这是Standard成功，`safety_certified=false`。
+
+突破来自不重跑抓取、以当前原生区域几何重新选放置朝向。先前直达路线在joint7下限附近停滞；同一路线的reverse侧绕行因caddy区域坐标翻转而继续向world−Y。普通侧绕行从t452分支推进约127mm后，在−55°布局仍停滞。随后从t545精确快照尝试ranked layout offset 1（+125°）的高位RRT，8秒内规划超时、没有物理动作；改为原生Region Progress OSC直接追踪，215动作完成姿态转向、入口对齐与下降并通过BDDL。这个任务表明短时RRT失败不该拦Stage A真实物理路线，放置候选方向对腕关节饱和有显著影响。
+
+审计清单：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T1_single_geometry_physics_dev_01/v3_run/selected_success_episode_manifest.json`。按时间顺序合并的逐动作物理记录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T1_single_geometry_physics_dev_01/v3_run/selected_success_episode_physical_step_records.jsonl.gz`（SHA256 `629671773bd9b7a6a2d7f1e3cad13c353b16f25b1df96ca5894fe47bb18f1ed0`）。覆盖从10/30升至11/30（9项Standard、2项Extended）。
+
+## OAH/L0T0 fixed-continuation live-physics checkpoint (2026-10-30 15:31 CST)
+
+Branch00 durable records contain36 complete actions at timesteps247–282, 900/900 monitored substeps, no incomplete action. Bilateral grasp remains confirmed. The reachability-biased `reachability_descent` lowered the bowl root from z1.14424m to1.08937m (~54.9mm); at t282 it has entered `region_progress`, with current route-waypoint distance32.9mm. Native XY goal distance moved only ~4.4mm during the mostly-vertical segment; this is expected before horizontal transit and is not terminal stagnation. Reward0/donefalse/task_successfalse so far. Continue branch00.
+
+---
+
+## OAH/L0T0 fixed continuation entered physical placement (2026-10-30 15:28 CST)
+
+Exact t246 Runtime Snapshot continuation has passed the former NameError and entered real placement branch00 `region_layout_12_direct_region_progress`. Executor PID153644 and Safety Bridge PID153772 active; 21 durable camera frames observed, action count/terminal report pending. This verifies route construction is executing after the forwarding fix, but is not a task-success result.
+
+---
+
+## OAH/L0T0 parameter-fix same-episode continuation launched (2026-10-30 15:24 CST)
+
+New bounded continuation is active at `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev03_fix_continuation_01`. It cold-start-continuation resumes the exact t246 Student-handoff Runtime Snapshot (payload SHA256 `f400d1206d951477b1f62f5bb3f2e8d2d6e4893bedaa98e74794fda002099ec8`) inside the prior V3 archive, with horizon1000 and `reachability_biased` On transport. No demos/success experience are loaded; grasp/lift is not repeated. Existing selected 246-action prefix manifest remains the required continuity chain. Fix source hash and invocation are in `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev03_fix_continuation_01/launch_config.json`; await restored-state check, real MuJoCo placement actions, and native BDDL verdict.
+
+---
+
+## OAH/L0T0 placement controller wiring error and exact continuation (2026-10-30 15:23 CST)
+
+The dev03 grasp/lift and 32-action post-grasp Student handoff both completed. Ordered prefix is 214 grasp/lift actions +32 handoff=246 actions and 6,150/6,150 substeps; handoff rows are timesteps215–246, each 7D, with all32×25 substeps monitored and bilateral grasp confirmed. Its start was an exact restore of the lifted candidate Snapshot; terminal handoff Snapshot hash is verified and native status at t246 remains `On=false`, `task_success=false`. Student-first32 is excluded. Placement code failed before any physical placement action because `_native_place_single` referenced `native_region_transit_clearance_mode` without receiving the argument. The new parameter is now forwarded through both `_native_place_single` call sites; no experiment process was active during the edit. V3 failure is `placement_branch_error`, not a physical route failure. Same-episode continuation is prepared from the real t246 Runtime Snapshot, preserving the 246-action prefix; audit manifest: `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/selected_prefix_manifest.json`.
+
+---
+
+## OAH/L0T0 dev03 verified grasp/lift prefix (2026-10-30 15:14 CST)
+
+Selected geom111 physical branch reached `task_success_candidate_created`: 214 control actions, 5,350/5,350 monitored physics substeps (0 actions with incomplete monitoring), 214 video frames. Stable opposing-finger grasp was confirmed for 22 consecutive states; akita_black_bowl_1 lifted +0.0364506m. Pregrasp and surface approach were physically reached; 11 close actions. RRT preflight had failed; the generic active-BDDL-geometry high-approach OSC fallback physically completed this grasp. Cold-start fresh reset verified timestep0 and exact integration-state SHA `191a26d96571dbc63eebc7d979f1b4f4f2b47641745a51f7d3c4dc28a0c02031`. Lifted candidate Snapshot is `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_141837_336613925/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T0_20261030_142606_922900193/task_success_candidate_lifted_runtime_snapshot.pkl`; physical record archive is `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_141837_336613925/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T0_20261030_142606_922900193/physical_step_records.jsonl.gz`. This is only a grasp/lift prefix, not native task success or a counted task. Student-first exploratory32 remains excluded. Outer executor PID140610 and V3 PID140520 remain active; new Safety Bridge PID152477/port53532 has started downstream execution. Coverage remains9/30 pending placement and BDDL verdict.
+
+---
+
+## OAH/L0T0 dev03 live checkpoint (2026-10-30 15:09 CST)
+
+Processes 140520/140610/141379/141507 remain active; Safety Bridge ~101% CPU. Physical grasp branch since its 14:41:48 Snapshot is ~27m43s old. No grasp physical records, terminal reports, or branch-switch evidence yet. The matched dev02 record-save reference is ~36m42s; keep the current branch running and do not infer an outcome.
+
+---
+
+## OAH/L0T0 dev03 live checkpoint (2026-10-30 15:01 CST)
+
+Selected geom111 physical grasp branch is ~20m since its 14:41:48 Snapshot; grasp executor/Bridge remain active, Bridge ~101% CPU. No new durable physical records or terminal reports. Current result and grasp status unknown; continue active run.
+
+---
+
+## OAH/L0T0 dev03 physical-branch checkpoint (2026-10-30 14:57 CST)
+
+PID 140520/140610/141379/141507仍在运行；Safety Bridge约101% CPU。selected geom111 branch-start Snapshot时间14:41:48，实际物理分支约15分24秒；尚无post-action grasp记录或run report，抓持/抬升与结果未知。dev02同抓姿记录约36分42秒才落盘，当前按历史物理执行时长继续观察；源码保持不变。
+
+---
+
+## OAH/L0T1 zero-pass screen diagnosis (2026-10-30 14:53 CST)
+
+回看已有合法t0 screen归档：24候选0 pass，9项IK不可达、15项collision screen拒绝；这15项pregrasp/grasp IK均reachable。首个候选预抓与approach最小距离约-99.46mm来自聚合`unmapped_scene_environment`，而目标book间距约13mm；旧报告未保存该aggregate的minimum-pair几何身份，因此具体固定安装/场景碰撞来源未证实，不能只凭该值排除物理抓取。改进后的Stage A零pass fallback只硬排除显式IK不可达和不可执行项；collision screen / pregrasp unsafe仅用于排序与诊断，有限进入MuJoCo。必须保留真实contact/substep记录，仍以原生BDDL判成功。
+
+---
+
+## OAH/L0T0 approach-screen rejection morphology (2026-10-30 14:50 CST)
+
+dev03 24候选中10项screen pass、14项rejected；逐项检查发现13个拒绝候选的pregrasp与闭合抓取IK均可达，主要在接近后半段因手指/目标几何体约5mm穿入而被判`task_surface_approach_physical_collision_or_premature_pad_contact`。这不是任务不可抓的证据：Stage A允许物理接触，且真实MuJoCo分支仍须自行证明抓持和原生BDDL成功。后续改为screen-pass-first队列：先处理所有通过项；若其数量少于本轮RRT预检名额，再追加IK可达的screen拒绝项。明确IK不可达项才硬排除；预抓通过与晚发生碰撞只是排序偏好，碰撞/失败照实记录。当前dev03有10项pass，不应用此fallback。
+
+---
+
+## OAH/L0T0 dev03物理抓取阶段历史时长参照（2026-10-30 14:48 Asia/Shanghai）
+
+dev02相同抓姿candidate `geom111_jaw0_approach2_-1_flip-1__rrtgenerated_geometry_high_approach` 的branch-start Snapshot mtime为11:52:19，grasp `physical_step_records.jsonl.gz` mtime为12:29:01，完整branch数据于36分42秒后落盘。dev03物理分支Snapshot为14:41:48；14:47:56时分支约6分08秒、暂无落盘记录。该时长只作旧run与当前分支进度比较的参考，不作为完成保证。
+
+---
+
+## OAH/L0T0 dev03 physical-branch elapsed-time correction (2026-10-30 14:45:10 Asia/Shanghai)
+
+Safety Bridge PID 141507 started 14:26:06; its 18m+ elapsed time includes candidate screening, RRT and the selected physical grasp stage. The selected branch-start Snapshot was written at 2026-10-30 14:41:48 CST; as of 14:44:53 it had run about 3m. Earlier commentary incorrectly attributed the Bridge's full process duration to that branch. No post-action grasp records are present yet; branch outcome and action count remain unknown. Do not reuse the process start time as branch start in later summaries.
+
+---
+
+## Stage A共享抓姿screen fallback待办（2026-10-30 14:31 Asia/Shanghai）
+
+dev03当前有10/24抓姿通过screen，物理尝试正在进行。代码现状是screen后只保留`offline_feasible_candidate`；若可行数为0就抛错、没有MuJoCo grasp branch。对后续0-pass任务，dev03终态后应修改Stage A：优先测试screen-pass项；若无pass，则从`collision_constraint_failure`候选里选有界子集继续真实预抓取/抓持动作，保留全量contact与违规证据，不把失败screen转成安全资格。仍以真实连续MuJoCo episode和原生BDDL `task_success`为唯一成功条件；明确IK不可达可通过RRT/物理分支终止，不能手改状态。此改变不会影响当前运行代码。
+
+---
+
+## OAH/L0T0 dev03已进入物理抓取分支（2026-10-30 14:30 Asia/Shanghai）
+
+24项前置screen中10项通过；executor选择`geom111_jaw0_approach2_-1_flip-1__rrtgenerated_geometry_high_approach`并保存独立branch-start Runtime Snapshot：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_141837_336613925/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T0_20261030_142606_922900193/geom111_jaw0_approach2_-1_flip-1__rrtgenerated_geometry_high_approach_branch_start_runtime_snapshot.pkl`。grasp-search executor PID 141379与Safety Bridge PID 141507仍在运行，尚无post-action物理记录，故抓持/抬升尚未确认。该抓姿在dev02已真实完成214步抓取和稳定抬升；本轮有针对性复用可行抓姿，实验改动集中在已失败的运输高度控制。cold-start成功标准不变。
+
+---
+
+## OAH/L0T0 dev03 task-approach screen完成（2026-10-30 14:29 Asia/Shanghai）
+
+合法t0指纹已精确核对。24个抓取候选中10个`offline_feasible_candidate`、14个因任务表面物理碰撞/过早pad接触失败；失败分类中仅1项另有pregrasp full-geometry/self-collision。screen `live_state_unchanged=true`，无专家物理动作已执行；当前executor继续RRT预检和候选选择，dev03 task still running。后续MuJoCo抓取分支会实际验证这些screen候选，screen pass不代表任务成功。阶段报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_141837_336613925/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T0_20261030_142606_922900193/task_approach_feasibility_screen.json`。
+
+---
+
+## OAH/L0T0 dev03冷启动与抓取筛查checkpoint（2026-10-30 14:27 Asia/Shanghai）
+
+V3 `run_manifest`状态为`running`，PID 140520；executor PID 140610和grasp-search PID 141379、Safety Bridge PID 141507活动。checkpoint模型已加载。Student-first 32步探索动作和physical记录已落盘，按协议排除，不计入成功轨迹。grasp-search当前持有从合法t0精确初始化的独立快照；`source_snapshot_manifest.json`中的payload SHA `fd5349865bb2f1f8983ea563b3b4f2a0a9601200c3faf33f1d28ba0798b360db`与integration-state SHA `191a26d96571dbc63eebc7d979f1b4f4f2b47641745a51f7d3c4dc28a0c02031`均与已核验t0匹配。候选筛查仍运行，尚无专家抓取动作记录/结论。完整归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run`；当前抓取阶段目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_141837_336613925/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T0_20261030_142606_922900193`。
+
+---
+
+## OAH/L0T0 dev02终态审计与dev03接管（2026-10-30 14:20 Asia/Shanghai）
+
+dev02已结束，任务矩阵仍为9/30。真实终态`t=433`：`On(akita_black_bowl_1, plate_1)=false`、`task_success=false`、reward=0、done=false；executor失败原因为`transport_region_progress_region_progress_waypoint_stagnated_for_24_actions`。该失败不计新增成功。
+
+可接受episode前缀来自同一抓取Snapshot的grasp/lift 214步、Student handoff 32步和placement branch02 187步，共433步，时间轴1–433连续；每步为有效7D动作且25/25 MuJoCo子步完整，共10,825子步。branch02双侧抓持保持确认。互斥branch00（186步）与branch01（197步）、student-first 32步已排除，未拼接。逐段核验见`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run/terminal_failure_audit.json`；失败placement终态Snapshot保留。
+
+路线问题已从真实记录定位：保守对象包围盒把`bottle_of_black_pepper_3_with_hand_1`列入横向走廊，其顶部1.2736m把碗的运输高度抬到1.3263m。末24步EEF请求平移约8mm，但实际位移由1.23mm/步衰减至0.076mm/步，方向余弦由0.78降至-0.39；抓持仍在，末段未发现与目标以外物体的机器人接触。V3 wrapper未能接管聚合：对已存在`v3_run`再次mkdir触发`FileExistsError`，故旧manifest仍标`running`且无`v3_report.json`；executor终态和新增terminal audit可复核。
+
+已修改共享Native Region Progress算法：增加`reachability_biased`运输模式，仅用于原生`On`目标；先在当前XY原地下降到目标根部上方10–16cm，再做水平运输，跳过把保守障碍包围盒高度当作必需清障高度；`In`目标继续使用compiled-obstacle高度。保留MuJoCo物理执行、原生BDDL验收和抓持监测，不触写qpos/物体。新run从原始合法t0完整冷启动，不复用任何旧目标动作或阶段Snapshot。
+
+当前dev03运行：PID 140520，Standard horizon=1000，reachability-biased clearance，最多3个物理分支；输出目录`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev_03/v3_run`，启动参数为同级`launch_config.json`。等待冷启动审计/抓持阶段后按1–5分钟间隔查看物理进度；中间success值不作为成功，只有完整连续Episode终态原生`task_success=true`才计数。
+
+---
+
+## OAH/L0T0 dev02 live checkpoint (2026-10-30 14:00 Asia/Shanghai)
+
+任务矩阵覆盖仍为9/30（7项Standard、2项Extended）。本run继续使用Standard horizon=1000及合法init-state 0/seed 0；未修改活动代码、Simulation或Snapshot。executor PID 112228、Safety Bridge PID 113961存活；engine wall-time预算14400秒，运行约151分钟、剩余约89分钟。Student-first 32动作已排除；selected candidate由214 grasp/lift +32 handoff + branch02组成。
+
+branch00 direct（186动作）和branch01 keypose-side（197动作）已从同一handoff状态分别结束，均为原生task_success=false，互斥分支不可拼接。末步Region平面XY距离分别46.8 mm、47.5 mm，物体根仍高于目标中心约0.384 m；runtime失败Snapshot保留。
+
+branch02 reverse-side截至t=408/step_index=161，累计162 placement动作，phase=`transport_region_progress_region_progress`、waypoint=3。active candidate前缀为214 grasp/lift +32 handoff +162 branch02 =408动作、10,200个预期MuJoCo子步；最新动作具有有效7D动作、抓持确认、25/25子步监测。按native Region坐标重算XY距离为51.5 mm（handoff起点187.6 mm），碗根位置`[0.0202414, 0.1322153, 1.3153127]`，高于Region中心约0.394 m。最新task_success=false、reward=0、done=false，仍是高位运输中间状态，不计成功；完整selected Episode和Snapshot边界审计待run终态。
+
+只读复核OAH/L0T1已有失败屏幕：24项为geom92的8个基姿加approach-depth偏移，9项IK不可达、15项碰撞失败；碰撞记录还包含持续不变的`unmapped_scene_environment=-99.46 mm`（该报告没有保留具体几何对身份），部分姿态在末段出现夹爪hand与目标book的实际几何重叠。屏幕使用pad-only target contact。这些证据表明原候选池不应直接重跑；后续应扩大几何抓姿覆盖，并分别核验静态安装接触和真实hand-book接触，再以MuJoCo物理执行判断候选。
+
+**下一步：** 保持dev02运行至自然终止，随后审计原生BDDL终态、全量动作/25子步、连续时间轴、Snapshot身份和Student-first排除边界。若失败，不计覆盖；再依据矩阵选择任务并改进共享抓取/运输算法。L0T1不在原候选池下立即重复。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run`。
+
+## OAH/L0T0 dev02 live update (2026-10-30 13:33 Asia/Shanghai; superseded by 14:00 checkpoint)
+
+任务矩阵核实当前覆盖为9/30（7条Standard、2条Extended），本run仍未产生完整成功Episode。Human L0T0 dev02保持原生任务与物理验收标准，未更改活动代码、仿真状态或Snapshot。
+
+branch00 direct和branch01 keypose-side均从同一handoff状态独立展开，分别在t432与t443结束，最后durable记录均为task_success=false/reward=0/done=false；二者保留runtime transport-failed Snapshot、不可拼接。末步根据native Region旋转坐标计算的XY中心距离分别为46.8 mm、47.5 mm，物体根部比目标Region中心高0.384 m、0.385 m。branch01曾在t416到达31.5 mm XY距离，但在其t443末步回到47.5 mm；这证明路线未完成放置，精确executor停止原因等终态报告核实。
+
+branch02反向侧向路线当前物理执行至t264/step_index17（18动作），phase=`transport_region_progress_adaptive_clearance`。最新耐久记录的7D动作有效、25子步监测完整，native Region XY距离从handoff起点187.6 mm降至170.8 mm，物体根位置`[-0.08622668568750944, 0.10060849492679218, 1.19176585855836]`；reward=0、done=false、task_success=false。当前active candidate前缀214抓取/抬升 +32 handoff +18 placement = 264动作（6600个预期子步），Student-first 32/800已排除。executor PID 112228、Bridge PID 113961仍在运行；wall-time上限14400秒，剩余约116分钟。没有启动新实验。
+
+**下一步：** 约每5分钟低开销检查活动分支；run终止后审计V3原生结果、全量7D动作与25子步、Snapshot身份、来源连续性和排除边界。若task_success未成立，不计新增成功；按全矩阵选择下一配置，当前矩阵接续候选为OAH/L0T1。
+
+## 2026-10-30 Native Region Progress共享修复：证据与复验进度
+
+## 接管审计：9条已登记成功轨迹的原生与Snapshot复核（2026-10-30）
+
+按矩阵定位的9条轨迹逐一读取最终V3与executor报告：7条Standard、2条Extended均为原生task_success=true、reward=1、done=true；动作源齐全，7D动作与状态记录有效，时间步连续，子步物理监测完整。旧报告中的L0T0、L0T1和L1T1 Snapshot边界标记未提供独立结论，现已复核：t0 payload/state/model与manifest一致且fresh reset精确匹配；持物Snapshot与handoff恢复状态匹配；handoff终态与被选placement起点的完整MuJoCo integration state、场景和模型身份匹配。L0T0两个Snapshot字节相同；L0T1、L1T1序列化字节不同但integration-state SHA相同。三项边界已独立验证，完整Stage A原生成功覆盖保持9/30。逐项哈希和证据路径见[基线Snapshot审计](GS_OPD_BASELINE_SNAPSHOT_AUDIT.json)；这不代表Strict-10mm安全认证或训练资格。
+
+## obstacle_avoidance_human/L0T0 dev02 Standard冷启动：运行中（2026-10-30）
+
+dev02从task matrix登记的identity-checked合法init-state 0/seed 0 t0启动，目标为`On(akita_black_bowl_1,plate_1)`，Standard horizon 1000，wall-time预算14400秒。上一轮dev01因3600秒engine budget耗尽停在t=268，没有原生最终查询；本轮使用新输出目录和当前共享代码bundle `9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7`，不加载旧run动作、候选报告或Snapshot阶段状态。合法t0输入目录为`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T0_cold_start_dev_01/t0_capture/stage_snapshots/t0`，payload SHA-256 `fd5349865bb2f1f8983ea563b3b4f2a0a9601200c3faf33f1d28ba0798b360db`，integration-state SHA-256 `191a26d96571dbc63eebc7d979f1b4f4f2b47641745a51f7d3c4dc28a0c02031`；启动器将运行时fresh-reset和Snapshot身份重新核验。候选从索引0开始，候选池偏移0，最多3个物理分支、8次RRT预检，每次20秒；V3采用`native_region_progress_osc`。运行目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run`；完整argv见同级`launch_config.json`。初始Student-first分支记录32动作/800子步，逐行核验为32/32有效7D动作、32/32完整子步监测、时间步1–32连续，末行`task_success=false`；候选screen随后从合法t0哈希对应状态开始，24项中10项可行、`live_state_unchanged=true`，t0 integration-state SHA完全匹配。Student-first段待V3终态审计确认回滚/排除。专家抓取阶段已落盘：报告状态`task_success_candidate_created`，选中`geom111_jaw0_approach2_-1_flip-1__rrtgenerated_geometry_high_approach`；RRT失败后使用active BDDL geometry生成的高位OSC fallback。执行214个真实抓取/抬升动作，报告显示稳定双侧样本22个连续状态、akita_black_bowl_1抬升36.4506 mm；`task_success_candidate=true`、`safety_certified=false`。阶段用时2430.8秒。handoff已完成32动作/800子步（t215–246，逐行7D与子步监测核验通过）；branch00 direct已结束并留下transport-failed runtime Snapshot（186动作、最后t432；具体诊断待executor终态报告）；branch01从与handoff及branch00起点相同的MuJoCo integration state继续，当前keypose-side route最新step_index=169/timestep=416，170动作，phase=transport_region_progress_region_progress，waypoint=4。最新Snapshot重算目标Region XY距离31.5 mm（相对共享handoff起点约187.6 mm减少156.2 mm）；waypoint段起始读数44.0 mm不是实时距离。末动作有效7D、25/25子步监测完整、task_success=false、reward=0、done=false。active candidate前缀214 grasp/lift +32 handoff +170 branch01动作=416动作、约10,400预期子步；两个placement分支互斥，最终selected stream待V3终态确认。V3 run_manifest仍为running，executor PID 112228及Safety Bridge PID 113961均存活（启动约114分钟，wall预算余约125分钟）； 接管检查点（2026-10-30 13:24 Asia/Shanghai）：run_manifest为running；executor PID 112228与Safety Bridge PID 113961存活（executor已运行约114分钟，wall预算余约125分钟）。branch00 direct留下transport-failed Snapshot（186动作、最后t432）；active branch01 keypose-side最新step_index=169/timestep=416，共170动作，phase=transport_region_progress_region_progress、waypoint=4，末动作有效7D且25/25子步监测完整，task_success=false、reward=0、done=false。最新Snapshot按native Region坐标系重算目标XY距离31.5 mm（handoff起点约187.6 mm，减少156.2 mm）；waypoint-start读数44.0 mm并非实时距离。当前候选前缀214 grasp +32 handoff +170 branch01=416动作/约10,400预期子步；branch00不拼接，最终selected stream待V3审计。branch起点与handoff的model/integration SHA一致。抓取动作源和各分支全量审计仍待完成。
+
+## 最新失败证据分类（2026-10-30）
+
+已在唯一任务矩阵增加 stage_a_failure_category：20项已终结但尚无完整成功轨迹，其中A抓取候选筛查11项、B插入RRT不可行1项、D运输失去抓持1项、F区域/入口进展停滞4项、H多目标续接1项、I Bridge/记录错误1项、J墙钟耗尽1项；另有OAH L0T0 dev02仍在运行。OA L0T2和L1T2各有Extended成功但未达到Standard 1000步；7项已有Standard完整成功。证据和任务清单见[失败分类](GS_OPD_FAILURE_CLASSIFICATION.md)。当前OAH L0T0距离进展仍在发生，等本次运行终态后再比较A组抓姿生成与F组放置能力的收益，不并行改动算法。
+
+## dev02性能观测（2026-10-30；根因尚未归属）
+
+已结算抓取搜索的首次稳定抓取候选耗时2430.8秒，真实执行214动作/5,350子步。8次RRT预检均耗尽各自20秒预算，累计161.52秒，约占该阶段墙钟6.6%；其余约2,269秒尚未按几何生成/筛查、MuJoCo子步、OSC跟踪、Bridge通信、渲染和序列化分别计时。阶段总耗时除以动作数约11.36秒/动作只是粗略均值，不能视作每步物理成本。接管采样时executor约9.8% CPU，Safety Bridge约102% CPU，GPU计算利用率采样为0%；这是单点资源观测，尚不能判定实际延迟由物理子步、图像、通信或控制哪项主导。当前branch01 keypose-side运行至t416，候选前缀416动作；最新Snapshot重算目标Region XY距离31.5 mm，相比t386的76.3 mm又减少44.8 mm（30动作），持续向目标推进。branch00已结束并存有transport-failed Snapshot；两分支不拼接，V3最终selected stream待审计。保持当前运行不变；终态后优先加轻量级分阶段计时，再决定针对性优化，不依据单次CPU采样改停滞阈值。
+
+## dev02 Same-episode放置分支身份核验（2026-10-30）
+
+branch00与branch01都从同一handoff末端Snapshot恢复：三份handoff、branch00起点、branch01起点Snapshot的model geometry SHA均为`a79f31ee3c75e8aee7c6d001d4d1b81bd8b3352cf3d0528a97c9f56e8a8d181c`，466维MuJoCo integration-state SHA均为`5110875732d477071e1c2b8097cb0c2c9d9a965c9055fdc944032b5cee7e807f`。handoff与branch00起点的序列化payload SHA相同；branch01起点payload SHA为`c4bf2a0f4c301a625debba320c88947757d9805d0b7225a81dad02f9cc679b03`，与handoff字节不同但integration-state及模型身份完全相同。两个放置分支是互斥候选，不能拼接。branch00已有transport-failed终态Snapshot；branch01继续运行，最终由V3确认selected分支及完整边界审计。
+
+## dev02性能测量点代码审阅（只读；尚无运行时归因）
+
+只读检查执行路径发现两个需要分开计时的阶段：每个物理控制动作先通过 Bridge 执行 `step_monitored`，随后单独请求 `grasp_state`；Bridge 在每个 MuJoCo 子步收集并深拷贝完整接触项，再计算子步几何监测。Region Progress 的 `persist_step` 每个动作同步JSON序列化完整记录、flush+fsync，并编码写出双相机帧。此前t404到t405的一次追加，durable JSONL增长约2.29 MB/动作；这只是单动作体量观测，不代表稳定吞吐或延迟比例。运行结束后，在不减少审计覆盖的前提下，优先测量Bridge物理步/接触与几何监测、Bridge请求响应、grasp_state请求、记录JSON序列化/fsync、JPEG编码写出以及OSC规划跟踪耗时，再判断是否优化。当前执行期间未修改代码。
+
+## obstacle_avoidance/L2T2 dev03 Standard多目标冷启动：native placement未完成（2026-10-30）
+
+dev03从任务自己的identity-checked合法init-state 0/seed 0 t0启动，Standard horizon 1000，V3 wall-time预算14400秒，并启用`--continue-pending-native-goals`。源码bundle为`9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7`；t0 integration-state SHA-256为`be3dc6055a419e3e6dc79cdaf99c2923b559ea4120d717a0fc69e267b9a91e36`。dev02动作、报告和Snapshot均未加载。24个抓取候选中4个可行、18个碰撞失败、2个IK不可达，筛查期间live state未变。候选`geom99_jaw0_approach1_-1_flip-1__rrtgenerated_geometry_high_approach`经active BDDL geometry生成的高位接近fallback完成185个真实抓取/抬升动作（4625子步），连续23个样本稳定双侧抓持，moka_pot_1抬升35.94 mm；随后同run Student handoff完成32动作（800子步）至t=217。
+
+Native Region Progress独立尝试了三个放置分支：branch00 direct、branch01 keypose-side、branch02 keypose-side reverse，各447动作，分别到t=664，均未达到task success。branch00、branch01为替代路线；最终V3选择branch02作为selected action stream，三支路不得拼接。三条分支逐行检查均为447/447有效连续7D动作、11,175/11,175子步监测完整，末行动作`task_success=false`。selected Episode记录为185 grasp + 32 handoff + 447 branch02，共664动作/16,600子步。
+
+V3终态为`task_incomplete`（executor `native_goal_transport_failed`），错误为`TimeoutError: transport_region_progress_native_region_placement_did_not_reach_pose_within_90_actions`；同时记录`planning_time_budget_exhausted`。V3 `physical_action_audit.status=complete`：三项selected来源齐全（grasp 185、handoff 32、branch02 447），664/664动作与16,600/16,600物理子步有记录，7D动作/state-action行有效、各来源连续、Snapshot边界已验证。审计同时标明`physical_branches=4`、`single_branch_contiguous_records=false`及`success_episode_timestep_continuous=false`；这表示归档来源核验完整，但没有形成经审计的成功Episode。`outcome.complete_substep_monitoring=false`、`physical_state_action_records_valid=false`、`standard_1000_step_success=false`、`native_task_success=false`，安全认证和Stage A训练资格均未授予；Strict-10mm未通过/未评估成功Episode。
+
+多目标调度只尝试了首个目标`On(moka_pot_1,flat_stove_1_cook_region)`，失败后停止；t=664 native query为pot1 On=false、pot2 On=false、`Turnon(flat_stove_1)=true`、`task_success=false`、reward=0、done=false。dev03 Student-first 31动作/775子步前缀已丢弃，不计入664动作selected stream。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T2_worldup_multigoal_cold_start_dev_03/v3_run`；executor报告位于其`task_success_engine/task_success_first_executor_obstacle_avoidance_L2T2_20261030_094425_270011202/run_report.json`。
+
+下一步依覆盖矩阵转至`obstacle_avoidance_human/L0T0`新鲜合法t0冷启动。L2T3两次首步Safety Bridge EOFError归档保留并等待公共Bridge诊断；L2T4既有失败运行也保留，后续在公共放置进展修复后回访。
+
+
+## obstacle_avoidance/L2T2 dev02 Standard冷启动：wall-time耗尽，分支动作已留档（2026-10-30）
+
+dev02从该任务identity-checked合法init-state 0/seed 0 t0冷启动，BDDL SHA-256 `58b3db56352473e7c453476991a0ad48ea7c214f934fcb4403b6c1da5467b523`，t0 integration-state SHA-256 `be3dc6055a419e3e6dc79cdaf99c2923b559ea4120d717a0fc69e267b9a91e36`，模型几何SHA-256 `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`。cold-start协议未加载目标成功示范、关键姿态、历史动作、成功参考或旧搜索报告。V3在3600秒wall-time上限结束，`status=engine_time_budget_exhausted`；没有生成executor终态报告或V3最终原生状态查询，因此不计成功。
+
+Task-approach screen完成24候选，4个可行、18个实际碰撞失败、2个IK不可达，live state未改变。抓姿`geom99_jaw0_approach1_-1_flip-1`经RRT生成高位接近路线到达表面并建立稳定双侧抓持；185动作后抬升35.94 mm，Student handoff再执行32步至t=217。Native Region Progress branch00（layout04 direct）保存447动作至t=664；branch01（layout09 keypose-side）保存210动作至t=427。两支路均为独立尝试，不拼接动作时间轴。Student-first 30步单独丢弃。
+
+对所有已归档物理action rows进行只读字段核查：grasp 185、handoff 32、branch00 447、branch01 210、Student-first 30行全部标记`substep_monitoring_complete=true`，每行`captured_physics_substeps=25`；branch00/01末行`task_success=false`。但wall-time终止使V3缺少executor report及聚合`physical_action_audit`，所以不将该轮记作完整Episode或安全认证。启动配置漏传V3的`--continue-pending-native-goals`，无法保证全部三个原生目标在同一Episode中续接；该轮仅保留首目标与路线诊断。修正配置后从同一合法t0启动dev03，显式启用多目标调度；不加载本轮动作或分支快照。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T2_worldup_route_cold_start_dev_02/v3_run`；启动参数：同目录`../launch_config.json`。
+
+
+## obstacle_avoidance/L2T1 dev02 Standard冷启动复验：抓取筛查再次耗尽（2026-10-30）
+
+dev02使用该任务identity-checked合法init-state 0/seed 0 t0，Standard horizon=1000；V3复位核验通过，MuJoCo integration-state SHA-256与t0完全匹配：`b568434f07865230542bda4f887a7a23ef722677b536db549ce0c5f1191f8bdd`。cold-start协议确认未加载目标成功示范、抓取关键姿态、历史动作、成功参考或旧搜索报告；当前源码bundle为`9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7`。
+
+Task-approach screen检查24个候选，0个可行：15个因实际碰撞约束失败，9个IK不可达；screen报告`live_state_unchanged=true`。无RRT和专家物理分支，接受专家动作/子步为0。12动作Student-first前缀在300/300个MuJoCo子步监测完整后回滚并丢弃；原生`In(black_book_1,desk_caddy_1_back_contain_region)=false`、`task_success=false`。V3为`task_incomplete`，失败原因为`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。V3 `physical_action_audit=incomplete`是因为没有接受的专家动作来源；Student段独立审计完整，不构成缺失动作或成功轨迹。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T1_current_shared_code_cold_start_dev_02/v3_run`。相同候选池已在L2T1两轮冷启动中耗尽，按覆盖优先暂存，下一项转至`obstacle_avoidance/L2T2`；待公共抓取候选族有实质改进后再回访。
+
+
+## obstacle_avoidance/L1T4 dev02 Standard冷启动：进入微波区域后放置停滞（2026-10-30）
+
+dev02从该任务自己的identity-checked合法init-state 0/seed 0 t0启动，Standard horizon=1000；cold-start协议确认没有加载目标成功示范、关键姿态、历史动作、成功参考或旧搜索报告。抓取screen检查24个候选，1个通过、22个碰撞/提前接触、1个IK不可达；screen未改变live state。候选`geom101_jaw0_approach2_+1_flip+1__approach_axis2_-26.2mm__rrt0`的RRT预检可行，抓取搜索完成真实双侧抓持和抬升。
+
+专家抓取/抬升217动作后执行32步Student handoff。Native Region Progress依次尝试3个放置分支：branch00 244动作，branch01 367动作，branch02 510动作；前两支路分别在区域进展和末端放置路点停滞，均独立保存并从最终所选轨迹排除。branch02将物体带入微波入口/内部区域附近，最终连续尝试24步未能满足放置路点进展保护。V3最终t=759原生`In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`、reward=0、done=false、`task_success=false`；失败原因为`transport_region_progress_native_region_placement_waypoint_stagnated_for_24_actions`。没有任务成功轨迹。
+
+最终所选路径由217抓取/抬升、32 handoff及branch02的510放置动作组成，共759动作/18,975个MuJoCo子步；V3物理记录审计complete，759/759动作、全部子步监测完整，动作维度和state-action记录有效、来源连续。该路径不是成功Episode，`success_episode_timestep_continuous=false`、Strict-10mm未通过、`safety_certified=false`、`safe_training_eligible=false`；几何监测192 complete/567 unsafe。Student-first 32步和branch00/branch01的244/367步替代分支均不计入所选失败路径。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T4_worldup_route_cold_start_dev_02/v3_run`。L1T4已有两次连续放置阶段失败；按覆盖优先暂存，下一项转向`obstacle_avoidance/L2T1`，待共享插入/路点进展改进后再回访。
+
+
+## obstacle_avoidance/L1T3 dev02 Standard冷启动：候选筛查再次耗尽（2026-10-30）
+
+`obstacle_avoidance/L1T3`使用本任务自己的identity-checked合法init-state 0/seed 0 t0独立冷启动，Standard horizon=1000；BDDL SHA-256 `b22d0fc993b595cd0cb82fd81cfed4a64ff66e5295fc6452425da0c2cd0398c3`，t0 integration-state SHA-256 `e1f35cf5d1fabfb98aa6cb6299321dba67836f78b597a90bf73048555003b283`，模型几何SHA-256 `6cc06b66c27a4645b53b53f78b42e59d523238b9071cec524bda814ecfd51b66`。V3 cold-start清单确认未加载previous search reports、目标成功示范/关键姿态、历史动作或成功参考。
+
+Task-approach screen完成24候选检查：21个因实际碰撞/提前接触失败，3个IK不可达，0个可行；live state保持不变且screen起始SHA与合法t0 integration-state一致。无RRT、无专家物理分支、接受专家动作/子步均为0；初始两个native In目标均false。31动作Student-first分支（775子步）按流程回滚到t0并丢弃，因此V3 `physical_action_audit=incomplete`仅表示没有专家动作源，不代表存在缺失的接受动作或成功Episode。失败为`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T3_worldup_route_cold_start_dev_02/v3_run`；V3报告和screen路径见矩阵。该轮没有测试L1T1特有的mount/table静态安装例外；当前world-up修正也未改变L1T3抓取筛查结果。按Phase 2覆盖顺序转向`obstacle_avoidance/L1T4`；后续公共候选族变化后再回访L1T3。
+
+
+## L1T1几何碰撞与世界竖直清障修复；dev06 Standard成功（2026-10-30）
+
+`obstacle_avoidance/L1T1`从既有identity-checked合法init-state 0/seed 0 t0独立冷启动；BDDL SHA-256 `a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3`，t0 payload SHA-256 `1bb657a9f1d1ec1233197ae7dc2f76014ae5655bbcdcec15f4ddfee97365f961`，integration-state SHA-256 `a3f00d570ffac8f5275abbdc323738ad1f24ef203a0c7808f515dec2aade77bb`，模型几何SHA-256 `d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53`。
+
+dev03/dev04通过筛查明细定位到精确固定碰撞对：机器人geom 90 `mount0_pedestal_col`/body 22 `mount0_pedestal` 对静态scene geom 14（无geom名）/body 1 `study_table`，两者祖先均无关节，最小间隙约−99.46 mm。Safety Bridge新增仅在该L1T1模型几何SHA上生效的精确静态安装对例外，并运行时核对双方geom/body ID、名称及joint-free祖先链；其它机器人/场景碰撞门禁、50 mm规划余量及10 mm/2 mm安全阈值未改。dev05据此在24候选中得到3个筛查可行，候选`geom92_jaw0_approach2_+1_flip-1__approach_axis2_-40.0mm__rrt0`通过真实RRT预抓取、表面接近、双侧抓持和30 mm抬升（226动作）；Student handoff 32动作。
+
+dev05的3个放置布局各执行106动作后，都在首个`adaptive_clearance`路点停滞。失败分析发现区域site旋转`diag(1,-1,-1)`将局部z反向，但`_native_region_corridor_obstacle_clearance`把该局部偏移与世界障碍顶高混用，要求书本root高度约1.245122 m；实测书本最低碰撞点已高出caddy顶约164 mm。修正后最低碰撞几何偏移按世界z计算，未降低障碍顶高或50 mm route clearance。代码新增回归验证倒置native region frame下仍沿世界up。dev06第一直接布局15路线30动作后停滞并排除；侧向绕行布局36路线跨过清障、入口和对齐阶段，placement执行355动作，t=613原生`In(black_book_1,desk_caddy_1_back_contain_region)=true`、reward=1、done=true、`task_success=true`。V3 `status=complete`、engine return code 0，计为Standard 1000步成功。
+
+成功Episode严格由226抓取/抬升+32 Student handoff+355布局36放置组成：613/613动作行、15,325/15,325 MuJoCo子步、连续成功时间轴、完整子步监测、7D action与state-action审计均通过。Student-first 32步及失败布局15支路未并入成功路径。Geometry monitoring为178 complete/435 unsafe；Strict-10mm false、`safety_certified=false`、`safe_training_eligible=false`，没有进行稳定释放认证。Executor的`post_success_terminal_exception=environment_done_during_grasp_only_branch`是任务已done后的终端异常记录；executor最终状态`complete_task_success`且原生成功，V3已正确提交。dev06完整归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run`。
+
+dev05旧报告虽`native_task_success=false`，但误把最后query timestep 364写入`native_task_success_timestep`。V3现仅在终态`task_success=true`且timestep为有效非负整数时写入该字段，并增加回归测试；旧dev05归档保持原样并在当前目标文档中标注字段错误。当前源码bundle（verification JSON有序路径算法）SHA-256：`9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7`；base revision `8e553b105baf6cc9129abec899fe3383d790543e`。
+
+测试：世界up清障与倒置Region路点定向测试2项通过；抓取screen、jointspace RRT、静态安装对和V3模块纳入的相关测试共136 passed、10 subtests passed，另4条既有断言仍不匹配当前candidate排序/朝向复用、route waypoint角色及transport reserve实现（未由本次world-up修复引入）。详细pytest输出在本轮执行记录；不据此更改无关生产行为。
+
+L1T1达到成功后当前主线按Phase 2覆盖顺序推进`obstacle_avoidance/L1T3`，开发调试结果与后续统一冻结版本评测分开统计。
+
+
+## L0T4当前深度候选族复验 dev_02（2026-10-30）
+
+`obstacle_avoidance/L0T4`从身份核验的合法t0重新冷启动，Standard horizon=1000，未加载历史搜索报告、目标示范、关键姿态或历史动作。当前自动扩展的24个抓取候选（16个基姿、8个接近深度变体）全部在open-surface task-approach screen以碰撞约束失败；无可行候选、RRT预检或专家物理分支。32步Student-first前缀已回滚并丢弃（800监测子步）；没有接受的专家任务动作，原生In、Close和`task_success`均false。V3为`task_incomplete`，失败为`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。这次复验表明当前深度候选扩展没有改善L0T4，按覆盖优先暂存，后续仅在共享候选族发生实质变化后重试。
+
+筛查前live state保持不变，使用的合法t0 integration-state SHA-256为`efba821b9abadbda5bf9431d2c204871dd8035d24e07473d3ec0dd9b9b83db72`。独立Student分支按流程精确回滚；V3物理审计标记incomplete是因为未创建专家动作源，不代表存在未监测的接受动作或成功Episode。几何原因分类包含目标表面接近碰撞/提前接触，部分候选另有预抓取全几何碰撞。安全认证、Strict-10mm与训练资格均未授予。下一步转至`obstacle_avoidance/L1T1`，使用该任务自己的合法t0验证当前候选扩展，不复用L0T4候选或历史动作。
+
+V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L0T4_depth_candidates_cold_start_dev_02/v3_run/v3_report.json`；task-approach screen和Student回滚记录见同目录`task_success_engine/`。
+
+## L1T1当前抓取候选族复验 dev_02（2026-10-30）
+
+`obstacle_avoidance/L1T1`使用任务自身identity-checked合法t0、init-state 0/seed 0、Standard horizon=1000全新冷启动。V3清单确认未加载previous search reports、目标成功示范/关键姿态或历史动作。抓取task-approach screen评估24个候选：8个原始基姿及16个接近深度变体；0个可行，15个因碰撞约束失败、9个IK不可达，未观察到仅因10 mm余量而拒绝的候选。没有RRT或专家物理分支。32动作Student-first前缀（800子步）按流程回滚并丢弃；接受的专家任务动作/子步为0，原生`In(black_book_1,desk_caddy_1_back_contain_region)`和`task_success`仍false。V3为`task_incomplete`，失败为`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。
+
+screen报告确认live state保持不变，integration-state SHA-256仍为`t0`值`a3f00d570ffac8f5275abbdc323738ad1f24ef203a0c7808f515dec2aade77bb`。15个碰撞失败候选的违规均指向`unmapped_scene_environment`，其中报告的最小间隙约−99.46 mm；精确碰撞几何对尚未输出，当前不据此修改碰撞豁免或阈值。该深度候选族未改善此任务的筛查通过数。V3物理审计标记incomplete是由于没有专家动作记录源；Student分支独立完整并已丢弃，不代表接受动作记录缺失。安全认证、Strict-10mm与训练资格未授予。
+
+V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_depth_candidates_cold_start_dev_02/v3_run/v3_report.json`；task-approach screen：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_depth_candidates_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_071417_186087280/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T1_20261030_071600_506681566/task_approach_feasibility_screen.json`。
+
+## 2026-10-30 dev_14全几何插入RRT复验结果与区域边缘预检
+
+dev_14从dev_13相同identity-checked OAH/L2T4合法t0全新冷启动（seed 0、horizon 1000、offset32、legacy_rrt、RRT预算60秒；端口51960/51961），未覆盖旧归档。抓取候选`geom105_jaw0_approach2_+1_flip-1__approach_axis2_-26.2mm`通过24候选筛查并完成36.036 mm抬升；放置`region_layout_15`外部RRT路线后到达内部高位，第二段全几何插入RRT按设计运行。
+
+插入目标IK的所有种子均未通过实场景碰撞门禁：机器人手部与`microwave_1`最小间隙约−56.2 mm，携带mug与微波结构约−6.8 mm。RRT零迭代拒绝目标，实时MuJoCo状态哈希未变；未执行直接下降。dev_14于t=527以`task_incomplete`结束，原生In、Close、`task_success`均false。放置布局36在入口目标处因无有界IK被拒；布局15执行275个放置动作。全物理记录审计为527/527动作、13,175/13,175子步、527/527完整子步监测、7D action与状态动作记录有效；几何状态195 complete/332 unsafe。V3的`outcome.complete_substep_monitoring`与`physical_state_action_records_valid`针对成功Episode时间轴，因此在无成功Episode时为false；聚合失败轨迹审计本身为complete。各源未提供预期物理子步计数，`reported_physics_substeps_match_record_rows`为null。覆盖仍8/30，Strict-10mm、安全认证与训练资格未通过。
+
+随后从精确t=527终态Snapshot进行只读`native_goal_query`与全几何RRT目标预检，物理动作数为0、每次规划后状态哈希均不变。修正诊断脚本的抓持绑定字段后，10个中心/朝向/±20–40 mm候选中9个可生成IK、但均被微波几何碰撞拒绝；1个朝向无有界IK。第一轮错误输入格式只在规划请求校验阶段失败、没有物理动作；其桥接日志保留在`goal_pose_preflight_bridge.log`，更正后的结构和结果见重跑JSON。入口方向60–80 mm偏移以及容器横向±60–80 mm的10个额外目标均保持杯子根部在native In区域xyz范围内，但仍无无碰撞目标IK：手部对微波间隙最小值约−47.7至−57.7 mm，杯体对微波间隙约−0.7至−64.9 mm；两个最外侧横向位姿之一无有界IK。共20个位姿、零物理动作、每次规划后状态哈希均不变。证据说明当前抓持变换无法靠容器内平移解决；下一步检查24个现有抓姿的腕向/物体相对变换，并设计插入目标可行性预筛，使物理冷启动优先选能将手留在容器外的抓姿，不放松碰撞门禁或改变BDDL及10 mm/2 mm阈值。
+
+基于t0同一通过抓取/抬升筛查的基姿，生成24个jaw tilt/approach roll候选；20个通过open-surface接近/抓取端点几何筛查（12个approach roll、8个jaw tilt），其余4个较大负向jaw tilt因接近碰撞被拒。新增只读`scratch_attached_goal_pose_preflight`在MuJoCo scratch data中用假设的EEF-to-object变换检查native In目标IK，不执行动作或路线。20个候选在region_layout_15中心目标上均有7个IK候选但全被碰撞拒绝；最佳手部/微波间隙约−53.1 mm，杯体/微波约−6.8 mm。完整48个compiled-geometry基姿t0预筛为0可行（37 collision、11 IK）；对其生成的192个接近深度变体中10个通过open-surface接近筛查（138 collision、44 IK）。
+
+新增的t527几何明细确认：`microwave_1_g6`和`g7`属于固定`microwave_1_main`顶板/底板，活动门是`microwave_1_microdoorroot`上的`g14–g17`。门当前角度−1.5043 rad，合法范围[−2.094,0]；scratch最大开角不改变中心目标处的固定顶板/底板穿透。10个深度候选在区域中心目标均无安全IK，手部/固定顶板约−48.4至−66.2 mm，携带杯体/固定底板约−6.8 mm。
+
+将入口偏移、开门和横向位置组合后，最大开门可解除部分入口姿态的门板阻挡：`entry +80 mm, z +10 mm`的特定假设抓姿下，手部/固定顶板间隙为+1.3 mm，但杯体/固定侧壁`g4`仍为−10.5 mm。沿X向−12至−28 mm移动后，机器人/微波和杯体/微波几何距离转正；不过该假设变换的指垫及手指—杯体接触超出允许接触范围，目标预检仍拒绝。使用实际dev14抓持变换时，同一边缘/开门组合的手部仍与顶板相交约−37.8 mm。
+
+另测试16个绕jaw/approach轴±45°/60°/75°/90°的大幅姿态变体：仅jaw −45°通过open-surface接近筛查；其t0闭爪接触筛查显示左右指垫各穿透杯体约6.87 mm，并有手部接触，故未作为可执行候选。四个横放杯体姿态也均无安全IK。已知真实稳定基姿`geom105_jaw0_approach2_+1_flip-1`在dev14确实双指稳定并抬升36.036 mm；离线闭爪全几何筛查仍因手部—杯体碰撞拒绝该基姿，因此该保守筛查不能推翻真实物理抓取证据。全部追加检查物理动作数为0，精确Snapshot状态哈希保持不变；未找到可执行的新插入候选，Strict-10mm、安全认证与训练资格仍未通过。dev14后续位姿、接触与几何映射证据均在该归档根目录的JSON报告中。为遵守覆盖优先策略，暂存OAH/L2T4，下一步用当前抓取深度候选族复验同类微波任务`obstacle_avoidance/L0T4`，不重复L2T4的小幅姿态筛选。
+
+dev_14 V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/grasp_pool32_rrt60_insertion_rrt_cold_start_dev_14/v3_report.json`；executor报告位于同目录`task_success_engine/`；终态Snapshot位于`task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T4_20261030_060219_988740341/expert_native_placement/placement_branch_01_region_layout_15/native_goal_transport_failed_runtime_snapshot.pkl`。20个位姿预检、48基姿及192深度变体筛查、大角度腕姿、门板与几何映射报告均保存在dev14根目录的JSON文件。插入RRT实现与回归见`research/gs_opd/repair/task_success_first_executor.py`及其测试；假设抓持目标IK scratch预检见`research/gs_opd/repair/mujoco_jointspace_planning.py`和`research/gs_opd/smoke/safety_bridge.py`。
+
+
+### dev_06复验结果与路线调整（2026-10-30）
+
+dev_06从相同identity-checked合法t0冷启动，Standard horizon=1000。单个抓取候选产生稳定双侧抓持；专家抬升、handoff和原生放置均使用真实MuJoCo动作。放置分支最终在t=667以`transport_region_progress_native_region_entry_approach_waypoint_stagnated_for_24_actions`结束，原生`In=false`、`Close=false`、reward=0、done=false；覆盖仍为8/30。V3报告为`task_incomplete`，该分支被截断且没有成功Episode，不计入轨迹覆盖。
+
+失败前的路点误差序列表明进展下降是局部的：此前四个连续24动作窗，物体位姿误差分别改善约51.0、45.4、42.7、29.7 mm；最终24动作窗只改善1.57 mm，EEF位置误差只改善1.15 mm，遂触发2 mm对象停滞阈值。最后窗未发现非夹爪接触，左右指持续接触，所有逐子步接触监测完整。此证据支持真实末端接近低进展，而非回归为上一轮低位穿框碰撞；不据此声称安全认证。
+
+由于连续OSC点到点跟踪抵达外侧高位入口时仍停滞，执行计划按物理证据调整：保持合法t0、Standard预算、Student/handoff/抓取冷启动流程和相同目标，改用已有`legacy_rrt`全几何关节空间运输候选。dev_07在t=219完成抓取/抬升前缀后，两个放置布局均被RRT目标配置门禁拒绝，未执行运输动作；首个候选的携带mug与`microwave_1`预测穿透14.36 mm，原生In/Close均false。审计219/219动作与5475/5475子步完整，但分支不连续、无成功Episode。
+
+dev_07证据显示`legacy_rrt`固定6 cm入口侧移仍落在微波碰撞几何内。已修正为`In`目标在RRT规划前复用对象足迹、原生Region边界与现场障碍高度生成外侧高位入口；RRT后内部对齐点也复用相同高位路线，写入`native_region_entry_transit_route.json`。dev_08两布局入口目标均未通过有界IK：50 mm路线余量给出物体根部过障碍高度1.2617 m、EEF约1.3233 m。dev_09把此诊断路线余量降为20 mm后，两个目标根部高度降至1.2310 m、EEF约1.2935 m；仍以`task_goal_has_no_bounded_current_scene_inverse_kinematics_solution`拒绝，placement动作/子步均0。全几何RRT碰撞门禁与Safety/Strict阈值未改。V3完整审计251动作、6,275子步，t=251时In/Close均false，无成功Episode。
+
+dev_10将抓取几何池窗口移至offset=16；24个task-approach候选全部在物理抓取前screen失败（21 collision constraint failure、3 IK unreachable），`live_state_unchanged=true`、RRT/专家物理分支均0。offset32的dev_11筛查出不同的稳定抓姿`geom105_jaw0_approach2_+1_flip-1__approach_axis2_-26.2mm`，真实抓取/抬升36.0 mm；入口路线物体根部高度1.2165 m、EEF约1.3023 m。全几何RRT通过目标IK，但20秒内仅6次迭代、373次配置检查，最终`planning_time_budget_exhausted`，运输动作/子步0。V3审计252动作/6,300子步完整；最终t=252时In/Close均false、无成功Episode。
+
+dev_12原计划重复同一合法t0、offset32冷启动、新抓姿族与Region边界路线，只把RRT预算从20秒提高到60秒；但Safety Bridge在物理引擎启动时绑定51760失败（`OSError: [Errno 98] Address already in use`）。V3/执行器均已退出，未生成V3报告或物理动作记录，故该次是启动失败，不能评价60秒RRT效果。启动清单和日志保存在`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/grasp_pool32_rrt60_obstacle_avoidance_human_L2T4_cold_start_dev_12`。dev_13已以合法t0、offset32、60秒RRT及其它原参数在新输出目录完成，桥接端口51860；启动前51860–51863均可绑定。初次命令因启动器要求输出路径不存在而在创建任何运行产物前退出，移除空目录后重启成功。抓取预筛完成：24候选中1个通过，候选为`geom105_jaw0_approach2_+1_flip-1__approach_axis2_-26.2mm`，筛查记录`live_state_unchanged=true`。抓取搜索报告`status=task_success_candidate_created`：该分支RRT预抓取路线`offline_feasible`，3条路线候选、13.137秒、996次配置检查；此路线的Safety状态仅诊断，不构成安全认证。真实执行220动作，到达预抓取与表面接近点，闭爪8动作后稳定双指抓持并抬升36.036 mm。其后放置分支01/布局41已获得一条全机器人及携带物几何RRT路线（193点、10次迭代、1,185次配置检查、63.325秒；规划模式`task_success_collision_aware_zero_extra_margin`，禁止穿透、未增加余量；路径`Safety`仍标记`false`）。dev_13最终于t=607以`task_incomplete`结束：原生`In`与`Close`均false，reward=0、done=false、task_success=false。放置分支01/布局41执行355动作（t=253–607），8,875/8,875个MuJoCo子步记录完整，双指抓持保持；放置RRT路线完成运输并进入内部垂直插入。RRT全几何路线193点、10次迭代、1,185次配置检查，规划用时63.325秒（配置上限60秒，超出约3.3秒）；最终Inside目标插入段未规划RRT，而由OSC直接跟踪。退出原因为`transport_native_goal_transport_waypoint_waypoint_stagnated_for_24_actions`。保护窗口t=583–607中，EEF位置误差从170.209 mm仅改善5.226 mm（门槛6 mm），姿态误差从2.86958 rad仅改善0.00501 rad（门槛0.06 rad），t=607仍差165.0 mm与2.869 rad。该窗中mug与微波`microwave_1_g6`有168条接触观测，带符号间隙0.248–0.500 mm，表明直接插入被微波结构挡住；这是对物理记录的归因，不改BDDL或安全阈值。V3审计保留尝试路径607动作/15,175子步，各归档动作子步监测完整、7D状态动作有效；分阶段来源不是成功Episode，且无原生成功，不计入8/30覆盖。全审计统计195个动作geometry=`complete`、412个`unsafe`；夹爪非指垫与mug间距记录约−0.223 mm，小于10 mm要求，不构成安全认证。终态报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/grasp_pool32_rrt60_obstacle_avoidance_human_L2T4_cold_start_dev_13/v3_report.json`。源码已加入第二段携物全几何RRT：外侧路线抵达容器内部高位对齐后，从实时MuJoCo状态规划到精确原生In目标，并逐点闭环跟踪；若预检不可行或规划改变状态，则不执行直接插入。V3 continuation loader要求原档案具有多目标stage history，而dev_13报告为单段executor结果，不满足其身份/连续性协议；因此不伪装为精确续跑，也不改写dev_13，改用相同identity-checked合法t0启动全新冷启动dev_14验证这项共享修复。10mm/2mm门槛和安全标注保持不变。保持60秒RRT预算与10 mm/2 mm定义，不重复直接竖直插入。dev_11因20秒内仅6次迭代、373次检查而超时；本次放置规划耗时63.325秒并产出路线，显示延长预算使路线生成取得进展，同时实测时间比配置的60秒多约3.3秒，需在终态分析规划器/调用计时定义。该实验没有改变Safety/Strict阈值。定向回归此前10 passed、62 deselected，三文件`py_compile`通过。dev_06–11归档根目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/{native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_06,legacy_rrt_obstacle_avoidance_human_L2T4_cold_start_dev_07,boundary_rrt_obstacle_avoidance_human_L2T4_cold_start_dev_08,reduced_margin_rrt_obstacle_avoidance_human_L2T4_cold_start_dev_09,grasp_pool16_rrt_obstacle_avoidance_human_L2T4_cold_start_dev_10,grasp_pool32_rrt_obstacle_avoidance_human_L2T4_cold_start_dev_11}`。
+
+跨任务物理记录确认，OA/L1T4与OAH/L0T4微波任务均在最终下降时持续接触`microwave_1_main`；OAH/L2T4的侧绕阶段则没有真实跟随生成的侧向路点。根因包括：侧绕时抬升与横移被合并成一个对角子目标，Region Progress循环又把侧绕点改写成朝最终目标的直线子目标；`In`目标始终从容器上方下降，没有按候选方向从几何边界外侧进入。OAH/L2T2的Pot运输记录还显示与桌面/场景物体接触后失去双侧抓持。
+
+公共代码已调整：先纯竖直抬升再做侧绕；短进度段跟踪当前生成路点；`In`目标先在容器外高位接近，再于容器内部高位横向对齐，最后下降至目标位；候选入口方向及route variant最多扩展到3个物理分支。dev_02证据后增加基于live object-to-EEF变换的动态末端目标、对象路点成功判定和双侧抓持条件下的对象停滞监测。对象路点停滞门槛现为2mm/0.02rad；EEF门槛、24动作观察窗、碰撞检查和双侧抓持检查不变。定向测试`test_task_success_first_executor.py -k 'native_region_route or native_in_route or native_region_progress_tracks_the_active_side_waypoint or placement_waypoint_stagnation or object_relative_eef_target'`通过（9 passed），目标文件`py_compile`通过。
+
+首个dev_01冷启动在路由创建前触发实现错误`UnboundLocalError: region_rotation`，最终t=251、In/Close均false；专家抓取219动作和handoff32动作完成，放置物理动作未开始，V3审计标记incomplete，不作为运输修复验证。报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_01/v3_report.json`。修正region旋转的局部来源后，定向测试曾6/6通过。独立dev_02冷启动最终`task_incomplete`：候选分支00、01分别在t=653、t=593于入口接近路点停滞；分支02在t=478侧绕detour路点停滞。最终In/Close均false，reward=0、done=false；V3汇总478动作/11,950子步、监测记录完整，但由3个Snapshot分支组成，`single_branch_contiguous_records=false`，不是成功Episode。三支均保持双侧抓持且无非夹爪接触；第三支物体只移动8.5mm，目标误差仍约22.27mm且24动作内仅改善0.94mm，失败证据指向末端跟踪与实物路点反馈不一致。报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_02/v3_report.json`。dev_03独立冷启动最终`task_incomplete`，最终t=499、`In=false`、`Close=false`、reward=0、done=false；原因`transport_region_progress_region_progress_waypoint_stagnated_for_24_actions`。分支00/01在入口接近阶段分别于t=655/t=591退出，第三支于t=499路点2停滞。三支所有placement动作记录均保持双侧抓持，直接接触记录未发现夹爪/目标物以外的接触。停滞前24动作窗内，分支00对象路点误差46.35→40.79mm（5.56mm）；分支01位置无进展但旋转改善0.047rad；分支02位置误差21.78→16.39mm（5.39mm），均略低于原6mm/0.06rad门槛。V3汇总499/499动作及12,475/12,475子步监测完整、7D记录有效；但无成功Episode且`single_branch_contiguous_records=false`，不计覆盖。报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_03/v3_report.json`。对象路点门槛现下调至3mm/0.03rad，定向回归9/9通过、`py_compile`通过；dev_04已用同一identity-checked fresh t0启动，最多3支、3600秒预算，结果目录`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_04`。覆盖仍为8/30，失败运行不计成功，安全认证仍未授予。
+
+## 2026-10-30 Native Region Progress dev_04复验：对象进度门槛仍触发停滞
+
+dev_04使用独立fresh进程、identity-checked OAH/L2T4 t0、seed 0、horizon 1000、最多3个placement分支与3600秒wall-time预算。最终`task_incomplete`，t=502时原生`In=false`、`Close=false`、reward=0、done=false；失败点为`transport_region_progress_region_progress_waypoint_stagnated_for_24_actions`。V3物理动作审计汇总502/502条有效7D动作记录、12,550/12,550子步监测完整；但没有成功Episode、`single_branch_contiguous_records=false`，不计成功覆盖。几何监测status为complete 130、unsafe 372，`safety_certified=false`。
+
+三个placement分支共1,003条durable动作记录均保持双侧抓持确认，直接接触日志中除夹爪与mug接触外没有其他接触。三支最后24动作窗：branch00对象路点误差38.65→35.85mm（2.80mm）；branch01位置误差无改善、姿态改善0.026rad；branch02对象路点误差19.42→16.92mm（2.49mm）。三者均略低于3mm/0.03rad对象停滞门槛，说明该门槛仍会停掉缓慢但可观测的末端进展；branch02只差约1.9mm到15mm对象路点容差。报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_04/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_04/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T4_20261030_022247_663346233/run_report.json`。
+
+对象停滞门槛已调整为2mm/0.02rad，EEF停滞门槛、24动作观察窗、物理碰撞和抓持校验保持不变；定向回归9/9通过，`py_compile`通过。dev_05已使用相同identity-checked合法t0启动，seed 0、horizon 1000、最多3支、3600秒wall-time；结果目录`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_05`。本轮验证近目标慢进展能否完成路点并达到原生任务成功。目标成功覆盖仍为8/30。
+
+## 2026-10-30 Native Region Progress dev_05复验：微波入口低位横移碰撞
+
+dev_05使用identity-checked fresh t0和同一Standard预算，最终`task_incomplete`，t=897时原生In/Close均false、reward=0、done=false，失败原因为`bilateral_grasp_lost_during_native_goal_transport`。第三候选已越过region progress和外侧入口路点；在低位水平进入微波时，mug的`white_yellow_mug_1_g1/g2`与`microwave_1_g3`接触，首次记录于t=891、穿透峰值约2.65mm，t=897左指接触消失。placement分支最后记录为646条动作，V3合并897/897条有效7D动作、22,425/22,425子步监测完整；没有成功Episode、`single_branch_contiguous_records=false`，不计覆盖。其余两路线仍因入口接近路点停滞退出。报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_05/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_05/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T4_20261030_030447_988968487/run_report.json`。
+
+物理记录揭示route顺序不合理：先在容器外下降，再在低高度横移穿过边框。已改为外侧高位接近、在容器内部高位横向进入、最后原地下降；对应route单测调整后仍9/9通过，`py_compile`通过。dev_06现已用相同identity-checked合法t0启动，seed 0、horizon 1000、最多3支、3600秒wall-time；结果目录`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/native_region_progress_fix_obstacle_avoidance_human_L2T4_cold_start_dev_06`。重点确认边框接触消失且In后能够继续Close。目标成功覆盖仍为8/30，安全认证未授予。
+
+## 2026-10-30 obstacle_avoidance_human/L2T4 Standard首轮失败：放置路点停滞
+
+`put_the_white_yellow_mug_in_the_microwave_and_close_it`从fresh legal t0启动：init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`。初始`In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`、`task_success=false`；BDDL SHA `9a2f2c5da2638bdd7ee574106fca6e6c33fdc96ad78beed3605faff9f9dbb4af`；payload SHA `8ed78ca22e19ff13ab880f6c8ec7c60e6fda64c6db1e0d6d404cf081d862b898`；integration-state SHA `c6ae0c3bb37e240059c36ca5ffed42b717d5c4ea6f85a4d8f4c63071297a0560`；model geometry SHA `2a8e2c6cb3e5e37a7f8b7d7f926ecde0627412a73ac55306253f4a5a87cc8517`。24个mug抓取候选中1可行、22碰撞、1 IK不可达；候选`geom101_jaw0_approach2_+1_flip+1__approach_axis2_-26.2mm__rrt0`完成219动作抓取/抬升，23个连续稳定双侧样本、抬升37.084 mm；Student handoff 32动作完成。
+
+V3最终`task_incomplete`，原因`transport_region_progress_region_progress_waypoint_stagnated_for_24_actions`。最终t=533时In与Close均false、`task_success=false`、reward=0、done=false。V3 physical-action audit为complete：533/533有效7D动作/状态记录、13,325/13,325子步监测完整，Snapshot边界核验通过；但原生放置包含多个物理分支、`single_branch_contiguous_records=false`，没有成功Episode。V3审计汇总中抓取219、handoff32、放置282动作，放置阶段含2个分支；Student-first 32动作已排除。一个未纳入V3最终动作汇总的放置探索分支原始记录曾运行到t=617；验收以V3最终报告与其中引用的源记录汇总为准，不能将该分支计入成功路径。几何监测130项complete、403项unsafe；Strict-10mm未通过/未评估，`safety_certified=false`、`safe_training_eligible=false`。
+
+V3：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T4_cold_start_dev_01/v3_run/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T4_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T4_20261030_000040_408938883/run_report.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T4_cold_start_dev_01`。30个配置的首轮覆盖扫描现已完成；下阶段比较跨任务运输路点停滞与失抓证据，修复公共Native Region Progress能力。
+
+## 2026-10-29 obstacle_avoidance_human/L2T3 Standard首轮失败：抓取候选筛查耗尽
+
+`put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket`从fresh legal t0启动：init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`。初始两个原生`In`目标均false、`task_success=false`；BDDL SHA `407e70ab5b621e5200745507bec701619dd7721f154c546a4ade7f1730f45fe0`；payload SHA `b121ae104a917b43b4427eb5b4366a2dabbda8303cc1c72e51f6652d8de438d3`；integration-state SHA `6430400eb0264ddaa37145be0b7c4f5862bfd19bfda64bf5691836155eb59f75`；model geometry SHA `66c014fd97ed32ae54c5d6b84e87911a43cb7e7a8aaac969a16df1866685990f`。首目标alphabet soup的24个抓取候选0可行（13 collision constraint failure、11 IK unreachable），`live_state_unchanged=true`；无RRT或专家物理分支。Student-first 28动作已排除，精确恢复t0；V3 native目标保持false，`task_incomplete`，物理动作审计因没有专家动作源而`incomplete`，不是部分成功Episode。安全认证未授予。
+
+筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T3_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T3_20261029_235614_190095520/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L2T3_20261029_235823_733516004/task_approach_feasibility_screen.json`；V3：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T3_cold_start_dev_01/v3_run/v3_report.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T3_cold_start_dev_01`。按覆盖优先转向`obstacle_avoidance_human/L2T4`。
+
+## 2026-10-29 obstacle_avoidance_human/L2T2 Standard首轮未成功：运输中失去双侧抓持
+
+`put_both_moka_pots_on_the_stove`从fresh legal t0启动：init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`。初始两个`On`目标均false、`Turnon(flat_stove_1)=true`、`task_success=false`；BDDL SHA `2a906ae1a1aaf6c481d85cd1644492e3a110722ea762db4679db1972d859403a`；payload SHA `34cd287c0d29e02a4eaf9a6042e277e20fb3385aabf32bfad312f679c26aa623`；integration-state SHA `5d919bbb270af4eb4f5eb49a422834bb795fbb5ce67977cd2fdf717cf0696fb0`；model geometry SHA `a29e4fa21d77e9b4d8cd7364a4796dfbd2596d39d660052bfe39ce0595486b40`。首目标Pot1筛查24候选中4可行、18碰撞、2 IK不可达，live state未改变；候选`geom99_jaw0_approach1_-1_flip-1__rrtgenerated_geometry_high_approach`完成177动作抓取与抬升（23个连续稳定双侧样本，35.992 mm），Student handoff 32动作完成。
+
+原生放置尝试经过多个Snapshot分支，最终V3在t=634因`bilateral_grasp_lost_during_native_goal_transport`返回`task_incomplete`；最终Pot1 On=false、Pot2 On=false、Stove Turnon=true、`task_success=false`、reward=0、done=false。V3物理动作审计`complete`：634/634条有效7D动作/状态记录，15,850/15,850子步完整监测，所有记录源各自连续，Snapshot边界核验通过；记录涉及3个物理分支，其中放置阶段含2个分支，`single_branch_contiguous_records=false`，没有成功Episode连续性。Student-first 19动作已排除。几何监测152项complete、482项unsafe；Strict-10mm未通过/未评估，`safety_certified=false`、`safe_training_eligible=false`。V3耗时3424.7秒后在3600秒预算前结束；未达到任务成功，不计覆盖。
+
+V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T2_cold_start_dev_01/v3_run/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T2_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T2_20261029_225615_318209837/run_report.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T2_cold_start_dev_01`。按覆盖优先转向`obstacle_avoidance_human/L2T3`。
+
+## 2026-10-29 obstacle_avoidance_human/L2T0 Standard冷启动原生成功
+
+`pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate`从fresh legal t0启动：init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`。初始`On(akita_black_bowl_1,plate_1)=false`、`task_success=false`；BDDL SHA `2c5adfecca2364e56fb72bb856ec0fd0fc8846c0fa60863e889a614f0734feb9`；payload SHA `3b8c551d60eccca48d5cf0bbbc6886982a53cb15ad299abeecefad2ee3b8f314`；integration-state SHA `080a7641a46f549990dcaefd888e13bff80692daf9d4c5a8130ab7a2b0720b75`；model geometry SHA `ba3f61208e8782263254e26f2a7330badb07116ff4ffc18e7aad2ab85e899118`。
+
+Standard 1000步V3最终`complete`，native task success=true：t=517时`On(akita_black_bowl_1,plate_1)=true`、`task_success=true`、reward=1、done=true。候选筛查24项中7可行、17碰撞；选中`geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm__rrt0`。专家抓取146动作/3650子步，稳定双侧抓持23个连续样本并抬升36.975 mm；Student handoff 32动作/800子步；原生放置339动作/8475子步。成功Episode共517动作/12925子步，V3 physical-action audit为complete：动作与7D状态动作行517/517有效且连续，子步监测12925/12925完整，成功timestep连续，Snapshot阶段边界核验通过；Student-first 32动作已排除。
+
+几何监测114项complete、403项unsafe；Strict-10mm未通过，`safety_certified=false`、`safe_training_eligible=false`。任务在release阶段完成（done=true），没有完成后withdrawal/settling评估；本结果只计Stage A Standard原生任务成功，不构成安全认证。V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T0_cold_start_dev_01/v3_run/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T0_20261029_221630_151428181`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T0_cold_start_dev_01`。按覆盖优先推进`obstacle_avoidance_human/L2T1`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T4 Standard首轮失败：抓取筛查耗尽
+
+`put_the_white_yellow_mug_in_the_microwave_and_close_it`从fresh legal t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动。初始`In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`、`task_success=false`；BDDL SHA `7bca6df87ec729aac1ee1daed0eb2a4197a1983bb1f5c7de759c90c3d1643c04`；payload SHA `fc6eb44325dd3d896290f333969f3794aa15619a12ed9b1252bec3c94412203e`；integration-state SHA `9ece3280f543f3b14c42c31313917501df471ecb57c0db5c63a5d7950fba5560`；model geometry SHA `4242c4c319178237202b1f841d7c367f9419726848e0a01d5261a16e64698ab2`。24个候选0可行（23个collision constraint failure、1个IK unreachable），`live_state_unchanged=true`；无RRT或专家物理动作。32步Student-first（800子步）已完整记录并排除。V3为`task_incomplete`，物理动作审计无专家记录源；原生任务未成功，安全认证未授予。
+
+筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T4_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T4_20261029_221229_357488739/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L1T4_20261029_221359_333332823/task_approach_feasibility_screen.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T4_cold_start_dev_01`。按矩阵优先级转至`obstacle_avoidance_human/L2T0`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T3 Standard首轮失败：抓取筛查耗尽
+
+`put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket`从fresh legal t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动。初始两个原生`In`目标均false、`task_success=false`；BDDL SHA `ee474251b08da72fdd308abadb90f0ec818e91c4017c92020366110baf2848f2`；payload SHA `90ce896fef3924a5ac4704e24611030206e676617d5e15f98995637e6cae0a41`；integration-state SHA `2bb410dec68049ab4b10a19b1416b758610fd11324350b6d2749be31b5aaa5fc`；model geometry SHA `868f9c0b1e2ee237eccfbc3819800a556ff122ea3e2787b13fc6e7154f696ae5`。24个任务接近抓取候选0可行：18个collision constraint failure、6个IK unreachable；`live_state_unchanged=true`。V3最终`task_incomplete`，原因`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`；没有RRT或专家物理动作。32步Student-first（800子步）已完整记录并排除。V3 physical-action audit为null/incomplete是因为没有专家动作源，不是部分成功轨迹。原生目标仍为t0两项false；无Task-Success Episode，安全认证未授予。
+
+筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T3_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T3_20261029_220615_176639246/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L1T3_20261029_220831_798011948/task_approach_feasibility_screen.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T3_cold_start_dev_01`。按覆盖优先继续`obstacle_avoidance_human/L1T4`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T2 Standard首轮未达成：3600秒预算耗尽
+
+`put_both_moka_pots_on_the_stove`从新鲜合法t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动。t0 Pot1 On=false、Pot2 On=false、Stove Turnon=true、`task_success=false`；BDDL SHA `f9ffc0717dddd9dc238b287a1329778fe63c6ed0816c5ee591f7e6697bffcbd8`；payload SHA `9ef4fcce34367b9b5be2e7e7c44b0214b67106252bf3a4d685968fb6790f946c`；integration-state SHA `b53b65256753da0b0e9bcb776255208136d1f2d6221df055a545195c5b3357d0`；model geometry SHA `85386d67ec142ff3bb6b029e12e30492310e68ebd4335074cf7f938134101b3e`。24个候选中4可行、18碰撞约束失败、2 IK不可达。首个专家候选`geom99_jaw0_approach1_-1_flip-1__rrtgenerated_geometry_high_approach`实现23个连续稳定双侧抓取样本并抬升35.96 mm；抓取段184/184动作子步监测完整，抓取后Student handoff 32/32动作已完成，连续前缀216动作/5,400子步；抓取技能成功耗时1088.0 s。Student-first 25动作/625子步已隔离排除。最终V3报告为`engine_time_budget_exhausted`，wall-time预算3600 s；没有最终原生goal-value汇总或multi-goal Episode报告。最后记录t=586位于`settle`，单步`task_success=false`、reward=0、done=false。原始记录源离线逐行核验：所选路径t=1–586连续，586/586个有效7D动作和状态向量、14,650/14,650个子步监测完整；其中当前放置分支t=217–586共370/370动作完整。几何监测为complete 62、unsafe 308；`safety_certified=false`，不计成功。按覆盖优先保留该部分Episode，下一项转`obstacle_avoidance_human/L1T3`。没有载入其他suite动作/状态、官方示范或历史Snapshot；安全认证未授予。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T2_cold_start_dev_01`；t0：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T2_cold_start_dev_01/t0_capture/stage_snapshots/t0`；候选筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T2_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T2_20261029_210103_769827692/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L1T2_20261029_210412_112607041/task_approach_feasibility_screen.json`；V3目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T2_cold_start_dev_01/v3_run`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T1首轮失败：无可行抓取候选
+
+`pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy`从fresh legal t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动Standard 1000步V3 cold-start。t0原生`In(black_book_1,desk_caddy_1_back_contain_region)=false`、`task_success=false`。BDDL SHA-256 `ceb8ca2516af5b6b02c825b0598597fb3a9726b0c82ada5a9ccf134fe6a16659`；payload SHA-256 `8cff8a4b60a0b9c2b955a2006f61da3efab6461e2b0f3767ed374e9a4bfb99a5`；integration-state SHA-256 `829272da3069fef5b33d6ee4039f7bdf2074451ea15651159ed42468bd56a287`；model geometry SHA-256 `6879128afa470c2cdb0a8d70c2c3c74750e0ef99938fc35f18236e1d21908ffa`。首轮24候选0可行（15 collision constraint failure、9 IK unreachable），`live_state_unchanged=true`；未进入RRT或专家物理执行，接受任务动作0。12步Student-first前缀（300子步）已排除。V3为`task_incomplete`、return code 2、native task false；物理动作审计`incomplete`是因为无专家动作记录源，不表示存在不完整成功轨迹。未使用官方示范、历史动作或外部Snapshot；安全认证未授予。按覆盖优先暂停，待共享候选族改进后回访。
+
+归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T1_cold_start_dev_01`；V3：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T1_cold_start_dev_01/v3_run/v3_report.json`；候选筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T1_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T1_20261029_205738_759978261/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L1T1_20261029_205840_150377151/task_approach_feasibility_screen.json`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T1 Standard冷启动进行中
+
+`pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy`从新鲜合法t0启动：suite=`obstacle_avoidance_human`、L1T1、init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`。t0原生`In(black_book_1,desk_caddy_1_back_contain_region)=false`且`task_success=false`。BDDL SHA-256 `ceb8ca2516af5b6b02c825b0598597fb3a9726b0c82ada5a9ccf134fe6a16659`；Snapshot payload SHA-256 `8cff8a4b60a0b9c2b955a2006f61da3efab6461e2b0f3767ed374e9a4bfb99a5`；integration-state SHA-256 `829272da3069fef5b33d6ee4039f7bdf2074451ea15651159ed42468bd56a287`；model geometry SHA-256 `6879128afa470c2cdb0a8d70c2c3c74750e0ef99938fc35f18236e1d21908ffa`。Standard 1000步V3 cold-start已启动，wall-time budget 3600 s、最多3个物理分支；没有复用同名其他suite的动作或状态，没有输入官方示范或历史Snapshot。最终候选、原生目标和连续Episode审计待运行完成。t0：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T1_cold_start_dev_01/t0_capture/stage_snapshots/t0`；V3目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T1_cold_start_dev_01/v3_run`。
+
+## 2026-10-29 obstacle_avoidance_human/L1T0 Standard 1000步原生成功
+
+`pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate`从独立新鲜合法t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）完成V3 Standard冷启动。t0原生`On(akita_black_bowl_1,plate_1)=false`、`task_success=false`；BDDL SHA-256 `3beed9127480333c0db50eb2aac67e0879ac601faedf497aecae04beb09103c4`；Snapshot payload SHA-256 `410cc2f7192bdbd63676d0cc88afc8af75d46d55c7983f889dfe8790d1cfd753`；integration-state SHA-256 `82b108860f6ec237424aaebd85569fe089b6718641115666f1e9de71c258e8a6`；model geometry SHA-256 `dc5c8d6ef2519c3730574e4997334f26bebe706ed6160f61d270a234b086ee0c`。未载入同名`obstacle_avoidance/L1T0`动作/状态、官方示范或历史Snapshot。
+
+活动BDDL绑定目标为黑碗`akita_black_bowl_1`→盘子`plate_1`。候选筛查24项中11可行、13碰撞约束失败；候选`geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm__rrt1`用143步实现稳定双侧抓取（连续样本23个）并抬升36.796 mm；随后32步Student handoff和309步原生放置/释放，t=484原生`On=true`、`task_success=true`、reward=1、done=true。V3最终状态`complete`/return code 0，`standard_1000_step_success=true`。
+
+V3成功Episode审计完整：484/484连续动作行、12,100/12,100物理子步全部监测；7D动作与state-action记录有效，所有物理记录源连续，成功Episode timestep连续，Snapshot阶段边界已核验。Student-first 32动作/800子步排除。几何监测状态115 complete、369 unsafe；Strict-10mm未通过，`safety_certified=false`、`safe_training_eligible=false`。这是Stage A原生任务成功轨迹，不是安全认证。V3：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T0_cold_start_dev_01/v3_run/v3_report.json`；executor：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T0_20261029_202718_043739108/run_report.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T0_cold_start_dev_01`。
+
+## 2026-10-29 obstacle_avoidance_human/L0T2 Pot2候选池耗尽；暂停并转向覆盖
+
+`put_both_moka_pots_on_the_stove`从fresh legal t0（init-state 0/seed 0、source=`fresh_reset_no_prior_experience`）启动Standard V3 cold-start。Stage1由187步专家抓取、32步Student handoff和448步原生放置组成，共667动作/16,675子步；t=667时Pot1 On=true、Pot2 On=false、Stove Turnon=true、整体`task_success=false`。V3接受的Stage1 partial Episode审计为667/667动作、16,675/16,675子步，连续7D状态—动作记录与Snapshot边界核验通过；几何监测191步complete、476步unsafe，安全认证未授予。
+
+从Stage1精确settled Snapshot续接Pot2，payload SHA `314dc362ab41a56fb8718072e683ce72693f900424f3eee9210d2f5a34d32dee`、integration-state SHA `81e95a72c570bd05fc3ea980d6d6766a0ac36f19a4eb2e181198392ffc95c75d`；两次恢复均exact verified。Pot2两个互不重叠的24候选池全部筛完：offset 0为0可行（20 collision constraint failure、4 IK unreachable），offset 24为0可行（19 collision constraint failure、5 IK unreachable）；无RRT或专家物理动作。V3将两次失败尝试排除，分别含28和29步Student-first前缀；原始t0尝试的18步Student-first也排除。Pot2搜索共48个候选无可行解，整体V3状态`task_incomplete`，`multi_goal_episode`为stage_count=1/attempt_count=3，不能计整任务成功。
+
+按30任务覆盖优先策略暂停L0T2，保留Pot1部分Episode、筛查与恢复证据；待公共候选生成或多目标顺序能力改善后再回访。未使用官方示范、历史动作或外部Snapshot。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T2_cold_start_dev_01/v3_run`；V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T2_cold_start_dev_01/v3_run/v3_report.json`；Stage02/03筛查分别归档在`continuation_stages/stage_02`与`stage_03`。Strict-10mm与训练资格未通过，安全认证未授予。
+
+## 2026-10-29 obstacle_avoidance_human/L0T3 首轮候选筛查失败；转向L0T4
+
+`put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket`从fresh legal t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动Standard 1000步V3 cold-start。初始两个原生`In`目标均false、`task_success=false`。BDDL SHA-256 `c5856c879f69931b9d1a9aa02550641f19f73b62ab68f3e0309c02861865a40d`；payload SHA-256 `4adc02f7f682467b09eb326e4197964656d15dbcfbc5f88bee861b664779760b`；integration-state SHA-256 `ba10635e7082e2324b4b6ae8124edd30b2164b5b15e1fdd61b1971bb3f2a3cf4`；model geometry SHA-256 `747780c9fb3e938a8c5fe704e633c4cc5d4eb043241465c7e13b009865de399a`。实时绑定显示alphabet soup目标有完整compiled collision geometry；t0对象布局：alphabet_soup_1=[0.10090574622154236, -0.1747812181711197, 0.03839290887117386] m；cream_cheese_1=[-0.02741975523531437, -0.2243836522102356, 0.008921477012336254] m；tomato_sauce_1=[0.15023909509181976, -0.27493923902511597, 0.03839259594678879] m；ketchup_1=[-0.1499970704317093, -0.06253383308649063, 0.07240547984838486] m；basket_1=[0.10731812566518784, 0.2716883420944214, -0.004582345485687256] m；hairbrush_1_with_hand_1=[0.07814788073301315, 0.07299306988716125, 0.16480380296707153] m。`hairbrush_1_with_hand_1`在活动场景中存在；BDDL记载travel distance=0，不据Suite名称推断其动态或安全语义。
+
+首轮V3为`task_incomplete`，失败在任务接近候选筛查：24个几何候选0可行（11 IK unreachable、13 collision constraint failure），其中有预抓取碰撞与表面接近提前接触诊断；`live_state_unchanged=true`。没有进入RRT、没有专家抓取/物理分支，接受任务动作0；30步Student-first前缀（750子步）已排除。V3 `physical_action_audit`因专家记录源缺失为incomplete，不代表有不完整的成功轨迹；原生任务未成功。按覆盖优先策略暂停，后续在公共抓取候选族改进后回访。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T3_cold_start_dev_01/v3_run`；t0：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T3_cold_start_dev_01/t0_capture/stage_snapshots/t0`；筛查：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T3_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T3_20261029_195717_559973216/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L0T3_20261029_195830_218496385/task_approach_feasibility_screen.json`。未使用官方示范、历史动作或Keypose；安全认证与训练资格未授予。
+
+## 2026-10-29 obstacle_avoidance_human/L0T4 Standard首轮失败：原生放置分支停滞
+
+`put_the_white_yellow_mug_in_the_microwave_and_close_it` 从fresh legal t0（init-state 0/50、seed 0、source=`fresh_reset_no_prior_experience`）启动，t0时原生In、Close与`task_success`均false。BDDL SHA-256 `f5ed50f99b7662cf6d4141067321938bd6af54e1445aba9a5acccce87fc48e76`；payload SHA `b3f19fe239002fda9ec73872d81059574c9aa3a9153afd14f8f6554ac1e4feb7`；integration-state SHA `19aee466c560ca9acd271f40fe1e0fbc32c02ff162bdc2b20b14e07db882c731`；model geometry SHA `aafe8ead94d885e80eb0ee3154e11d1c2b06e33cc4dfbbbf222b6e9c6716df5d`。24个接近候选中1个通过、22个碰撞约束失败、1个IK不可达；通过候选`geom103_jaw0_approach2_+1_flip+1__approach_axis2_-26.2mm__rrt0`完成抓取与36.346 mm抬升，稳定双侧抓取样本3/3。
+
+选定部分路径由抓取221步、Student handoff 32步及keypose-side原生放置分支01的363步组成，共616动作/15,400子步。V3物理记录审计完成：616/616动作行与子步监测完整，7D action与state-action有效、各源内部连续且Snapshot阶段边界核验通过。t=616时In与Close仍false、reward=0、done=false、`task_success=false`；分支01因24动作waypoint stagnation结束。直接放置分支00另有23动作/575子步，作为失败备选分支保留、未并入选定路径。首个Student-first段32动作/800子步已排除。几何监测记录中196为complete、420为unsafe；安全认证、Strict-10mm与训练资格均未授予。未使用官方示范、历史动作或外部Snapshot。
+
+V3状态`task_incomplete`、return code 2；不计任务成功。按覆盖优先策略转至`obstacle_avoidance_human/L1T0`，失败候选与部分动作归档保留，待公共放置能力改进后回访。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T4_cold_start_dev_01`；V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T4_cold_start_dev_01/v3_run/v3_report.json`；放置分支01记录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T4_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T4_20261029_200049_574555639/expert_native_placement/placement_branch_01_region_layout_41_keypose_side_region_progress/durable_physical_step_records.jsonl`。
+## 2026-10-29 obstacle_avoidance_human/L0T1 首轮筛查耗尽；无可行抓取候选
+
+`obstacle_avoidance_human/L0T1`任务`pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy`从独立fresh reset的合法init-state 0/seed 0 t0开始，source=`fresh_reset_no_prior_experience`，init-state count=50。t0原生`In(black_book_1,desk_caddy_1_back_contain_region)=false`、`task_success=false`。BDDL SHA-256 `3ecbfd2f0203ca0d32ca2904f07b4902669a492f79c5b02fa6a4aadb572c3c30`；payload SHA-256 `01016f070812d8929a7b82e142c333257f6979b7cd695db958ceea4fbd9d0ce0`；integration-state SHA-256 `f43b512429385d6db9895975cbe07875dd9b28a80e3ecea567a3498e6d623f37`；model geometry SHA-256 `f95bdeb72eca8276dfa877389f985908aad9532aa569dcd2e66f25b69d718d5e`。V3最终`task_incomplete`，原因=`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`；24候选中0可行、15碰撞约束失败、9 IK不可达，未进入RRT或expert物理分支。32个Student-first动作均为有效7D且完整子步监测，但已排除；目标位移5.89e-8 m，t0 snapshot精确恢复。V3 `physical_action_audit.status=incomplete`，所选expert物理动作=0；`native_task_success=false`、Strict-10mm=false、`safe_training_eligible=false`。本轮未成功；下一项为`obstacle_avoidance_human/L0T2`。t0归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T1_cold_start_dev_01/t0_capture`；V3归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T1_cold_start_dev_01/v3_run`。
+
+## 2026-10-29 obstacle_avoidance_human/L0T0 首轮搜索耗尽3600秒；未完成原生目标
+
+`obstacle_avoidance_human/L0T0`任务`pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate`从独立fresh reset的合法init-state 0/seed 0 t0开始，source=`fresh_reset_no_prior_experience`，init-state count=50。原生`On(akita_black_bowl_1,plate_1)=false`、`task_success=false`。BDDL SHA-256 `b2af85a2f074215abdce4178ae01b6af4030048409a8d2103ca23250c17414e2`；payload SHA-256 `fd5349865bb2f1f8983ea563b3b4f2a0a9601200c3faf33f1d28ba0798b360db`；integration-state SHA-256 `191a26d96571dbc63eebc7d979f1b4f4f2b47641745a51f7d3c4dc28a0c02031`；model geometry SHA-256 `a79f31ee3c75e8aee7c6d001d4d1b81bd8b3352cf3d0528a97c9f56e8a8d181c`。V3以3600秒wall-time budget结束，`status=engine_time_budget_exhausted`，`native_task_success=null`，最终native status与V3 `physical_action_audit`均不可用。已归档的候选路径包含214个grasp、32个Student handoff、22个placement动作；逐源只读检查中268/268动作均为7D且`substep_monitoring_complete=true`，轨迹记录的`task_success=true`计数为0。placement最后记录为timestep 268、`task_success=false`。另外32个Student-first动作保留为丢弃前缀。没有宣称完整任务成功或V3跨源连续性审计。Grasp skill已出现22个连续稳定双侧样本，目标提升36.457 mm。下一覆盖项推进到`obstacle_avoidance_human/L0T2`。t0归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T0_cold_start_dev_01/t0_capture`；V3归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T0_cold_start_dev_01/v3_run`。
+
+## 2026-10-29 L2T4 Standard冷启动未成功；物理动作审计完整
+
+`obstacle_avoidance/L2T4`任务`put_the_white_yellow_mug_in_the_microwave_and_close_it`从新鲜合法init-state 0/seed 0 t0冷启动，source=`fresh_reset_no_prior_experience`；t0的In、Close与`task_success`均false。V3最终`status=task_incomplete`，failure=`RuntimeError: transport_region_progress_native_region_placement_waypoint_stagnated_for_24_actions`；timestep 597时`In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`、reward=0、done=false、`task_success=false`。选择审计的来源为task-success grasp 188动作/4,700子步、Student handoff 32动作/800子步、placement branch 01 377动作/9,425子步，总计597动作/14,925子步。V3 `physical_action_audit.status=complete`：3个来源均存在且连续，7D action/state-action记录有效，597/597动作完整子步监测，snapshot阶段边界核验通过。Branch 00另有271动作替代轨迹，未纳入所选物理来源；32动作Student-first段已排除。`success_episode_timestep_continuous=false`；Strict-10mm未通过、`safety_certified=false`、`safe_training_eligible=false`，几何监测含434个unsafe状态样本（监测完整但不是安全通过）。本轮不计成功覆盖；下一覆盖项转到`obstacle_avoidance_human/L0T0`。
+
+## 2026-10-29 L2T3两次冷启动均遇Safety Bridge EOFError；无可审计物理动作
+
+`obstacle_avoidance/L2T3`任务`put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket`已进行两次独立新鲜t0/no-prior启动，均未形成可用物理记录。run01 payload `0994c26a6f0fd0a1215c9f9c3d73682f43e325edd391c6264ba3980a534856fa`，run02 payload `69fb990b037c201261d93f523fb8e5d80d704da9caed61a5116ff3f675be4a84`；两次integration-state均为`cab15ccc9c3c11770998f76419213a9214782f058de7c1caca20215f0bbc6cda`，BDDL `3447ca39f0f0008a5d81f6b3b8e287b858aae5b1567d08ddf88575f71482bc4f`，model `545153e72c17be2ab17dfd7e3ab3282de31197fcefdbb1ec13d1ad31965e6982`，合法init-state 0/seed 0复位核验通过，初始两个In目标与`task_success`均false。两次Pi0.5 checkpoint加载后，Safety Bridge均在首个`step_monitored`请求时断连并报`EOFError`；V3均为`status=incomplete`，`physical_action_audit.status=not_available`、record sources=0。Bridge log只到`SAFETY BRIDGE READY`，因此首个请求是否推进过仿真状态未知；不把这两次计作任务失败或成功轨迹，也不再对L2T3盲目重复。run01报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T3_cold_start_dev_01/v3_run/v3_report.json`；run02报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T3_cold_start_dev_02/v3_run/v3_report.json`；执行日志：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T3_cold_start_dev_02/v3_run/execution.log`。下一覆盖项推进到`obstacle_avoidance/L2T4`；L2T3保留为待桥接器诊断的基础设施中断。
+
+## 2026-10-29 L2T2 Standard冷启动首轮未成功：抓取/抬升已验证，原生放置未完成
+
+`obstacle_avoidance/L2T2`任务`put_both_moka_pots_on_the_stove`从新鲜合法init-state 0/seed 0 t0冷启动，source=`fresh_reset_no_prior_experience`，没有载入其他任务成功动作、抓姿或示范。BDDL SHA-256 `58b3db56352473e7c453476991a0ad48ea7c214f934fcb4403b6c1da5467b523`；t0 payload SHA-256 `993c04d1eaeb9a3e48d6042ecfb686c50a69ce3deb67422ef6484fcb6268c430`；integration-state SHA-256 `be3dc6055a419e3e6dc79cdaf99c2923b559ea4120d717a0fc69e267b9a91e36`；model geometry SHA-256 `718ba2a082c0ce2bff8c069f83e35e09b0a1c95dd737d2d03b51602f9f39efbf`。24候选task-approach screen有4可行、18碰撞/提前接触、2 IK失败；4次RRT预检中1个offline feasible、3个因`planning_time_budget_exhausted`未给出路径。geom99 generated high-approach分支真实执行185动作/4,625子步，23个连续稳定双指样本并抬升Pot1 35.940 mm；随后Student handoff 32动作/800子步。
+
+V3最终`status=task_incomplete`、return code 2，t=664时reward=0、done=false、`task_success=false`；Pot1与Pot2的原生On均false，Stove Turnon=true。失败原因=`TimeoutError: transport_region_progress_native_region_placement_did_not_reach_pose_within_149_actions`，另保留`planning_time_budget_exhausted`诊断。所选执行源由185抓取/抬升、32 handoff、447个placement branch01动作组成。V3 `physical_action_audit.status=complete`：664行/16,600子步，7D与state-action记录有效，所有子步监测完整、各记录源连续、Snapshot边界通过核验。Placement branch00另有447动作/11,175完整子步的替代尝试，已归档但不计入所选源；30动作Student-first前缀/750子步已排除。因原生任务未完成，V3不认定成功Episode（`success_episode_timestep_continuous=false`）；`safety_certified=false`、Strict-10mm未通过、release未评估、`safe_training_eligible=false`，不作安全认证声明。
+
+V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T2_cold_start_dev_01/v3_run/v3_report.json`；executor报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T2_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L2T2_20261029_154552_255679573/run_report.json`；归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T2_cold_start_dev_01/v3_run`。下一覆盖项推进到`obstacle_avoidance/L2T3`。
+
+## 2026-10-29 L2T1 Standard冷启动首轮失败：24个抓取候选均不可行
+
+`obstacle_avoidance/L2T1`从新鲜合法init-state 0/seed 0 t0开始，source=`fresh_reset_no_prior_experience`；BDDL SHA-256 `2178d401ad7a0d045c0ddbc795f1c8ee88e07329a70867535cf0678e98357b87`；payload SHA-256 `64b26c548310fcb1d81b2a0af001e43c0aa31554341eb951a63364ffec26eb69`；integration-state SHA-256 `b568434f07865230542bda4f887a7a23ef722677b536db549ce0c5f1191f8bdd`；model geometry SHA-256 `dcc6e8d19e2b252dea44f8d7fba882f3929bf627ebfb04de159ac6b87d7ac272`。冷启动复位校验通过，t0原生`In(black_book_1,desk_caddy_1_back_contain_region)=false`、`task_success=false`。
+
+12步Student-first分支在目标位移停滞后停止（`student_goal_approach_and_object_progress_stagnated_for_12_actions`），12/12动作7D有效且子步监测完整，之后被排除。身份匹配的task-approach Scratch screen完整运行、live state未改变：24候选中0个可行，15个碰撞/提前指垫接触失败、9个IK不可达；没有10mm clearance-only拒绝。该screen为task-approach-only，使用活动场景目标姿态，未进入后续历史放置姿态clearance-prior计算。无候选进入RRT或专家物理分支；无动作被接受，t0原生目标保持false。V3 `task_incomplete`、return code 2，failure reason=`no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。V3物理审计因没有专家动作源标记incomplete；独立检查确认12个被丢弃Student动作完整且未进入成功路径。本轮首层覆盖完成，待共享抓取候选族出现有物理依据的改善后再重试；当前转到L2T2。
+
+V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T1_cold_start_dev_01/v3_run/v3_report.json`；task-approach screen：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T1_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L2T1_20261029_154003_573757458/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L2T1_20261029_154122_218850829/task_approach_feasibility_screen.json`；Student-first独立记录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T1_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L2T1_20261029_154003_573757458/student_first/physical_step_records.jsonl.gz`。
+
+## 2026-10-29 L2T0 Standard冷启动成功：Native On任务在t497完成
+
+`obstacle_avoidance/L2T0`任务`pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate`从新鲜合法init-state 0、seed 0 t0开始，source=`fresh_reset_no_prior_experience`，没有提供L1T0或其他目标场景成功动作、抓姿、示范或历史经验。t0时`On(akita_black_bowl_1,plate_1)=false`、`task_success=false`。BDDL SHA-256 `c72a1fd35d6de09eff90b217b7aa6f990743faa8be8a84af54694545d187599d`；payload SHA-256 `0bd50d95927a60e56d7ceb0e184ced0da8666e961061a25ecc0b707743111156`；integration-state SHA-256 `056d32f4b945cdd676a59cc7b8e778bf484ba4e68e4bf1eaea5c6c06fd97a329`；model geometry SHA-256 `4f9b8695c2bc660d6df163727b651f7c3410dd1589036d8acd4e7dbaf50109d2`。源码bundle `bac297d3a3ecd7d8dcd8b7a2c1bcc3ba8b6e225492e42981d349cf78eab63fe6a`。
+
+Identity-matched task-approach screen评估24个几何候选，11个可行、13个碰撞/提前指垫接触、0个IK失败。冷启动复位核验通过；活动BDDL几何候选`geom112_jaw0_approach2_+1_flip+1__approach_axis2_-11.2mm`选择RRT route1，验证23个连续稳定双指接触样本并抬升36.973 mm。成功Episode由专家抓取/抬升142动作（t1–142）、Student handoff 32动作（t143–174）和native region placement 323动作（t175–497）组成。32动作Student-first前缀已排除。V3动作审计为497/497动作行、12,425/12,425物理子步，所有动作7D及状态—动作记录有效，全部子步监测完整，跨阶段时间轴连续且Snapshot边界核验通过。t=497时原生`On(akita_black_bowl_1,plate_1)=true`、`task_success=true`、reward=1、done=true；V3 `status=complete`、return code 0。因此计为Standard 1000步任务成功。
+
+报告保留`planning_time_budget_exhausted`作为搜索诊断；不影响已提交的native成功和完整Episode审计。几何监测统计383步unsafe；`safety_certified=false`、`strict_10mm_pass=false`、`safe_training_eligible=false`，稳定释放未评估，不作安全认证声明。V3报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T0_cold_start_dev_01/v3_run/v3_report.json`；executor报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L2T0_20261029_144748_683490979/run_report.json`。
+
+## 2026-10-29 L1T3 Standard冷启动首轮失败：任务接近抓取筛查耗尽
+
+`obstacle_avoidance/L1T3`以本地注册任务`put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket`从合法init-state 0/seed 0新鲜t0开始，`no_prior_experience=true`。BDDL SHA-256 `f2a65e8c1ee2c8f1f35ada22e42d4d3f12b4f04eef6335dcbe436639f4836f7e`；t0 payload SHA-256 `d8aea9ad3339d223e5ecd60c9c7d5117f0ed630731f7a887c0f47df499f8db43`；integration-state SHA-256 `e1f35cf5d1fabfb98aa6cb6299321dba67836f78b597a90bf73048555003b283`；model geometry SHA-256 `6cc06b66c27a4645b53b53f78b42e59d523238b9071cec524bda814ecfd51b66`。两个原生In目标在t0均为false。V3以Standard 1000配置执行，Student首分支31动作后目标位移停滞并被丢弃；Scratch任务接近筛查评估24个候选，21个为碰撞/提前指垫接触、3个IK不可达、0个可行。没有进入RRT或专家物理分支，接受动作0，原生`task_success=false`，V3状态`task_incomplete`。筛查失败不是Strict-10mm余量门槛拒绝。V3汇总动作审计为incomplete，原因是没有专家物理动作记录源；没有成功Episode动作被接受。
+
+诊断文件：V3 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T3_cold_start_dev_01/v3_run/v3_report.json`；executor `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T3_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T3_20261029_142016_360164625/run_report.json`；候选筛查 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T3_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T3_20261029_142016_360164625/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T3_20261029_142144_831810482/task_approach_feasibility_screen.json`。源码bundle `bac297d3a3ecd7d8dcd8b7a2c1bcc3ba8b6e225492e42981d349cf78eab63fe6a`。按Goal第一层覆盖策略，L1T3暂不重复搜索；待共享候选族发生有物理依据的改进后再回来。
+
+## 2026-10-29 L1T4 Standard首轮失败：原生微波放置停滞
+
+`obstacle_avoidance/L1T4`以本地注册任务`put_the_white_yellow_mug_in_the_microwave_and_close_it`从新鲜合法init-state 0、seed 0的t0开始，`no_prior_experience=true`，init-state count=50。Snapshot manifest source为`fresh_reset_no_prior_experience`。初始`In(white_yellow_mug_1,microwave_1_heating_region)=false`、`Close(microwave_1)=false`、`task_success=false`。BDDL SHA-256 `0a11866ebe343d3d10ed66f18128ba284d577e47618c9db8c55b441e8acea445`；t0 payload SHA-256 `8c8deb6fabb269ae900670309a713b3c414e0342dd524fa7c379f7431a4a010d`；integration-state SHA-256 `eb3893036b8987a90100efbb022900b3563976c358f77d558c8ab688db63fd04`；model geometry SHA-256 `cd3358c1ebc108ede8d3e9bf71c74cc9455c272e0c62a50e9ee72b8856b33a88`。现场对象为white/yellow mug、microwave与moving toy train，位姿保存在`t0_capture/preflight.json`。
+
+Standard 1000 V3使用当前源码bundle `bac297d3a3ecd7d8dcd8b7a2c1bcc3ba8b6e225492e42981d349cf78eab63fe6a`。24个grasp几何候选中仅`geom101_jaw0_approach2_+1_flip+1__approach_axis2_-26.2mm`通过task-approach筛查；22个为碰撞/提前指垫接触、1个IK不可达。RRT route0预检可行，expert grasp search验证22个连续状态稳定双指接触，并将mug抬升36.393 mm；真实抓取/抬升217动作。首个Student分支32动作被丢弃；之后32动作Student handoff精确从已核验的lifted Snapshot继续。
+
+自动原生放置branch00 (`region_layout_36_direct_region_progress`)记录250动作至t=499，在微波入口对齐处导出`native_goal_transport_failed_runtime_snapshot.pkl`。V3随后运行branch01 (`region_layout_15_keypose_side_region_progress`) 277动作至t=526；距离原生In Region 3.439 mm后，触发`transport_region_progress_native_region_placement_waypoint_stagnated_for_24_actions`。最终原生状态两个目标均false、`task_success=false`、reward=0、done=false；executor `native_goal_transport_failed`，V3 `task_incomplete`、return code 2。此配置未获得Standard成功，Close阶段没有执行完成。
+
+所选失败尝试路径由expert grasp 217行、Student handoff 32行和branch01 277行构成；局部核对为t=1–526连续、526/526动作7D有效，V3 `physical_action_audit`为526/526动作行及13,150/13,150物理子步完整监测，Snapshot边界核验通过。V3不将其标记为成功Episode（`success_episode_timestep_continuous=false`），且原生任务失败。被排除的Student首段32动作和branch00 250动作各自保留独立归档，不拼入所选路径。成功候选只有任务抓取阶段；全任务未成功，不作安全认证或训练资格声明（`strict_10mm_pass=false`、`safety_certified=false`）。
+
+报告：V3 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T4_cold_start_dev_01/v3_run/v3_report.json`；executor `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T4_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T4_20261029_142729_564104647/run_report.json`。当时下一项按矩阵优先级推进到`obstacle_avoidance/L2T0`；L2T0现已Standard成功，下一覆盖项为L2T1。L1T4待共享原生区域插入/停滞诊断能力改进后再回测。
+
+## 2026-10-29 L1T2 Stage 7完成：Extended native task success
+
+Stage 7从原V3同Episode已提交的t=595 Runtime Snapshot继续，未使用目标场景历史成功动作、抓姿或示范；源码bundle为`bac297d3a3ecd7d8cd8b7a2c1bcc3ba8b6e225492e42981d349cf78eab63fe6a`。布局20的当前场景IK预检失败、0放置动作；布局21得到BDDL/model身份匹配的全几何RRT route，并执行319个真实OSC/MuJoCo控制动作。Stage 7此前成功完成237动作pot2专家抓取/抬升和32步Student handoff，最终于t=1183使Pot1/Pot2 `On=true`、炉灶`Turnon=true`，原生`task_success=true`、reward=1、done=true。Stage 7新增588动作/14,700子步；整体同一t0 Episode为1183连续动作/29,575子步，所有动作7维有效且1183/1183动作的25个物理子步监测完整。V3报告`status=complete`、engine return code 0、两个已提交目标阶段、stage boundary核验通过，`native_task_success=true`。
+
+Standard 1000配置仍未完成：t=595时仅pot1 On，pot2 On=false；后续同Episode horizon=5000续接属于Extended Demonstration Success，不计作Standard Success。stage_07 executor在最后动作令native task完成后记录`RuntimeError: environment_done_during_grasp_only_branch`；最终native task status仍明确为complete，V3据此以code 0提交成功阶段。该异常是任务成功后的grasp-only guard终止，不改变`t=1183`原生谓词证据。全程未将失败Student前缀或Stage 2–6弃置分支加入成功动作序列。
+
+报告路径：V3 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/v3_report.json`；Stage 7 executor `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/continuation_stages/stage_07/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T2_20261029_135352_585622114/run_report.json`。V3审计汇总1183/1183动作记录、29575物理子步、连续时间轴、全动作监测完整。`safe_training_eligible=false`、`safety_certified=false`及`strict_10mm_pass=false`保留为Stage B安全工作信息；Stage A明确允许任务可行搜索轨迹存在后续安全违规，故不阻止本项计为原生任务成功。最终稳定释放未评估。
+
+该L1T2检查点时覆盖为5/30配置至少有成功轨迹：3项Standard（L0T0、L0T1、L1T0）与2项Extended（L0T2、L1T2），当时下一项为L1T3。后续L1T3/L1T4首轮已完成，L2T0 Standard成功；最新覆盖与下一项见本文顶部。只有共享候选能力发生实质变化后才重试已失败场景。
+
+## 2026-10-29 L1T2 Stage 7调度上限修正
+
+Stage 6 executor报告`placement_branch_error`并被V3从连续Episode弃置后，使用相同`v3_report.json`调用Stage 7。该调用没有生成`stage_07`目录或启动executor；V3在调度前返回`native_goal_continuation_stage_limit_reached`，因为原`maximum_stages=2*len(initial_native_goals)=6`已由Stage 2–6弃置尝试用尽。t595已提交Snapshot和native status未变化，未发生任何新动作。
+
+已在`trajectory_generator_v3.py`中把最大stage index改为“原native-goal数量×2 + 先前same-run discarded attempt数量”，每次V3执行仍受既有wall-time budget约束。本次cap修复bundle指纹为`bac297d3a3ecd7d8cd8b7a2c1bcc3ba8b6e225492e42981d349cf78eab63fe6a`；其中先前expected BDDL SHA传递修复fingerprint为`df918be555072ca5904a4765a8c1f1936c01edbfa9819ba07d91797836436d79`。下一步保持同一t595 Snapshot和V3归档，在新空闲Bridge端口重跑Stage 7，确认它进入executor并实际测试layout21完整几何RRT/放置。
+
+## 2026-10-29 L1T2 Stage 6抓取成功、放置前代码异常；修复已合入工作树
+
+Stage 6端口38700的retry从已核验t=595 Snapshot恢复成功。专家分支`geom116_jaw0_approach1_-1_flip-1__rrt1`为moka_pot_2执行237个真实MuJoCo动作（t=596–832）、5,925子步；独立读取`physical_step_records.jsonl.gz`确认237行连续，timestep连续，动作7维有效，237/237子步监测完整。抓取报告验证连续23个状态的稳定双指接触，实际抬升36.476 mm；精确Snapshot恢复验证通过。随后32步Student handoff到t=864。
+
+Stage 6 native放置布局20经全几何RRT预检失败（当前场景有界IK无解），记录0物理放置动作；布局21在`_native_place_single`编写RRT route record时抛出`NameError: expected_bddl_sha256 is not defined`，同样0物理放置动作。最终原生状态Pot1 On=true、Pot2 On=false、炉灶Turnon=true、`task_success=false`。V3将该Stage整体标为`placement_branch_error`、排除其237个专家抓取动作和32步handoff，不改变已提交t=595状态。报告路径：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/continuation_stages/stage_06/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T2_20261029_134004_264781262/run_report.json`。
+
+已修复`research/gs_opd/repair/task_success_first_executor.py`：新增expected BDDL SHA-256到`_native_place_single`的参数，并在两个调用路径传入，从而保留RRT route record场景身份。没有修改BDDL/阈值/任务谓词。Stage 6源码bundle为`16bf4da59356db6af8b3d0b9501d94616e4c232b386b5f7339d46278dba889e8`；当前修复源码bundle为`df918be555072ca5904a4765a8c1f1936c01edbfa9819ba07d91797836436d79`，已同步到verification JSON。下一步从同一个t=595 Snapshot在原V3归档续接Stage 7并使用另一个空闲端口。Stage 6数据与先前失败均保留，不拼接成成功轨迹。
+
+## 2026-10-29 L1T2 Stage 6端口重试已启动
+
+原Stage 6尝试在端口38658绑定失败，Safety Bridge记录`OSError: [Errno 98] Address already in use`，Stage 6执行日志为空，未生成动作或executor报告。上一轮中断后，V3父进程退出，executor orphan继续等待且不再受原10,800秒父层超时控制。核对无动作工件、execution.log为0字节、GPU无活动后，对该孤立executor发送TERM；失败目录和Bridge日志保留在`continuation_stages/stage_06/`。
+
+随后从相同、已核验的t=595提交Snapshot重新运行同run续接，使用端口38700。当前Stage 6 Bridge监听并已加载Pi0.5。24个task-approach候选有2项可行；`geom116_jaw0_approach1_-1_flip-1__rrt1`专家抓取分支执行237动作，t=596–832连续、7维动作有效，237/237动作完成全部子步监测（5,925子步）。稳定双指抓持连续状态23次，moka_pot_2实际抬升36.476 mm；Snapshot恢复核验通过。尚未完成pot2 On，237行的原生task_success均false，Stage尚未最终提交。布局20运输route preflight失败，布局21放置分支当前进行中。源码bundle仍为`16bf4da59356db6af8b3d0b9501d94616e4c232b386b5f7339d46278dba889e8`。归档根目录为`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run`，t595快照、原t0和之前失败分支均保留。
+
+## 2026-10-29 L1T2标准Episode部分提交；扩展续接遇到Bridge端口冲突
+
+预算修正后从新鲜合法t0继续运行L1T2。Standard 1000 Episode在t=595提交pot1：`On(pot1)=true`、`On(pot2)=false`、`Turnon(stove)=true`，整体 `task_success=false`。接受前缀为595动作/14,875子步：159专家抓取 + 32 Student handoff + 404原生放置控制；动作行连续，595/595行动作维度有效，子步监测完整。失败Student前缀19动作已精确丢弃。该部分轨迹不能记作任务成功。
+
+同run续接使用已提交t=595 Snapshot `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T2_20261029_105029_684047365/expert_native_placement/placement_branch_01_region_layout_09_keypose_side_region_progress/native_goal_placement_terminal_runtime_snapshot.pkl`，不加载历史L1T2成功轨迹、动作或姿态。Stage 2在1000步内因pot2当前路线剩余预算仅40动作而失败；Stage 3的两条native区域路线在horizon 5000下物理停滞；Stage 4/5的legacy RRT目标候选在当前场景IK预检失败，未产生放置动作。Stage 6采用当前源码bundle指纹`16bf4da59356db6af8b3d0b9501d94616e4c232b386b5f7339d46278dba889e8`，但Safety Bridge在端口绑定时报`OSError: [Errno 98] Address already in use`。该阶段执行器仍在V3配置的有界等待内，尚未报告动作；未终止运行。待Stage 6自然退出后，将从t=595 Snapshot以不同空闲端口重试。归档根目录：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run`。原始尝试归档保留在`.../obstacle_avoidance_L1T2_cold_start_dev_01/v3_run`。
+
+本轮调整了Native transport未来目标预算reserve、On放置方向处理和legacy RRT布局候选排序；task-approach实际碰撞门槛保留且不继承Strict-10mm。BDDL、t0身份、Strict阈值未改。当前代码bundle指纹为`16bf4da59356db6af8b3d0b9501d94616e4c232b386b5f7339d46278dba889e8`。完整阶段报告、弃置分支和动作记录留在上述归档内；矩阵为逐任务状态唯一来源。
+
+## 2026-10-29 L1T2取得新鲜合法t0并启动标准V3
+
+`obstacle_avoidance/L1T2` init-state 0、seed 0经reset/export新鲜生成；reset阶段没有任务动作，`no_prior_experience=true`。初始三个native目标中，`On(moka_pot_1,flat_stove_1_cook_region)=false`、`On(moka_pot_2,flat_stove_1_cook_region)=false`，`Turnon(flat_stove_1)=true`，整体 `task_success=false`。init-state count=50；BDDL SHA-256 `88c64be300fa5934a096c6ef545514e1f541cc67c7c1f09bed1bc4f7e6583bc6`；t0 payload SHA-256 `b8137dca32defb9b1d0c2cde8c91fc132d66991129f823a180974765e561b456`；integration-state SHA-256 `6494373b0f5670cfd2e33e096b35c5f85f732a8767b85241c660f36f5563ae2a`；模型几何SHA-256 `6996aaa940b011861510ebd1911ae19f7db66c54e189ca4c107d372b06033edf`。标准1000步现有V3已启动，源码bundle指纹`6b75e613b78f6662ad650d3a51d892bfcbbe6150120847aeea927ee788706371`。虽有旧L1T2归档，本轮未读取或输入其轨迹、关键姿态或搜索报告。当前等待V3与完整episode审计；归档根目录 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_cold_start_dev_01/v3_run`。
+
+本轮Task-approach筛查24项中2项可行、20项实际碰撞、2项IK不可达。第一个待完成On目标进入专家物理分支，所选 `geom99_jaw0_approach1_-1_flip-1__rrt0` 实现稳定双指抓持并抬升36.904 mm。抓取分支159行记录连续覆盖t=1–159，159/159动作记录维度有效且逐动作子步监测完成，几何状态为133 complete、26 unsafe。原生pot1放置、pot2目标和最终`task_success`仍未完成/核验。
+
+## 2026-10-29 L1T1标准冷启动在物理分支前结束
+
+新鲜合法t0为init-state 0、seed 0，初始 `In(black_book_1,desk_caddy_1_back_contain_region)=false`；标准1000步V3在抓姿筛查阶段停止。修正后的task-approach模式筛查24个候选，15个因实际几何碰撞失败、9个IK不可达，0个可行；没有10mm clearance-only拒绝、RRT路线或专家物理分支。Student首分支32动作/800子步记录连续完整，随后精确恢复t0并丢弃；接受Episode动作和子步均为0。V3顶层物理审计为incomplete，因为bounded expert search未产生动作记录源；这不是已执行1000个物理动作的失败episode。原生任务未成功，错误为 `no_task_feasible_grasp_candidate_passed_open_surface_approach_screen`。源码bundle指纹`6b75e613b78f6662ad650d3a51d892bfcbbe6150120847aeea927ee788706371`。归档根目录`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T1_cold_start_dev_01/v3_run`；下一项推进L1T2。
+
+## 2026-10-29 L1T1已取得合法t0并启动标准V3冷启动（启动记录）
+
+`obstacle_avoidance/L1T1` init-state 0、seed 0由现有reset/export流程新鲜生成，`no_prior_experience=true`，只做reset、observe、native status与Snapshot导出，没有执行动作。init-state count=50；初始 `In(black_book_1,desk_caddy_1_back_contain_region)=false`；BDDL SHA-256 `a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3`；t0 payload SHA-256 `1bb657a9f1d1ec1233197ae7dc2f76014ae5655bbcdcec15f4ddfee97365f961`；MuJoCo integration-state SHA-256 `a3f00d570ffac8f5275abbdc323738ad1f24ef203a0c7808f515dec2aade77bb`；模型几何SHA-256 `d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53`。随后以修正后的task-approach筛查逻辑启动标准1000步现有V3，运行指纹`6b75e613b78f6662ad650d3a51d892bfcbbe6150120847aeea927ee788706371`，归档根目录 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T1_cold_start_dev_01/v3_run`。当前等待V3结束与完整episode审计。
+
 ## 2026-10-29 L1T0 Standard 1000步原生成功，完整审计通过
 
 `obstacle_avoidance/L1T0` 从新鲜合法init-state 0、seed 0的t0开始；初始 `On(akita_black_bowl_1,plate_1)=false`。最终在t=402由原生BDDL报告 `On=true`、`task_success=true`、reward=1、done=true，属于Standard 1000步成功。成功Episode按连续timestep由专家抓取145步（t=1–145）、从已核验抓持抬升Snapshot继续的Student handoff 32步（t=146–177）、专家放置225步（t=178–402）组成。更早的Student首分支32步已精确恢复t0并丢弃，不计入成功轨迹；最终成功不是Student-only结果。
@@ -4833,3 +5341,54 @@ Git 分支 `gs-opd-overfit-recovery-08a0198`，提交基线 `9099c197`，初始�
 
 执行器现只在距铰接接触路径65 mm内的RRT目标上把OSC到点容差放到6 mm；远离接触路径处仍为4 mm，接触阶段仍依靠逐步动作和原生目标反馈。99项executor/search/V3聚焦回归通过。下轮从同一合法t0冷启动确认控制能否越过该接触点、跟随后续按钮路径并在标准1000步内达到原生Turnoff。归档 `/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/libero90_turnoff_low_precontact_rrt_11/task_success_engine/task_success_first_executor_libero_90_L0T39_20261029_032451_865521721`。
 
+
+
+## 2026-10-30 15:35 CST：OAH L0T0 placement exact-snapshot continuation checkpoint
+
+修复 `_native_place_single` 参数转发后，从同一 Episode 的合法 t246 快照继续执行 reachability-biased 路线；当前 branch00 已实际执行到 t303，新增57动作/1,425 MuJoCo 子步，记录的每个动作子步监测完整。抓持持续 bilateral confirmed。placement 先完成 reachability descent，再推进两个 region-progress 路点；按目标 pose 平移量计算，碗根到 plate 目标距离由 t247 的约0.288 m 降至 t303 的约0.213 m。末步 EEF 命令位置跟踪误差约6.2 mm。t303 原生 BDDL `On` 仍为 false，故尚不计成功；executor 仍运行且尚未生成终态报告。续跑归档 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_reachability_biased_dev03_fix_continuation_01/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_152353_503753598/expert_native_goal_stage_control/placement_branch_00_region_layout_12_direct_region_progress/durable_physical_step_records.jsonl`。
+
+
+## Stage A效率改造与OAH/L0T0成功；L1T1筛选回退复验启动（2026-10-30）
+
+OAH/L0T0现为Standard原生成功，覆盖由9/30增至10/30（8 Standard、2 Extended）。所选完整轨迹428动作、10,700个25Hz接触子步，时间轴t1–428连续；t428原生`on(akita_black_bowl_1, plate_1)=true`、`task_success=true`、reward=1、done=true。Exact Snapshot续接链和末端SHA均在selected manifest中逐段记录；Student-first32步及step-size探针分支尾段排除。清单：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_t425_near_goal_release_probe_01/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_161106_801186037/selected_success_episode_t428.json`；Executor报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_t425_near_goal_release_probe_01/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_161106_801186037/run_report.json`。未使用演示或直接状态写入，安全认证未授予。
+
+耗时剖析发现每个物理动作的25个MuJoCo子步均重复执行约18,360对全Geom间隙排序，`step_monitored`均值11.64秒/动作；JSON编码/fsync约0.062秒/动作。Stage A新增contact-only审计profile后仍记录每个子步接触、动作/状态、抓持与BDDL，但跳过逐子步全几何清障扫描，实测约0.445秒/动作（约26倍提速）。这只是任务可行性搜索profile，`safety_certified=false`。另实现screen-pass-first：通过项优先，screen拒绝但预抓与闭合端点IK可达的候选在物理名额不足时回退进入MuJoCo。
+
+随后启动OAH/L1T1 fresh legal-t0 Standard复验，归档`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_02`。失败假设明确：旧24候选中15个screen拒绝项端点IK仍可达，硬过滤使搜索0物理动作耗尽；本轮限制1次RRT预检、1个物理抓取分支、4秒RRT预算、1800秒总wall预算，启用全子步接触审计及近目标释放探针。若抓取/放置失败，保留真实Snapshot分支分析控制和接触，再决定换任务/算法，不重复旧完整Episode。
+
+## OAH/L1T1 fallback gate failure isolated; exact-candidate physical retry launched (2026-10-30)
+
+`obstacle_avoidance_human/L1T1` dev02从合法t0重新筛查24候选，0个screen pass，15 collision rejects、9 IK-unreachable。screen-pass-first保留端点IK可达的拒绝项并选中`geom92_jaw0_approach2_+1_flip-1__approach_axis2_-40.0mm`；单个RRT 4.107秒到达`planning_time_budget_exhausted`，记录1个精确IK解、`live_state_unchanged=true`，但0物理分支。原因不是物理碰撞：`generated_geometry_high_approach_admitted`要求`candidate_source`完全相等，而深度扰动后缀导致真实可用的Stage A高位OSC fallback被拒绝。该run另有12步Student首段被排除；V3报告`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_02/v3_run/v3_report.json`。
+
+已将fallback判定改成识别active BDDL几何来源前缀，并加上skip-Student选项；原生BDDL、实际muJoCo物理动作、接触样本和Episode审计要求不变。dev03用原始合法t0与模型/BDDL指纹重新生成并限定同一确定性几何候选，跳过task-approach重复筛查和Student前缀，只做一次4秒RRT及一个物理分支，避免再付24候选和12步前缀成本。当前归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_03`；假设文件记录候选来源和所有输入哈希。
+
+## OAH/L1T1候选重建边界与dev04单候选验证（2026-10-30）
+
+dev03使用skip-Student和candidate-ID pin绕过重复24项screen后，低层生成器拒绝请求ID`geom92_jaw0_approach2_+1_flip-1__approach_axis2_-40.0mm`：该深度变体只在旧screen期间生成，不存在于基础候选池，故0候选/0物理动作。legal t0 reset核验通过，Integration State与模型/BDDL指纹精确匹配。已增加“从任务本身基础碰撞几何重建被pin的深度候选”路径，不加载序列化候选对象或历史动作；配合前缀识别使RRT超时后的高位OSC路线可进入Stage A物理执行。
+
+dev04当前启动，限定上述单一任务内确定性candidate ID，从init-state 0/seed 0 legal t0重建，skip-Student、1 RRT、1物理分支、4秒RRT和contact-only子步审计。归档：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04`；详细假设和Snapshot/模型/BDDL哈希见`experiment_hypothesis.json`。dev02/03均为0专家物理动作，故尚无成功覆盖变化。
+
+
+### OAH/L1T1 dev04 entered real physical branch
+
+The task-local depth candidate was regenerated, its one-candidate open-path screen rejected it for collision while both endpoint IK checks passed, and the 4-second RRT budget expired without mutating live t0. The repaired prefix-based Stage A fallback then created the genuine branch-start Runtime Snapshot at `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T1_20261030_162610_334299966/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_human_L1T1_20261030_162621_648214450/geom92_jaw0_approach2_+1_flip-1__approach_axis2_-40.0mm__rrtgenerated_geometry_high_approach_branch_start_runtime_snapshot.pkl`. This is the first dev02–dev04 run to cross from zero-action planning into real MuJoCo grasp control. Physical records and grasp/lift outcome are still pending; the branch remains bounded to one candidate.
+
+
+## OAH/L1T1 440-action grasp-route failure and exact-snapshot continuation (2026-10-30)
+
+Dev04 executed 440 real actions, t1–440 continuous, with 11,000/11,000 MuJoCo contact samples complete and no target displacement (5.9e-8m). The original 320-action high-OSC route ended 0.324m from its elevated pregrasp point; a local physical continuation moved monotonically from there to 0.082m error over120 actions, then hit `local_replan_task_success_first_rrt_osc_pregrasp_route_did_not_reach_pose_within_120_actions`. No stable grasp or native In; this is a route/controller reachability failure, not a collision gate. The exact t440 failed Runtime Snapshot payload SHA is `54c68ed49c0a3fa659597af736e72ff9448d28ad054027c1bddadc92de45aed4`; model fingerprint matches, its Integration State hash matches the final recorded action, and Snapshot task bookkeeping timestep is440. Prefix audit manifest: `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04/v3_run/selected_prefix_manifest_t440.json`.
+
+Audit review found the executor's contact-only flag had not been forwarded into its separate grasp-search process. Thus dev04 kept all contacts but also ran geom-clearance sweeps. Fixed the child command/parser and added a configurable local-replan RRT time bound. The next controlled continuation starts at the verified t440 Snapshot, uses the same deterministic candidate, enables true contact-only audit, and gives one local RRT preflight up to8s; existing440 physical actions remain the selected continuous Episode prefix.
+
+## OAH/L1T1 local-RRT grasp and lift success; held-object placement continues (2026-10-30)
+
+The exact t440 Snapshot fork reduced planning/control to 138 actions: 63 RRT pregrasp, 50 surface approach, 6 bilateral close, 19 lift. Candidate `geom92_jaw0_approach2_+1_flip-1__approach_axis2_-40.0mm__rrt0` was reached with `jointspace_rrt_connect.v1`; stable bilateral contact held for22 distinct states and the black book lifted36.942mm. Selected Episode prefix is now t1–578, 578 actions/14,450 contact substeps; t578 lifted Snapshot SHA `f33895478b933023c410660f4d34cd0d85dc7a84bbb07eb8f3f3b80599e811a8`, integration SHA `b46a6acef589ef2057c6d6b17c4e1235d0d292c08b4335fb026121add1a5f0a3`, matches last record exactly. Native In is still false at t578, so this is a physical grasp/lift success, not task success. Prefix manifest: `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04/v3_run/selected_prefix_manifest_t578.json`.
+
+The low-level grasp child now records `substep_clearance_sweeps=disabled_for_stage_a_search`, with all25 contacts/action retained; RPC averaged about0.22s/action. First 440 prefix actions retained contacts and exhaustive sweeps because the wrapper flag had not been forwarded; this discrepancy is captured in the manifest. Continue the exact held t578 Snapshot into native In placement; remaining Standard horizon422 actions.
+
+
+## 2026-10-30 OAH/L1T1 waypoint失败归因与OAH/L0T1抓取突破
+
+OAH/L1T1从精确t578持物Snapshot运行273个新动作到t851；t579–851记录连续、每步25/25接触子步，终态Snapshot积分态SHA与末记录完全一致，累计前缀t1–851为21,275个接触子步。书本仍被稳定抓持，但原生In=false。末24步位于region-progress waypoint：机器人请求负Y，书本仅有毫米级变化，Panda joint7实测-2.897667rad接近下限；终态接触记录没有机器人与环境障碍碰撞。归因优先怀疑关节限位/姿态控制饱和，尚未证明因果。该Standard Episode剩余149步而目标仍约228mm，故停止同路线重试并保留完整失败Snapshot。审计文件：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L1T1_contact_fast_fallback_dev_04/v3_run/selected_prefix_manifest_t851.json`。
+
+OAH/L0T1新实验只用同任务自身screen中的一个endpoint-IK可达候选，从合法t0真实执行285动作/7,125个完整接触子步，稳定双侧抓持22态并抬升37.121mm。原筛查拒绝原因为预抓全几何碰撞与表面接近碰撞；实际物理分支在RRT失败后由通用活动BDD L几何高位OSC fallback完成抓取，证明这类筛查拒绝不应阻断Stage A任务搜索。V3随后因`skip-student-first`后`student=None`仍调用handoff而报错；已修复分支逻辑，未重放物理前缀。t285 Snapshot SHA `183536589e2e807ea7d970558243557bd01b3ba1164f5faa55ab3e3cfc8b724b`，积分态SHA `47369480c6d9f0dc20448d9579b12b16d86dc79e00ecf3f4a3ff507f342518a1`；prefix manifest位于当前V3归档。正在从该精确Snapshot继续原生In放置，总Standard上限1000。

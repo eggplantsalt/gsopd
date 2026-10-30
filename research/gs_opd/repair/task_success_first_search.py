@@ -463,9 +463,11 @@ def generated_geometry_high_approach_admitted(
     candidate: dict[str, Any], planner_response: dict[str, Any]
 ) -> bool:
     """Admit one generic high-approach fallback after a failed scratch RRT."""
+    candidate_source = str(candidate.get("candidate_source", ""))
     return bool(
-        candidate.get("candidate_source")
-        == "active_BDDL_target_compiled_collision_geom_and_live_Panda_pad_centers"
+        candidate_source.startswith(
+            "active_BDDL_target_compiled_collision_geom_and_live_Panda_pad_centers"
+        )
         and planner_response.get("status") != "offline_feasible"
         and planner_response.get("live_state_unchanged") is True
         and planner_response.get("ik_candidates")

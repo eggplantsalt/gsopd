@@ -73,14 +73,24 @@ def _minimum_distance(
         if value < 10.0 and (best is None or value < best):
             best = value
             if return_detail:
+                robot_body_id = int(model.geom_bodyid[robot_id])
+                object_body_id = int(model.geom_bodyid[object_id])
                 best_pair = {
                     "robot_geom_id": robot_id,
                     "robot_geom_name": mujoco.mj_id2name(
                         model, mujoco.mjtObj.mjOBJ_GEOM, robot_id
                     ),
+                    "robot_body_id": robot_body_id,
+                    "robot_body_name": mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_BODY, robot_body_id
+                    ),
                     "object_geom_id": object_id,
                     "object_geom_name": mujoco.mj_id2name(
                         model, mujoco.mjtObj.mjOBJ_GEOM, object_id
+                    ),
+                    "object_body_id": object_body_id,
+                    "object_body_name": mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_BODY, object_body_id
                     ),
                     "closest_points_world": fromto.tolist(),
                 }
@@ -363,6 +373,9 @@ def plan_current_scene(
     ik_seed_qpos: list[list[float]] | None = None,
     ik_selection_seed_qpos: list[float] | None = None,
     planner_config: dict[str, Any] | None = None,
+    goal_configuration_preflight_only: bool = False,
+    hypothetical_eef_to_object_transform: list[list[float]] | np.ndarray | None = None,
+    scene_joint_qpos_overrides: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Resolve a world EEF goal, then plan from the active MuJoCo 7D qpos.
 
@@ -382,6 +395,44 @@ def plan_current_scene(
         raise ValueError("start_state_sha256_is_missing_or_malformed")
     if not isinstance(normalized_safety_policy, dict):
         raise ValueError("verified_safety_geometry_policy_is_required")
+    planner_values = dict(planner_config or {})
+    start_joint_limit_tolerance_rad = float(
+        planner_values.get("start_joint_limit_tolerance_rad", 0.0)
+    )
+    if (
+        not np.isfinite(start_joint_limit_tolerance_rad)
+        or start_joint_limit_tolerance_rad < 0.0
+    ):
+        raise ValueError("start_joint_limit_tolerance_must_be_finite_and_non_negative")
+    if not isinstance(goal_configuration_preflight_only, bool):
+        raise ValueError("goal_configuration_preflight_only_must_be_boolean")
+    if scene_joint_qpos_overrides is not None and not goal_configuration_preflight_only:
+        raise ValueError("scene_joint_qpos_overrides_are_diagnostic_goal_preflight_only")
+    if goal_configuration_preflight_only:
+        if hypothetical_eef_to_object_transform is None:
+            raise ValueError("hypothetical_attachment_transform_is_required_for_goal_preflight")
+        carried = normalized_safety_policy.get("carried_object")
+        if not isinstance(carried, dict):
+            raise ValueError("verified_carried_object_binding_is_required_for_goal_preflight")
+        hypothetical_transform = np.asarray(
+            hypothetical_eef_to_object_transform, dtype=np.float64,
+        )
+        if (
+            hypothetical_transform.shape != (4, 4)
+            or not np.isfinite(hypothetical_transform).all()
+            or not np.allclose(hypothetical_transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)
+            or not np.allclose(
+                hypothetical_transform[:3, :3].T @ hypothetical_transform[:3, :3],
+                np.eye(3), atol=1e-6,
+            )
+            or not np.isclose(np.linalg.det(hypothetical_transform[:3, :3]), 1.0, atol=1e-6)
+        ):
+            raise ValueError("hypothetical_eef_to_object_transform_must_be_finite_SE3")
+        normalized_safety_policy = dict(normalized_safety_policy)
+        normalized_safety_policy["carried_object"] = dict(carried)
+        normalized_safety_policy["carried_object"]["eef_to_object_transform"] = (
+            hypothetical_transform.copy()
+        )
     sim = environment.sim
     robot = environment.robots[0]
     model = sim.model._model
@@ -405,6 +456,30 @@ def plan_current_scene(
     }
     scratch = mujoco.MjData(model)
     mujoco.mj_setState(model, scratch, integration_state, integration_spec)
+    validated_joint_overrides = []
+    for index, row in enumerate(scene_joint_qpos_overrides or []):
+        if not isinstance(row, dict):
+            raise ValueError(f"scene_joint_qpos_overrides_{index}_must_be_an_object")
+        address = row.get("qpos_address")
+        position_value = row.get("position")
+        if (
+            isinstance(address, bool) or not isinstance(address, int)
+            or not 0 <= address < int(model.nq)
+            or isinstance(position_value, bool)
+        ):
+            raise ValueError(f"scene_joint_qpos_overrides_{index}_address_or_position_is_invalid")
+        position = float(position_value)
+        if not np.isfinite(position):
+            raise ValueError(f"scene_joint_qpos_overrides_{index}_position_must_be_finite")
+        validated_joint_overrides.append({
+            "qpos_address": int(address),
+            "position": position,
+            "joint_name": str(row.get("joint_name", "")),
+        })
+    if len({row["qpos_address"] for row in validated_joint_overrides}) != len(validated_joint_overrides):
+        raise ValueError("scene_joint_qpos_overrides_duplicate_qpos_addresses")
+    for row in validated_joint_overrides:
+        scratch.qpos[row["qpos_address"]] = row["position"]
     mujoco.mj_forward(model, scratch)
     robot_geoms = np.asarray(sorted(normalized_safety_policy["robot_geom_ids"]), dtype=np.int64)
     robot_bodies = set(normalized_safety_policy["robot_body_ids"])
@@ -427,7 +502,10 @@ def plan_current_scene(
     limited = np.asarray(model.jnt_limited[arm_joint_ids], dtype=bool)
     if not limited.all() or np.any(lower >= upper):
         raise ValueError("active_arm_joint_limits_are_incomplete")
-    if np.any(q_start < lower - 1e-8) or np.any(q_start > upper + 1e-8):
+    if (
+        np.any(q_start < lower - start_joint_limit_tolerance_rad)
+        or np.any(q_start > upper + start_joint_limit_tolerance_rad)
+    ):
         raise ValueError("current_real_qpos_is_outside_controller_joint_limits")
 
     def set_scratch_qpos(qpos):
@@ -515,6 +593,7 @@ def plan_current_scene(
     def check_configuration(qpos):
         set_scratch_qpos(qpos)
         clearances = {}
+        clearance_pair_details = {}
         forbidden_contacts = []
         for item in checked_objects:
             group_allowed_pairs = {
@@ -525,13 +604,16 @@ def plan_current_scene(
             group_static_installation_pairs = _verified_static_pairs_for_scene_group(
                 robot_geoms, item["geom_ids"], static_installation_pair_ids,
             )
-            distance = _minimum_distance(
+            distance_detail = _minimum_distance(
                 mujoco, model, scratch, robot_geoms, item["geom_ids"],
                 group_allowed_pairs | group_static_installation_pairs,
+                return_detail=True,
             )
+            distance = distance_detail["distance_m"]
             if distance is None or not np.isfinite(distance):
                 return ConfigurationCheck("incomplete", None, {}, diagnostics={"object_id": item["object_id"]})
             clearances[item["object_id"]] = distance
+            clearance_pair_details[item["object_id"]] = distance_detail.get("pair")
             if distance < item["minimum_clearance_m"]:
                 forbidden_contacts.append({
                     "object_id": item["object_id"],
@@ -568,15 +650,18 @@ def plan_current_scene(
                     and next(geom_id for geom_id in pair if geom_id not in carried["geom_ids"])
                     in item["geom_ids"]
                 }
-                distance = _minimum_distance(
-                    mujoco, model, scratch, carried_geoms, item["geom_ids"], allowed_pairs
+                distance_detail = _minimum_distance(
+                    mujoco, model, scratch, carried_geoms, item["geom_ids"], allowed_pairs,
+                    return_detail=True,
                 )
+                distance = distance_detail["distance_m"]
                 if distance is None or not np.isfinite(distance):
                     return ConfigurationCheck(
                         "incomplete", None, {}, diagnostics={"carried_object_id": carried["object_id"], "scene_object_id": item["object_id"]}
                     )
                 key = f"carried:{carried['object_id']}->{item['object_id']}"
                 clearances[key] = distance
+                clearance_pair_details[key] = distance_detail.get("pair")
                 required = (
                     item["minimum_clearance_m"]
                     if item["policy_class"] == "forbidden_objects"
@@ -652,10 +737,12 @@ def plan_current_scene(
             clearances,
             forbidden_contacts,
             self_contacts,
-            {"qpos_rad": np.asarray(qpos).tolist()},
+            {
+                "qpos_rad": np.asarray(qpos).tolist(),
+                "clearance_pairs_by_object": clearance_pair_details,
+            },
         )
 
-    planner_values = dict(planner_config or {})
     configured_margin = float(
         planner_values.pop("minimum_clearance_m", normalized_safety_policy["minimum_clearance_m"])
     )
@@ -665,6 +752,8 @@ def plan_current_scene(
         **planner_values,
         minimum_clearance_m=configured_margin,
     )
+    if goal_configuration_preflight_only and not planner_cfg.require_safe_configurations:
+        raise ValueError("goal_configuration_preflight_requires_full_collision_checks")
     goal_ik_configuration_checks = 0
     if planner_cfg.require_safe_configurations:
         safe_ik_candidates = []
@@ -687,6 +776,9 @@ def plan_current_scene(
             item["goal_configuration_clearances_by_object_m"] = (
                 goal_check.clearances_by_object_m
             )
+            item["goal_configuration_clearance_pairs_by_object"] = (
+                goal_check.diagnostics.get("clearance_pairs_by_object", {})
+            )
             item["goal_configuration_forbidden_contacts"] = goal_check.forbidden_contacts
             item["goal_configuration_self_contacts"] = goal_check.self_contacts
             if safe:
@@ -706,6 +798,9 @@ def plan_current_scene(
                     ),
                     "clearances_by_object_m": item.get(
                         "goal_configuration_clearances_by_object_m", {}
+                    ),
+                    "clearance_pairs_by_object": item.get(
+                        "goal_configuration_clearance_pairs_by_object", {}
                     ),
                     "forbidden_contact_count": len(
                         item.get("goal_configuration_forbidden_contacts", [])
@@ -738,11 +833,54 @@ def plan_current_scene(
                 ],
                 "route_candidates": [],
                 "live_state_unchanged": unchanged,
+                "goal_configuration_preflight_only": goal_configuration_preflight_only,
+                "hypothetical_attachment_transform_used": goal_configuration_preflight_only,
+                "scene_joint_qpos_overrides": validated_joint_overrides,
             }
         q_goal = safe_ik_candidates[0]["qpos"]
         selected_ik_seed_index = int(safe_ik_candidates[0]["seed_index"])
     else:
         selected_ik_seed_index = int(ik_valid[0]["seed_index"])
+    if goal_configuration_preflight_only:
+        live_state_after = np.zeros_like(integration_state)
+        mujoco.mj_getState(model, live_data, live_state_after, integration_spec)
+        unchanged = np.array_equal(integration_state, live_state_after)
+        if not unchanged:
+            raise RuntimeError("live_environment_mutated_during_goal_configuration_preflight")
+        selected = next(
+            item for item in ik_valid
+            if int(item["seed_index"]) == selected_ik_seed_index
+        )
+        return {
+            "status": "goal_configuration_preflight_passed",
+            "planner_source": "jointspace_rrt_connect.v1",
+            "planning_seconds": time.monotonic() - planning_started,
+            "config_checks": 0,
+            "goal_ik_configuration_checks": goal_ik_configuration_checks,
+            "iterations": 0,
+            "selected_ik_seed_index": selected_ik_seed_index,
+            "minimum_forbidden_clearance_m": selected.get(
+                "goal_configuration_minimum_forbidden_clearance_m"
+            ),
+            "goal_configuration_clearances_by_object_m": selected.get(
+                "goal_configuration_clearances_by_object_m", {}
+            ),
+            "goal_configuration_clearance_pairs_by_object": selected.get(
+                "goal_configuration_clearance_pairs_by_object", {}
+            ),
+            "ik_goal_qpos": q_goal.tolist(),
+            "ik_candidates": [
+                {key: value.tolist() if isinstance(value, np.ndarray) else value
+                 for key, value in item.items()}
+                for item in ik_candidates
+            ],
+            "route_candidates": [],
+            "live_state_unchanged": unchanged,
+            "goal_configuration_preflight_only": True,
+            "hypothetical_attachment_transform_used": True,
+            "scene_joint_qpos_overrides": validated_joint_overrides,
+            "safety_certified": False,
+        }
     planner = JointSpaceRRTConnect(lower, upper, check_configuration, kinematics, config=planner_cfg)
     result = planner.plan(q_start, q_goal)
     live_state_after = np.zeros_like(integration_state)
@@ -1094,9 +1232,13 @@ def screen_grasp_candidates(
                     sorted(set(int(value) for value in robot_geoms) - pad_geom_id_set),
                     dtype=np.int64,
                 )
-            record_pair = (
-                (strict_target_contact_policy or task_approach_only)
-                and group_id == target_object_id
+            # Task-approach screens need the exact pair for every reported
+            # scene group. In particular, the aggregated unmapped environment
+            # group can otherwise hide a fixed installation contact behind a
+            # generic collision label. This adds diagnostics only; it does not
+            # change the collision threshold or candidate acceptance result.
+            record_pair = task_approach_only or (
+                strict_target_contact_policy and group_id == target_object_id
             )
             distance_result = _minimum_distance(
                 mujoco, model, scratch, clearance_robot_geoms,

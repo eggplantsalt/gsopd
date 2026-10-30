@@ -1,0 +1,728 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-10-30",
+  "scope": "Read-only handover audit of all matrix-native-success Stage A trajectories; archived run artifacts were not modified.",
+  "result": {
+    "tasks": 30,
+    "standard_native_success": 7,
+    "extended_native_success": 2,
+    "full_audited_native_success": 9,
+    "failed_or_unverified_successes": 0
+  },
+  "acceptance_checks": [
+    "native task_success true with reward=1 and done=true",
+    "complete V3 physical action audit",
+    "valid 7D action and state-action rows",
+    "continuous success timestep",
+    "complete per-substep physical monitoring",
+    "verified Snapshot boundaries"
+  ],
+  "trajectory_audits": [
+    {
+      "task": "obstacle_avoidance/L0T0",
+      "kind": "standard",
+      "actions": 499,
+      "monitored_physics_substeps": 12475,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "akita_black_bowl_1",
+            "plate_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "independently_verified",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_independently_verified": true
+      },
+      "snapshot_boundary_audit": {
+        "prior_v3_status": "requires_independent_snapshot_identity_audit",
+        "source_snapshot_manifest": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T0_20261028_223055_116833309/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_223413_597435584/source_snapshot_manifest.json",
+        "checks": {
+          "t0_payload_manifest_match": true,
+          "t0_integration_state_manifest_match": true,
+          "t0_model_manifest_match": true,
+          "t0_scene_matches_task": true,
+          "fresh_reset_exact_state_match": true,
+          "grasp_restore_exact_match": true,
+          "held_snapshot_matches_handoff_restore": true,
+          "handoff_terminal_matches_placement_start_state": true,
+          "handoff_and_placement_same_scene_and_model": true
+        },
+        "initial_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_trajectory_generator_v3_20261028_0255/l0t0_state0_attempt8_snapshot_root/snapshots/initial_runtime_snapshot.pkl",
+          "payload_sha256": "bc86043308518e857703b319b2c309e4e9ca62b332fc939be20235991610cba7",
+          "integration_state_sha256": "4c2419e66b0ebc95b8966b1cd9b5b3c3123cab2a0aa47bc4afbb7eeed06bf50f",
+          "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 0,
+            "task_name": "pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate",
+            "instruction": "pick up the akita black bowl on the stove and place it on the plate",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl",
+            "bddl_sha256": "b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840"
+          }
+        },
+        "held_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T0_20261028_223055_116833309/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T0_20261028_223413_597435584/task_success_candidate_lifted_runtime_snapshot.pkl",
+          "payload_sha256": "61127dbbe65bc00fdd0744ba87347b66b1ef45a1cc5a0d876726d974af1a8c02",
+          "integration_state_sha256": "38b48d929703f635529b33a9eb457dbb10adff779e246731d2e9153b730d3625",
+          "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 0,
+            "task_name": "pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate",
+            "instruction": "pick up the akita black bowl on the stove and place it on the plate",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl",
+            "bddl_sha256": "b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840"
+          }
+        },
+        "handoff_terminal_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T0_20261028_223055_116833309/student_handoff/student_after_expert_grasp_lift_terminal_runtime_snapshot.pkl",
+          "payload_sha256": "04968bfecbedca5ca512d926ed802396a923812bb00583c0331efc17959c40cb",
+          "integration_state_sha256": "ea6be6f379d255c6003fef2db1ef24f642095bd2e062646b611636fd9f9ee46b",
+          "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 0,
+            "task_name": "pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate",
+            "instruction": "pick up the akita black bowl on the stove and place it on the plate",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl",
+            "bddl_sha256": "b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840"
+          }
+        },
+        "selected_placement_start_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T0_20261028_223055_116833309/expert_native_placement/placement_branch_00_region_layout_12_direct_region_progress/native_goal_transport_start_runtime_snapshot.pkl",
+          "payload_sha256": "04968bfecbedca5ca512d926ed802396a923812bb00583c0331efc17959c40cb",
+          "integration_state_sha256": "ea6be6f379d255c6003fef2db1ef24f642095bd2e062646b611636fd9f9ee46b",
+          "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 0,
+            "task_name": "pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate",
+            "instruction": "pick up the akita black bowl on the stove and place it on the plate",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl",
+            "bddl_sha256": "b631d2f9be0884f5fb908abc0cf271e34a9c368085252dc48bbd5207d5b7fe12",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "085817d128dd03511cfd14cd810a6c035e85258e0b8260881f3f0e0f3db2e840"
+          }
+        },
+        "handoff_and_placement_payloads_byte_identical": true
+      },
+      "v3_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t0_post_entry_alignment_regression_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T0_20261028_223055_116833309/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L0T1",
+      "kind": "standard",
+      "actions": 752,
+      "monitored_physics_substeps": 18800,
+      "native_goals": [
+        {
+          "predicate": [
+            "in",
+            "black_book_1",
+            "desk_caddy_1_back_contain_region"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "independently_verified",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_independently_verified": true
+      },
+      "snapshot_boundary_audit": {
+        "prior_v3_status": "requires_independent_snapshot_identity_audit",
+        "source_snapshot_manifest": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T1_20261028_211617_891133841/source_snapshot_manifest.json",
+        "checks": {
+          "t0_payload_manifest_match": true,
+          "t0_integration_state_manifest_match": true,
+          "t0_model_manifest_match": true,
+          "t0_scene_matches_task": true,
+          "fresh_reset_exact_state_match": true,
+          "grasp_restore_exact_match": true,
+          "held_snapshot_matches_handoff_restore": true,
+          "handoff_terminal_matches_placement_start_state": true,
+          "handoff_and_placement_same_scene_and_model": true
+        },
+        "initial_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T1_20261028_211617_891133841/source_initial_runtime_snapshot.pkl",
+          "payload_sha256": "0cde9aecfda71aa76c795811fb380ce19ee90620428794b9e124de0e09007492",
+          "integration_state_sha256": "41a6cd314d41cda632876ed7a889958bf3ccd99484196de55c81fb54daca2522",
+          "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e"
+          }
+        },
+        "held_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L0T1_20261028_211617_891133841/task_success_candidate_lifted_runtime_snapshot.pkl",
+          "payload_sha256": "2a5abcc79e2cc0b883ca8593cb80eba93aa942dbb57ec9bacf36bf79dda945fb",
+          "integration_state_sha256": "a8e75de17fc11b25cf06fc151b75985dc987139980554b33f26c37eb8d79ddbb",
+          "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e"
+          }
+        },
+        "handoff_terminal_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/student_handoff/student_after_expert_grasp_lift_terminal_runtime_snapshot.pkl",
+          "payload_sha256": "7a37cff263ddcaeb110b992e70941089be74088e16262d6eb5ce5fa5db265bf3",
+          "integration_state_sha256": "4bd742ba406f26ddb096cff8c023b6ab6267d19550c30259a67544d2bdf1878e",
+          "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e"
+          }
+        },
+        "selected_placement_start_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/expert_native_placement/placement_branch_01_region_layout_10_keypose_side_region_progress/native_goal_transport_start_runtime_snapshot.pkl",
+          "payload_sha256": "3547861b73ed93e809e8ffcaf28cbed16d0bc4edd7a326b419ba8dc2e6b10939",
+          "integration_state_sha256": "4bd742ba406f26ddb096cff8c023b6ab6267d19550c30259a67544d2bdf1878e",
+          "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 0,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "b14943e935d04f7fe07dabce8c097dac3721d2c689965c0abb407df96dfcc844",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "9e2f374b19a09a123e715dcefc0cebaa11d647b4029d4546bc6b52a2944d451e"
+          }
+        },
+        "handoff_and_placement_payloads_byte_identical": false
+      },
+      "v3_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t1_standard1000_entry_aligned_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T1_20261028_211438_578420102/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L0T2",
+      "kind": "extended",
+      "actions": 1390,
+      "monitored_physics_substeps": 34750,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "moka_pot_1",
+            "flat_stove_1_cook_region"
+          ],
+          "value": true
+        },
+        {
+          "predicate": [
+            "on",
+            "moka_pot_2",
+            "flat_stove_1_cook_region"
+          ],
+          "value": true
+        },
+        {
+          "predicate": [
+            "turnon",
+            "flat_stove_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_04_h5000/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/gs_opd_zero_shot_bootstrap_20261028/l0t2_native_multigoal_cold_start_04_h5000/v3_run/continuation_stages/stage_05/task_success_engine/task_success_first_executor_obstacle_avoidance_L0T2_20261029_010734_526387529/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L1T0",
+      "kind": "standard",
+      "actions": 402,
+      "monitored_physics_substeps": 10050,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "akita_black_bowl_1",
+            "plate_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T0_cold_start_dev_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T0_20261029_101052_259169585/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L1T1",
+      "kind": "standard",
+      "actions": 613,
+      "monitored_physics_substeps": 15325,
+      "native_goals": [
+        {
+          "predicate": [
+            "in",
+            "black_book_1",
+            "desk_caddy_1_back_contain_region"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "independently_verified",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_independently_verified": true
+      },
+      "snapshot_boundary_audit": {
+        "prior_v3_status": "not_applicable_single_stage",
+        "source_snapshot_manifest": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T1_20261030_074654_067673459/source_snapshot_manifest.json",
+        "checks": {
+          "t0_payload_manifest_match": true,
+          "t0_integration_state_manifest_match": true,
+          "t0_model_manifest_match": true,
+          "t0_scene_matches_task": true,
+          "fresh_reset_exact_state_match": true,
+          "grasp_restore_exact_match": true,
+          "held_snapshot_matches_handoff_restore": true,
+          "handoff_terminal_matches_placement_start_state": true,
+          "handoff_and_placement_same_scene_and_model": true
+        },
+        "initial_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T1_20261030_074654_067673459/source_initial_runtime_snapshot.pkl",
+          "payload_sha256": "1bb657a9f1d1ec1233197ae7dc2f76014ae5655bbcdcec15f4ddfee97365f961",
+          "integration_state_sha256": "a3f00d570ffac8f5275abbdc323738ad1f24ef203a0c7808f515dec2aade77bb",
+          "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 1,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L1/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53"
+          }
+        },
+        "held_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L1T1_20261030_074654_067673459/task_success_candidate_lifted_runtime_snapshot.pkl",
+          "payload_sha256": "f9ebe6b42442d74fdaa47b02eb1e48d7f5b7b3ce71520bcd4ee8f2b915d5661e",
+          "integration_state_sha256": "8d9052fd3e9b17bace908692b0ad8ce15b90e08a0adf303dfb1c38319cf746c4",
+          "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 1,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L1/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53"
+          }
+        },
+        "handoff_terminal_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/student_handoff/student_after_expert_grasp_lift_terminal_runtime_snapshot.pkl",
+          "payload_sha256": "8c56b0fe73af3c8960bd24d9e3b6b12fffb10b272bd88b5a5c563fd5ce627d70",
+          "integration_state_sha256": "0f1ef88c3c058c24c3f7e36e8477e5d9b68eca701a055c4d83ca101f701aaf14",
+          "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 1,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L1/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53"
+          }
+        },
+        "selected_placement_start_snapshot": {
+          "path": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/expert_native_placement/placement_branch_01_region_layout_36_keypose_side_region_progress/native_goal_transport_start_runtime_snapshot.pkl",
+          "payload_sha256": "c5ccdacdcf1dfa1df17fcf4bff95505139edca54872e3a5935508d4c5acd0c35",
+          "integration_state_sha256": "0f1ef88c3c058c24c3f7e36e8477e5d9b68eca701a055c4d83ca101f701aaf14",
+          "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+          "scene_metadata": {
+            "benchmark": "obstacle_avoidance",
+            "level": 1,
+            "task_id": 1,
+            "task_name": "pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+            "instruction": "pick up the book and place it in the back compartment of the caddy",
+            "bddl_path": "/workspace/zy_workspace/LIBERO-Safety/libero/libero/bddl_files/obstacle_avoidance/L1/pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+            "bddl_sha256": "a84967cdb8bd66e5e42e4504e3dd89414923b215bf0c8a97cdc0a7fb909df0f3",
+            "init_state_index": 0,
+            "init_state_count": 50,
+            "environment_seed": 0,
+            "camera_resolution": 256,
+            "camera_names": [
+              "agentview_image",
+              "robot0_eye_in_hand_image"
+            ],
+            "standard_evaluation_horizon": 1000,
+            "bridge_horizon": 1000,
+            "horizon_mode": "standard_benchmark",
+            "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53"
+          }
+        },
+        "handoff_and_placement_payloads_byte_identical": false
+      },
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T1_20261030_074500_342483841/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L1T2",
+      "kind": "extended",
+      "actions": 1183,
+      "monitored_physics_substeps": 29575,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "moka_pot_1",
+            "flat_stove_1_cook_region"
+          ],
+          "value": true
+        },
+        {
+          "predicate": [
+            "on",
+            "moka_pot_2",
+            "flat_stove_1_cook_region"
+          ],
+          "value": true
+        },
+        {
+          "predicate": [
+            "turnon",
+            "flat_stove_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L1T2_budgetfix_01/v3_run/continuation_stages/stage_07/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T2_20261029_135352_585622114/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance/L2T0",
+      "kind": "standard",
+      "actions": 497,
+      "monitored_physics_substeps": 12425,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "akita_black_bowl_1",
+            "plate_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T0_cold_start_dev_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L2T0_20261029_144748_683490979/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance_human/L1T0",
+      "kind": "standard",
+      "actions": 484,
+      "monitored_physics_substeps": 12100,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "akita_black_bowl_1",
+            "plate_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T0_cold_start_dev_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L1T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L1T0_20261029_202718_043739108/run_report.json"
+    },
+    {
+      "task": "obstacle_avoidance_human/L2T0",
+      "kind": "standard",
+      "actions": 517,
+      "monitored_physics_substeps": 12925,
+      "native_goals": [
+        {
+          "predicate": [
+            "on",
+            "akita_black_bowl_1",
+            "plate_1"
+          ],
+          "value": true
+        }
+      ],
+      "native_task_success": true,
+      "reward": 1.0,
+      "done": true,
+      "physical_action_audit": "complete",
+      "snapshot_boundary_status": "verified_by_native_goal_stage_scheduler",
+      "checks": {
+        "v3_complete": true,
+        "native_task_success": true,
+        "native_reward_done": true,
+        "complete_physical_action_audit": true,
+        "valid_7d_and_state_action_records": true,
+        "continuous_and_substep_complete": true,
+        "recorded_actions_match_success_timestep": true,
+        "snapshot_boundaries_verified_by_v3_scheduler": true
+      },
+      "snapshot_boundary_audit": null,
+      "v3_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T0_cold_start_dev_01/v3_run/v3_report.json",
+      "executor_report": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L2T0_cold_start_dev_01/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L2T0_20261029_221630_151428181/run_report.json"
+    }
+  ],
+  "limitations": "This Stage A audit does not claim Strict-10mm safety certification or safe-training eligibility."
+}

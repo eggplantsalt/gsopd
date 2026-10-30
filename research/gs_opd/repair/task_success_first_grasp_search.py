@@ -92,6 +92,19 @@ MAX_LIFT_CONTROL_ACTIONS = 40
 MINIMUM_OBJECT_LIFT_M = 0.030
 LIFT_COMMAND_M = 0.040
 
+# Stage A can search for native task success without computing exhaustive
+# all-Geom clearances after every MuJoCo microstep.  Physical contact samples
+# remain complete when this option is enabled; only the separate Stage B style
+# clearance sweep is skipped.
+_STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT = False
+
+
+def configure_stage_a_contact_only_substep_audit(enabled: bool) -> None:
+    global _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT
+    if not isinstance(enabled, bool):
+        raise TypeError("stage_a_contact_only_substep_audit_requires_bool")
+    _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT = enabled
+
 
 class _PythonObjectState:
     """Compatibility wrapper for opaque runtime objects in archived Snapshots."""
@@ -1598,12 +1611,17 @@ def _record_step(
     raise_on_done: bool = True,
     planning_tracking: dict[str, Any] | None = None,
 ) -> None:
+    monitored_step_started = time.perf_counter()
     reply = bridge.request({
         "op": "step_monitored",
         "action": np.asarray(action, dtype=np.float32).tolist(),
         "action_index": int(action_index),
-        "safety_geometry_policy": policy,
+        "safety_geometry_policy": (
+            None if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else policy
+        ),
     })
+    monitored_step_wall_s = time.perf_counter() - monitored_step_started
+    grasp_started = time.perf_counter()
     try:
         grasp = bridge.request({
             "op": "grasp_state",
@@ -1612,9 +1630,16 @@ def _record_step(
         })
     except Exception as exc:
         grasp = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
+    grasp_state_wall_s = time.perf_counter() - grasp_started
     sample = monitor.update(grasp, rollout_step=action_index)
     contact_monitoring = reply.get("contact_monitoring", {})
-    monitoring_complete = _contact_substep_monitoring_complete(contact_monitoring)
+    contact_monitoring_complete = _contact_substep_monitoring_complete(
+        contact_monitoring, require_geometry=False
+    )
+    clearance_monitoring_complete = _contact_substep_monitoring_complete(
+        contact_monitoring, require_geometry=True
+    )
+    monitoring_complete = contact_monitoring_complete
     snapshot_state = reply.get("snapshot_state", {})
     record = {
         "candidate_id": candidate_id,
@@ -1628,6 +1653,16 @@ def _record_step(
         "start_contacts": reply.get("start_contacts", {}),
         "contact_monitoring": contact_monitoring,
         "substep_monitoring_complete": monitoring_complete,
+        "substep_contact_monitoring_complete": contact_monitoring_complete,
+        "substep_clearance_monitoring_complete": clearance_monitoring_complete,
+        "physics_audit_profile": {
+            "substep_contacts": "complete_per_MuJoCo_step",
+            "substep_clearance_sweeps": (
+                "disabled_for_stage_a_search"
+                if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else "enabled"
+            ),
+            "safety_certified": False,
+        },
         "safety_geometry": reply.get("safety_geometry"),
         "grasp_state": grasp,
         "grasp_monitor_sample": sample,
@@ -1635,6 +1670,10 @@ def _record_step(
         "done": reply.get("done", False),
         "task_success": reply.get("task_success"),
         "timestep": reply.get("timestep"),
+        "execution_timing_s": {
+            "step_monitored_rpc": monitored_step_wall_s,
+            "grasp_state_rpc": grasp_state_wall_s,
+        },
     }
     if planning_tracking is not None:
         tracking = dict(planning_tracking)
@@ -1660,7 +1699,9 @@ def _record_step(
         raise RuntimeError("environment_done_during_grasp_only_branch")
 
 
-def _contact_substep_monitoring_complete(contact_monitoring: dict[str, Any]) -> bool:
+def _contact_substep_monitoring_complete(
+    contact_monitoring: dict[str, Any], *, require_geometry: bool = True
+) -> bool:
     """Check observation coverage separately from the observed safety verdict.
 
     The Safety Bridge marks measured geometry samples as ``unsafe`` when a
@@ -1690,6 +1731,8 @@ def _contact_substep_monitoring_complete(contact_monitoring: dict[str, Any]) -> 
             or step.get("capture_error") is not None
         ):
             return False
+    if not require_geometry:
+        return True
     geometry = contact_monitoring.get("geometry_monitoring", {})
     substeps = geometry.get("substeps", []) if isinstance(geometry, dict) else []
     complete_geometry_statuses = {"complete", "unsafe"}
@@ -1724,10 +1767,12 @@ def _advance_pose(
     stagnation_window_actions: int = 0,
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
+    max_translation_step_m: float = 0.008,
     planning_tracking: dict[str, Any] | None = None,
     target_pose_provider: Callable[
         [dict[str, Any]], tuple[np.ndarray, np.ndarray]
     ] | None = None,
+    object_progress_target_world: np.ndarray | None = None,
     gripper_action: float = 0.0,
     absolute_action_limit: int | None = MAX_BRANCH_CONTROL_ACTIONS,
 ) -> bool:
@@ -1746,6 +1791,13 @@ def _advance_pose(
     ):
         raise ValueError("pose_tracking_tolerances_must_be_positive_and_finite")
     if (
+        isinstance(max_translation_step_m, bool)
+        or not isinstance(max_translation_step_m, (int, float))
+        or not np.isfinite(float(max_translation_step_m))
+        or not 0.001 <= float(max_translation_step_m) <= 0.02
+    ):
+        raise ValueError("pose_tracking_max_translation_step_must_be_in_0.001_to_0.02")
+    if (
         isinstance(gripper_action, bool)
         or not isinstance(gripper_action, (int, float))
         or not np.isfinite(float(gripper_action))
@@ -1753,11 +1805,30 @@ def _advance_pose(
     ):
         raise ValueError("pose_tracking_gripper_action_must_be_finite_and_in_minus1_to_1")
     progress_history: list[tuple[float, float]] = []
+    object_progress_history: list[tuple[float, float]] = []
+    object_progress_target = None
+    if object_progress_target_world is not None:
+        object_progress_target = np.asarray(object_progress_target_world, dtype=np.float64)
+        if object_progress_target.shape != (4, 4) or not np.isfinite(object_progress_target).all():
+            raise ValueError("pose_tracking_object_progress_target_must_be_a_finite_4x4_pose")
+
+    def previous_bilateral_grasp_confirmed() -> bool:
+        if not records:
+            return True
+        previous_grasp = records[-1].get("grasp_state", {})
+        previous_fingers = previous_grasp.get("finger_contacts", {})
+        return bool(
+            previous_grasp.get("grasp_confirmed") is True
+            and previous_fingers.get("left") is True
+            and previous_fingers.get("right") is True
+        )
+
     for _ in range(maximum_steps):
         if stop_condition is not None and stop_condition():
             return False
         observed = bridge.request({"op": "observe", "include_snapshot_state": True})
-        if target_pose_provider is not None:
+        bilateral_for_tracking = previous_bilateral_grasp_confirmed()
+        if target_pose_provider is not None and bilateral_for_tracking:
             target_position, target_quaternion = target_pose_provider(
                 observed.get("snapshot_state", {})
             )
@@ -1779,7 +1850,26 @@ def _advance_pose(
             quaternion_multiply(target_quaternion, quaternion_conjugate(current_quaternion))
         )
         rotation_norm = float(np.linalg.norm(rotation_error))
-        if _pose_tracking_error_within_tolerance(
+        object_progress_window = None
+        object_position_error = None
+        object_rotation_error = None
+        if object_progress_target is not None and bilateral_for_tracking:
+            live_object = _object_state(
+                observed.get("snapshot_state", {}), int(target_binding["body_id"]),
+            )
+            live_object_world = _runtime_object_pose(live_object)
+            object_position_error = float(np.linalg.norm(
+                object_progress_target[:3, 3] - live_object_world[:3, 3]
+            ))
+            object_rotation_error = float(np.linalg.norm(Rotation.from_matrix(
+                object_progress_target[:3, :3] @ live_object_world[:3, :3].T
+            ).as_rotvec()))
+            if _pose_tracking_error_within_tolerance(
+                object_position_error, object_rotation_error,
+                position_tolerance_m, rotation_tolerance_rad,
+            ):
+                return True
+        elif object_progress_target is None and _pose_tracking_error_within_tolerance(
             distance, rotation_norm, position_tolerance_m, rotation_tolerance_rad,
         ):
             return True
@@ -1792,13 +1882,25 @@ def _advance_pose(
                 raise ValueError("pose_tracking_stagnation_window_must_be_zero_or_at_least_two")
             progress_history.append((distance, rotation_norm))
             progress_history = progress_history[-(stagnation_window_actions + 1):]
+            if object_progress_target is not None:
+                if bilateral_for_tracking:
+                    object_progress_history.append((object_position_error, object_rotation_error))
+                    object_progress_history = object_progress_history[-(stagnation_window_actions + 1):]
+                    object_progress_window = object_progress_history
+                else:
+                    object_progress_history.clear()
             if _pose_tracking_window_stagnated(
                 progress_history, window_actions=stagnation_window_actions,
+                object_progress_history=object_progress_window,
+                object_minimum_position_progress_m=0.002,
+                object_minimum_rotation_progress_rad=0.02,
             ):
                 raise RuntimeError(
                     f"{phase}_waypoint_stagnated_for_{stagnation_window_actions}_actions"
                 )
-        delta_position = position_error * min(1.0, 0.008 / max(distance, 1e-12))
+        delta_position = position_error * min(
+            1.0, float(max_translation_step_m) / max(distance, 1e-12),
+        )
         delta_rotation = rotation_error * min(1.0, 0.10 / max(rotation_norm, 1e-12))
         next_quaternion_xyzw = Rotation.from_rotvec(delta_rotation).as_quat()
         next_quaternion = quaternion_multiply(
@@ -1866,16 +1968,54 @@ def _pose_tracking_window_stagnated(
     window_actions: int,
     minimum_position_progress_m: float = 0.006,
     minimum_rotation_progress_rad: float = 0.06,
+    object_progress_history: list[tuple[float, float]] | None = None,
+    object_minimum_position_progress_m: float | None = None,
+    object_minimum_rotation_progress_rad: float | None = None,
 ) -> bool:
-    """Detect a blocked OSC waypoint while allowing measured route progress."""
-    if len(history) < window_actions + 1:
+    """Detect blocked tracking from EEF error and held-object progress when available."""
+    object_position_threshold = (
+        minimum_position_progress_m
+        if object_minimum_position_progress_m is None
+        else float(object_minimum_position_progress_m)
+    )
+    object_rotation_threshold = (
+        minimum_rotation_progress_rad
+        if object_minimum_rotation_progress_rad is None
+        else float(object_minimum_rotation_progress_rad)
+    )
+    if not np.isfinite([object_position_threshold, object_rotation_threshold]).all() or min(
+        object_position_threshold, object_rotation_threshold,
+    ) <= 0.0:
+        raise ValueError("object_pose_tracking_progress_thresholds_must_be_positive_and_finite")
+
+    def stagnant(
+        rows: list[tuple[float, float]],
+        *,
+        position_threshold_m: float,
+        rotation_threshold_rad: float,
+    ) -> bool:
+        if len(rows) < window_actions + 1:
+            return False
+        window = rows[-(window_actions + 1):]
+        position_progress = max(0.0, window[0][0] - min(row[0] for row in window[1:]))
+        rotation_progress = max(0.0, window[0][1] - min(row[1] for row in window[1:]))
+        return bool(
+            position_progress < position_threshold_m
+            and rotation_progress < rotation_threshold_rad
+        )
+
+    if not stagnant(
+        history,
+        position_threshold_m=minimum_position_progress_m,
+        rotation_threshold_rad=minimum_rotation_progress_rad,
+    ):
         return False
-    window = history[-(window_actions + 1):]
-    position_progress = max(0.0, window[0][0] - min(row[0] for row in window[1:]))
-    rotation_progress = max(0.0, window[0][1] - min(row[1] for row in window[1:]))
-    return bool(
-        position_progress < minimum_position_progress_m
-        and rotation_progress < minimum_rotation_progress_rad
+    if object_progress_history is None:
+        return True
+    return stagnant(
+        object_progress_history,
+        position_threshold_m=object_position_threshold,
+        rotation_threshold_rad=object_rotation_threshold,
     )
 
 
@@ -2214,7 +2354,7 @@ def _run_physical_branch(
                     "max_iterations": 400,
                     "max_config_checks": 4000,
                     "max_candidate_routes": 1,
-                    "search_time_budget_s": 2.0,
+                    "search_time_budget_s": args.local_replan_rrt_time_budget_s,
                     "shortcut_attempts": 20,
                     "minimum_clearance_m": 0.0,
                     "require_safe_configurations": False,
@@ -2518,6 +2658,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_started = time.monotonic()
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
 
+    configure_stage_a_contact_only_substep_audit(
+        bool(getattr(args, "contact_only_substep_audit", False))
+    )
     cold_start_continuation = bool(getattr(args, "cold_start_continuation", False))
     cold_start = bool(getattr(args, "cold_start", False) or cold_start_continuation)
     if cold_start and (
@@ -2527,7 +2670,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or args.strict_grasp_screen_only
         or args.strict_screen_reference_report is not None
         or (args.resume_from_runtime_snapshot is not None and not cold_start_continuation)
-        or args.candidate_id
         or args.candidate_start_index != 0
         or args.candidate_tilt_degrees
         or args.candidate_roll_degrees
@@ -2955,6 +3097,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.candidate_id:
             generated_ids = {candidate.get("candidate_id") for candidate in candidates}
             missing_ids = set(args.candidate_id) - generated_ids
+            if missing_ids and cold_start:
+                # Task-approach depth variants are normally generated before the
+                # screen. A cold-start pin may name one such same-task variant;
+                # regenerate it from its deterministic active-geometry parent
+                # instead of importing a serialized candidate or replaying a path.
+                target_pose_for_pin = _pose(
+                    context["target_root_pose_world"]["position_m"],
+                    context["target_root_pose_world"]["rotation"],
+                )
+                eef_position_for_pin = np.asarray(
+                    context["eef_pose_world"]["position_m"], dtype=np.float64
+                )
+                base_candidates = {
+                    str(candidate.get("candidate_id")): candidate
+                    for candidate in candidates
+                }
+                regenerated = []
+                for requested_id in sorted(missing_ids):
+                    if "__approach_axis" not in requested_id:
+                        continue
+                    parent_id = requested_id.split("__approach_axis", 1)[0]
+                    parent = base_candidates.get(parent_id)
+                    if parent is None:
+                        continue
+                    expanded, expansion_report = expand_task_approach_depth_candidates(
+                        [parent],
+                        target_pose_world=target_pose_for_pin,
+                        eef_position_world=eef_position_for_pin,
+                        target_collision_geometries=context["target_collision_geometries"],
+                    )
+                    regenerated.extend(
+                        candidate for candidate in expanded[1:]
+                        if candidate.get("candidate_id") == requested_id
+                    )
+                    if regenerated:
+                        generation["pinned_candidate_regenerated_from_active_geometry"] = {
+                            "requested_candidate_id": requested_id,
+                            "parent_candidate_id": parent_id,
+                            "expansion": expansion_report,
+                            "serialized_candidate_or_prior_action_used": False,
+                        }
+                candidates.extend(regenerated)
+                generated_ids = {candidate.get("candidate_id") for candidate in candidates}
+                missing_ids = set(args.candidate_id) - generated_ids
             if missing_ids:
                 raise ValueError(f"requested_candidate_ids_not_generated:{sorted(missing_ids)}")
             candidates = [
@@ -3005,6 +3191,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 offset_object_mm=offset_values,
                 offset_object_axis=offset_axis,
             )
+        task_approach_pass_ids: set[str] | None = None
         if not args.strict_grasp_screen_only:
             unfiltered_candidate_count = len(candidates)
             candidates, mechanically_infeasible = filter_mechanically_infeasible_grasp_candidates(
@@ -3068,18 +3255,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 for candidate_id in sorted(screened_ids - feasible_ids)
             ]
             _write_json(output_dir / "task_approach_feasibility_screen.json", task_approach_screen)
+            task_approach_pass_ids = set(feasible_ids)
+            rejected_ids = screened_ids - feasible_ids
+            physically_reachable_reject_ids = set()
+            ik_unreachable_ids = set()
+            for candidate_id in rejected_ids:
+                reachability = approach_rows[candidate_id].get("joint_reachability", {})
+                pregrasp_reachable = (
+                    reachability.get("pregrasp", {}).get("reachable") is True
+                )
+                grasp_reachable = (
+                    reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                )
+                if pregrasp_reachable and grasp_reachable:
+                    physically_reachable_reject_ids.add(candidate_id)
+                else:
+                    ik_unreachable_ids.add(candidate_id)
             generation["task_approach_feasibility_screen"] = {
                 "applied": True,
                 "scope": "open_gripper_pregrasp_to_grasp_cartesian_path_only",
                 "candidate_count_before_screen": len(candidates),
                 "candidate_count_after_screen": len(feasible_ids),
+                "candidate_count_retained_as_stage_a_physical_fallback": len(
+                    physically_reachable_reject_ids
+                ),
+                "candidate_count_excluded_for_missing_endpoint_ik": len(ik_unreachable_ids),
+                "stage_a_selection_policy": (
+                    "screen_pass_first_then_try_rejected_candidates_with_both_endpoint_IKs"
+                ),
+                "screen_rejection_is_not_a_hard_stage_a_safety_gate": True,
                 "rejected_candidates": approach_rejections,
                 "live_state_unchanged": task_approach_screen.get("live_state_unchanged"),
                 "strict_safety_gate_used": False,
                 "safety_certified": False,
                 "screen_report": str(output_dir / "task_approach_feasibility_screen.json"),
             }
-            candidates = [candidate for candidate in candidates if candidate["candidate_id"] in feasible_ids]
+            candidates = [
+                candidate for candidate in candidates
+                if candidate["candidate_id"] in feasible_ids | physically_reachable_reject_ids
+            ]
         else:
             generation["mechanical_opening_filter"] = {
                 "applied": False,
@@ -3092,12 +3306,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 start=args.candidate_start_index,
                 count=args.maximum_candidates,
             )
-        candidates = diversify_candidates(candidates)
+        if task_approach_pass_ids is None:
+            candidates = diversify_candidates(candidates)
+        else:
+            # Diversify within each evidence tier, then keep every scratch-screen
+            # pass ahead of collision/premature-contact fallbacks. Stage A does
+            # not discard a candidate solely because its open-surface screen
+            # predicts a safety violation.
+            passed = diversify_candidates([
+                candidate for candidate in candidates
+                if candidate["candidate_id"] in task_approach_pass_ids
+            ])
+            fallback = diversify_candidates([
+                candidate for candidate in candidates
+                if candidate["candidate_id"] not in task_approach_pass_ids
+            ])
+            candidates = passed + fallback
         if not args.strict_grasp_screen_only:
             candidates = candidates[:args.maximum_candidates]
         if not candidates:
             if generation.get("task_approach_feasibility_screen", {}).get("applied"):
-                raise RuntimeError("no_task_feasible_grasp_candidate_passed_open_surface_approach_screen")
+                raise RuntimeError(
+                    "no_stage_a_grasp_candidate_with_pregrasp_and_grasp_endpoint_ik"
+                )
             raise RuntimeError("no_supported_collision_geometry_produced_a_pad_grasp_candidate")
         _write_json(output_dir / "geometry_candidates.json", candidates)
         _write_json(output_dir / "experience_transfer.json", experience_use)
@@ -3935,8 +4166,13 @@ def _parse_args() -> argparse.Namespace:
         help="select a later window from the deterministic active-geometry candidate pool",
     )
     parser.add_argument("--maximum-rrt-preflights", type=int, default=MAX_RRT_PREFLIGHTS)
+    parser.add_argument("--local-replan-rrt-time-budget-s", type=float, default=2.0)
     parser.add_argument("--maximum-physical-branches", type=int, default=MAX_PHYSICAL_BRANCHES)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
+    parser.add_argument(
+        "--contact-only-substep-audit", action="store_true",
+        help="retain all per-substep contacts and skip exhaustive per-substep all-Geom clearance sweeps",
+    )
     parser.add_argument(
         "--strict-grasp-screen-only", action="store_true",
         help="run scratch-only full-geometry pad-only/10mm screening, then exit before RRT or physical actions",
@@ -4028,6 +4264,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error(f"--maximum-physical-branches must be in 1..{MAX_PHYSICAL_BRANCHES}")
     if not 0.5 <= args.rrt_time_budget_s <= 60.0:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
+    if not 0.5 <= args.local_replan_rrt_time_budget_s <= 60.0:
+        parser.error("--local-replan-rrt-time-budget-s must be in 0.5..60")
     if args.strict_grasp_screen_only and args.strict_screen_reference_report is None:
         parser.error("--strict-grasp-screen-only requires --strict-screen-reference-report")
     if args.strict_screen_reference_report is not None and not args.strict_grasp_screen_only:
@@ -4044,7 +4282,6 @@ def _parse_args() -> argparse.Namespace:
         or args.strict_grasp_screen_only
         or args.strict_screen_reference_report is not None
         or (args.resume_from_runtime_snapshot is not None and not args.cold_start_continuation)
-        or args.candidate_id
         or args.candidate_start_index != 0
         or args.candidate_tilt_degrees
         or args.candidate_roll_degrees

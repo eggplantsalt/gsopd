@@ -72,8 +72,8 @@
   },
   "verified_bddl_and_pruned_init_files": 30,
   "verification": "Runtime-registered both local suites through benchmark/__init__.py from local vla_safety_task_map.py; checked each returned task identity and each local BDDL and pruned_init file exists; recorded BDDL SHA-256 and parsed full native goal expression.",
-  "repository_head": "9099c1979b000a8e632b4d94c56d9c397da31cc4",
-  "current_search_source_bundle_sha256": "d0ea082cf6d31e6c7b4e5f6a55a80a95a8efe8e3f8a157c634b3106e4ad12e2b",
+  "repository_head": "8e553b105baf6cc9129abec899fe3383d790543e",
+  "current_search_source_bundle_sha256": "9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7",
   "source_bundle_files": [
     "research/gs_opd/repair/trajectory_generator_v3.py",
     "research/gs_opd/repair/task_success_first_executor.py",
@@ -106,5 +106,97 @@
       }
     },
     "user_config_modified": false
+  },
+  "previous_run_source_bundle_sha256_before_task_approach_clearance_fix": "d0ea082cf6d31e6c7b4e5f6a55a80a95a8efe8e3f8a157c634b3106e4ad12e2b",
+  "source_bundle_fingerprint_method": "SHA-256 of ordered UTF-8 lines: <relative_path> <SHA-256(file bytes)><LF>, in source_bundle_files order.",
+  "current_search_source_file_sha256": {
+    "research/gs_opd/repair/trajectory_generator_v3.py": "0b70bb09c1763521ee2f76b179849f660f043430ea1f8f51515d221d50888278",
+    "research/gs_opd/repair/task_success_first_executor.py": "7fe7b9fdf98a6b01d1ba74aac1620307bc1a9501c54c89f92a75d856d28498a9",
+    "research/gs_opd/repair/task_success_first_grasp_search.py": "3ab0d34e88f344b8c1714f35b75de2b8192c61c6ee101a35948a482580373fdb",
+    "research/gs_opd/repair/mujoco_jointspace_planning.py": "1e5c7fd1f340dc2b69fbaa7d5e420dcf03c71dc80ff53a6315188e9bfc70d085",
+    "research/gs_opd/repair/jointspace_rrt.py": "3957832f5a3cfe64e672aeea1ae68298c508a99a2f91fa2ac0499c2c77ddf1ae",
+    "research/gs_opd/smoke/safety_bridge.py": "1aab956dca8f2cac7cf1f45a2e091208aec915726c4011ced4a42238eb279834",
+    "research/gs_opd/repair/task_phase_controller.py": "23d774a079ba211845a71d7b5e15d0343ffbca5e392aa971ffafd5e2b6942b46"
+  },
+  "task_approach_clearance_gate_correction": {
+    "implemented_in": "research/gs_opd/repair/mujoco_jointspace_planning.py",
+    "behavior": "task_approach_only no longer applies the Strict-10mm clearance to BDDL-forbidden objects; actual collision/penetration checks remain enabled.",
+    "strict_threshold_definitions_changed": false,
+    "introduced_after_archived_L1T0_run": true,
+    "l0t3_l0t4_margin_only_rejections_observed": 0
+  },
+  "previous_run_source_bundle_sha256_before_native_transport_reserve_cap": "6b75e613b78f6662ad650d3a51d892bfcbbe6150120847aeea927ee788706371",
+  "native_transport_future_goal_reserve_correction": {
+    "implemented_in": "research/gs_opd/repair/task_success_first_executor.py",
+    "behavior": "Future-object action reserves are capped to remaining horizon slack after the estimated current-goal route and required current-goal completion actions, preventing future-goal reserves from reducing current-goal transport budget to zero.",
+    "fixed_reserves_changed": false,
+    "strict_threshold_definitions_changed": false,
+    "introduced_after_archived_L1T2_budget_failure": true
+  },
+  "previous_run_source_bundle_sha256_before_native_On_orientation_fallback": "1019806cb8b3779055ac400076f8a44751be9128080e30356d4f30afed03840f",
+  "native_On_orientation_fallback": {
+    "implemented_in": "research/gs_opd/repair/task_success_first_executor.py",
+    "behavior": "For additional objects placed with native On, preserve the live held-object orientation; use the completed sibling only for matching support height because BDDL On imposes no yaw constraint.",
+    "native_goal_definition_changed": false,
+    "direct_object_or_robot_state_write": false,
+    "introduced_after_archived_L1T2_RRT_IK_preflight_failure": true
+  },
+  "previous_run_source_bundle_sha256_before_native_On_layout_diversification": "fad5e1edca6242fb4db4ef59ae9b2b2ccfd6512c50bf7d35bd5e1ce7bc0709da",
+  "native_On_layout_diversification": {
+    "implemented_in": "research/gs_opd/repair/task_success_first_executor.py",
+    "behavior": "For multi-object native On placement under legacy full-geometry RRT, keep the highest sibling-clearance candidate and choose the shorter-travel alternate among generated candidates within 30 mm of its estimated clearance.",
+    "maximum_physical_placement_branches_changed": false,
+    "native_goal_definition_changed": false,
+    "introduced_after_archived_L1T2_RRT_IK_preflight_failure": true
+  },
+  "previous_run_source_bundle_sha256_before_native_On_route_record_bddl_hash_fix": "16bf4da59356db6af8b3d0b9501d94616e4c232b386b5f7339d46278dba889e8",
+  "native_On_route_record_bddl_hash_pass_through": {
+    "implemented_in": "research/gs_opd/repair/task_success_first_executor.py",
+    "behavior": "Pass expected scene BDDL SHA-256 through both _native_place call paths into _native_place_single so an offline-feasible RRT route record can preserve its BDDL identity without a NameError.",
+    "introduced_after_archived_L1T2_placement_branch_error": true,
+    "native_goal_definition_changed": false,
+    "physics_or_safety_threshold_changed": false
+  },
+  "previous_run_source_bundle_sha256_before_continuation_retry_slot_cap": "df918be555072ca5904a4765a8c1f1936c01edbfa9819ba07d91797836436d79",
+  "native_goal_continuation_retry_slot_cap": {
+    "implemented_in": "research/gs_opd/repair/trajectory_generator_v3.py",
+    "behavior": "The bounded maximum stage index equals twice the initial native-goal count plus one extra retry slot per previously discarded same-run attempt.",
+    "wall_time_budget_still_applies": true,
+    "introduced_after_L1T2_stage_limit_stopped_before_executor": true
+  },
+  "exact_static_installation_contact_exception": {
+    "implemented_in": "research/gs_opd/smoke/safety_bridge.py",
+    "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+    "exact_pair": {
+      "robot_geom_id": 90,
+      "robot_geom_name": "mount0_pedestal_col",
+      "robot_body_id": 22,
+      "robot_body_name": "mount0_pedestal",
+      "scene_geom_id": 14,
+      "scene_geom_name": null,
+      "scene_body_id": 1,
+      "scene_body_name": "study_table"
+    },
+    "runtime_guards": "Exact model fingerprint, geom/body IDs and names, and joint-free ancestor chains are required; all other robot/scene collision checks remain active.",
+    "strict_safety_thresholds_changed": false,
+    "introduced_after_L1T1_dev04_exact_pair_diagnostic": true
+  },
+  "native_region_clearance_world_vertical_axis_correction": {
+    "implemented_in": "research/gs_opd/repair/task_success_first_executor.py",
+    "behavior": "Compute target lowest collision-geometry offset in world-up orientation before combining it with world-space obstacle top heights, so inverted native-region local z cannot inflate the route height.",
+    "obstacle_top_heights_or_clearance_margin_changed": false,
+    "verified_by": "test_corridor_clearance_uses_world_up_with_inverted_native_region_frame",
+    "physical_verification_archive": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T1_world_vertical_clearance_cold_start_dev_06/v3_run",
+    "native_success_timestep": 613,
+    "success_episode_actions": 613,
+    "monitored_mujoco_substeps": 15325,
+    "strict_10mm_pass": false,
+    "safety_certified": false
+  },
+  "native_success_timestep_guard": {
+    "implemented_in": "research/gs_opd/repair/trajectory_generator_v3.py",
+    "behavior": "Write native_task_success_timestep only when the final native task status has task_success=true and a valid nonnegative timestep.",
+    "regression_test": "test_native_success_timestep_is_null_for_final_unsuccessful_status",
+    "archived_dev05_report_note": "dev05 remains unchanged and has native_task_success=false with the legacy erroneous timestep 364."
   }
 }

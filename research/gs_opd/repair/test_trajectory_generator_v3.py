@@ -19,6 +19,7 @@ from research.gs_opd.repair.l0t0_success_reference import load_success_reference
 from research.gs_opd.repair.trajectory_generator_v3 import (
     _classify_run_status,
     _classify_experience_run_status,
+    _native_success_timestep,
     _experience_failure_reasons,
     _experience_task_success_command,
     _load_v3_continuation_history,
@@ -55,6 +56,12 @@ def test_experience_failure_reason_prefers_recorded_terminal_transport_failure()
         }],
     })
     assert reasons[-1] == "RuntimeError: transport_region_progress_waypoint_stagnated_for_24_actions"
+
+
+def test_native_success_timestep_is_null_for_final_unsuccessful_status() -> None:
+    assert _native_success_timestep({"task_success": False, "timestep": 364}) is None
+    assert _native_success_timestep({"task_success": True, "timestep": 364}) == 364
+    assert _native_success_timestep({"task_success": True, "timestep": True}) is None
 
 
 def _sha(path: Path) -> str:

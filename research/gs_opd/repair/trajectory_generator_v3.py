@@ -393,7 +393,6 @@ def _experience_task_success_command(
         or getattr(args, "keypose_experience", [])
         or getattr(args, "previous_search_report", [])
         or getattr(args, "resume_from_runtime_snapshot", None) is not None
-        or getattr(args, "grasp_candidate_id", None) is not None
         or getattr(args, "strict_grasp_screen_report", None) is not None
     ):
         raise ValueError("cold_start_cannot_use_historical_experience_or_partial_task_inputs")
@@ -414,6 +413,7 @@ def _experience_task_success_command(
         "--maximum-physical-branches", str(args.maximum_physical_branches),
         "--maximum-rrt-preflights", str(args.maximum_rrt_preflights),
         "--rrt-time-budget-s", str(args.rrt_time_budget_s),
+        "--local-replan-rrt-time-budget-s", str(args.local_replan_rrt_time_budget_s),
         "--candidate-start-index", str(getattr(args, "candidate_start_index", 0)),
         "--geometry-candidate-pool-offset", str(getattr(args, "geometry_candidate_pool_offset", 0)),
         "--transport-strategy", args.transport_strategy,
@@ -421,6 +421,25 @@ def _experience_task_success_command(
     native_region_route_variant = getattr(args, "native_region_route_variant", None)
     if native_region_route_variant is not None:
         argv.extend(["--native-region-route-variant", native_region_route_variant])
+    transit_clearance_mode = getattr(
+        args, "native_region_transit_clearance_mode", "compiled_obstacle",
+    )
+    argv.extend([
+        "--native-region-transit-clearance-mode", transit_clearance_mode,
+    ])
+    native_region_progress_max_step_m = float(
+        getattr(args, "native_region_progress_max_step_m", 0.008)
+    )
+    argv.extend([
+        "--native-region-progress-max-step-m",
+        str(native_region_progress_max_step_m),
+    ])
+    if getattr(args, "contact_only_substep_audit", False):
+        argv.append("--contact-only-substep-audit")
+    if getattr(args, "stage_a_near_goal_release_probe", False):
+        argv.append("--stage-a-near-goal-release-probe")
+    if getattr(args, "skip_student_first", False):
+        argv.append("--skip-student-first")
     if cold_start:
         port = int(getattr(args, "bridge_port", 38569))
         if not 1 <= port <= 65532:
@@ -817,6 +836,14 @@ def _classify_experience_run_status(
     if engine_return_code not in (0, 2) or not report_available or not scene_matches:
         return "incomplete"
     return "complete" if native_task_success else "task_incomplete"
+
+
+def _native_success_timestep(final_native_status: Any) -> int | None:
+    """Return a task-success time only when the final native status succeeded."""
+    if not isinstance(final_native_status, dict) or final_native_status.get("task_success") is not True:
+        return None
+    timestep = final_native_status.get("timestep")
+    return timestep if type(timestep) is int and timestep >= 0 else None
 
 
 def _nested_contact_monitoring_complete(monitoring: Any) -> bool:
@@ -1377,7 +1404,10 @@ def _run_cold_start_native_goal_continuations(
         }]
     last_return_code = first_return_code
     stop_reason: str | None = None
-    maximum_stages = max(1, len(initial_goals) * 2)
+    # Discarded same-run attempts did not satisfy a native goal, so grant one
+    # additional stage slot for each prior discard. The invocation itself is
+    # still bounded by the V3 wall-time budget.
+    maximum_stages = max(1, len(initial_goals) * 2 + len(discarded_attempt_reports))
 
     current = history_reports[-1]
     previous_stage_index = max(
@@ -2282,7 +2312,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             native_task_success=native_success,
         )
         final_native = inner_report.get("final_native_task_status", {})
-        success_timestep = final_native.get("timestep") if isinstance(final_native, dict) else None
+        success_timestep = _native_success_timestep(final_native)
         standard_1000_success = (
             bool(native_success and isinstance(success_timestep, int) and success_timestep <= 1000)
             if isinstance(success_timestep, int)
@@ -2388,7 +2418,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--grasp-candidate-id", default=None,
-        help="restrict resumed experience search to one generated grasp candidate ID",
+        help="restrict search to one deterministically generated same-task geometry candidate ID",
+    )
+    parser.add_argument(
+        "--skip-student-first", action="store_true",
+        help="start bounded physical Stage A search directly from the verified legal t0 Snapshot",
     )
     parser.add_argument(
         "--strict-grasp-screen-report", type=Path, default=None,
@@ -2403,6 +2437,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-physical-branches", type=int, default=2)
     parser.add_argument("--maximum-rrt-preflights", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
+    parser.add_argument("--local-replan-rrt-time-budget-s", type=float, default=2.0)
     parser.add_argument("--wall-time-budget-s", type=float, default=3600.0,
                         help="wall-clock limit for the physical engine and its subprocesses")
     parser.add_argument(
@@ -2425,6 +2460,24 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="select a region-progress route variant for native-region OSC transport",
     )
+    parser.add_argument(
+        "--native-region-transit-clearance-mode",
+        choices=("compiled_obstacle", "reachability_biased"),
+        default="compiled_obstacle",
+        help="choose obstacle-overflight or reachability-biased On transport height",
+    )
+    parser.add_argument(
+        "--native-region-progress-max-step-m", type=float, default=0.008,
+        help="per-action OSC target displacement limit for native-region transport",
+    )
+    parser.add_argument(
+        "--contact-only-substep-audit", action="store_true",
+        help="retain every MuJoCo contact substep while skipping exhaustive per-substep clearance sweeps",
+    )
+    parser.add_argument(
+        "--stage-a-near-goal-release-probe", action="store_true",
+        help="enable physical release probes near unsatisfied native placement goals",
+    )
     args = parser.parse_args()
     if not 1.0 <= args.wall_time_budget_s <= 86400.0:
         parser.error("--wall-time-budget-s must be in 1..86400 seconds")
@@ -2438,7 +2491,6 @@ def _parse_args() -> argparse.Namespace:
             args.additional_reference_trace,
             args.lora_checkpoint,
             args.resume_from_runtime_snapshot,
-            args.grasp_candidate_id,
             args.strict_grasp_screen_report,
             args.route_candidate_id,
         )
@@ -2480,6 +2532,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-rrt-preflights must be in 1..8")
     if args.native_region_route_variant is not None and args.transport_strategy != "native_region_progress_osc":
         parser.error("--native-region-route-variant requires --transport-strategy native_region_progress_osc")
+    if not 0.001 <= args.native_region_progress_max_step_m <= 0.02:
+        parser.error("--native-region-progress-max-step-m must be in 0.001..0.02")
     if args.candidate_start_index < 0:
         parser.error("--candidate-start-index must be nonnegative")
     if not 0 <= args.geometry_candidate_pool_offset <= 32:
@@ -2488,6 +2542,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--grasp-candidate-id requires --candidate-start-index 0")
     if not 0.5 <= args.rrt_time_budget_s <= 60:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
+    if not 0.5 <= args.local_replan_rrt_time_budget_s <= 60:
+        parser.error("--local-replan-rrt-time-budget-s must be in 0.5..60")
     if not args.rlinf_python.is_absolute() or not args.rlinf_python.is_file():
         parser.error("--rlinf-python must be an existing absolute interpreter path")
     if not 1024 <= args.bridge_port <= 65535:

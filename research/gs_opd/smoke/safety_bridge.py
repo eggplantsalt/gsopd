@@ -5080,6 +5080,17 @@ _VERIFIED_STATIC_INSTALLATION_CONTACTS = (
         "scene_body_id": 1,
         "scene_body_name": "study_table",
     },
+    {
+        "model_geometry_sha256": "d7d12c6d41f7f6f8184e8ec4f947d7bf03c4b299478257b9f1b43295483cbc53",
+        "robot_geom_id": 90,
+        "robot_geom_name": "mount0_pedestal_col",
+        "robot_body_id": 22,
+        "robot_body_name": "mount0_pedestal",
+        "scene_geom_id": 14,
+        "scene_geom_name": None,
+        "scene_body_id": 1,
+        "scene_body_name": "study_table",
+    },
 )
 
 
@@ -5109,25 +5120,27 @@ def _fixed_body_ancestor_chain(model, body_id):
 def _normalize_static_installation_contact_pairs(
     raw_pairs, model, robot_body_ids, robot_geom_ids, other_scene_groups
 ):
-    """Validate the narrowly pinned L0T1 fixed mount/table contact exception."""
+    """Validate one exact model-specific fixed mount/table contact exception."""
     if not isinstance(raw_pairs, list):
         raise ValueError("allowed_static_installation_contact_pairs_must_be_an_array")
     if not raw_pairs:
         return set(), []
-    if len(raw_pairs) != 1 or len(_VERIFIED_STATIC_INSTALLATION_CONTACTS) != 1:
+    if len(raw_pairs) != 1:
         raise ValueError("static_installation_contact_pair_is_not_in_the_verified_allowlist")
-
-    expected = _VERIFIED_STATIC_INSTALLATION_CONTACTS[0]
-    pair = raw_pairs[0]
-    if not isinstance(pair, dict) or pair != expected:
-        raise ValueError("static_installation_contact_pair_identity_is_not_in_the_verified_allowlist")
 
     cache = _STATIC_INSTALLATION_MODEL_SIGNATURE_CACHE
     if cache["model"] is not model:
         cache["model"] = model
         cache["signature"] = _planning_model_signature(model)
-    if cache["signature"] != expected["model_geometry_sha256"]:
+    matching_specs = [
+        spec for spec in _VERIFIED_STATIC_INSTALLATION_CONTACTS
+        if cache["signature"] == spec["model_geometry_sha256"]
+    ]
+    if len(matching_specs) != 1:
         raise ValueError("static_installation_contact_model_fingerprint_is_not_verified")
+    expected = matching_specs[0]
+    if raw_pairs[0] != expected:
+        raise ValueError("static_installation_contact_pair_identity_is_not_in_the_verified_allowlist")
 
     robot_geom = int(expected["robot_geom_id"])
     scene_geom = int(expected["scene_geom_id"])
@@ -7514,6 +7527,108 @@ try:
                             "physical_state_unchanged": False,
                             "states": [],
                             "error": f"{type(exc).__name__}: {exc}",
+                        }
+                elif request["op"] == "scratch_attached_goal_pose_preflight":
+                    try:
+                        import hashlib
+                        from research.gs_opd.repair.mujoco_jointspace_planning import plan_current_scene
+
+                        expected_instruction = request.get("expected_instruction")
+                        if expected_instruction != task.language:
+                            raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+                        expected_model = request.get("model_geometry_sha256")
+                        actual_model = _planning_model_signature(env.sim.model._model)
+                        if expected_model != actual_model:
+                            raise ValueError("compiled_model_geometry_signature_changed")
+                        current_state = _mujoco_integration_state(env.sim)
+                        current_state_hash = hashlib.sha256(current_state.tobytes()).hexdigest()
+                        if request.get("start_state_sha256") != current_state_hash:
+                            raise ValueError("active_7d_qpos_start_state_changed_before_goal_preflight")
+                        policy = _normalize_safety_geometry_policy(
+                            request.get("safety_geometry_policy")
+                        )
+                        if policy.get("carried_object") is None:
+                            raise ValueError("a_live_verified_carried_object_is_required_for_goal_preflight")
+                        raw_joint_overrides = request.get("scene_joint_qpos_overrides", [])
+                        if not isinstance(raw_joint_overrides, list) or len(raw_joint_overrides) > 8:
+                            raise ValueError("scene_joint_qpos_overrides_must_be_a_bounded_array")
+                        joint_overrides = []
+                        if raw_joint_overrides:
+                            fixture_id = request.get("expected_fixture_id")
+                            fixtures = getattr(env.env, "fixtures_dict", {})
+                            fixture = fixtures.get(fixture_id) if isinstance(fixture_id, str) else None
+                            if fixture is None:
+                                raise ValueError("scene_joint_override_requires_a_registered_fixture")
+                            fixture_root = int(env.sim.model.body_name2id(fixture.root_body))
+                            fixture_bodies = _planning_body_subtree(
+                                env.sim.model._model, fixture_root,
+                            )
+                            for index, override in enumerate(raw_joint_overrides):
+                                if not isinstance(override, dict):
+                                    raise ValueError(f"scene_joint_override_{index}_must_be_an_object")
+                                joint_name = override.get("joint_name")
+                                position_value = override.get("position")
+                                if not isinstance(joint_name, str) or not joint_name:
+                                    raise ValueError(f"scene_joint_override_{index}_joint_name_is_required")
+                                try:
+                                    joint_id = int(env.sim.model.joint_name2id(joint_name))
+                                except Exception as exc:
+                                    raise ValueError(f"scene_joint_override_{index}_joint_name_is_unknown") from exc
+                                joint_model = env.sim.model._model
+                                joint_type = int(joint_model.jnt_type[joint_id])
+                                if (
+                                    int(joint_model.jnt_bodyid[joint_id]) not in fixture_bodies
+                                    or not bool(joint_model.jnt_limited[joint_id])
+                                    or joint_type not in (
+                                        int(mujoco.mjtJoint.mjJNT_HINGE),
+                                        int(mujoco.mjtJoint.mjJNT_SLIDE),
+                                    )
+                                    or isinstance(position_value, bool)
+                                ):
+                                    raise ValueError(f"scene_joint_override_{index}_is_not_a_limited_fixture_joint")
+                                position = float(position_value)
+                                lower, upper = (
+                                    float(value) for value in joint_model.jnt_range[joint_id]
+                                )
+                                if not np.isfinite(position) or position < lower - 1e-9 or position > upper + 1e-9:
+                                    raise ValueError(f"scene_joint_override_{index}_position_is_outside_fixture_joint_range")
+                                joint_overrides.append({
+                                    "joint_name": joint_name,
+                                    "qpos_address": int(joint_model.jnt_qposadr[joint_id]),
+                                    "position": position,
+                                })
+                        result = plan_current_scene(
+                            env,
+                            request.get("goal_pose_world"),
+                            policy,
+                            start_state_sha256=current_state_hash,
+                            expected_instruction=expected_instruction,
+                            actual_instruction=task.language,
+                            ik_seed_qpos=request.get("ik_seed_qpos"),
+                            planner_config=request.get("planner_config"),
+                            goal_configuration_preflight_only=True,
+                            hypothetical_eef_to_object_transform=request.get(
+                                "hypothetical_eef_to_object_transform"
+                            ),
+                            scene_joint_qpos_overrides=joint_overrides,
+                        )
+                        result["operation"] = "scratch_attached_goal_pose_preflight"
+                        result["start_state_sha256"] = current_state_hash
+                        result["model_geometry_sha256"] = actual_model
+                        result["safety_policy_source"] = request.get(
+                            "safety_geometry_policy", {}
+                        ).get("source")
+                        result["physical_actions"] = 0
+                        result["diagnostic_only"] = True
+                        result["expected_fixture_id"] = request.get("expected_fixture_id")
+                    except Exception as exc:
+                        result = {
+                            "operation": "scratch_attached_goal_pose_preflight",
+                            "status": "unavailable",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": None,
+                            "physical_actions": 0,
+                            "diagnostic_only": True,
                         }
                 elif request["op"] == "rrt_connect":
                     try:

@@ -43,6 +43,7 @@ class JointSpacePlannerConfig:
     edge_max_geom_center_step_m: float = 0.004
     edge_max_geom_midpoint_curvature_m: float = 0.0005
     minimum_clearance_m: float = 0.01
+    start_joint_limit_tolerance_rad: float = 0.0
     require_safe_configurations: bool = True
     seed: int = 20261023
 
@@ -73,6 +74,11 @@ class JointSpacePlannerConfig:
             raise ValueError("goal_bias must lie in (0, 1)")
         if not math.isfinite(float(self.minimum_clearance_m)) or self.minimum_clearance_m < 0.0:
             raise ValueError("planner clearance must be finite and non-negative")
+        if (
+            not math.isfinite(float(self.start_joint_limit_tolerance_rad))
+            or self.start_joint_limit_tolerance_rad < 0.0
+        ):
+            raise ValueError("start joint-limit tolerance must be finite and non-negative")
         if not isinstance(self.require_safe_configurations, bool):
             raise ValueError("require_safe_configurations must be a bool")
 
@@ -354,7 +360,14 @@ class JointSpaceRRTConnect:
 
         try:
             for endpoint_name, endpoint in (("start", start), ("goal", goal)):
-                if np.any(endpoint < self.lower) or np.any(endpoint > self.upper):
+                tolerance = (
+                    float(self.config.start_joint_limit_tolerance_rad)
+                    if endpoint_name == "start" else 0.0
+                )
+                if (
+                    np.any(endpoint < self.lower - tolerance)
+                    or np.any(endpoint > self.upper + tolerance)
+                ):
                     raise ValueError(f"{endpoint_name}_outside_joint_limits")
                 check = self._check(endpoint)
                 if not self._configuration_admissible(check):

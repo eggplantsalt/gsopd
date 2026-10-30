@@ -50,11 +50,15 @@ from research.gs_opd.repair.task_success_first_executor import (
     _finger_contacts_clear,
     _generate_native_region_placement_candidates,
     _native_region_progress_route,
+    _native_region_entry_transit_poses,
+    _native_region_progress_waypoint_target,
+    _native_object_relative_eef_target_world,
     _native_region_corridor_obstacle_clearance,
     _native_region_progress_tracking_tolerances,
     _keypose_rrt_call_count,
     _native_region_entry_offset_m,
     _native_placement_planner_target,
+    _native_goal_insertion_rrt_path_arrays,
     _object_contact_escape_direction,
     _placement_ik_seed_portfolio,
     _preflight_row_is_task_success_admissible,
@@ -820,6 +824,60 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         np.testing.assert_allclose(entry_pose[:2, 3], goal[:2, 3])
         self.assertGreater(entry_pose[2, 3], goal[2, 3])
 
+    def test_native_in_rrt_transit_poses_use_boundary_footprint_and_obstacle_height(self):
+        start = np.eye(4, dtype=np.float64)
+        start[:3, 3] = [0.0, -0.40, 1.0]
+        goal = np.eye(4, dtype=np.float64)
+        goal[:3, 3] = [0.0, 0.0, 0.90]
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.90],
+            "site_rotation_world": np.eye(3).tolist(),
+            "site_size_m": [0.20, 0.10, 0.01],
+        }
+
+        transit = _native_region_entry_transit_poses(
+            start,
+            goal,
+            region=region,
+            entry_direction_world=np.asarray([0.0, 1.0, 0.0]),
+            entry_clearance_radius_m=0.05,
+            obstacle_clearance_height_world_m=1.30,
+        )
+
+        outside = transit["outside_entry_object_world"]
+        inside = transit["inside_alignment_object_world"]
+        self.assertAlmostEqual(transit["route"]["entry_offset_m"], 0.17)
+        np.testing.assert_allclose(outside[:3, 3], [0.0, 0.17, 1.30])
+        np.testing.assert_allclose(inside[:3, 3], [0.0, 0.0, 1.30])
+
+    def test_native_goal_insertion_rrt_requires_verified_aligned_full_paths(self):
+        eef_path = np.zeros((2, 7), dtype=np.float64)
+        qpos_path = np.zeros((2, 7), dtype=np.float64)
+        result = {
+            "status": "offline_feasible",
+            "live_state_unchanged": True,
+            "eef_reference_poses_world": eef_path.tolist(),
+            "qpos_path": qpos_path.tolist(),
+        }
+        actual_eef, actual_qpos = _native_goal_insertion_rrt_path_arrays(result)
+        np.testing.assert_array_equal(actual_eef, eef_path)
+        np.testing.assert_array_equal(actual_qpos, qpos_path)
+
+        with self.assertRaisesRegex(RuntimeError, "not_feasible_before_OSC"):
+            _native_goal_insertion_rrt_path_arrays({
+                **result, "live_state_unchanged": False,
+            })
+        with self.assertRaisesRegex(RuntimeError, "path_alignment_invalid"):
+            _native_goal_insertion_rrt_path_arrays({
+                **result, "qpos_path": np.zeros((1, 7)).tolist(),
+            })
+        invalid_eef = eef_path.copy()
+        invalid_eef[0, 0] = np.nan
+        with self.assertRaisesRegex(RuntimeError, "path_alignment_invalid"):
+            _native_goal_insertion_rrt_path_arrays({
+                **result, "eef_reference_poses_world": invalid_eef.tolist(),
+            })
+
     def test_final_native_region_alignment_uses_tight_tracking_tolerances(self):
         self.assertEqual(
             _native_region_progress_tracking_tolerances(
@@ -1321,6 +1379,22 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         self.assertEqual([row["object_id"] for row in clearance["intersecting_objects"]], ["bottle"])
         self.assertAlmostEqual(clearance["maximum_intersecting_obstacle_top_world_m"], 0.5)
         self.assertAlmostEqual(clearance["required_transit_height_world_m"], 0.6)
+        reduced_route_margin = _native_region_corridor_obstacle_clearance(
+            start_object_world=start,
+            goal_object_world=goal,
+            region=region,
+            target_context=self._placement_context("bowl", [0.0, 0.0, 0.0]),
+            object_to_eef=np.eye(4),
+            scene_envelopes=scene,
+            excluded_object_ids={"bowl", "plate"},
+            expected_model_sha256="model",
+            clearance_margin_m=0.02,
+        )
+        self.assertAlmostEqual(
+            clearance["required_transit_height_world_m"]
+            - reduced_route_margin["required_transit_height_world_m"],
+            0.03,
+        )
         route = _native_region_progress_route(
             start,
             goal,
@@ -1345,13 +1419,119 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
             goal,
             region=region,
             route_variant="keypose_side_region_progress",
+            keypose_side_region=[0.0, 1.0],
             obstacle_clearance_height_world_m=1.4438,
         )
         self.assertGreaterEqual(route["adaptive_transit_height_world_m"], 1.4438)
+        self.assertEqual(route["waypoints"][0]["role"], "adaptive_clearance")
+        first_lift = np.asarray(route["waypoints"][0]["object_pose_world"])
+        np.testing.assert_allclose(first_lift[:2, 3], start[:2, 3])
+        self.assertEqual(route["waypoints"][1]["role"], "keypose_side_detour")
         for waypoint in route["waypoints"][:-1]:
             pose = np.asarray(waypoint["object_pose_world"], dtype=np.float64)
             self.assertAlmostEqual(pose[2, 3], route["adaptive_transit_height_world_m"], places=8)
         np.testing.assert_allclose(route["waypoints"][-1]["object_pose_world"], goal)
+
+    def test_corridor_clearance_uses_world_up_with_inverted_native_region_frame(self):
+        start = np.eye(4, dtype=np.float64)
+        start[:3, 3] = [0.0, 0.0, 0.8]
+        goal = np.eye(4, dtype=np.float64)
+        goal[:3, 3] = [1.0, 0.0, 0.8]
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.9],
+            "site_rotation_world": np.diag([1.0, -1.0, -1.0]).tolist(),
+            "site_size_m": [0.1, 0.1, 0.1],
+        }
+        target = {
+            "target_object_id": "book",
+            "target_root_pose_world": {
+                "position_m": [0.0, 0.0, 0.8],
+                "rotation": np.eye(3).tolist(),
+            },
+            "target_collision_geometries": [{
+                "center_root_m": [0.0, 0.0, 0.07],
+                "rotation_root": np.eye(3).tolist(),
+                "size_m": [0.01, 0.01, 0.02],
+            }],
+        }
+        scene = {
+            "status": "complete",
+            "model_geometry_sha256": "model",
+            "objects": [{
+                "object_id": "bottle",
+                "mapping_name": "objects_dict",
+                "root_position_world_m": [0.5, 0.0, 0.0],
+                "root_rotation_world": np.eye(3).tolist(),
+                "envelope_lower_root_m": [-0.05, -0.05, 0.0],
+                "envelope_upper_root_m": [0.05, 0.05, 0.5],
+                "collision_geom_count": 1,
+            }],
+        }
+
+        clearance = _native_region_corridor_obstacle_clearance(
+            start_object_world=start,
+            goal_object_world=goal,
+            region=region,
+            target_context=target,
+            object_to_eef=np.eye(4),
+            scene_envelopes=scene,
+            excluded_object_ids={"book"},
+            expected_model_sha256="model",
+        )
+
+        self.assertAlmostEqual(clearance["maximum_intersecting_obstacle_top_world_m"], 0.5)
+        self.assertAlmostEqual(clearance["required_transit_height_world_m"], 0.5)
+
+    def test_native_in_route_uses_geometric_lateral_entry_before_final_pose(self):
+        start = np.eye(4, dtype=np.float64)
+        start[:3, 3] = [0.0, -0.30, 1.10]
+        goal = np.eye(4, dtype=np.float64)
+        goal[:3, 3] = [0.01, 0.02, 0.90]
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.90],
+            "site_rotation_world": np.eye(3).tolist(),
+            "site_size_m": [0.10, 0.10, 0.06],
+        }
+        route = _native_region_progress_route(
+            start,
+            goal,
+            region=region,
+            route_variant="direct_region_progress",
+            entry_direction_world=[0.0, -1.0, 0.0],
+            entry_clearance_radius_m=0.04,
+        )
+        roles = [row["role"] for row in route["waypoints"]]
+        self.assertIn("native_region_entry_approach", roles)
+        self.assertEqual(roles[-2], "native_region_entry_alignment")
+        self.assertEqual(roles[-1], "native_region_placement")
+        outside_approach = np.asarray(route["waypoints"][-3]["object_pose_world"])
+        inside_alignment = np.asarray(route["waypoints"][-2]["object_pose_world"])
+        self.assertLess(outside_approach[1, 3], -0.10)
+        self.assertAlmostEqual(outside_approach[2, 3], route["adaptive_transit_height_world_m"], places=8)
+        np.testing.assert_allclose(inside_alignment[:2, 3], goal[:2, 3])
+        self.assertAlmostEqual(
+            inside_alignment[2, 3], route["adaptive_transit_height_world_m"], places=8,
+        )
+        np.testing.assert_allclose(route["waypoints"][-1]["object_pose_world"], goal)
+
+    def test_native_region_progress_tracks_the_active_side_waypoint(self):
+        region = {
+            "site_position_world_m": [0.0, 0.0, 0.0],
+            "site_rotation_world": np.eye(3).tolist(),
+            "site_size_m": [0.2, 0.2, 0.1],
+        }
+        current = np.eye(4, dtype=np.float64)
+        current[:3, 3] = [0.0, 0.0, 1.0]
+        waypoint = np.eye(4, dtype=np.float64)
+        waypoint[:3, 3] = [0.20, 0.10, 1.0]
+        target, distance = _native_region_progress_waypoint_target(
+            region, current, waypoint, 1.0,
+        )
+        self.assertAlmostEqual(distance, np.hypot(0.20, 0.10), places=8)
+        np.testing.assert_allclose(target[:3, 3], [0.20 * 0.045 / distance, 0.10 * 0.045 / distance, 1.0])
+        self.assertIsNone(_native_region_progress_waypoint_target(
+            region, waypoint, waypoint, 1.0,
+        )[0])
 
     def test_placement_waypoint_stagnation_detection_keeps_progressing_routes(self):
         self.assertFalse(_pose_tracking_window_stagnated(
@@ -1364,6 +1544,58 @@ class TaskSuccessFirstExecutorTests(unittest.TestCase):
         ))
         self.assertFalse(_pose_tracking_error_within_tolerance(0.006, 0.05, 0.004, 0.045))
         self.assertTrue(_pose_tracking_error_within_tolerance(0.006, 0.05, 0.010, 0.10))
+
+    def test_placement_waypoint_stagnation_uses_held_object_progress(self):
+        stagnant_eef = [(0.10, 0.2), (0.099, 0.199), (0.101, 0.201), (0.100, 0.200)]
+        improving_object = [(0.08, 0.1), (0.06, 0.09), (0.04, 0.08), (0.02, 0.07)]
+        stagnant_object = [(0.08, 0.1), (0.079, 0.099), (0.081, 0.101), (0.080, 0.100)]
+        self.assertFalse(_pose_tracking_window_stagnated(
+            stagnant_eef, window_actions=3, object_progress_history=improving_object,
+        ))
+        self.assertTrue(_pose_tracking_window_stagnated(
+            stagnant_eef, window_actions=3, object_progress_history=stagnant_object,
+        ))
+
+    def test_placement_waypoint_stagnation_allows_small_object_progress(self):
+        stagnant_eef = [(0.10, 0.2), (0.099, 0.199), (0.101, 0.201), (0.100, 0.200)]
+        small_object_progress = [(0.050, 0.08), (0.049, 0.07), (0.0485, 0.06), (0.0475, 0.055)]
+        self.assertTrue(_pose_tracking_window_stagnated(
+            stagnant_eef, window_actions=3, object_progress_history=small_object_progress,
+        ))
+        self.assertFalse(_pose_tracking_window_stagnated(
+            stagnant_eef,
+            window_actions=3,
+            object_progress_history=small_object_progress,
+            object_minimum_position_progress_m=0.002,
+            object_minimum_rotation_progress_rad=0.02,
+        ))
+        still_stagnant_object = [(0.050, 0.08), (0.0498, 0.078), (0.0495, 0.076), (0.049, 0.075)]
+        self.assertTrue(_pose_tracking_window_stagnated(
+            stagnant_eef,
+            window_actions=3,
+            object_progress_history=still_stagnant_object,
+            object_minimum_position_progress_m=0.002,
+            object_minimum_rotation_progress_rad=0.02,
+        ))
+
+    def test_native_object_relative_eef_target_tracks_live_grasp_transform(self):
+        desired_object = np.eye(4, dtype=np.float64)
+        desired_object[:3, 3] = [0.5, -0.2, 0.8]
+        live_object = np.eye(4, dtype=np.float64)
+        live_object[:3, 3] = [0.1, 0.2, 0.3]
+        live_object[:3, :3] = [
+            [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
+        ]
+        live_eef = live_object.copy()
+        live_eef[:3, 3] += [0.03, 0.0, 0.02]
+        target = _native_object_relative_eef_target_world(
+            desired_object, live_object, live_eef,
+        )
+        np.testing.assert_allclose(
+            np.linalg.inv(desired_object) @ target,
+            np.linalg.inv(live_object) @ live_eef,
+            atol=1e-10,
+        )
 
     def test_live_contact_close_requires_candidate_pose_alignment(self):
         current = np.eye(4, dtype=np.float64)

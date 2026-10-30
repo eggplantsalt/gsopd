@@ -67,6 +67,7 @@ class GraspScreenContactPolicyTests(unittest.TestCase):
     def test_minimum_distance_can_return_exact_geom_pair_diagnostics(self):
         class FakeModel:
             geom_rbound = np.zeros(4)
+            geom_bodyid = np.asarray([4, 5, 6, 7])
 
         class FakeData:
             geom_xpos = np.zeros((4, 3))
@@ -74,9 +75,11 @@ class GraspScreenContactPolicyTests(unittest.TestCase):
         class FakeMujoco:
             class mjtObj:
                 mjOBJ_GEOM = 0
+                mjOBJ_BODY = 1
 
             distances = {(0, 2): 0.004, (0, 3): 0.008, (1, 2): 0.006, (1, 3): 0.005}
             names = {0: "panda_finger1", 1: "panda_hand", 2: "moka_handle", 3: "moka_lid"}
+            body_names = {4: "finger_body", 5: "hand_body", 6: "handle_body", 7: "lid_body"}
 
             @classmethod
             def mj_geomDistance(cls, model, data, geom_a, geom_b, cutoff, segment):
@@ -85,14 +88,16 @@ class GraspScreenContactPolicyTests(unittest.TestCase):
 
             @classmethod
             def mj_id2name(cls, model, object_type, geom_id):
-                return cls.names[geom_id]
+                return cls.names[geom_id] if object_type == 0 else cls.body_names[geom_id]
 
         result = _minimum_distance(
             FakeMujoco, FakeModel(), FakeData(), [0, 1], [2, 3], return_detail=True
         )
         self.assertAlmostEqual(result["distance_m"], 0.004)
         self.assertEqual(result["pair"]["robot_geom_name"], "panda_finger1")
+        self.assertEqual(result["pair"]["robot_body_name"], "finger_body")
         self.assertEqual(result["pair"]["object_geom_name"], "moka_handle")
+        self.assertEqual(result["pair"]["object_body_name"], "handle_body")
         self.assertEqual(result["pair"]["closest_points_world"], [0.0, 0.0, 0.0, 2.0, 0.0, 0.0])
 
     def test_historical_lifted_object_pose_cannot_offset_candidate_close_contact(self):

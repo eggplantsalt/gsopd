@@ -126,6 +126,7 @@ class TaskPhaseController:
         self._lift_eef_start: np.ndarray | None = None
         self._settle_samples: deque[tuple[np.ndarray, np.ndarray]] = deque(maxlen=5)
         self._settle_last_timestep = -1
+        self._near_goal_release_probe_enabled = False
 
     @property
     def current_object(self) -> dict[str, Any]:
@@ -194,6 +195,58 @@ class TaskPhaseController:
         self._expert_handoff = True
         self._phase_steps = 0
         self._last_timestep = -1
+
+    def enable_near_goal_release_probe(self) -> None:
+        """Allow a bounded physical release probe when transport stalls near a goal."""
+        self._near_goal_release_probe_enabled = True
+
+    @property
+    def near_goal_release_probe_enabled(self) -> bool:
+        return self._near_goal_release_probe_enabled
+
+    def begin_near_goal_release_probe(
+        self,
+        *,
+        object_id: str,
+        native_goal_satisfied: bool,
+        held_object: str | None,
+        bilateral_grasp_confirmed: bool,
+        object_goal_position_error_m: float,
+        maximum_position_error_m: float = 0.012,
+    ) -> dict[str, Any] | None:
+        """Switch to real gripper-open actions near the native target region.
+
+        This is an exploration branch only: the caller must still observe the
+        native BDDL predicate after release before reporting task success.
+        """
+        if not self._near_goal_release_probe_enabled:
+            return None
+        if self.phase not in {"transport", "precise_placement"} or not self._expert_handoff:
+            return None
+        if self.current_object["object_id"] != object_id:
+            raise ValueError("near_goal_release_probe_object_differs_from_active_task_object")
+        if native_goal_satisfied:
+            return None
+        error = float(object_goal_position_error_m)
+        maximum = float(maximum_position_error_m)
+        if not np.isfinite(error) or error < 0.0 or not np.isfinite(maximum) or maximum <= 0.0:
+            raise ValueError("near_goal_release_probe_distance_must_be_finite_and_nonnegative")
+        if held_object != object_id or not bilateral_grasp_confirmed or error > maximum:
+            return None
+        self._transition("release")
+        return {
+            "status": "physical_release_probe_selected",
+            "object_id": object_id,
+            "native_goal_satisfied_before_release": False,
+            "held_object_verified": held_object,
+            "bilateral_grasp_confirmed": True,
+            "object_goal_position_error_m": error,
+            "maximum_position_error_m": maximum,
+            "next_phase": self.phase,
+            "success_requires_post_release_native_BDDL_true": True,
+            "direct_simulator_state_write": False,
+            "safety_certified": False,
+        }
 
     def adopt_native_goal_contact_for_release(
         self,

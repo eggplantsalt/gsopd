@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "checkpoint_time_local": "2026-10-30 13:33 Asia/Shanghai",
+  "stage": "SafeTRAIL Stage A / Task-Feasible Bootstrap",
+  "coverage_baseline": {
+    "tasks": 30,
+    "standard_native_success": 7,
+    "extended_native_success": 2,
+    "total_native_success": 9
+  },
+  "active_task": {
+    "suite": "obstacle_avoidance_human",
+    "level": 0,
+    "task_id": 0,
+    "native_goal": "On(akita_black_bowl_1, plate_1)",
+    "standard_horizon": 1000
+  },
+  "run": {
+    "run_id": "worldup_route_cold_start_dev_02",
+    "status": "running",
+    "v3_run_manifest": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run/run_manifest.json",
+    "launch_config": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/launch_config.json",
+    "executor_pid": 112228,
+    "bridge_pid": 113961,
+    "observed_elapsed_seconds_approx": 7430,
+    "wall_time_budget_seconds": 14400,
+    "remaining_wall_time_seconds_approx": 6970,
+    "maximum_physical_branches": 3,
+    "maximum_rrt_preflights": 8,
+    "rrt_time_budget_seconds_each": 20.0
+  },
+  "identity": {
+    "git_head": "8e553b10",
+    "source_bundle_sha256": "9c820fc0d0699086a6afb79ba9b48c03b1a27fa5fced83e8bb20ef8ef5c520b7",
+    "init_state_index": 0,
+    "environment_seed": 0,
+    "t0_snapshot_root": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T0_cold_start_dev_01/t0_capture/stage_snapshots/t0",
+    "t0_payload_sha256": "fd5349865bb2f1f8983ea563b3b4f2a0a9601200c3faf33f1d28ba0798b360db",
+    "t0_integration_state_sha256": "191a26d96571dbc63eebc7d979f1b4f4f2b47641745a51f7d3c4dc28a0c02031",
+    "model_geometry_sha256": "a79f31ee3c75e8aee7c6d001d4d1b81bd8b3352cf3d0528a97c9f56e8a8d181c",
+    "cold_start": true,
+    "historical_actions_or_success_demo_loaded": false
+  },
+  "execution": {
+    "phase": "native placement; placement_branch_02_region_layout_07_keypose_side_region_progress_reverse adaptive-clearance waypoint",
+    "selected_actions_so_far": null,
+    "selected_physical_substeps_so_far": null,
+    "selected_prefix": {
+      "expert_grasp_lift_actions": 214,
+      "student_handoff_actions": 32,
+      "placement_branch00_actions_observed": 186,
+      "placement_branch01_actions_observed": 197,
+      "active_placement_branch_id": "placement_branch_02_region_layout_07_keypose_side_region_progress_reverse",
+      "active_placement_branch_actions_observed": 18,
+      "active_candidate_prefix_actions": 264,
+      "candidate_prefix_includes_only_active_branch": true
+    },
+    "discarded_student_first": {
+      "actions": 32,
+      "physical_substeps": 800,
+      "excluded_from_selected_stream": true
+    },
+    "branch_budget": {
+      "branch00_active": false,
+      "branches_started_total": 3,
+      "alternate_branches_opened": 2,
+      "current_active_branch_id": "placement_branch_02_region_layout_07_keypose_side_region_progress_reverse",
+      "maximum_total": 3
+    },
+    "latest_recorded_step": 264,
+    "latest_task_success": false,
+    "native_terminal_query": "not yet; run is active",
+    "audit": {
+      "handoff_7d_and_substeps": "verified 32/32 and 800/800",
+      "active_placement_7d_and_substeps": "latest durable row t264/step_index17: finite 7D action, substep_monitoring_complete=True; full branch audit pending",
+      "grasp_214_action_source": "pending full row/substep audit",
+      "final_selected_episode_continuity": "pending V3 terminal audit"
+    },
+    "latest_native_state": {
+      "reward": 0.0,
+      "done": false,
+      "task_success": false,
+      "timestep": 264,
+      "step_index": 17,
+      "phase": "transport_region_progress_adaptive_clearance",
+      "waypoint_index": 0,
+      "latest_action_7d_finite_and_valid": true,
+      "latest_action_substep_monitoring": "complete",
+      "actual_object_to_region_xy_distance_at_latest_record_m": 0.1707542952796465,
+      "actual_object_to_region_xy_progress_from_branch_start_m": 0.016848380978417177,
+      "latest_object_root_position_world_m": [
+        -0.08622668568750944,
+        0.10060849492679218,
+        1.19176585855836
+      ],
+      "vertical_delta_to_native_region_center_m": 0.2728328909148857,
+      "active_branch_id": "placement_branch_02_region_layout_07_keypose_side_region_progress_reverse"
+    },
+    "selected_physical_substeps_expected": 6600,
+    "active_candidate_actions_so_far": 264,
+    "active_candidate_physical_substeps_expected": 6600,
+    "active_branch": {
+      "branch_id": "placement_branch_02_region_layout_07_keypose_side_region_progress_reverse",
+      "route_variant": "keypose_side_region_progress_reverse",
+      "actions_observed": 18,
+      "latest_timestep": 264,
+      "latest_step_index": 17,
+      "latest_phase": "transport_region_progress_adaptive_clearance",
+      "candidate_prefix_actions": 264,
+      "candidate_prefix_includes_only_active_branch": true,
+      "latest_native_region_xy_distance_m": 0.1707542952796465,
+      "branch_start_native_region_xy_distance_m": 0.18760267625806368,
+      "progress_from_branch_start_m": 0.016848380978417177,
+      "latest_object_root_position_world_m": [
+        -0.08622668568750944,
+        0.10060849492679218,
+        1.19176585855836
+      ],
+      "vertical_delta_to_native_region_center_m": 0.2728328909148857,
+      "waypoint_index": 0,
+      "task_success": false,
+      "reward": 0.0,
+      "done": false
+    },
+    "completed_alternative_branches": [
+      {
+        "branch_id": "placement_branch_00_region_layout_12_direct_region_progress",
+        "status": "ended; runtime transport-failed snapshot present; native success false at last durable row; exact executor reason pending final V3 audit",
+        "actions_observed": 186,
+        "last_timestep": 432,
+        "last_native_region_xy_distance_m": 0.046792582367961945,
+        "last_object_root_position_world_m": [
+          0.01447705597295278,
+          0.1730224433448787,
+          1.3029203936609455
+        ],
+        "excluded_from_active_candidate": true
+      },
+      {
+        "branch_id": "placement_branch_01_region_layout_13_keypose_side_region_progress",
+        "status": "ended; runtime transport-failed snapshot present; native success false at last durable row; exact executor reason pending final V3 audit",
+        "actions_observed": 197,
+        "last_timestep": 443,
+        "last_native_region_xy_distance_m": 0.04745344596468975,
+        "last_object_root_position_world_m": [
+          0.00787266824787877,
+          0.18740913754923588,
+          1.3042681520128396
+        ],
+        "excluded_from_active_candidate": true
+      }
+    ],
+    "branch_snapshot_identity": {
+      "model_geometry_sha256": "a79f31ee3c75e8aee7c6d001d4d1b81bd8b3352cf3d0528a97c9f56e8a8d181c",
+      "handoff_payload_sha256": "76815f44c410b80232acff8473e19544b180f25a2e06c4300863ae1cec800238",
+      "branch00_payload_sha256": "76815f44c410b80232acff8473e19544b180f25a2e06c4300863ae1cec800238",
+      "branch01_payload_sha256": "c4bf2a0f4c301a625debba320c88947757d9805d0b7225a81dad02f9cc679b03",
+      "shared_mujoco_integration_state_sha256": "5110875732d477071e1c2b8097cb0c2c9d9a965c9055fdc944032b5cee7e807f",
+      "integration_state_matches_handoff": true,
+      "serialized_payloads_all_identical": false
+    },
+    "recent_active_branch_distance_changes": [
+      {
+        "from_timestep": 356,
+        "to_timestep": 386,
+        "from_distance_m": 0.12119852537032662,
+        "to_distance_m": 0.07628244758315325,
+        "improvement_m": 0.04491607778717337,
+        "actions_elapsed": 30
+      },
+      {
+        "from_timestep": 386,
+        "to_timestep": 416,
+        "from_distance_m": 0.07628244758315325,
+        "to_distance_m": 0.03145015540983222,
+        "improvement_m": 0.044832292173321034,
+        "actions_elapsed": 30
+      }
+    ],
+    "latest_step_index": 17
+  },
+  "snapshots": [
+    {
+      "role": "same_episode_placement_start_t246",
+      "paths": [
+        "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_112925_779073017/student_handoff/student_after_expert_grasp_lift_terminal_runtime_snapshot.pkl",
+        "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_112925_779073017/expert_native_placement/placement_branch_00_region_layout_12_direct_region_progress/native_goal_transport_start_runtime_snapshot.pkl"
+      ],
+      "sha256": "76815f44c410b80232acff8473e19544b180f25a2e06c4300863ae1cec800238",
+      "identity": "same run, same task/model/BDDL; t246 boundary before placement branch00 actions"
+    }
+  ],
+  "active_record_path": "/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T0_worldup_route_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_human_L0T0_20261030_112925_779073017/expert_native_placement/placement_branch_02_region_layout_07_keypose_side_region_progress_reverse/durable_physical_step_records.jsonl",
+  "recovery": {
+    "method": "Do not restart while either process is alive. After both exit, audit V3 report and all accepted/discarded source boundaries. If recovery is required, V3 and executor expose --resume-from-runtime-snapshot; resume only from the hashed t246 snapshot after runtime task/model/BDDL/integration-state identity checks and V3 continuation audit. Do not include branch00 actions after t246 when restoring t246.",
+    "source_support": "trajectory_generator_v3.py and task_success_first_executor.py contain verified runtime snapshot resume paths; no resumed run started."
+  },
+  "next_action": "Monitor the active third branch at approximately five-minute intervals. After both processes exit, audit final native predicates/task_success/reward/done, every action and 25-substep source, exact branch snapshots and excluded prefixes; then select the next task from the full matrix.",
+  "baseline_audit": {
+    "status": "complete",
+    "standard_native_success": 7,
+    "extended_native_success": 2,
+    "fully_audited_native_success": 9,
+    "unresolved_snapshot_boundaries": 0,
+    "report": "docs/GS_OPD_BASELINE_SNAPSHOT_AUDIT.json"
+  },
+  "performance_observation": {
+    "grasp_stage_wall_seconds": 2430.804493855685,
+    "grasp_physical_actions": 214,
+    "grasp_physical_substeps": 5350,
+    "rrt_preflights": 8,
+    "rrt_preflight_wall_seconds_total": 161.52035430446267,
+    "rrt_preflight_timeout_each_seconds_range": [
+      20.121400639414787,
+      20.24418580532074
+    ],
+    "rrt_fraction_of_grasp_stage": 0.066447283075515,
+    "unattributed_grasp_stage_seconds": 2269.2841395512223,
+    "rough_wall_seconds_per_action_not_a_physics_measurement": 11.358899503998527,
+    "sampled_process_profile": {
+      "executor_cpu_percent": 9.8,
+      "safety_bridge_cpu_percent": 102.0,
+      "gpu_utilization_percent": 0
+    },
+    "conclusion": "Timing granularity is insufficient to assign the remaining wall time; do not change budgets or stagnation thresholds from this sample. Add lightweight phase timers after the active run exits.",
+    "code_path_review": {
+      "status": "read_only_review_no_runtime_attribution",
+      "instrumentation_targets": [
+        "Bridge step_monitored physical execution",
+        "per-MuJoCo-substep contact collection and deep copy",
+        "per-substep safety geometry calculation",
+        "separate grasp_state request",
+        "full-record JSON serialization and per-action flush/fsync",
+        "dual-camera JPEG encoding and write",
+        "OSC planning/tracking"
+      ],
+      "single_action_durable_jsonl_growth_observed_bytes": 2291163,
+      "single_action_growth_observation": "durable log grew from t404 to t405; one-action sample only, not a throughput estimate",
+      "code_modified_during_active_run": false
+    },
+    "recent_live_region_xy_distance_change": {
+      "from_timestep": 246,
+      "to_timestep": 264,
+      "from_distance_m": 0.18760267625806368,
+      "to_distance_m": 0.1707542952796465,
+      "improvement_m": 0.016848380978417177,
+      "actions_elapsed": 18,
+      "interpretation": "Measured native-region XY distance decreased on the active reverse-side branch; current phase is adaptive clearance and task_success remains false. This partial progress is not a completed placement."
+    }
+  },
+  "failure_categories": {
+    "counts": {
+      "none": 7,
+      "J": 3,
+      "A": 11,
+      "F": 4,
+      "I": 1,
+      "in_progress": 1,
+      "H": 1,
+      "D": 1,
+      "B": 1
+    },
+    "unresolved_task_count": 21,
+    "category_document": "docs/GS_OPD_FAILURE_CLASSIFICATION.md",
+    "matrix_field": "stage_a_failure_category"
+  },
+  "last_observed_at_asia_shanghai": "2026-10-30 13:33 Asia/Shanghai"
+}
