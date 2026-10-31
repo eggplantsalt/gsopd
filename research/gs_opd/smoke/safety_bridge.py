@@ -1062,7 +1062,10 @@ def _parse_tracking_gripper_closure(current_action):
     return parse_panda_gripper_closure(current_action)
 
 
-def _live_grasp_state(binding, expected_instruction):
+_LIVE_GRASP_VALIDATION_CACHE = {}
+
+
+def _live_grasp_state(binding, expected_instruction, *, contacts_snapshot=None):
     """Read current Panda finger contacts for a semantically bound task object."""
     sim = env.sim
     result = {
@@ -1076,7 +1079,6 @@ def _live_grasp_state(binding, expected_instruction):
     before = model_signature = cache_signature = None
     try:
         before = _mujoco_integration_state(sim)
-        model_signature = _planning_model_signature(sim.model._model)
         cache_signature = _planning_cache_signature(sim.data._data)
         if (
             not isinstance(expected_instruction, str)
@@ -1111,53 +1113,78 @@ def _live_grasp_state(binding, expected_instruction):
         ):
             raise ValueError("live_grasp_semantic_body_geom_binding_is_malformed")
 
-        registered = _planning_registered_objects(sim.model, env.env)
-        if body_id not in registered or registered[body_id]["body_name"] != body_name:
-            raise ValueError("live_grasp_body_is_not_a_registered_task_object")
-        subtree = _planning_body_subtree(model, body_id)
-        inventory = _geometry_inventory()
-        if inventory.get("status") != "complete":
-            raise ValueError("live_grasp_geometry_inventory_incomplete")
-        inventory_by_id = {
-            item["geom_id"]: item for item in inventory.get("geometries", [])
-        }
-        for geom_id, geom_name in zip(semantic_geom_ids, semantic_geom_names):
-            item = inventory_by_id.get(geom_id)
-            if (
-                item is None
-                or item.get("geom_name") != geom_name
-                or item.get("body_id") != body_id
-                or item.get("body_name") != body_name
-                or item.get("category") != "scene"
-            ):
-                raise ValueError("live_grasp_semantic_geom_conflicts_with_current_model")
+        cache_key = (
+            id(model), expected_instruction, object_id, body_id, body_name,
+            tuple(semantic_geom_ids), tuple(semantic_geom_names),
+        )
+        cached = _LIVE_GRASP_VALIDATION_CACHE.get(cache_key)
+        if cached is not None and cached["model"] is not model:
+            raise ValueError("live_grasp_cached_model_identity_changed")
+        if cached is None:
+            model_signature = _planning_model_signature(model)
+            registered = _planning_registered_objects(sim.model, env.env)
+            if body_id not in registered or registered[body_id]["body_name"] != body_name:
+                raise ValueError("live_grasp_body_is_not_a_registered_task_object")
+            subtree = _planning_body_subtree(model, body_id)
+            inventory = _geometry_inventory()
+            if inventory.get("status") != "complete":
+                raise ValueError("live_grasp_geometry_inventory_incomplete")
+            inventory_by_id = {
+                item["geom_id"]: item for item in inventory.get("geometries", [])
+            }
+            for geom_id, geom_name in zip(semantic_geom_ids, semantic_geom_names):
+                item = inventory_by_id.get(geom_id)
+                if (
+                    item is None
+                    or item.get("geom_name") != geom_name
+                    or item.get("body_id") != body_id
+                    or item.get("body_name") != body_name
+                    or item.get("category") != "scene"
+                ):
+                    raise ValueError("live_grasp_semantic_geom_conflicts_with_current_model")
 
-        explicit_pair_geoms = set()
-        for pair_index in range(int(model.npair)):
-            explicit_pair_geoms.add(int(model.pair_geom1[pair_index]))
-            explicit_pair_geoms.add(int(model.pair_geom2[pair_index]))
-        object_geom_ids = {
-            geom_id
-            for geom_id in range(int(model.ngeom))
-            if int(model.geom_bodyid[geom_id]) in subtree
-            and (
-                int(model.geom_contype[geom_id]) != 0
-                or int(model.geom_conaffinity[geom_id]) != 0
-                or geom_id in explicit_pair_geoms
-            )
-        }
-        if not object_geom_ids:
-            raise ValueError("live_grasp_object_collision_geometry_is_unavailable")
-        if any(
-            inventory_by_id.get(geom_id, {}).get("category") != "scene"
-            or inventory_by_id.get(geom_id, {}).get("body_id") not in subtree
-            for geom_id in object_geom_ids
-        ):
-            raise ValueError("live_grasp_collision_geom_classification_is_incomplete")
-        if len(env.robots) != 1:
-            raise ValueError("live_grasp_requires_one_active_Panda_robot")
-        gripper_groups, gripper_closure = _tracking_gripper_sides(env.robots[0])
-        contacts = _collect_contacts()
+            explicit_pair_geoms = set()
+            for pair_index in range(int(model.npair)):
+                explicit_pair_geoms.add(int(model.pair_geom1[pair_index]))
+                explicit_pair_geoms.add(int(model.pair_geom2[pair_index]))
+            object_geom_ids = {
+                geom_id
+                for geom_id in range(int(model.ngeom))
+                if int(model.geom_bodyid[geom_id]) in subtree
+                and (
+                    int(model.geom_contype[geom_id]) != 0
+                    or int(model.geom_conaffinity[geom_id]) != 0
+                    or geom_id in explicit_pair_geoms
+                )
+            }
+            if not object_geom_ids:
+                raise ValueError("live_grasp_object_collision_geometry_is_unavailable")
+            if any(
+                inventory_by_id.get(geom_id, {}).get("category") != "scene"
+                or inventory_by_id.get(geom_id, {}).get("body_id") not in subtree
+                for geom_id in object_geom_ids
+            ):
+                raise ValueError("live_grasp_collision_geom_classification_is_incomplete")
+            if len(env.robots) != 1:
+                raise ValueError("live_grasp_requires_one_active_Panda_robot")
+            gripper_groups, _ = _tracking_gripper_sides(env.robots[0])
+            cached = {
+                "model": model,
+                "model_signature": model_signature,
+                "subtree": subtree,
+                "object_geom_ids": object_geom_ids,
+                "gripper_groups": gripper_groups,
+            }
+            _LIVE_GRASP_VALIDATION_CACHE[cache_key] = cached
+        else:
+            model_signature = cached["model_signature"]
+            subtree = cached["subtree"]
+            object_geom_ids = cached["object_geom_ids"]
+            gripper_groups = cached["gripper_groups"]
+        gripper_closure = _parse_tracking_gripper_closure(
+            getattr(env.robots[0].gripper, "current_action", None)
+        )
+        contacts = contacts_snapshot if contacts_snapshot is not None else _collect_contacts()
         from research.gs_opd.repair.trajectory_bundle_acceptance import (
             classify_opposing_finger_contacts,
         )
@@ -1178,12 +1205,12 @@ def _live_grasp_state(binding, expected_instruction):
             and gripper_closed
         )
         after = _mujoco_integration_state(sim)
-        model_after = _planning_model_signature(sim.model._model)
         cache_after = _planning_cache_signature(sim.data._data)
         unchanged = bool(
             before.shape == after.shape
             and np.array_equal(before, after)
-            and model_signature == model_after
+            and cached["model"] is model
+            and model_signature == cached["model_signature"]
             and cache_signature == cache_after
         )
         if not unchanged:
@@ -1235,6 +1262,8 @@ def _live_grasp_state(binding, expected_instruction):
             else:
                 result["reason"] = "opposing_left_and_right_finger_contacts_not_both_present"
     except Exception as exc:
+        if "cache_key" in locals():
+            _LIVE_GRASP_VALIDATION_CACHE.pop(cache_key, None)
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["reason"] = result["error"]
         if before is not None:
@@ -7180,6 +7209,7 @@ try:
                     # Reset may hard-rebuild the compiled model; prior snapshots
                     # are no longer valid for the new simulation instance.
                     snapshots.clear()
+                    _LIVE_GRASP_VALIDATION_CACHE.clear()
                     env.reset()
                     obs = env.set_init_state(states[scene_args.init_state])
                     scene_metadata["model_geometry_sha256"] = _planning_model_signature(
@@ -7227,6 +7257,22 @@ try:
                     result["contacts"] = _collect_contacts()
                     result["start_contacts"] = start_contacts
                     result["safety_geometry"] = monitor["geometry_substeps"][-1] if monitor.get("geometry_substeps") else None
+                    if request.get("include_grasp_state") is True:
+                        try:
+                            result["grasp_state"] = _live_grasp_state(
+                                request.get("grasp_binding"),
+                                request.get("expected_instruction"),
+                                contacts_snapshot=result["contacts"],
+                            )
+                        except Exception as exc:
+                            result["grasp_state"] = {
+                                "operation": "grasp_state",
+                                "status": "unavailable",
+                                "grasp_confirmed": False,
+                                "physical_state_unchanged": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "reason": f"{type(exc).__name__}: {exc}",
+                            }
                 elif request["op"] == "preview_joint_trajectory_step":
                     result = _preview_joint_trajectory_step(request)
                 elif request["op"] == "joint_trajectory_step":
@@ -7763,6 +7809,62 @@ try:
                             "safety_certified": False,
                             "failure_reason": f"{type(exc).__name__}: {exc}",
                             "live_state_unchanged": None,
+                        }
+                elif request["op"] == "task_success_first_ik_preflight":
+                    current_state = None
+                    try:
+                        import hashlib
+                        from research.gs_opd.repair.mujoco_jointspace_planning import plan_current_scene
+
+                        expected_instruction = request.get("expected_instruction")
+                        if expected_instruction != task.language:
+                            raise ValueError("task_instruction_does_not_match_active_BDDL_task")
+                        expected_model = request.get("model_geometry_sha256")
+                        actual_model = _planning_model_signature(env.sim.model._model)
+                        if expected_model != actual_model:
+                            raise ValueError("compiled_model_geometry_signature_changed")
+                        current_state = _mujoco_integration_state(env.sim)
+                        current_state_hash = hashlib.sha256(current_state.tobytes()).hexdigest()
+                        if request.get("start_state_sha256") != current_state_hash:
+                            raise ValueError("active_state_changed_before_endpoint_ik_preflight")
+                        policy = _normalize_safety_geometry_policy(
+                            request.get("safety_geometry_policy")
+                        )
+                        result = plan_current_scene(
+                            env,
+                            request.get("goal_pose_world"),
+                            policy,
+                            start_state_sha256=current_state_hash,
+                            expected_instruction=expected_instruction,
+                            actual_instruction=task.language,
+                            ik_seed_qpos=request.get("ik_seed_qpos"),
+                            ik_selection_seed_qpos=request.get("ik_selection_seed_qpos"),
+                            goal_ik_only=True,
+                            ik_solver_max_nfev=int(request.get("ik_solver_max_nfev", 120)),
+                            jointspace_reference_start_qpos=request.get(
+                                "jointspace_reference_start_qpos"
+                            ),
+                            jointspace_reference_max_step_rad=float(
+                                request.get("jointspace_reference_max_step_rad", 0.10)
+                            ),
+                        )
+                        result["operation"] = "task_success_first_ik_preflight"
+                        result["start_state_sha256"] = current_state_hash
+                        result["model_geometry_sha256"] = actual_model
+                        result["diagnostic_only"] = True
+                    except Exception as exc:
+                        unchanged = (
+                            current_state is not None
+                            and np.array_equal(current_state, _mujoco_integration_state(env.sim))
+                        )
+                        result = {
+                            "operation": "task_success_first_ik_preflight",
+                            "status": "unavailable",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": bool(unchanged),
+                            "diagnostic_only": True,
+                            "physical_actions": 0,
+                            "safety_certified": False,
                         }
                 elif request["op"] == "screen_grasp_candidates":
                     try:

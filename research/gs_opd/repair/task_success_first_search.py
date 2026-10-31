@@ -175,8 +175,9 @@ def high_approach_route(
     target_pose_world: Iterable[float],
     *,
     elevation_m: float = 0.10,
+    lift_before_translate: bool = False,
 ) -> list[list[float]]:
-    """Create a generic high-then-descend OSC route for an IK-reachable pose."""
+    """Create a high-then-descend OSC route for an IK-reachable pose."""
     start = np.asarray(start_pose_world, dtype=np.float64)
     target = np.asarray(target_pose_world, dtype=np.float64)
     if (
@@ -193,9 +194,20 @@ def high_approach_route(
         if norm <= 1e-12:
             raise ValueError("high_approach_route_pose_has_zero_quaternion")
         pose[3:] /= norm
-    high = target.copy()
-    high[2] += float(elevation_m)
-    return [start.tolist(), high.tolist(), target.tolist()]
+    if not lift_before_translate:
+        high = target.copy()
+        high[2] += float(elevation_m)
+        return [start.tolist(), high.tolist(), target.tolist()]
+    # Clear tabletop clutter before translating. A direct diagonal from the
+    # robot's current pose to ``target + z`` can pass through bottles or a
+    # receptacle wall even when both endpoints are collision-free. Lift at
+    # the current XY, traverse at shared clearance, then descend at target XY.
+    clearance_z = max(float(start[2]), float(target[2])) + float(elevation_m)
+    start_high = start.copy()
+    start_high[2] = clearance_z
+    target_high = target.copy()
+    target_high[2] = clearance_z
+    return [start.tolist(), start_high.tolist(), target_high.tolist(), target.tolist()]
 
 
 def robot_contact_escape_direction(
@@ -203,6 +215,7 @@ def robot_contact_escape_direction(
 ) -> dict[str, Any] | None:
     """Estimate an outward direction from actual MuJoCo robot-scene contacts."""
     vectors: list[tuple[float, np.ndarray, str]] = []
+    contact_heights: list[float] = []
     for contact in contacts:
         if not isinstance(contact, dict):
             continue
@@ -234,6 +247,12 @@ def robot_contact_escape_direction(
         weight = max(1.0, force_norm) * (1.0 + min(distance, 0.02) * 10.0)
         blocker = str((geom1 if robot2 else geom2).get("name", "unknown_scene_geom"))
         vectors.append((weight, direction, blocker))
+        position = np.asarray(
+            contact.get("position_world_m", contact.get("position", [])),
+            dtype=np.float64,
+        )
+        if position.shape == (3,) and np.isfinite(position).all():
+            contact_heights.append(float(position[2]))
     if not vectors:
         return None
     resultant = sum((weight * direction for weight, direction, _ in vectors), np.zeros(3))
@@ -246,6 +265,10 @@ def robot_contact_escape_direction(
         "direction_world": direction.tolist(),
         "contact_count": len(vectors),
         "blocker_geom_names": sorted({name for _, _, name in vectors}),
+        "highest_contact_point_z_m": max(contact_heights) if contact_heights else None,
+        "contact_clearance_waypoint_z_m": (
+            max(contact_heights) + 0.12 if contact_heights else None
+        ),
         "source": "MuJoCo_robot_scene_contact_normals",
         "task_success_search_diagnostic_only": True,
     }

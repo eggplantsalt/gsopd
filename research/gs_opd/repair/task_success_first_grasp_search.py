@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 from research.gs_opd.repair.task_success_first_search import (
     MAX_DEMONSTRATION_HORIZON,
     SearchFailureMemory,
@@ -82,14 +82,34 @@ MAX_BRANCH_CONTROL_ACTIONS = 440
 MAX_PREFIX_CONTROL_ACTIONS = 320
 MAX_APPROACH_CONTROL_ACTIONS = 60
 MAX_CLOSE_CONTROL_ACTIONS = 18
+MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS = 8
+# A unilateral pad contact can occur well before the generated grasp pose is
+# reached.  Only use a pose-held close probe when that contact is already near
+# the nominal frame; otherwise finish the live object-relative surface approach.
+LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M = 0.010
+LIVE_UNILATERAL_APPROACH_CONTINUE_POSITION_M = 0.075
 MAX_LIVE_CONTACT_SETTLE_ACTIONS = 2
+MAX_LIVE_CLOSE_BILATERAL_CONTACT_LOSS_ACTIONS = 2
+LIVE_CONTACT_UNOPPOSED_NORMAL_DOT_THRESHOLD = 0.5
+NEAR_SURFACE_START_POSITION_M = 0.025
+NEAR_SURFACE_START_ROTATION_RAD = 0.08
+NEAR_PREGRASP_START_POSITION_M = 0.075
+NEAR_PREGRASP_START_ROTATION_RAD = 0.08
 LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S = 0.015
 LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S = 0.08
 LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES = 3
 LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M = 0.004
 LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD = 0.045
 MAX_LIFT_CONTROL_ACTIONS = 40
-MINIMUM_OBJECT_LIFT_M = 0.030
+LIVE_CONTACT_LIFT_CONTROL_ACTIONS = 120
+LIVE_CONTACT_LIFT_TRANSLATION_STEP_M = 0.002
+# Stage A needs a short physical lift to confirm that a grasp moves the target;
+# it does not need the former arbitrary 30 mm excursion.  Some valid thin
+# features (mug handles, pot rims) lose contact near that distance.  Stop the
+# lift as soon as this smaller displacement is reached while the live grasp
+# monitor still confirms bilateral contact, then let native-task transport
+# determine whether the grasp is useful.
+MINIMUM_OBJECT_LIFT_M = 0.022
 LIFT_COMMAND_M = 0.040
 
 # Stage A can search for native task success without computing exhaustive
@@ -173,13 +193,15 @@ def _box_half_extents(geometry: dict[str, Any]) -> np.ndarray:
 
 
 def generate_geometry_candidates(
-    context: dict[str, Any], *, maximum_candidates: int = MAX_GEOMETRY_CANDIDATES
+    context: dict[str, Any], *, maximum_candidates: int = MAX_GEOMETRY_CANDIDATES,
+    required_candidate_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Enumerate opposing-pad grasps on the active target's compiled geometry."""
     if isinstance(maximum_candidates, bool) or not 1 <= maximum_candidates <= MAX_OFFLINE_GEOMETRY_GENERATION:
         raise ValueError(
             f"maximum_candidates_must_be_in_1..{MAX_OFFLINE_GEOMETRY_GENERATION}"
         )
+    required_candidate_ids = set(required_candidate_ids or ())
     target_pose = _pose(
         context["target_root_pose_world"]["position_m"],
         context["target_root_pose_world"]["rotation"],
@@ -278,10 +300,20 @@ def generate_geometry_candidates(
                 "candidate_id": candidate["candidate_id"],
                 "duplicate_of": original,
             })
-            continue
-        seen_candidates[signature] = candidate["candidate_id"]
-        unique_candidates.append(candidate)
-        if len(unique_candidates) >= maximum_candidates:
+            if candidate["candidate_id"] not in required_candidate_ids:
+                continue
+            # Preserve an explicitly pinned active-scene geom ID even when a
+            # different compiled geom yields the same physical grasp transform.
+            candidate["duplicate_pose_alias_of"] = original
+        else:
+            seen_candidates[signature] = candidate["candidate_id"]
+        if (
+            len(unique_candidates) < maximum_candidates
+            or candidate["candidate_id"] in required_candidate_ids
+        ):
+            unique_candidates.append(candidate)
+        selected_ids = {str(row["candidate_id"]) for row in unique_candidates}
+        if len(unique_candidates) >= maximum_candidates and required_candidate_ids <= selected_ids:
             break
     candidates = unique_candidates
     return candidates, {
@@ -295,11 +327,82 @@ def generate_geometry_candidates(
         "duplicate_candidates_deduplicated": duplicate_candidates,
         "deduplicated_candidate_count": len(candidates),
         "maximum_candidate_budget": maximum_candidates,
+        "required_active_geometry_candidate_ids": sorted(required_candidate_ids),
         "jaw_pad_center_source": "active_runtime_MuJoCo_geom_xpos_relative_to_eef_site",
         "pad_separation_open_m": context["gripper_pad_separation_m"],
         "maximum_pad_separation_m": max_opening,
         "all_candidates_unique": True,
     }
+
+
+def _rank_by_endpoint_ik_joint_travel(
+    candidates: list[dict[str, Any]],
+    approach_rows: dict[str, dict[str, Any]],
+    start_arm_qpos: np.ndarray,
+    screen_pass_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prefer reachable grasp poses whose IK posture is close to the live arm.
+
+    A Cartesian-nearest pregrasp can require a large wrist/elbow winding from
+    the current posture. OSC then may stall at an intermediate pose even when
+    both endpoint IK checks pass. Rank within the existing screen evidence
+    tier by estimated joint travel; this only changes search order and does not
+    certify or gate a physical attempt.
+    """
+    start = np.asarray(start_arm_qpos, dtype=np.float64)
+    screen_pass_ids = set(screen_pass_ids or ())
+    if start.shape != (7,) or not np.isfinite(start).all():
+        return list(candidates), []
+    scored: list[tuple[tuple[float, int, float, float, str], dict[str, Any], dict[str, Any]]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id", ""))
+        reachability = approach_rows.get(candidate_id, {}).get("joint_reachability", {})
+        pregrasp = reachability.get("pregrasp", {})
+        grasp = reachability.get("grasp_open_gripper", {})
+        pre_q = np.asarray(pregrasp.get("qpos", []), dtype=np.float64)
+        grasp_q = np.asarray(grasp.get("qpos", []), dtype=np.float64)
+        endpoint_ik = bool(
+            pregrasp.get("reachable") is True
+            and grasp.get("reachable") is True
+            and pre_q.shape == grasp_q.shape == (7,)
+            and np.isfinite(pre_q).all()
+            and np.isfinite(grasp_q).all()
+        )
+        if endpoint_ik:
+            pregrasp_delta = pre_q - start
+            surface_delta = grasp_q - pre_q
+            pregrasp_travel = float(np.linalg.norm(pregrasp_delta))
+            surface_travel = float(np.linalg.norm(surface_delta))
+            maximum_joint_delta = float(np.max(np.abs(pregrasp_delta)))
+            score = pregrasp_travel + 0.5 * surface_travel
+        else:
+            pregrasp_travel = None
+            surface_travel = None
+            maximum_joint_delta = None
+            score = float("inf")
+        row = {
+            "candidate_id": candidate_id,
+            "endpoint_ik_verified": endpoint_ik,
+            "task_approach_screen_pass": candidate_id in screen_pass_ids,
+            "pregrasp_joint_travel_l2_rad": pregrasp_travel,
+            "grasp_surface_joint_travel_l2_rad": surface_travel,
+            "maximum_pregrasp_joint_delta_rad": maximum_joint_delta,
+            "joint_travel_score_rad": score if np.isfinite(score) else None,
+            "pregrasp_eef_distance_m": float(candidate.get("pregrasp_eef_distance_m") or 0.0),
+        }
+        diagnostics.append(row)
+        # Candidates without endpoint IK retain their prior relative order.
+        key = (
+            score,
+            0 if candidate_id in screen_pass_ids else 1,
+            maximum_joint_delta if maximum_joint_delta is not None else float("inf"),
+            float(candidate.get("pregrasp_eef_distance_m") or 0.0),
+            candidate_id,
+        )
+        scored.append((key, candidate, row))
+    scored.sort(key=lambda item: item[0])
+    return [item[1] for item in scored], [item[2] for item in scored]
 
 
 def _candidate_window(
@@ -417,6 +520,7 @@ def expand_task_approach_depth_candidates(
     eef_position_world: np.ndarray,
     target_collision_geometries: list[dict[str, Any]],
     screen_batch_limit: int = MAX_OFFLINE_GEOMETRY_SCREEN_BATCH,
+    depth_offset_fractions: tuple[float, ...] = (0.30, 0.60),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Shift candidate pad centers along the object-geom approach axis."""
     if isinstance(screen_batch_limit, bool) or not 1 <= screen_batch_limit <= MAX_OFFLINE_GEOMETRY_SCREEN_BATCH:
@@ -429,6 +533,16 @@ def expand_task_approach_depth_candidates(
         raise ValueError("task_approach_target_pose_must_be_finite_4x4")
     if eef_position.shape != (3,) or not np.isfinite(eef_position).all():
         raise ValueError("task_approach_eef_position_must_be_finite_xyz")
+    fractions = np.asarray(depth_offset_fractions, dtype=np.float64)
+    if (
+        fractions.ndim != 1
+        or len(fractions) == 0
+        or not np.isfinite(fractions).all()
+        or np.any(fractions <= 0.0)
+        or np.any(fractions > 1.5)
+        or len(set(float(item) for item in fractions)) != len(fractions)
+    ):
+        raise ValueError("task_approach_depth_offset_fractions_must_be_unique_in_(0,1.5]")
     base_ids = [str(candidate.get("candidate_id", "")) for candidate in candidates]
     if any(not candidate_id for candidate_id in base_ids) or len(set(base_ids)) != len(base_ids):
         raise ValueError("task_approach_base_candidate_ids_must_be_nonempty_and_unique")
@@ -462,8 +576,8 @@ def expand_task_approach_depth_candidates(
             raise ValueError("task_approach_target_geom_rotation_is_invalid")
         half_extent = float(half_extents[approach_axis])
         offset_magnitudes = [
-            min(0.30 * half_extent, 0.020),
-            min(0.60 * half_extent, 0.040),
+            min(float(fraction) * half_extent, 0.050)
+            for fraction in fractions
         ]
         offset_magnitudes = list(dict.fromkeys(value for value in offset_magnitudes if value > 1e-6))
         if not offset_magnitudes:
@@ -568,13 +682,19 @@ def generate_grasp_surface_offset_variants(
         raise ValueError("grasp_surface_offset_target_pose_must_be_finite_4x4")
     if eef_position.shape != (3,) or not np.isfinite(eef_position).all():
         raise ValueError("grasp_surface_offset_eef_position_must_be_finite_xyz")
+    axis_index = {"x": 0, "y": 1, "z": 2}[offset_object_axis]
+    object_up_in_world = target_pose[:3, :3][:, axis_index]
+    gravity_alignment = abs(float(np.dot(object_up_in_world, np.asarray([0.0, 0.0, 1.0]))))
+    maximum_offset_mm = 60.0 if gravity_alignment >= 0.80 else 20.0
     if (
         not offsets
         or not np.isfinite(offsets).all()
-        or any(abs(value) <= 1e-8 or abs(value) > 20.0 for value in offsets)
+        or any(abs(value) <= 1e-8 or abs(value) > maximum_offset_mm for value in offsets)
         or len(set(offsets)) != len(offsets)
     ):
-        raise ValueError("grasp_surface_offsets_must_be_unique_nonzero_values_within_20mm")
+        raise ValueError(
+            "grasp_surface_offsets_must_be_unique_nonzero_values_within_60mm_on_a_gravity_aligned_axis_or_20mm_elsewhere"
+        )
     variants = []
     for candidate in candidates:
         transform = np.asarray(candidate.get("object_to_eef"), dtype=np.float64)
@@ -593,7 +713,6 @@ def generate_grasp_surface_offset_variants(
         for offset_mm in offsets:
             tilted = dict(candidate)
             new_transform = transform.copy()
-            axis_index = {"x": 0, "y": 1, "z": 2}[offset_object_axis]
             delta = np.zeros(3, dtype=np.float64)
             delta[axis_index] = offset_mm / 1000.0
             new_transform[:3, 3] += delta
@@ -651,22 +770,26 @@ def generate_grasp_coupled_pose_grid_variants(
     rotation_axis: str,
     offsets_by_object_axis: dict[str, list[float]],
 ) -> list[dict[str, Any]]:
-    """Generate a bounded Cartesian grid of wrist rotations and object-frame shifts."""
+    """Generate a bounded grid of wrist rotations and/or object-frame shifts."""
     if not candidates:
         raise ValueError("coupled_grasp_perturbations_require_base_candidates")
     if not isinstance(offsets_by_object_axis, dict) or not offsets_by_object_axis:
         raise ValueError("coupled_grasp_perturbations_require_object_frame_offsets")
     if any(axis not in {"x", "y", "z"} for axis in offsets_by_object_axis):
         raise ValueError("coupled_grasp_offset_axes_must_be_x_y_or_z")
-    oriented = generate_grasp_tilt_variants(
-        candidates,
-        target_pose_world=target_pose_world,
-        eef_position_world=eef_position_world,
-        tilt_degrees=tilt_degrees,
-        rotation_axis=rotation_axis,
+    oriented = (
+        generate_grasp_tilt_variants(
+            candidates,
+            target_pose_world=target_pose_world,
+            eef_position_world=eef_position_world,
+            tilt_degrees=tilt_degrees,
+            rotation_axis=rotation_axis,
+        )
+        if tilt_degrees else [dict(candidate) for candidate in candidates]
     )
     for candidate in oriented:
         candidate["_coupled_base_candidate_id"] = str(candidate.get("source_candidate_id", ""))
+        candidate["_coupled_orientation_candidate_id"] = str(candidate.get("candidate_id", ""))
         candidate["_coupled_offsets_by_axis"] = {}
     coupled = oriented
     for axis in ("x", "y", "z"):
@@ -684,11 +807,7 @@ def generate_grasp_coupled_pose_grid_variants(
             offsets[axis] = float(variant["surface_contact_offset"]["offset_mm"])
             variant["_coupled_offsets_by_axis"] = offsets
     for variant in coupled:
-        orientation_candidate_id = next(
-            str(variant["candidate_id"]).split(f"__object_{axis}_", 1)[0]
-            for axis in ("x", "y", "z")
-            if f"__object_{axis}_" in str(variant["candidate_id"])
-        )
+        orientation_candidate_id = str(variant.pop("_coupled_orientation_candidate_id"))
         base_candidate_id = str(variant.pop("_coupled_base_candidate_id"))
         offsets = dict(variant.pop("_coupled_offsets_by_axis"))
         variant["source_candidate_id"] = base_candidate_id
@@ -699,7 +818,10 @@ def generate_grasp_coupled_pose_grid_variants(
         variant["coupled_pose_perturbation"] = {
             "base_candidate_id": base_candidate_id,
             "orientation_candidate_id": orientation_candidate_id,
-            "composition_order": "rotate_about_gripper_axis_then_translate_in_object_frame_axes",
+            "composition_order": (
+                "rotate_about_gripper_axis_then_translate_in_object_frame_axes"
+                if tilt_degrees else "translate_in_object_frame_axes"
+            ),
         }
     return coupled
 
@@ -1240,6 +1362,67 @@ def _runtime_eef_pose(snapshot_state: dict[str, Any]) -> np.ndarray:
     return _pose(robot.get("eef_pos"), rotation)
 
 
+def _target_pad_contact_normal_diagnostics(
+    contact_reply: dict[str, Any], target_body_id: int,
+) -> dict[str, Any]:
+    """Measure whether left/right live pad contacts face opposing object surfaces."""
+    contacts = contact_reply.get("contacts", [])
+    if not isinstance(contacts, list):
+        return {"status": "unavailable", "reason": "contact_list_is_unavailable"}
+    normals_by_side: dict[str, list[np.ndarray]] = {"left": [], "right": []}
+    for contact in contacts:
+        if not isinstance(contact, dict) or contact.get("normal_status") != "available":
+            continue
+        body1 = contact.get("body1", {})
+        body2 = contact.get("body2", {})
+        try:
+            body1_id, body2_id = int(body1.get("id", -1)), int(body2.get("id", -1))
+            normal = np.asarray(contact.get("normal_geom1_to_geom2"), dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if normal.shape != (3,) or not np.isfinite(normal).all():
+            continue
+        geom1 = str(contact.get("geom1", {}).get("name", ""))
+        geom2 = str(contact.get("geom2", {}).get("name", ""))
+        if body1_id == target_body_id and "finger1" in geom2:
+            side, object_to_finger = "left", normal
+        elif body2_id == target_body_id and "finger1" in geom1:
+            side, object_to_finger = "left", -normal
+        elif body1_id == target_body_id and "finger2" in geom2:
+            side, object_to_finger = "right", normal
+        elif body2_id == target_body_id and "finger2" in geom1:
+            side, object_to_finger = "right", -normal
+        else:
+            continue
+        magnitude = float(np.linalg.norm(object_to_finger))
+        if magnitude > 1e-12:
+            normals_by_side[side].append(object_to_finger / magnitude)
+
+    means: dict[str, np.ndarray] = {}
+    for side, values in normals_by_side.items():
+        if values:
+            mean = np.mean(np.stack(values), axis=0)
+            magnitude = float(np.linalg.norm(mean))
+            if magnitude > 1e-12:
+                means[side] = mean / magnitude
+    if len(means) != 2:
+        return {
+            "status": "unavailable",
+            "contact_counts_by_side": {side: len(values) for side, values in normals_by_side.items()},
+            "reason": "both_pad_contact_normals_not_available",
+        }
+    dot = float(np.clip(np.dot(means["left"], means["right"]), -1.0, 1.0))
+    return {
+        "status": "complete",
+        "contact_counts_by_side": {side: len(values) for side, values in normals_by_side.items()},
+        "left_object_to_finger_normal": means["left"].tolist(),
+        "right_object_to_finger_normal": means["right"].tolist(),
+        "left_right_normal_dot": dot,
+        "surfaces_are_opposed": dot <= -LIVE_CONTACT_UNOPPOSED_NORMAL_DOT_THRESHOLD,
+        "source": "live_MuJoCo_contact_frames_normalized_object_to_finger",
+    }
+
+
 def _object_relative_target_pose(
     snapshot_state: dict[str, Any],
     target_body_id: int,
@@ -1473,6 +1656,20 @@ def _build_bddl_grasp_screen_policy(
     from research.gs_opd.repair.automatic_recovery_runtime import _parse_bddl_entities
 
     _fixtures, _objects, forbidden_robot, forbidden_pairs, goal_targets = _parse_bddl_entities(bddl_text)
+    # BDDL can repeat an identical CheckContact constraint.  The predicates
+    # are idempotent, but the Safety Bridge correctly rejects duplicate body
+    # pairs in a compiled policy; canonicalize them here without changing the
+    # active task semantics.
+    unique_forbidden_pairs = []
+    seen_forbidden_pairs = set()
+    for object_a, object_b in forbidden_pairs:
+        canonical_pair = tuple(sorted((str(object_a), str(object_b))))
+        if canonical_pair in seen_forbidden_pairs:
+            continue
+        seen_forbidden_pairs.add(canonical_pair)
+        unique_forbidden_pairs.append((str(object_a), str(object_b)))
+    duplicate_constraint_count = len(forbidden_pairs) - len(unique_forbidden_pairs)
+    forbidden_pairs = unique_forbidden_pairs
     target_id = str(context["target_object_id"])
     if target_id not in goal_targets or not forbidden_robot:
         raise ValueError("active_BDDL_screen_policy_has_no_target_or_robot_contact_constraints")
@@ -1586,6 +1783,7 @@ def _build_bddl_grasp_screen_policy(
     semantics = {
         "forbidden_robot_contact_objects": sorted(forbidden_robot),
         "forbidden_object_contact_pairs": [list(pair) for pair in forbidden_pairs],
+        "duplicate_forbidden_contact_constraints_collapsed": duplicate_constraint_count,
         "goal_target_objects": sorted(goal_targets),
         "support_contacts_added_as_exceptions": False,
         "source_and_goal_support_semantics": "recorded from BDDL relations; no additional support exception is introduced by this candidate screen",
@@ -1611,26 +1809,35 @@ def _record_step(
     raise_on_done: bool = True,
     planning_tracking: dict[str, Any] | None = None,
 ) -> None:
+    if action_index >= MAX_BRANCH_CONTROL_ACTIONS:
+        raise RuntimeError("physical_branch_control_action_budget_exhausted_before_step")
     monitored_step_started = time.perf_counter()
     reply = bridge.request({
         "op": "step_monitored",
         "action": np.asarray(action, dtype=np.float32).tolist(),
         "action_index": int(action_index),
+        "include_grasp_state": True,
+        "grasp_binding": target_binding,
+        "expected_instruction": instruction,
         "safety_geometry_policy": (
             None if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else policy
         ),
     })
     monitored_step_wall_s = time.perf_counter() - monitored_step_started
-    grasp_started = time.perf_counter()
-    try:
-        grasp = bridge.request({
-            "op": "grasp_state",
-            "carried_binding": target_binding,
-            "expected_instruction": instruction,
-        })
-    except Exception as exc:
-        grasp = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
-    grasp_state_wall_s = time.perf_counter() - grasp_started
+    grasp_state_inline = isinstance(reply.get("grasp_state"), dict)
+    grasp_state_wall_s = 0.0
+    grasp = reply.get("grasp_state") if grasp_state_inline else None
+    if grasp is None:
+        grasp_started = time.perf_counter()
+        try:
+            grasp = bridge.request({
+                "op": "grasp_state",
+                "carried_binding": target_binding,
+                "expected_instruction": instruction,
+            })
+        except Exception as exc:
+            grasp = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
+        grasp_state_wall_s = time.perf_counter() - grasp_started
     sample = monitor.update(grasp, rollout_step=action_index)
     contact_monitoring = reply.get("contact_monitoring", {})
     contact_monitoring_complete = _contact_substep_monitoring_complete(
@@ -1649,6 +1856,9 @@ def _record_step(
         "state": reply.get("state", {}),
         "snapshot_state": snapshot_state,
         "target_body_id": int(target_binding["body_id"]),
+        "grasp_state_source": (
+            "inline_step_monitored" if grasp_state_inline else "separate_rpc_fallback"
+        ),
         "contacts": reply.get("contacts", {}),
         "start_contacts": reply.get("start_contacts", {}),
         "contact_monitoring": contact_monitoring,
@@ -1773,8 +1983,10 @@ def _advance_pose(
         [dict[str, Any]], tuple[np.ndarray, np.ndarray]
     ] | None = None,
     object_progress_target_world: np.ndarray | None = None,
+    object_progress_rotation_only: bool = False,
+    object_progress_horizontal_only: bool = False,
     gripper_action: float = 0.0,
-    absolute_action_limit: int | None = MAX_BRANCH_CONTROL_ACTIONS,
+    absolute_action_limit: int | None = None,
 ) -> bool:
     from research.gs_opd.repair.trajectory_tracking import (
         quaternion_conjugate,
@@ -1804,6 +2016,14 @@ def _advance_pose(
         or not -1.0 <= float(gripper_action) <= 1.0
     ):
         raise ValueError("pose_tracking_gripper_action_must_be_finite_and_in_minus1_to_1")
+    if not isinstance(object_progress_rotation_only, bool):
+        raise ValueError("pose_tracking_object_rotation_only_must_be_boolean")
+    if not isinstance(object_progress_horizontal_only, bool):
+        raise ValueError("pose_tracking_object_horizontal_only_must_be_boolean")
+    if absolute_action_limit is None:
+        absolute_action_limit = MAX_BRANCH_CONTROL_ACTIONS
+    if object_progress_rotation_only and object_progress_target_world is None:
+        raise ValueError("pose_tracking_rotation_only_requires_an_object_progress_target")
     progress_history: list[tuple[float, float]] = []
     object_progress_history: list[tuple[float, float]] = []
     object_progress_target = None
@@ -1824,6 +2044,8 @@ def _advance_pose(
         )
 
     for _ in range(maximum_steps):
+        if action_counter[0] >= absolute_action_limit:
+            raise RuntimeError("physical_branch_control_action_budget_exhausted_before_step")
         if stop_condition is not None and stop_condition():
             return False
         observed = bridge.request({"op": "observe", "include_snapshot_state": True})
@@ -1858,15 +2080,22 @@ def _advance_pose(
                 observed.get("snapshot_state", {}), int(target_binding["body_id"]),
             )
             live_object_world = _runtime_object_pose(live_object)
-            object_position_error = float(np.linalg.norm(
-                object_progress_target[:3, 3] - live_object_world[:3, 3]
-            ))
+            position_delta = (
+                object_progress_target[:2, 3] - live_object_world[:2, 3]
+                if object_progress_horizontal_only
+                else object_progress_target[:3, 3] - live_object_world[:3, 3]
+            )
+            object_position_error = float(np.linalg.norm(position_delta))
             object_rotation_error = float(np.linalg.norm(Rotation.from_matrix(
                 object_progress_target[:3, :3] @ live_object_world[:3, :3].T
             ).as_rotvec()))
-            if _pose_tracking_error_within_tolerance(
-                object_position_error, object_rotation_error,
-                position_tolerance_m, rotation_tolerance_rad,
+            if (
+                object_rotation_error <= rotation_tolerance_rad
+                if object_progress_rotation_only
+                else _pose_tracking_error_within_tolerance(
+                    object_position_error, object_rotation_error,
+                    position_tolerance_m, rotation_tolerance_rad,
+                )
             ):
                 return True
         elif object_progress_target is None and _pose_tracking_error_within_tolerance(
@@ -1884,7 +2113,10 @@ def _advance_pose(
             progress_history = progress_history[-(stagnation_window_actions + 1):]
             if object_progress_target is not None:
                 if bilateral_for_tracking:
-                    object_progress_history.append((object_position_error, object_rotation_error))
+                    object_progress_history.append((
+                        0.0 if object_progress_rotation_only else object_position_error,
+                        object_rotation_error,
+                    ))
                     object_progress_history = object_progress_history[-(stagnation_window_actions + 1):]
                     object_progress_window = object_progress_history
                 else:
@@ -1894,6 +2126,7 @@ def _advance_pose(
                 object_progress_history=object_progress_window,
                 object_minimum_position_progress_m=0.002,
                 object_minimum_rotation_progress_rad=0.02,
+                rotation_only=object_progress_rotation_only,
             ):
                 raise RuntimeError(
                     f"{phase}_waypoint_stagnated_for_{stagnation_window_actions}_actions"
@@ -1971,6 +2204,7 @@ def _pose_tracking_window_stagnated(
     object_progress_history: list[tuple[float, float]] | None = None,
     object_minimum_position_progress_m: float | None = None,
     object_minimum_rotation_progress_rad: float | None = None,
+    rotation_only: bool = False,
 ) -> bool:
     """Detect blocked tracking from EEF error and held-object progress when available."""
     object_position_threshold = (
@@ -1987,6 +2221,8 @@ def _pose_tracking_window_stagnated(
         object_position_threshold, object_rotation_threshold,
     ) <= 0.0:
         raise ValueError("object_pose_tracking_progress_thresholds_must_be_positive_and_finite")
+    if not isinstance(rotation_only, bool):
+        raise ValueError("object_pose_tracking_rotation_only_must_be_boolean")
 
     def stagnant(
         rows: list[tuple[float, float]],
@@ -1999,19 +2235,34 @@ def _pose_tracking_window_stagnated(
         window = rows[-(window_actions + 1):]
         position_progress = max(0.0, window[0][0] - min(row[0] for row in window[1:]))
         rotation_progress = max(0.0, window[0][1] - min(row[1] for row in window[1:]))
+        position_stalled = position_progress < position_threshold_m
+        rotation_stalled = rotation_progress < rotation_threshold_rad
         return bool(
-            position_progress < position_threshold_m
-            and rotation_progress < rotation_threshold_rad
+            (position_stalled and rotation_stalled)
+            # A component that remains far outside tolerance must make its own
+            # progress. Otherwise, improvement in the other component can hide
+            # a blocked or diverging OSC axis for an entire long waypoint.
+            or (position_stalled and min(row[0] for row in window[1:]) > 0.020)
+            or (rotation_stalled and min(row[1] for row in window[1:]) > 0.12)
         )
 
-    if not stagnant(
-        history,
-        position_threshold_m=minimum_position_progress_m,
-        rotation_threshold_rad=minimum_rotation_progress_rad,
-    ):
-        return False
     if object_progress_history is None:
-        return True
+        return stagnant(
+            history,
+            position_threshold_m=minimum_position_progress_m,
+            rotation_threshold_rad=minimum_rotation_progress_rad,
+        )
+    if rotation_only:
+        if len(object_progress_history) < window_actions + 1:
+            return False
+        window = object_progress_history[-(window_actions + 1):]
+        rotation_progress = max(0.0, window[0][1] - min(row[1] for row in window[1:]))
+        return bool(
+            rotation_progress < object_rotation_threshold
+            and min(row[1] for row in window[1:]) > 0.12
+        )
+    # During a confirmed grasp, object motion is the meaningful progress
+    # signal; EEF error can remain large while the object is still moving.
     return stagnant(
         object_progress_history,
         position_threshold_m=object_position_threshold,
@@ -2072,8 +2323,17 @@ def _run_physical_branch(
     records: list[dict[str, Any]],
     frames: list[dict[str, Any]],
     output_dir: Path,
+    local_replan_rrt_time_budget_s: float = 2.0,
     abort_target_displacement_m: float | None = None,
+    force_route_before_contact_close: bool = False,
+    stage_a_unilateral_close_probe_position_m: float = LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M,
+    stage_a_pregrasp_staged_clearance_height_m: float = 0.0,
+    stage_a_pregrasp_lateral_detour_m: float = 0.0,
+    stage_a_pregrasp_lift_before_lateral_detour: bool = False,
 ) -> tuple[dict[str, Any], bytes | None]:
+    from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
+
+    _advance_pose.controller_fields = controller_fields
     candidate_id = candidate["candidate_id"]
     _restore_initial(bridge, initial_payload, initial_state, model_sha)
     start_export = bridge.request({"op": "export_runtime_snapshot"})
@@ -2093,6 +2353,99 @@ def _run_physical_branch(
         "safety_certified": False,
         "action_budget": MAX_BRANCH_CONTROL_ACTIONS,
     }
+    branch_record_start = len(records)
+
+    def unintended_robot_contacts(record: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return physical robot contacts with scene objects other than the grasp target/table."""
+        contacts = record.get("contacts", {}).get("contacts", [])
+        if not isinstance(contacts, list):
+            return []
+        result = []
+        target_body_id = int(target_binding["body_id"])
+        for contact in contacts:
+            geom1 = contact.get("geom1", {})
+            geom2 = contact.get("geom2", {})
+            body1 = contact.get("body1", {})
+            body2 = contact.get("body2", {})
+            name1 = str(geom1.get("name", ""))
+            name2 = str(geom2.get("name", ""))
+            robot1 = name1.startswith(("robot0_", "gripper0_"))
+            robot2 = name2.startswith(("robot0_", "gripper0_"))
+            if robot1 == robot2:
+                continue
+            other_body = body2 if robot1 else body1
+            if int(other_body.get("id", -1)) == target_body_id:
+                continue
+            if str(other_body.get("name", "")).lower() in {"table", "table_main"}:
+                continue
+            result.append({
+                "robot_geom": name1 if robot1 else name2,
+                "obstacle_geom": name2 if robot1 else name1,
+                "obstacle_body_id": int(other_body.get("id", -1)),
+                "obstacle_body_name": str(other_body.get("name", "")),
+                "contact_position_world_m": contact.get("position"),
+                "signed_contact_distance_m": contact.get("signed_contact_distance_m"),
+            })
+        return result
+
+    def record_robot_obstacle_contact() -> bool:
+        """Record incidental Stage A contact without treating it as a stop condition.
+
+        Task-success search permits safety violations.  The MuJoCo contact is
+        retained in the per-action audit and the first event is archived for
+        diagnosis, while OSC continues until the requested pose, target contact,
+        or its normal physical stagnation/action limit decides feasibility.
+        """
+        if len(records) <= branch_record_start:
+            return False
+        hits = unintended_robot_contacts(records[-1])
+        if not hits:
+            return False
+        branch.setdefault("first_robot_obstacle_contact", {
+            "timestep": records[-1].get("timestep"),
+            "physical_action_index": action_counter[0] - 1,
+            "contacts": hits,
+            "source": "per_action_MuJoCo_contacts",
+            "stage_a_policy": "record_and_continue_until_target_contact_or_physical_tracking_failure",
+            "action_taken_before_contact_detection": True,
+        })
+        return False
+
+    def checkpoint_runtime_snapshot(
+        checkpoint_name: str,
+        observed_state: dict[str, Any],
+    ) -> None:
+        """Save an exact live checkpoint at expensive grasp-phase boundaries."""
+        exported = bridge.request({"op": "export_runtime_snapshot"})
+        observed_vector = _snapshot_state_vector(observed_state)
+        exported_vector = _snapshot_state_vector(exported.get("snapshot_state", {}))
+        checkpoint: dict[str, Any] = {
+            "name": checkpoint_name,
+            "export_status": exported.get("status"),
+            "model_geometry_sha256": exported.get("model_geometry_sha256"),
+            "integration_state_matches_observation": bool(
+                observed_vector.shape == exported_vector.shape
+                and np.array_equal(observed_vector, exported_vector)
+            ),
+        }
+        if (
+            exported.get("status") == "complete"
+            and isinstance(exported.get("payload"), bytes)
+            and exported.get("model_geometry_sha256") == model_sha
+            and checkpoint["integration_state_matches_observation"]
+        ):
+            path = output_dir / f"{candidate_id}__{checkpoint_name}_runtime_snapshot.pkl"
+            path.write_bytes(exported["payload"])
+            checkpoint.update({
+                "status": "saved_exact_runtime_snapshot",
+                "path": str(path),
+                "sha256": _sha256_bytes(exported["payload"]),
+                "timestep": float(observed_vector[0]),
+            })
+        else:
+            checkpoint["status"] = "snapshot_export_or_identity_check_failed"
+        branch.setdefault("runtime_snapshot_checkpoints", []).append(checkpoint)
+
     action_counter = [0]
     monitor = monitor_type(required_samples=3)
     initial_grasp_state = bridge.request({
@@ -2100,9 +2453,89 @@ def _run_physical_branch(
             "carried_binding": target_binding,
             "expected_instruction": context["instruction"],
         })
+    initial_live_target_contact_sides = target_finger_contact_sides(initial_grasp_state)
     monitor.update(initial_grasp_state, rollout_step=-1)
     initial_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
     initial_runtime_state = initial_observation.get("snapshot_state", {})
+    # Geometry screening assumes the jaws can open to their model limits, but
+    # the live Panda often starts halfway open. A 39 mm live aperture cannot
+    # admit a 42 mm target even when the scratch candidate is reachable. Open
+    # with real controller actions before approaching; retain a verified grasp.
+    gripper_ranges = np.asarray(context.get("gripper_joint_ranges", []), dtype=np.float64)
+    initial_gripper_qpos = np.asarray(
+        initial_runtime_state.get("robot_states", [{}])[0].get("gripper_qpos", []),
+        dtype=np.float64,
+    )
+    if (
+        gripper_ranges.shape != (2, 2)
+        or initial_gripper_qpos.shape != (2,)
+        or not np.isfinite(gripper_ranges).all()
+        or not np.isfinite(initial_gripper_qpos).all()
+    ):
+        raise RuntimeError("pregrasp_live_gripper_joint_limits_or_qpos_unavailable")
+    open_gripper_qpos_target = np.asarray(
+        [gripper_ranges[0, 1], gripper_ranges[1, 0]], dtype=np.float64
+    )
+    pregrasp_open_actions = 0
+    pregrasp_open_qpos_tolerance_m = 0.0005
+    pregrasp_open_qpos_start = initial_gripper_qpos.copy()
+    if (
+        initial_grasp_state.get("grasp_confirmed") is not True
+        and not initial_live_target_contact_sides
+    ):
+        while (
+            pregrasp_open_actions < 16
+            and float(np.max(np.abs(open_gripper_qpos_target - initial_gripper_qpos)))
+            > pregrasp_open_qpos_tolerance_m
+        ):
+            _record_step(
+                bridge,
+                np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32),
+                "task_success_first_pregrasp_open_gripper",
+                candidate_id,
+                action_counter[0],
+                target_binding,
+                context["instruction"],
+                policy,
+                monitor,
+                records,
+                frames,
+            )
+            action_counter[0] += 1
+            pregrasp_open_actions += 1
+            initial_runtime_state = records[-1]["snapshot_state"]
+            initial_gripper_qpos = np.asarray(
+                initial_runtime_state.get("robot_states", [{}])[0].get("gripper_qpos", []),
+                dtype=np.float64,
+            )
+            if initial_gripper_qpos.shape != (2,) or not np.isfinite(initial_gripper_qpos).all():
+                raise RuntimeError("pregrasp_live_gripper_qpos_became_unavailable")
+        if pregrasp_open_actions:
+            initial_grasp_state = records[-1].get("grasp_state", {})
+    branch["pregrasp_gripper_opening"] = {
+        "status": (
+            "already_verified_grasp_preserved"
+            if initial_grasp_state.get("grasp_confirmed") is True
+            else (
+                "opening_deferred_to_preserve_measured_target_finger_contact"
+                if initial_live_target_contact_sides else (
+                    "opened_to_model_joint_limits"
+                    if float(np.max(np.abs(open_gripper_qpos_target - initial_gripper_qpos)))
+                    <= pregrasp_open_qpos_tolerance_m
+                    else "open_action_budget_exhausted_before_joint_limits"
+                )
+            )
+        ),
+        "measured_target_contact_sides_at_branch_start": list(initial_live_target_contact_sides),
+        "opening_skipped_to_preserve_live_contact": bool(initial_live_target_contact_sides),
+        "actions": pregrasp_open_actions,
+        "gripper_qpos_start_m": pregrasp_open_qpos_start.tolist(),
+        "gripper_qpos_target_m": open_gripper_qpos_target.tolist(),
+        "gripper_qpos_end_m": initial_gripper_qpos.tolist(),
+        "joint_limit_tolerance_m": pregrasp_open_qpos_tolerance_m,
+        "model_maximum_pad_separation_m": context.get("maximum_pad_separation_m"),
+        "state_was_changed_only_by_recorded_physical_OSC_actions": True,
+    }
     initial_object = _object_state(
         initial_runtime_state, int(context["target_binding"]["root_body_id"])
     )
@@ -2111,14 +2544,150 @@ def _run_physical_branch(
         @ np.asarray(candidate["object_to_eef"], dtype=np.float64)
     )
     initial_eef_world = _runtime_eef_pose(initial_runtime_state)
+    close_hold_eef_world = initial_eef_world.copy()
+    close_probe_start_runtime_state = initial_runtime_state
     initial_pose_aligned, initial_grasp_distance_m, initial_grasp_rotation_error_rad = (
         _live_contact_pose_is_close_to_candidate(
             initial_eef_world, initial_grasp_world,
         )
     )
     initial_contact_sides = target_finger_contact_sides(initial_grasp_state)
-    close_from_live_contact = bool(initial_contact_sides and initial_pose_aligned)
+    live_bilateral_target_contact = len(initial_contact_sides) == 2
+    live_unilateral_target_contact = len(initial_contact_sides) == 1
+    contact_free_candidate_pose_close_probe = bool(
+        not initial_contact_sides
+        and initial_grasp_state.get("grasp_confirmed") is not True
+        and initial_grasp_distance_m <= 0.010
+        and initial_grasp_rotation_error_rad <= 0.08
+    )
+    if contact_free_candidate_pose_close_probe:
+        # No contact must be preserved, so finish the last few millimeters to
+        # the geometry-derived pad-center pose while the real gripper closes.
+        close_hold_eef_world = initial_grasp_world.copy()
+    initial_pad_contact_normal_diagnostics: dict[str, Any] = {
+        "status": "not_applicable_without_bilateral_target_contact"
+    }
+    bilateral_contact_surfaces_admissible = False
+    if live_bilateral_target_contact:
+        live_contacts = bridge.request({"op": "inspect_contacts"})
+        initial_pad_contact_normal_diagnostics = _target_pad_contact_normal_diagnostics(
+            live_contacts, int(target_binding["body_id"]),
+        )
+        # Missing normals remain eligible for a bounded physical probe. A
+        # complete pair of same-facing surfaces, however, is a top/edge brush
+        # rather than opposing jaw contact and should not trigger a costly
+        # close-plus-lift sequence.
+        bilateral_contact_surfaces_admissible = bool(
+            initial_pad_contact_normal_diagnostics.get("status") != "complete"
+            or initial_pad_contact_normal_diagnostics.get("surfaces_are_opposed") is True
+        )
+    candidate_orientation_aligned = bool(
+        initial_grasp_rotation_error_rad <= LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD
+    )
+    unilateral_close_probe_position_match = bool(
+        live_unilateral_target_contact
+        # A contact alone is insufficient: the other pad may still be outside
+        # the object, as happens when a downward approach first touches a can's
+        # upper rim.  Keep the pose-held close probe local to the grasp frame.
+        # Once the active target finger itself is in MuJoCo contact, however,
+        # the candidate's nominal orientation is only a prior: the physical
+        # close probe holds the measured EEF pose and the live stability
+        # monitor decides whether this contact is actually graspable.
+        and initial_grasp_distance_m <= stage_a_unilateral_close_probe_position_m
+    )
+    unilateral_surface_approach_start = bool(
+        live_unilateral_target_contact
+        and stage_a_unilateral_close_probe_position_m < initial_grasp_distance_m
+        <= LIVE_UNILATERAL_APPROACH_CONTINUE_POSITION_M
+        and initial_grasp_rotation_error_rad <= NEAR_SURFACE_START_ROTATION_RAD
+    )
+    # Real bilateral pad contacts provide stronger evidence than matching the
+    # nominal candidate pose. A physically obstructed surface approach can
+    # stop short of that pose while both pads already clamp opposite sides.
+    # A closed, bilateral-contact Snapshot is stronger still: slight object
+    # rotation during closure must not route it back through repeated close
+    # pulses, which can push the object out of the gripper.
+    preclosed_bilateral_contact = bool(
+        live_bilateral_target_contact
+        and initial_grasp_state.get("gripper_closed") is True
+    )
+    close_from_live_contact_evidence = bool(
+        preclosed_bilateral_contact
+        # A measured contact from each active target-finger pad is direct
+        # physical evidence that the gripper is already at the object.  The
+        # nominal generated grasp frame can differ substantially when a
+        # fixture or earlier contact deflects the EEF, so do not route away
+        # from an otherwise useful bilateral-contact Snapshot merely because
+        # that stale frame is misaligned.  Closure remains a bounded real
+        # MuJoCo probe and must still pass the live grasp stability monitor.
+        or (live_bilateral_target_contact and bilateral_contact_surfaces_admissible)
+        or unilateral_close_probe_position_match
+        or contact_free_candidate_pose_close_probe
+    )
+    close_from_live_contact = bool(
+        close_from_live_contact_evidence and not force_route_before_contact_close
+    )
+    skip_pregrasp_route = bool(
+        close_from_live_contact or unilateral_surface_approach_start
+    )
     branch["initial_target_finger_contact_sides"] = list(initial_contact_sides)
+    branch["live_bilateral_target_contact_observed"] = live_bilateral_target_contact
+    branch["initial_pad_contact_normal_diagnostics"] = initial_pad_contact_normal_diagnostics
+    branch["live_bilateral_target_contact_surfaces_admissible"] = bilateral_contact_surfaces_admissible
+    branch["contact_free_candidate_pose_close_probe"] = {
+        "admitted": contact_free_candidate_pose_close_probe,
+        "position_error_m": initial_grasp_distance_m,
+        "position_limit_m": 0.010,
+        "rotation_error_rad": initial_grasp_rotation_error_rad,
+        "rotation_limit_rad": 0.08,
+        "physical_success_still_requires_opposing_contacts_and_lift": True,
+    }
+    branch["live_unilateral_target_contact_observed"] = live_unilateral_target_contact
+    branch["live_unilateral_close_probe_position_match"] = unilateral_close_probe_position_match
+    branch["live_unilateral_close_probe_action_limit"] = (
+        MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS
+        if unilateral_close_probe_position_match else 0
+    )
+    branch["live_unilateral_surface_approach_continuation"] = {
+        "enabled": unilateral_surface_approach_start,
+        "position_error_to_candidate_grasp_m": initial_grasp_distance_m,
+        "position_limit_m": LIVE_UNILATERAL_APPROACH_CONTINUE_POSITION_M,
+        "rotation_error_rad": initial_grasp_rotation_error_rad,
+        "reason": (
+            "single_pad_contact_is_above_or_offset_from_generated_grasp_frame"
+            if unilateral_surface_approach_start else None
+        ),
+    }
+    branch["live_unilateral_close_probe_position_threshold_m"] = (
+        stage_a_unilateral_close_probe_position_m
+    )
+    branch["preclosed_bilateral_contact_snapshot"] = preclosed_bilateral_contact
+    branch["initial_gripper_closed"] = bool(
+        initial_grasp_state.get("gripper_closed") is True
+    )
+    branch["live_contact_close_candidate_orientation_aligned"] = candidate_orientation_aligned
+    branch["live_contact_close_position_match_required"] = not (
+        preclosed_bilateral_contact
+        or (live_bilateral_target_contact and bilateral_contact_surfaces_admissible)
+        or unilateral_close_probe_position_match
+        or contact_free_candidate_pose_close_probe
+    )
+    branch["live_contact_close_basis"] = (
+        "verified_preclosed_bilateral_target_pad_contacts_on_runtime_snapshot"
+        if preclosed_bilateral_contact else (
+            "verified_bilateral_target_pad_contacts_without_nominal_pose_gate"
+            if live_bilateral_target_contact and close_from_live_contact else (
+                "verified_unilateral_target_contact_and_near_candidate_pose"
+                if unilateral_close_probe_position_match else (
+                    "contact_free_live_EEF_near_candidate_grasp_pose"
+                    if contact_free_candidate_pose_close_probe else "candidate_pose_alignment"
+                )
+            )
+        )
+    )
+    branch["live_unilateral_close_probe_candidate_rotation_error_ignored"] = bool(
+        unilateral_close_probe_position_match
+    )
     branch["initial_eef_to_migrated_grasp_pose_m"] = initial_grasp_distance_m
     branch["initial_eef_to_migrated_grasp_rotation_error_rad"] = initial_grasp_rotation_error_rad
     branch["live_contact_close_pose_aligned_with_candidate"] = initial_pose_aligned
@@ -2126,20 +2695,46 @@ def _run_physical_branch(
         "position_error_max_m": LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
         "rotation_error_max_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
     }
-    branch["pregrasp_route_skipped_due_to_live_target_contact"] = close_from_live_contact
+    branch["pregrasp_route_skipped_due_to_live_target_contact"] = skip_pregrasp_route
+    branch["live_contact_close_deferred_until_selected_route_end"] = bool(
+        force_route_before_contact_close and close_from_live_contact_evidence
+    )
     if close_from_live_contact:
+        if live_bilateral_target_contact and not preclosed_bilateral_contact:
+            # Do not commit an unverified sidewall slide while the open pads
+            # already make real bilateral target contact. A scratch route can
+            # be blocked by the same object that produced those contacts, and
+            # the old 20 mm normal-guided slide could erase the only useful
+            # state before testing closure. First spend the bounded, pose-held
+            # physical close probe; if it cannot stabilize a grasp, its exact
+            # Runtime Snapshot remains available for a later side-entry branch.
+            branch["live_contact_sidewall_reposition"] = {
+                "status": "deferred_until_after_bounded_live_contact_close_probe",
+                "reason": "preserve_measured_bilateral_contact_before_testing_grasp_closure",
+                "normal_diagnostics": initial_pad_contact_normal_diagnostics,
+            }
         if len(initial_contact_sides) == 2:
             settle_actions = 0
             settled_samples = 0
             maximum_linear_speed = 0.0
             maximum_angular_speed = 0.0
+            # If both pads touch but the gripper is still open, a zero action
+            # leaves the object unsupported and can erase the only useful
+            # contact state before the close probe. Close immediately; only
+            # an already-closed bilateral grasp can safely spend actions on
+            # velocity settling.
+            settle_action_limit = (
+                MAX_LIVE_CONTACT_SETTLE_ACTIONS
+                if preclosed_bilateral_contact and initial_pose_aligned
+                else 0
+            )
             settle_start_object = _object_state(
                 initial_runtime_state, int(target_binding["body_id"])
             )
             settle_start_position = np.asarray(
                 settle_start_object.get("root_pos"), dtype=np.float64
             )
-            while settle_actions < MAX_LIVE_CONTACT_SETTLE_ACTIONS:
+            while settle_actions < settle_action_limit:
                 object_state = _object_state(
                     initial_runtime_state, int(target_binding["body_id"])
                 ) if settle_actions == 0 else _object_state(
@@ -2195,9 +2790,17 @@ def _run_physical_branch(
             branch["live_contact_settle"] = {
                 "actions": settle_actions,
                 "status": (
-                    "settled_with_bilateral_contact"
-                    if settled_samples >= LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES
-                    else "action_budget_exhausted_bilateral_contact_preserved"
+                    "skipped_to_preserve_bilateral_contact_before_close_probe"
+                    if settle_action_limit == 0
+                    else (
+                        "settled_with_bilateral_contact"
+                        if settled_samples >= LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES
+                        else "action_budget_exhausted_bilateral_contact_preserved"
+                    )
+                ),
+                "skip_reason": (
+                    "live_bilateral_pad_contact_is_outside_nominal_candidate_position_tolerance"
+                    if settle_action_limit == 0 else None
                 ),
                 "required_consecutive_low_velocity_samples": LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES,
                 "linear_speed_threshold_m_s": LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S,
@@ -2216,16 +2819,82 @@ def _run_physical_branch(
                 "actions": 0,
                 "status": "skipped_without_bilateral_target_contact",
             }
-        branch["live_contact_close_probe_action_budget"] = MAX_CLOSE_CONTROL_ACTIONS
+        live_close_action_limit = (
+            MAX_CLOSE_CONTROL_ACTIONS if live_bilateral_target_contact
+            else (
+                MAX_CLOSE_CONTROL_ACTIONS
+                if contact_free_candidate_pose_close_probe
+                else MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS
+            )
+        )
+        branch["live_contact_close_probe_action_budget"] = live_close_action_limit
+        branch["live_contact_close_probe_kind"] = (
+            "bilateral_contact_close"
+            if live_bilateral_target_contact else (
+                "contact_free_candidate_pose_close"
+                if contact_free_candidate_pose_close_probe
+                else "bounded_unilateral_contact_close"
+            )
+        )
+        branch["live_contact_close_pose_hold_target_world"] = np.r_[
+            close_hold_eef_world[:3, 3],
+            _wxyz(close_hold_eef_world[:3, :3]),
+        ].tolist()
+        branch["live_contact_close_pose_hold_controller"] = (
+            "feedback_OSC_tracks_the_contact_snapshot_EEF_pose_on_every_close_action"
+        )
         live_close_actions = 0
-        while live_close_actions < MAX_CLOSE_CONTROL_ACTIONS and not monitor.stable:
+        bilateral_contact_loss_actions = 0
+        closure_stable_samples = 0
+        closure_position_tolerance_m = 0.0002
+        prior_gripper_qpos = np.asarray(
+            initial_runtime_state.get("robot_states", [{}])[0].get("gripper_qpos", []),
+            dtype=np.float64,
+        )
+        maximum_gripper_qpos_step_m = 0.0
+        branch["live_contact_close_probe_contact_sides"] = []
+        branch["live_contact_physical_closure_settle"] = {
+            "required_consecutive_stable_samples": 2,
+            "maximum_per_joint_qpos_change_m": closure_position_tolerance_m,
+            "gripper_qpos_start_m": prior_gripper_qpos.tolist(),
+            "cartesian_motion_during_physical_settle": "zero_OSC_delta",
+            "verification_basis": "measured_runtime_gripper_joint_qpos_and_live_bilateral_target_pad_contacts",
+        }
+        while (
+            not preclosed_bilateral_contact
+            and live_close_actions < live_close_action_limit
+            and (not monitor.stable or closure_stable_samples < 2)
+        ):
+            live_runtime_state = (
+                close_probe_start_runtime_state
+                if live_close_actions == 0
+                else records[-1]["snapshot_state"]
+            )
+            if monitor.stable:
+                # The stability monitor verifies real opposing contacts and a
+                # fully issued close command, but actuator qpos can still be
+                # moving several millimeters per control step. Hold the live
+                # OSC target exactly in place while MuJoCo finishes the
+                # physical squeeze; do not begin lifting on command state.
+                close_action = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                live_eef_world = _runtime_eef_pose(live_runtime_state)
+                close_action = world_pose_tracking_action(
+                    live_eef_world[:3, 3], _wxyz(live_eef_world[:3, :3]),
+                    close_hold_eef_world[:3, 3], _wxyz(close_hold_eef_world[:3, :3]),
+                    controller_fields,
+                    gripper_action=1.0,
+                )
             _record_step(
                 bridge,
-                np.asarray([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+                close_action,
                 (
                     "task_success_first_live_bilateral_contact_close_probe"
-                    if len(initial_contact_sides) == 2
-                    else "task_success_first_live_unilateral_contact_close_probe"
+                    if len(initial_contact_sides) == 2 else (
+                        "task_success_first_contact_free_candidate_pose_close_probe"
+                        if contact_free_candidate_pose_close_probe
+                        else "task_success_first_live_unilateral_contact_close_probe"
+                    )
                 ),
                 candidate_id,
                 action_counter[0],
@@ -2238,15 +2907,87 @@ def _run_physical_branch(
             )
             action_counter[0] += 1
             live_close_actions += 1
+            contact_sides = target_finger_contact_sides(records[-1]["grasp_state"])
+            branch["live_contact_close_probe_contact_sides"].append(contact_sides)
+            current_gripper_qpos = np.asarray(
+                records[-1].get("snapshot_state", {}).get("robot_states", [{}])[0].get("gripper_qpos", []),
+                dtype=np.float64,
+            )
+            if (
+                prior_gripper_qpos.shape != (2,)
+                or current_gripper_qpos.shape != (2,)
+                or not np.isfinite(prior_gripper_qpos).all()
+                or not np.isfinite(current_gripper_qpos).all()
+            ):
+                raise RuntimeError("live_contact_close_probe_gripper_qpos_unavailable")
+            gripper_qpos_step_m = float(np.max(np.abs(current_gripper_qpos - prior_gripper_qpos)))
+            maximum_gripper_qpos_step_m = max(maximum_gripper_qpos_step_m, gripper_qpos_step_m)
+            if (
+                monitor.stable
+                and len(contact_sides) == 2
+                and gripper_qpos_step_m <= closure_position_tolerance_m
+            ):
+                closure_stable_samples += 1
+            elif monitor.stable:
+                closure_stable_samples = 0
+            prior_gripper_qpos = current_gripper_qpos
+            if len(initial_contact_sides) == 2 and len(contact_sides) < 2:
+                bilateral_contact_loss_actions += 1
+            else:
+                bilateral_contact_loss_actions = 0
+            if live_unilateral_target_contact and not contact_sides:
+                branch["live_unilateral_close_probe_contact_lost"] = {
+                    "action": live_close_actions,
+                    "contact_sides": contact_sides,
+                }
+                raise RuntimeError(
+                    "live_unilateral_target_contact_lost_during_pose_held_close_probe"
+                )
+            if (
+                not monitor.stable
+                and bilateral_contact_loss_actions
+                >= MAX_LIVE_CLOSE_BILATERAL_CONTACT_LOSS_ACTIONS
+            ):
+                branch["live_contact_close_probe_early_stop"] = {
+                    "reason": "bilateral_target_pad_contact_lost_during_pose_held_close",
+                    "consecutive_actions_without_bilateral_contact": bilateral_contact_loss_actions,
+                    "maximum_consecutive_actions": MAX_LIVE_CLOSE_BILATERAL_CONTACT_LOSS_ACTIONS,
+                }
+                raise RuntimeError(
+                    "live_bilateral_target_contact_lost_during_pose_held_close_probe"
+                )
         branch["live_contact_close_probe_actions"] = live_close_actions
         branch["live_contact_close_probe_grasp"] = monitor.diagnostics()
-        if not monitor.stable:
+        branch["live_contact_close_probe_skipped"] = preclosed_bilateral_contact
+        branch["live_contact_physical_closure_settle"].update({
+            "actions": live_close_actions,
+            "stable_physical_closure_samples": closure_stable_samples,
+            "maximum_observed_per_joint_qpos_step_m": maximum_gripper_qpos_step_m,
+            "gripper_qpos_end_m": prior_gripper_qpos.tolist(),
+            "status": (
+                "verified" if preclosed_bilateral_contact or closure_stable_samples >= 2
+                else "not_settled_within_close_action_budget"
+            ),
+        })
+        if not monitor.stable and not preclosed_bilateral_contact:
             raise RuntimeError("live_target_contact_close_probe_did_not_stabilize")
-        branch["live_contact_close_probe_succeeded"] = True
+        if (
+            not preclosed_bilateral_contact
+            and live_bilateral_target_contact
+            and closure_stable_samples < 2
+        ):
+            raise RuntimeError("live_bilateral_grasp_physical_closure_not_settled")
+        branch["live_contact_close_probe_succeeded"] = bool(
+            monitor.stable or preclosed_bilateral_contact
+        )
     else:
         branch["live_contact_close_probe_succeeded"] = False
     _advance_pose.controller_fields = controller_fields
-    route = _compress_eef_route(rrt.get("eef_reference_poses_world"))
+    route = (
+        np.asarray(rrt.get("eef_reference_poses_world"), dtype=np.float64)
+        if rrt.get("preserve_eef_waypoints") is True
+        else _compress_eef_route(rrt.get("eef_reference_poses_world"))
+    )
     branch["rrt_eef_waypoint_count"] = int(len(route))
     route_action_budget = route_control_action_budget(
         route,
@@ -2255,6 +2996,21 @@ def _run_physical_branch(
     )
     branch["pregrasp_route_action_budget"] = route_action_budget
     branch["local_replans"] = []
+    # Keep screen-derived IK with the candidate before crossing into this
+    # branch helper.  approach_rows is owned by the caller's screening scope
+    # and is intentionally not a global/implicit dependency here.
+    candidate_pregrasp_ik_seed_qpos = candidate.get(
+        "_pregrasp_ik_seed_qpos"
+    )
+    if candidate_pregrasp_ik_seed_qpos is not None:
+        candidate_pregrasp_ik_seed_qpos = np.asarray(
+            candidate_pregrasp_ik_seed_qpos, dtype=np.float64,
+        )
+        if (
+            candidate_pregrasp_ik_seed_qpos.shape != (7,)
+            or not np.isfinite(candidate_pregrasp_ik_seed_qpos).all()
+        ):
+            candidate_pregrasp_ik_seed_qpos = None
 
     def advance_with_local_replan(
         target_position: np.ndarray,
@@ -2264,16 +3020,35 @@ def _run_physical_branch(
         target_pose_provider: Callable[
             [dict[str, Any]], tuple[np.ndarray, np.ndarray]
         ] | None = None,
-    ) -> None:
+        max_translation_step_m: float = 0.008,
+        position_tolerance_m: float = 0.004,
+        rotation_tolerance_rad: float = 0.045,
+        step_callback=None,
+        stop_condition=None,
+    ) -> bool | None:
         try:
-            _advance_pose(
+            reached = _advance_pose(
                 bridge, target_position, target_quaternion, phase, candidate_id,
                 action_counter, maximum_steps, target_binding, context["instruction"],
                 policy, monitor, records, frames,
+                stop_condition=stop_condition,
+                stagnation_window_actions=(
+                    12 if target_pose_provider is None or stop_condition is not None else 0
+                ),
+                position_tolerance_m=position_tolerance_m,
+                rotation_tolerance_rad=rotation_tolerance_rad,
+                max_translation_step_m=max_translation_step_m,
                 target_pose_provider=target_pose_provider,
+                step_callback=step_callback,
             )
-            return
-        except TimeoutError as original_error:
+            return reached
+        except (TimeoutError, RuntimeError) as original_error:
+            is_stagnation = (
+                isinstance(original_error, RuntimeError)
+                and "_waypoint_stagnated_for_" in str(original_error)
+            )
+            if not isinstance(original_error, TimeoutError) and not is_stagnation:
+                raise
             if target_pose_provider is not None:
                 branch["local_replans"].append({
                     "phase": phase,
@@ -2346,6 +3121,10 @@ def _run_physical_branch(
                     "position_world_m": target_pose[:3].tolist(),
                     "quaternion_wxyz": target_pose[3:].tolist(),
                 },
+                "ik_seed_qpos": (
+                    [candidate_pregrasp_ik_seed_qpos.tolist()]
+                    if candidate_pregrasp_ik_seed_qpos is not None else None
+                ),
                 "safety_geometry_policy": policy,
                 "planner_config": {
                     "step_rad": 0.22,
@@ -2354,7 +3133,7 @@ def _run_physical_branch(
                     "max_iterations": 400,
                     "max_config_checks": 4000,
                     "max_candidate_routes": 1,
-                    "search_time_budget_s": args.local_replan_rrt_time_budget_s,
+                    "search_time_budget_s": local_replan_rrt_time_budget_s,
                     "shortcut_attempts": 20,
                     "minimum_clearance_m": 0.0,
                     "require_safe_configurations": False,
@@ -2382,6 +3161,10 @@ def _run_physical_branch(
                 "RRT_status": plan.get("status"),
                 "RRT_failure_reason": plan.get("failure_reason"),
                 "route_source": route_source,
+                "candidate_pregrasp_endpoint_ik_seed_used": (
+                    candidate_pregrasp_ik_seed_qpos is not None
+                ),
+                "ik_selection_seed_source": "exact_live_arm_qpos_at_local_replan_start",
                 "remaining_physical_action_budget": route_action_cap,
                 "safety_certified": False,
             })
@@ -2390,7 +3173,7 @@ def _run_physical_branch(
                 local_remaining = MAX_BRANCH_CONTROL_ACTIONS - action_counter[0]
                 if local_remaining <= 0:
                     raise RuntimeError("local_segment_replan_physical_action_budget_exhausted")
-                _advance_pose(
+                reached = _advance_pose(
                     bridge,
                     local_waypoint[:3],
                     local_waypoint[3:],
@@ -2404,21 +3187,242 @@ def _run_physical_branch(
                     monitor,
                     records,
                     frames,
+                    stop_condition=record_robot_obstacle_contact,
+                    stagnation_window_actions=12,
+                    position_tolerance_m=position_tolerance_m,
+                    rotation_tolerance_rad=rotation_tolerance_rad,
+                    max_translation_step_m=max_translation_step_m,
                 )
             branch["local_replans"][-1]["status"] = "physical_replan_segment_reached"
             candidate["_local_replans"] = list(branch["local_replans"])
 
-    if not close_from_live_contact:
-        for waypoint in route[1:]:
-            advance_with_local_replan(
+    if not skip_pregrasp_route:
+        route_source = str(rrt.get("planner_source", ""))
+        adaptive_jointspace_route = bool(
+            rrt.get("preserve_eef_waypoints") is True
+            or route_source.startswith("adaptive_jointspace_continuation_")
+        )
+        route_translation_step_m = (
+            0.02
+            if route_source == "near_target_direct_pregrasp_approach.v1"
+            or route_source in {
+                "active_BDDL_geometry_high_OSC_approach_after_RRT_failure",
+                "explicit_active_BDDL_geometry_direct_OSC_approach",
+            }
+            or adaptive_jointspace_route
+            or any(
+                item.get("route_source")
+                == "active_BDDL_geometry_high_OSC_approach_after_RRT_failure"
+                for item in rrt.get("route_candidates", [])
+            )
+            else 0.008
+        )
+        branch["pregrasp_route_max_translation_step_m"] = route_translation_step_m
+        route_waypoints = route[1:]
+        if stage_a_pregrasp_staged_clearance_height_m > 0.0 and len(route) >= 2:
+            # A grasp can start with the wrist above a container after an
+            # earlier predicate was completed. Moving directly toward the
+            # next object can rotate the forearm through that container even
+            # when the EEF path is collision free. First lift while holding
+            # the live wrist orientation, translate above the candidate
+            # pregrasp, rotate at clearance height, then descend.
+            live_eef = _runtime_eef_pose(initial_runtime_state)
+            live_quaternion = _wxyz(live_eef[:3, :3])
+            pregrasp = np.asarray(route[-1], dtype=np.float64)
+            if pregrasp.shape != (7,) or not np.isfinite(pregrasp).all():
+                raise RuntimeError("staged_pregrasp_clearance_endpoint_unavailable")
+            clearance_z = max(
+                float(stage_a_pregrasp_staged_clearance_height_m),
+                float(live_eef[2, 3]),
+                float(pregrasp[2]) + 0.025,
+            )
+            held_orientation_start = np.r_[
+                live_eef[:2, 3], clearance_z, live_quaternion,
+            ]
+            if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6:
+                displacement_xy = pregrasp[:2] - live_eef[:2, 3]
+                displacement_norm = float(np.linalg.norm(displacement_xy))
+                if displacement_norm <= 1e-6:
+                    raise RuntimeError("staged_pregrasp_lateral_detour_has_degenerate_xy_route")
+                # Keep the full transit parallel to the direct start-to-goal
+                # line but offset to one side. This lets the forearm clear a
+                # container even when a point-to-point wrist route crosses
+                # its rim; return to the candidate side only after passing it.
+                side_xy = np.array(
+                    [-displacement_xy[1], displacement_xy[0]], dtype=np.float64,
+                ) / displacement_norm * float(stage_a_pregrasp_lateral_detour_m)
+                start_side_at_live_height = np.r_[
+                    live_eef[:2, 3] + side_xy, float(live_eef[2, 3]), live_quaternion,
+                ]
+                start_side_clearance = np.r_[
+                    live_eef[:2, 3] + side_xy, clearance_z, live_quaternion,
+                ]
+                target_side = np.r_[
+                    pregrasp[:2] + side_xy, clearance_z, live_quaternion,
+                ]
+                target_side_rotated = np.r_[
+                    pregrasp[:2] + side_xy, clearance_z, pregrasp[3:],
+                ]
+                target_at_clearance = np.r_[
+                    pregrasp[:2], clearance_z, pregrasp[3:],
+                ]
+                if stage_a_pregrasp_lift_before_lateral_detour:
+                    route_waypoints = [
+                        # Some held-object snapshots start above a container.
+                        # Leaving that opening sideways can strike its rim, so
+                        # first lift with the live wrist orientation, then take
+                        # the obstacle-offset corridor at clearance height.
+                        held_orientation_start,
+                        start_side_clearance,
+                        target_side,
+                        target_side_rotated,
+                        target_at_clearance,
+                        pregrasp,
+                    ]
+                    detour_waypoint_order = [
+                        "vertical_lift_with_live_wrist_orientation",
+                        "lateral_shift_at_clearance_with_live_wrist_orientation",
+                        "parallel_transit_beyond_obstacle_with_live_wrist_orientation",
+                        "rotate_at_clearance_beyond_obstacle",
+                        "lateral_return_to_candidate_at_clearance",
+                        "descend_to_candidate_pregrasp",
+                    ]
+                else:
+                    route_waypoints = [
+                        # Move the wrist sideways before lifting. Prior physical
+                        # branches showed that raising in the starting arm
+                        # configuration can stall without contact, or sweep link6
+                        # into a nearby obstacle before the detour begins.
+                        start_side_at_live_height,
+                        start_side_clearance,
+                        target_side,
+                        target_side_rotated,
+                        target_at_clearance,
+                        pregrasp,
+                    ]
+                    detour_waypoint_order = [
+                        "lateral_shift_at_live_height_with_live_wrist_orientation",
+                        "vertical_lift_after_leaving_start_corridor",
+                        "parallel_transit_beyond_obstacle_with_live_wrist_orientation",
+                        "rotate_at_clearance_beyond_obstacle",
+                        "lateral_return_to_candidate_at_clearance",
+                        "descend_to_candidate_pregrasp",
+                    ]
+            else:
+                horizontal_transit = np.r_[
+                    pregrasp[:2], clearance_z, live_quaternion,
+                ]
+                orientation_at_clearance = np.r_[
+                    pregrasp[:2], clearance_z, pregrasp[3:],
+                ]
+                route_waypoints = [
+                    held_orientation_start,
+                    horizontal_transit,
+                    orientation_at_clearance,
+                    pregrasp,
+                ]
+            branch["pregrasp_staged_clearance_route"] = {
+                "enabled": True,
+                "clearance_height_world_m": clearance_z,
+                "lateral_detour_signed_m": float(stage_a_pregrasp_lateral_detour_m),
+                "lift_before_lateral_detour": bool(
+                    stage_a_pregrasp_lift_before_lateral_detour
+                ),
+                "waypoint_order": (
+                    detour_waypoint_order
+                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6 else [
+                        "vertical_lift_with_live_wrist_orientation",
+                        "horizontal_transit_with_live_wrist_orientation",
+                        "rotate_at_clearance_over_candidate_pregrasp",
+                        "descend_to_candidate_pregrasp",
+                    ]
+                ),
+                "lateral_detour_start_waypoint_world": (
+                    (
+                        start_side_clearance
+                        if stage_a_pregrasp_lift_before_lateral_detour
+                        else start_side_at_live_height
+                    ).tolist()
+                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6 else None
+                ),
+                "lateral_detour_target_waypoint_world": (
+                    target_side.tolist()
+                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6 else None
+                ),
+                "start_eef_pose_world": [
+                    live_eef[:3, 3].tolist(), live_quaternion.tolist(),
+                ],
+                "candidate_pregrasp_pose_world": pregrasp.tolist(),
+                "state_changes_only_through_recorded_MuJoCo_OSC_actions": True,
+                "safety_certified": False,
+            }
+            route_translation_step_m = 0.02
+        else:
+            branch["pregrasp_staged_clearance_route"] = {
+                "enabled": False,
+                "configured_clearance_height_world_m": float(
+                    stage_a_pregrasp_staged_clearance_height_m
+                ),
+            }
+        for route_waypoint_index, waypoint in enumerate(route_waypoints):
+            final_adaptive_endpoint = bool(
+                adaptive_jointspace_route
+                and route_waypoint_index == len(route_waypoints) - 1
+            )
+            reached = advance_with_local_replan(
                 waypoint[:3],
                 waypoint[3:],
                 "task_success_first_rrt_osc_pregrasp_route",
                 max(1, route_action_budget - action_counter[0]),
+                max_translation_step_m=route_translation_step_m,
+                position_tolerance_m=(
+                    0.005
+                    if final_adaptive_endpoint
+                    else 0.025
+                    if adaptive_jointspace_route
+                    else 0.004
+                ),
+                rotation_tolerance_rad=(
+                    0.045
+                    if final_adaptive_endpoint
+                    else 0.12
+                    if adaptive_jointspace_route
+                    else 0.045
+                ),
+                stop_condition=record_robot_obstacle_contact,
             )
             if action_counter[0] > route_action_budget:
                 raise RuntimeError("RRT_OSC_pregrasp_route_action_budget_exceeded")
-    branch["pregrasp_route_reached"] = True
+    branch["pregrasp_route_reached"] = not skip_pregrasp_route
+    branch["pregrasp_route_skipped_due_to_live_target_contact"] = skip_pregrasp_route
+    if not skip_pregrasp_route:
+        pregrasp_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
+        checkpoint_runtime_snapshot("pregrasp", pregrasp_observation.get("snapshot_state", {}))
+
+    def checkpoint_first_target_contact(record: dict[str, Any], _frame: dict[str, Any]) -> None:
+        if branch.get("first_target_contact_snapshot") is not None:
+            return
+        sides = target_finger_contact_sides(record.get("grasp_state", {}))
+        if sides:
+            checkpoint_runtime_snapshot("first_target_pad_contact", record["snapshot_state"])
+            branch["first_target_contact_snapshot"] = {
+                "finger_sides": sides,
+                "timestep": record.get("timestep"),
+                "snapshot_checkpoint_index": len(branch["runtime_snapshot_checkpoints"]) - 1,
+            }
+
+    surface_approach_record_start = [len(records)]
+
+    def target_pad_contact_sides_observed() -> list[str]:
+        if len(records) <= surface_approach_record_start[0]:
+            return []
+        return target_finger_contact_sides(records[-1].get("grasp_state", {}))
+
+    def target_pad_contact_observed() -> bool:
+        return bool(target_pad_contact_sides_observed())
+
+    def bilateral_target_pad_contact_observed() -> bool:
+        return len(target_pad_contact_sides_observed()) == 2
 
     root_pose = _pose(
         context["target_root_pose_world"]["position_m"],
@@ -2471,25 +3475,143 @@ def _run_physical_branch(
                     "migrated_object_relative_approach",
                     remaining,
                     target_pose_provider=object_relative_target_provider(relative_pose),
+                    step_callback=checkpoint_first_target_contact,
                 )
             remaining = MAX_APPROACH_CONTROL_ACTIONS - (action_counter[0] - approach_start_actions)
             if remaining <= 0:
                 raise RuntimeError("migrated_object_relative_grasp_endpoint_action_budget_exhausted")
         else:
             remaining = MAX_APPROACH_CONTROL_ACTIONS
-        advance_with_local_replan(
+        surface_approach_record_start[0] = len(records)
+        branch["surface_approach_contact_alignment_policy"] = {
+            "stop_on_bilateral_target_pad_contact": True,
+            "stop_on_unilateral_contact_only_when_candidate_pose_aligned": True,
+            "unilateral_position_tolerance_m": 0.012,
+            "unilateral_rotation_tolerance_rad": 0.08,
+            "unaligned_unilateral_contact_action": "continue_object_relative_approach_with_existing_target_displacement_abort",
+            "safety_certified": False,
+        }
+        def stop_surface_approach() -> bool:
+            nonlocal close_hold_eef_world
+            # An open gripper that has touched the target is already at a
+            # useful physical branch point only when the nominal grasp pose is
+            # already aligned. A unilateral pad can touch the top edge of a
+            # can or box several centimetres before the jaw center reaches the
+            # intended grasp. Continue the short object-relative approach in
+            # that case; the existing target-displacement abort bounds any
+            # physical push, while bilateral contact or a near-aligned single
+            # pad still stops immediately for a feedback-held close.
+            record_robot_obstacle_contact()
+            sides = target_pad_contact_sides_observed()
+            if sides:
+                live_state = records[-1]["snapshot_state"]
+                if len(sides) == 2:
+                    should_stop = True
+                    alignment = {"position_error_m": None, "rotation_error_rad": None}
+                    stop_reason = "bilateral_target_pad_contact"
+                else:
+                    live_eef = _runtime_eef_pose(live_state)
+                    target_position, target_quaternion = object_relative_target_provider(
+                        object_to_eef
+                    )(live_state)
+                    target_pose = np.eye(4, dtype=np.float64)
+                    target_pose[:3, :3] = Rotation.from_quat(
+                        np.asarray(target_quaternion, dtype=np.float64)[[1, 2, 3, 0]]
+                    ).as_matrix()
+                    target_pose[:3, 3] = np.asarray(target_position, dtype=np.float64)
+                    position_error, rotation_error = _pose_tracking_error_components(
+                        live_eef, target_pose,
+                    )
+                    should_stop = _pose_tracking_error_within_tolerance(
+                        position_error, rotation_error, 0.012, 0.08,
+                    )
+                    alignment = {
+                        "position_error_m": position_error,
+                        "rotation_error_rad": rotation_error,
+                    }
+                    stop_reason = (
+                        "aligned_unilateral_target_pad_contact"
+                        if should_stop else "unaligned_unilateral_contact_continued"
+                    )
+                branch.setdefault("surface_approach_contact_events", []).append({
+                    "timestep": records[-1].get("timestep"),
+                    "finger_contact_sides": sides,
+                    "candidate_pose_alignment": alignment,
+                    "decision": stop_reason,
+                    "target_object_root_position_m": _object_state(
+                        live_state, int(target_binding["body_id"])
+                    ).get("root_pos"),
+                })
+                if not should_stop:
+                    return False
+                # Preserve the exact measured contact pose for a feedback
+                # controlled close. A zero OSC delta is not a pose hold under
+                # contact: the arm can drift while the gripper actuator closes
+                # and lose the only useful unilateral target contact.
+                close_hold_eef_world = _runtime_eef_pose(
+                    live_state
+                )
+                branch["surface_approach_stop_reason"] = stop_reason
+                branch["surface_contact_pose_hold_target_world"] = np.r_[
+                    close_hold_eef_world[:3, 3],
+                    _wxyz(close_hold_eef_world[:3, :3]),
+                ].tolist()
+                branch["surface_contact_pose_hold_controller"] = (
+                    "feedback_OSC_tracks_the_first_target_pad_contact_pose_during_close"
+                )
+                return True
+            return False
+
+        approach_reached = advance_with_local_replan(
             grasp_world[:3, 3],
             _wxyz(grasp_world[:3, :3]),
             "task_success_first_surface_approach" if not migrated_waypoints else "migrated_object_relative_grasp_endpoint",
             remaining,
             target_pose_provider=object_relative_target_provider(object_to_eef),
+            step_callback=checkpoint_first_target_contact,
+            stop_condition=stop_surface_approach,
+            # Drive long free-space grasp approaches with the controller's
+            # full validated translation increment. The old 8 mm increment
+            # needed >60 actions for a 75 mm reach from a legal snapshot.
+            max_translation_step_m=0.02,
         )
         branch["surface_approach_target_frame"] = "live_target_object_root_pose_times_generated_object_to_eef"
-    branch["surface_approach_reached"] = True
+        branch["surface_approach_stopped_on_target_contact"] = bool(
+            approach_reached is False and branch.get("surface_approach_stop_reason")
+        )
+        branch["surface_approach_target_pad_contact_sides_at_stop"] = (
+            target_pad_contact_sides_observed()
+            if branch["surface_approach_stopped_on_target_contact"] else []
+        )
+        if (
+            not approach_reached
+            and not target_pad_contact_observed()
+            and branch.get("first_robot_obstacle_contact")
+        ):
+            raise RuntimeError("surface_approach_stopped_on_first_robot_obstacle_contact")
+    branch["surface_approach_reached"] = bool(
+        close_from_live_contact or approach_reached is not False
+        or target_pad_contact_observed()
+    )
 
     close_actions = 0
-    while close_actions < MAX_CLOSE_CONTROL_ACTIONS and not monitor.stable:
-        action = np.asarray([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+    while (
+        not preclosed_bilateral_contact
+        and close_actions < MAX_CLOSE_CONTROL_ACTIONS
+        and not monitor.stable
+    ):
+        if branch.get("surface_approach_stopped_on_target_contact"):
+            live_eef_world = _runtime_eef_pose(records[-1]["snapshot_state"])
+            action = world_pose_tracking_action(
+                live_eef_world[:3, 3],
+                _wxyz(live_eef_world[:3, :3]),
+                close_hold_eef_world[:3, 3],
+                _wxyz(close_hold_eef_world[:3, :3]),
+                controller_fields,
+                gripper_action=1.0,
+            )
+        else:
+            action = np.asarray([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
         _record_step(
             bridge,
             action,
@@ -2509,7 +3631,7 @@ def _run_physical_branch(
             raise RuntimeError("physical_branch_control_action_budget_exceeded")
     branch["close_actions"] = close_actions
     branch["grasp_before_lift"] = monitor.diagnostics()
-    if not monitor.stable:
+    if not monitor.stable and not preclosed_bilateral_contact:
         raise RuntimeError("bilateral_grasp_not_stable_within_close_action_budget")
 
     closed = bridge.request({"op": "export_runtime_snapshot"})
@@ -2528,20 +3650,66 @@ def _run_physical_branch(
     ).tolist()
     eef_before = np.asarray(before["snapshot_state"]["robot_states"][0]["eef_pos"], dtype=np.float64)
     orientation = np.asarray(before["snapshot_state"]["robot_states"][0]["eef_quat"], dtype=np.float64)
+    live_contact_lift = bool(close_from_live_contact)
+    lift_action_budget = (
+        LIVE_CONTACT_LIFT_CONTROL_ACTIONS if live_contact_lift
+        else MAX_LIFT_CONTROL_ACTIONS
+    )
+    lift_translation_step_m = (
+        LIVE_CONTACT_LIFT_TRANSLATION_STEP_M if live_contact_lift else 0.008
+    )
+    lift_phase = (
+        "task_success_first_live_contact_incremental_40mm_lift"
+        if live_contact_lift else "task_success_first_40mm_lift"
+    )
+    branch["lift_control_profile"] = {
+        "strategy": (
+            "incremental_low_speed_lift_from_verified_live_bilateral_contact"
+            if live_contact_lift else "standard_pose_tracking_lift"
+        ),
+        "target_lift_m": LIFT_COMMAND_M,
+        "minimum_verified_object_lift_m": MINIMUM_OBJECT_LIFT_M,
+        "early_stop_when_minimum_lift_and_stable_bilateral_contact": True,
+        "max_translation_step_m": lift_translation_step_m,
+        "action_budget": lift_action_budget,
+    }
+
+    def stable_minimum_lift_reached() -> bool:
+        """Avoid overshooting a short valid grasp lift into contact loss."""
+        if not records or not monitor.stable:
+            return False
+        latest_state = records[-1].get("snapshot_state", {})
+        try:
+            latest_target = _object_state(
+                latest_state, int(target_binding["body_id"]),
+            )
+            latest_lift = float(
+                latest_target["root_pos"][2] - target_before["root_pos"][2]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return bool(
+            np.isfinite(latest_lift)
+            and latest_lift >= MINIMUM_OBJECT_LIFT_M
+            and records[-1].get("grasp_state", {}).get("grasp_confirmed") is True
+        )
+
     _advance_pose(
         bridge,
         eef_before + np.asarray([0.0, 0.0, LIFT_COMMAND_M]),
         orientation,
-        "task_success_first_40mm_lift",
+        lift_phase,
         candidate_id,
         action_counter,
-        MAX_LIFT_CONTROL_ACTIONS,
+        lift_action_budget,
         target_binding,
         context["instruction"],
         policy,
         monitor,
         records,
         frames,
+        stop_condition=stable_minimum_lift_reached,
+        max_translation_step_m=lift_translation_step_m,
     )
     after = bridge.request({"op": "observe", "include_snapshot_state": True})
     target_after = _object_state(after["snapshot_state"], int(context["target_binding"]["root_body_id"]))
@@ -2650,11 +3818,354 @@ def _state_sha(value: np.ndarray) -> str:
     return _sha256_bytes(np.ascontiguousarray(value, dtype=np.float64).tobytes())
 
 
-def _cold_start_geometry_fallback_allowed(cold_start: bool, candidate: dict[str, Any], planner: dict[str, Any]) -> bool:
-    return bool(cold_start and generated_geometry_high_approach_admitted(candidate, planner))
+def _generated_geometry_fallback_allowed(
+    candidate: dict[str, Any], planner: dict[str, Any],
+) -> bool:
+    """Admit a bounded physical OSC approach after scratch IK succeeds but RRT does not.
+
+    Stage A continuation snapshots are valid search starts too: limiting this
+    fallback to cold starts discarded physically reachable candidates whenever
+    RRT timed out, even though its scratch query had left the live state intact.
+    """
+    return generated_geometry_high_approach_admitted(candidate, planner)
+
+
+def _forbidden_object_root_positions(
+    safety_geometry_policy: dict[str, Any], snapshot_state: dict[str, Any],
+    *, active_target_object_id: str,
+) -> list[dict[str, Any]]:
+    """Read current root positions for active-BDDL forbidden scene objects."""
+    object_states = snapshot_state.get("object_states", {})
+    if not isinstance(object_states, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in safety_geometry_policy.get("forbidden_objects", []):
+        if not isinstance(item, dict):
+            continue
+        object_id = str(item.get("object_id", ""))
+        if not object_id or object_id == active_target_object_id:
+            continue
+        state = object_states.get(f"objects_dict:{object_id}")
+        if not isinstance(state, dict):
+            continue
+        position = np.asarray(state.get("root_pos", []), dtype=np.float64)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            continue
+        rows.append({
+            "object_id": object_id,
+            "position_world_m": position.tolist(),
+            "position_source": "read_only_live_runtime_snapshot_object_root",
+        })
+    return rows
+
+
+def _adaptive_geometry_approach_route(
+    bridge: BridgeSession,
+    *,
+    start_pose: np.ndarray,
+    target_pose: np.ndarray,
+    forbidden_obstacle_positions_world: list[dict[str, Any]] | None = None,
+    minimum_transit_height_m: float | None = None,
+    approach_direction_world: np.ndarray | None,
+    live_arm_qpos: np.ndarray,
+    instruction: str,
+    model_sha: str,
+    state_sha: str,
+    policy: dict[str, Any],
+) -> tuple[list[list[float]] | None, dict[str, Any]]:
+    """Choose a short lift-and-traverse OSC route whose waypoints all have IK.
+
+    The previous fixed +10 cm route could demand an unreachable high pose and
+    then waste physical actions discovering that OSC saturation. This samples
+    five progressively lower transit planes, using read-only scratch IK and a
+    warm joint seed between short Cartesian segments. Only the returned route
+    is physically executed; collisions and contacts remain real Stage A
+    dynamics and no state is written during preflight.
+    """
+    start = np.asarray(start_pose, dtype=np.float64)
+    target = np.asarray(target_pose, dtype=np.float64)
+    live_q = np.asarray(live_arm_qpos, dtype=np.float64)
+    if (
+        start.shape != (7,) or target.shape != (7,)
+        or live_q.shape != (7,)
+        or not all(np.isfinite(x).all() for x in (start, target, live_q))
+    ):
+        return None, {"status": "invalid_route_seed", "physical_actions": 0}
+    if minimum_transit_height_m is not None and (
+        not np.isfinite(float(minimum_transit_height_m))
+        or float(minimum_transit_height_m) <= 0.0
+    ):
+        return None, {"status": "invalid_contact_clearance_transit_height", "physical_actions": 0}
+
+    route_trials: list[dict[str, Any]] = []
+    route_start_q = live_q.copy()
+    # Keep the robot at its current clearance while leaving the source area,
+    # then descend along the final traverse.  Using one shared height for the
+    # whole route made a floor-level grasp inherit the initial 0.5 m EEF
+    # height: the later surface-approach controller spent its entire 60-action
+    # budget just descending, before it could reach the grasp pose.
+    target_clearances = (0.14, 0.18, 0.22, 0.26, 0.30)
+    approach = None
+    if approach_direction_world is not None:
+        approach = np.asarray(approach_direction_world, dtype=np.float64)
+        if approach.shape != (3,) or not np.isfinite(approach).all():
+            return None, {"status": "invalid_approach_direction", "physical_actions": 0}
+        approach_norm = float(np.linalg.norm(approach))
+        if approach_norm <= 1e-8:
+            return None, {"status": "degenerate_approach_direction", "physical_actions": 0}
+        approach /= approach_norm
+    side_detour_enabled = bool(
+        approach is not None and float(np.linalg.norm(approach[:2])) >= 0.15
+    )
+    start_rotation = Rotation.from_quat(start[3:][[1, 2, 3, 0]])
+    target_rotation = Rotation.from_quat(target[3:][[1, 2, 3, 0]])
+    horizontal_delta = target[:2] - start[:2]
+    horizontal_length = float(np.linalg.norm(horizontal_delta))
+    horizontal_direction = (
+        horizontal_delta / horizontal_length
+        if horizontal_length > 1e-6 else np.zeros(2, dtype=np.float64)
+    )
+    horizontal_perpendicular = np.asarray(
+        [-horizontal_direction[1], horizontal_direction[0]], dtype=np.float64,
+    )
+    obstacle_route_candidates: list[dict[str, Any]] = []
+
+    for target_clearance in target_clearances:
+        target_height = max(
+            float(target[2]) + target_clearance,
+            float(minimum_transit_height_m)
+            if minimum_transit_height_m is not None else 0.12,
+            0.12,
+        )
+        start_height = max(float(start[2]), target_height)
+        start_high = start.copy()
+        start_high[2] = start_height
+        target_high = target.copy()
+        target_high[2] = target_height
+        segment_rotations = Slerp(
+            [0.0, 1.0], Rotation.from_quat(np.stack([
+                start_rotation.as_quat(), target_rotation.as_quat(),
+            ]))
+        )([1.0 / 3.0, 2.0 / 3.0])
+        poses = [start_high]
+        if not side_detour_enabled:
+            obstacle_route_candidates = []
+            if horizontal_length > 1e-6:
+                for obstacle in forbidden_obstacle_positions_world or []:
+                    obstacle_position = np.asarray(
+                        obstacle.get("position_world_m", []), dtype=np.float64,
+                    )
+                    if obstacle_position.shape != (3,) or not np.isfinite(obstacle_position).all():
+                        continue
+                    relative_xy = obstacle_position[:2] - start[:2]
+                    projection = float(np.dot(relative_xy, horizontal_direction))
+                    if projection < 0.10 or projection > horizontal_length - 0.10:
+                        continue
+                    nearest_xy = start[:2] + projection * horizontal_direction
+                    lateral_distance = float(np.linalg.norm(obstacle_position[:2] - nearest_xy))
+                    vertical_distance = abs(float(obstacle_position[2]) - start_height)
+                    if lateral_distance >= 0.19 or vertical_distance >= 0.24:
+                        continue
+                    signed_lateral = float(np.dot(relative_xy, horizontal_perpendicular))
+                    if abs(signed_lateral) < 1e-6:
+                        side_sign = 1.0 if horizontal_perpendicular[0] >= 0.0 else -1.0
+                    else:
+                        side_sign = -1.0 if signed_lateral > 0.0 else 1.0
+                    obstacle_route_candidates.append({
+                        "object_id": str(obstacle.get("object_id", "unknown")),
+                        "projection_m": projection,
+                        "lateral_distance_m": lateral_distance,
+                        "vertical_distance_m": vertical_distance,
+                        "signed_lateral_m": signed_lateral,
+                        "side_sign": side_sign,
+                    })
+            if obstacle_route_candidates:
+                blocker = min(
+                    obstacle_route_candidates,
+                    key=lambda row: (row["lateral_distance_m"], row["projection_m"]),
+                )
+                projection = float(blocker["projection_m"])
+                side_offset = horizontal_perpendicular * float(blocker["side_sign"]) * 0.16
+                before_distance = max(0.05, projection - 0.12)
+                after_distance = min(horizontal_length - 0.05, projection + 0.12)
+                detour_points = [
+                    (before_distance / horizontal_length,
+                     start[:2] + horizontal_direction * before_distance + side_offset),
+                    (after_distance / horizontal_length,
+                     start[:2] + horizontal_direction * after_distance + side_offset),
+                ]
+                blocker["lateral_clearance_m"] = 0.16
+                blocker["waypoint_source"] = "active_BDDL_forbidden_object_root_projection"
+            else:
+                blocker = None
+                detour_points = [
+                    (1.0 / 3.0, start[:2] + horizontal_delta / 3.0),
+                    (2.0 / 3.0, start[:2] + 2.0 * horizontal_delta / 3.0),
+                ]
+            for fraction, position_xy in detour_points:
+                rotation = Slerp(
+                    [0.0, 1.0], Rotation.from_quat(np.stack([
+                        start_rotation.as_quat(), target_rotation.as_quat(),
+                    ]))
+                )([fraction])[0]
+                pose = np.empty(7, dtype=np.float64)
+                pose[:2] = position_xy
+                pose[2] = start_height
+                pose[3:] = rotation.as_quat()[[3, 0, 1, 2]]
+                poses.append(pose)
+            poses.append(target_high)
+            # `target` is the actual candidate pregrasp, while `target_high`
+            # is only a transit waypoint.  Omitting this final descent made
+            # the later surface-approach controller start as much as 30 cm
+            # above the grasp and cut diagonally through the target instead
+            # of following the candidate's collision-aware approach axis.
+            poses.append(target.copy())
+            detour_margin_m = (
+                float(blocker["lateral_clearance_m"])
+                if blocker is not None else 0.0
+            )
+        else:
+            # Stay high while crossing the workspace, reach beyond the target
+            # on the chosen grasp approach side, lower there, then enter along
+            # the object's free-space approach axis. This avoids dropping the
+            # wrist through an intervening fixture while descending diagonally.
+            detour_margin_m = 0.06
+            detour = target_high.copy()
+            detour[:3] -= approach * detour_margin_m
+            detour[2] = start_height
+            for fraction, rotation in zip((1.0 / 3.0, 2.0 / 3.0), segment_rotations):
+                pose = np.empty(7, dtype=np.float64)
+                pose[:3] = start_high[:3] + fraction * (detour[:3] - start_high[:3])
+                pose[2] = start_height
+                pose[3:] = rotation.as_quat()[[3, 0, 1, 2]]
+                poses.append(pose)
+            detour[3:] = target_high[3:]
+            poses.extend([detour, target_high])
+            detour_low = detour.copy()
+            detour_low[2] = float(target[2])
+            # Descend on the outside of the target to the actual pregrasp
+            # height, then approach horizontally to that pregrasp.  The old
+            # route stopped at `target_high`; the following surface approach
+            # consequently descended diagonally through the target geometry.
+            poses[-1:] = [detour_low, target.copy()]
+
+        previous_q = route_start_q.copy()
+        previous_pose = start
+        checks: list[dict[str, Any]] = []
+        jointspace_reference_poses: list[list[float]] = [start.tolist()]
+        rejected: dict[str, Any] | None = None
+        for index, pose in enumerate(poses):
+            if np.linalg.norm(pose[:3] - previous_pose[:3]) < 1e-5 and index == 0:
+                # An already occupied lift endpoint needs no redundant IK RPC.
+                previous_pose = pose
+                continue
+            reply = bridge.request({
+                "op": "task_success_first_ik_preflight",
+                "expected_instruction": instruction,
+                "model_geometry_sha256": model_sha,
+                "start_state_sha256": state_sha,
+                "goal_pose_world": {
+                    "position_world_m": pose[:3].tolist(),
+                    "quaternion_wxyz": pose[3:].tolist(),
+                },
+                "ik_seed_qpos": [previous_q.tolist()],
+                "ik_selection_seed_qpos": previous_q.tolist(),
+                "ik_solver_max_nfev": 120,
+                "jointspace_reference_start_qpos": previous_q.tolist(),
+                "jointspace_reference_max_step_rad": 0.10,
+                "safety_geometry_policy": policy,
+            })
+            qpos = reply.get("ik_goal_qpos")
+            if (
+                reply.get("status") != "goal_ik_preflight_passed"
+                or reply.get("live_state_unchanged") is not True
+                or not isinstance(qpos, list)
+                or len(qpos) != 7
+                or not np.isfinite(np.asarray(qpos, dtype=np.float64)).all()
+            ):
+                rejected = {
+                    "waypoint_index": index,
+                    "failure_reason": reply.get("failure_reason") or reply.get("status"),
+                    "live_state_unchanged": reply.get("live_state_unchanged"),
+                }
+                break
+            qpos_array = np.asarray(qpos, dtype=np.float64)
+            joint_step = float(np.linalg.norm(qpos_array - previous_q))
+            reference_path = reply.get("eef_jointspace_reference_path_world")
+            if not isinstance(reference_path, list) or len(reference_path) < 2:
+                rejected = {
+                    "waypoint_index": index,
+                    "failure_reason": "jointspace_reference_path_missing_or_empty",
+                }
+                break
+            checks.append({
+                "waypoint_index": index,
+                "position_world_m": pose[:3].tolist(),
+                "endpoint_joint_step_rad": joint_step,
+                "ik_goal_qpos": qpos_array.tolist(),
+                "jointspace_reference_waypoints": len(reference_path) - 1,
+                "jointspace_reference_path_status": "bridge_verified_continuous_IK_chain",
+                "endpoint_joint_step_is_not_a_route_continuity_test": True,
+                "IK_solver_evaluations": [
+                    row.get("solver_evaluations")
+                    for row in reply.get("ik_candidates", [])
+                ],
+            })
+            # The bridge has already proven a bounded joint-space reference
+            # chain from `previous_q` to this endpoint. Rejecting the route on
+            # the endpoint L2 delta alone discards continuous paths that wind
+            # through multiple small IK steps (for example, 1.43 rad over 11
+            # verified waypoints). Stage A must test such routes with real OSC
+            # and MuJoCo feedback; the endpoint delta is retained as a metric.
+            previous_q = qpos_array
+            previous_pose = pose
+            jointspace_reference_poses.extend(reference_path[1:])
+        route_trials.append({
+            "transit_height_m": target_height,
+            "start_transit_height_m": start_height,
+            "target_transit_height_m": target_height,
+            "target_clearance_above_grasp_m": target_clearance,
+            "target_side_detour_margin_m": detour_margin_m,
+            "obstacle_route_candidate_count": len(obstacle_route_candidates),
+            "selected_obstacle_detour": (
+                blocker if not side_detour_enabled and blocker is not None else None
+            ),
+            "status": "IK_waypoints_passed" if rejected is None else "rejected",
+            "waypoint_checks": checks,
+            "rejection": rejected,
+        })
+        if rejected is None:
+            route = jointspace_reference_poses
+            return route, {
+                "status": "ik_feasible_route_selected",
+                "route_source": "adaptive_jointspace_continuation_descending_to_target_clearance_with_OSC_EEF_references.v2",
+                "selected_transit_height_m": target_height,
+                "selected_start_transit_height_m": start_height,
+                "selected_target_transit_height_m": target_height,
+                "contact_clearance_transit_floor_m": (
+                    float(minimum_transit_height_m)
+                    if minimum_transit_height_m is not None else None
+                ),
+                "target_side_detour_margin_m": detour_margin_m,
+                "final_waypoint_is_candidate_pregrasp": True,
+                "side_approach_descends_outside_then_translates_to_pregrasp": side_detour_enabled,
+                "transit_height_trials": route_trials,
+                "obstacle_route_candidates": obstacle_route_candidates,
+                "all_waypoints_preflighted_without_live_state_change": True,
+                "jointspace_reference_max_step_rad": 0.10,
+                "physical_controller": "MuJoCo OSC_POSE tracks scratch-FK references; no qpos writes",
+                "safety_certified": False,
+            }
+    return None, {
+        "status": "no_IK_continuous_adaptive_transit_route",
+        "transit_height_trials": route_trials,
+        "all_waypoint_preflights_were_read_only": True,
+        "safety_certified": False,
+    }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    global MAX_BRANCH_CONTROL_ACTIONS
     run_started = time.monotonic()
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
 
@@ -2671,12 +4182,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or args.strict_screen_reference_report is not None
         or (args.resume_from_runtime_snapshot is not None and not cold_start_continuation)
         or args.candidate_start_index != 0
-        or args.candidate_tilt_degrees
-        or args.candidate_roll_degrees
-        or args.candidate_offset_object_x_mm
-        or args.candidate_offset_object_y_mm
-        or args.candidate_offset_object_z_mm
+        or (
+            not cold_start_continuation
+            and (
+                args.candidate_tilt_degrees
+                or args.candidate_roll_degrees
+            )
+        )
     ):
+        # Object-local contact offsets are generated from the active BDDL
+        # collision geometry. They are valid fresh-t0 candidates and import
+        # no historical poses, actions, or partial-task state.
         raise ValueError("cold_start_cannot_use_historical_experience_or_partial_search_inputs")
     if cold_start_continuation and args.resume_from_runtime_snapshot is None:
         raise ValueError("cold_start_continuation_requires_a_runtime_snapshot_from_the_active_episode")
@@ -2816,6 +4332,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "RRT_preflights_max": args.maximum_rrt_preflights,
             "physical_snapshot_branches_max": args.maximum_physical_branches,
             "branch_control_actions_max": MAX_BRANCH_CONTROL_ACTIONS,
+            "stage_a_pregrasp_staged_clearance_height_world_m": float(
+                args.stage_a_pregrasp_staged_clearance_height_m
+            ),
             "pregrasp_route_actions_max": MAX_PREFIX_CONTROL_ACTIONS,
             "approach_actions_max": MAX_APPROACH_CONTROL_ACTIONS,
             "close_actions_max": MAX_CLOSE_CONTROL_ACTIONS,
@@ -2870,6 +4389,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         native = bridge.request({"op": "native_task_status"})
         if native.get("status") != "complete" or native.get("task_success") is not False:
             raise RuntimeError("source_t0_native_task_state_is_not_false_or_complete")
+        resumed_timestep = int(native.get("timestep", 0))
+        horizon_remaining = int(args.demonstration_horizon) - resumed_timestep
+        configured_branch_action_limit = int(args.branch_control_action_budget)
+        # Do not issue a physical action after the active Bridge episode horizon.
+        # MuJoCo terminates the environment at the horizon but may report done=False;
+        # a following step raises and prevents terminal Snapshot export. Reserve one
+        # action so an unsuccessful branch remains recoverable at the exact boundary.
+        MAX_BRANCH_CONTROL_ACTIONS = min(
+            configured_branch_action_limit,
+            max(1, horizon_remaining - 1),
+        )
+        report["search_budget"]["branch_action_budget_clamp"] = {
+            "configured_branch_control_actions_max": configured_branch_action_limit,
+            "search_start_timestep": resumed_timestep,
+            "demonstration_horizon": int(args.demonstration_horizon),
+            "horizon_remaining_actions": horizon_remaining,
+            "effective_branch_control_actions_max": MAX_BRANCH_CONTROL_ACTIONS,
+            "reserved_actions_before_horizon": 1,
+            "reason": "preserve_recoverable_snapshot_without_stepping_a_terminated_episode",
+        }
+        report["search_budget"]["branch_control_actions_max"] = MAX_BRANCH_CONTROL_ACTIONS
         geometry = bridge.request({"op": "geometry_inventory"})
         semantic = bridge.request({"op": "task_semantic_geometry_bindings"})
         gripper = bridge.request({"op": "gripper_geometry_inventory"})
@@ -2973,25 +4513,248 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         else:
             policy = _build_safety_policy(context, semantic, geometry, gripper)
-        initial_safety = bridge.request({"op": "safety_geometry_check", "safety_geometry_policy": policy})
+        route_observation = bridge.request({
+            "op": "observe", "include_snapshot_state": True,
+        })
+        def arm_joint_limit_diagnostics(inventory: dict[str, Any]) -> dict[str, Any]:
+            rows = []
+            for joint in inventory.get("joints", []):
+                if not isinstance(joint, dict):
+                    continue
+                name = str(joint.get("joint_name", ""))
+                if not name.startswith("robot0_joint"):
+                    continue
+                try:
+                    index = int(name.removeprefix("robot0_joint")) - 1
+                    qpos = float(joint.get("qpos"))
+                    lower = float(joint.get("lower"))
+                    upper = float(joint.get("upper"))
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= index < 7 or not np.isfinite([qpos, lower, upper]).all():
+                    continue
+                rows.append({
+                    "joint_name": name,
+                    "arm_index": index,
+                    "qpos_rad": qpos,
+                    "lower_rad": lower,
+                    "upper_rad": upper,
+                    "lower_excess_rad": max(0.0, lower - qpos),
+                    "upper_excess_rad": max(0.0, qpos - upper),
+                    "excess_rad": max(0.0, lower - qpos, qpos - upper),
+                })
+            return {
+                "within_limits": bool(rows) and all(row["excess_rad"] <= 1e-8 for row in rows),
+                "maximum_excess_rad": max((row["excess_rad"] for row in rows), default=None),
+                "joints": rows,
+            }
+
+        initial_limit_state = arm_joint_limit_diagnostics(limits)
+        if (
+            not initial_limit_state["within_limits"]
+            and initial_limit_state["maximum_excess_rad"] is not None
+            and initial_limit_state["maximum_excess_rad"] > 0.0002
+            and initial_limit_state["maximum_excess_rad"] <= 0.02
+        ):
+            from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
+
+            controller_fields = controller["robots"][0]["fields"]
+            recovery_monitor = GraspStabilityMonitor(required_samples=3)
+            recovery: dict[str, Any] = {
+                "status": "bounded_unheld_OSC_recovery_in_progress",
+                "initial_joint_limits": initial_limit_state,
+                "maximum_actions": 4,
+                "command": "joint-limit-directed world-Z OSC correction; real MuJoCo only",
+                "robot_or_object_state_written_directly": False,
+                "safety_certified": False,
+                "action_indices": [],
+            }
+            for recovery_index in range(4):
+                current_limit_state = arm_joint_limit_diagnostics(limits)
+                if current_limit_state["within_limits"]:
+                    break
+                if current_limit_state["maximum_excess_rad"] is None or current_limit_state["maximum_excess_rad"] > 0.02:
+                    break
+                current_robot = route_observation["snapshot_state"]["robot_states"][0]
+                current_position = np.asarray(current_robot["eef_pos"], dtype=np.float64)
+                current_quaternion = np.asarray(current_robot["eef_quat"], dtype=np.float64)
+                limiting_joint = max(
+                    current_limit_state["joints"], key=lambda row: row["excess_rad"],
+                )
+                z_correction_m = 0.002
+                if (
+                    limiting_joint["joint_name"].endswith("joint4")
+                    and limiting_joint["upper_excess_rad"] > 0.0
+                ):
+                    # A physical finite-difference probe on the exact failure
+                    # Snapshot showed +Z increased the joint4 upper-limit
+                    # excess.  Reverse the local direction and use a bounded
+                    # 8 mm target so OSC tracking clears integration noise in
+                    # a few audited steps without writing arm qpos.
+                    z_correction_m = -0.008
+                target_position = current_position + np.asarray([0.0, 0.0, z_correction_m])
+                target_quaternion = current_quaternion.copy()
+                recovery_rotation = None
+                if limiting_joint["joint_name"].endswith("joint7"):
+                    current_rotation = Rotation.from_quat(current_quaternion[[1, 2, 3, 0]])
+                    axis_world = current_rotation.as_matrix()[:, 2]
+                    direction = 1.0 if limiting_joint["lower_excess_rad"] > 0.0 else -1.0
+                    target_rotation = Rotation.from_rotvec(axis_world * direction * 0.01) * current_rotation
+                    target_quaternion = target_rotation.as_quat()[[3, 0, 1, 2]]
+                    recovery_rotation = {
+                        "joint_name": limiting_joint["joint_name"],
+                        "axis_world": axis_world.tolist(),
+                        "direction": direction,
+                        "command_rotation_rad": 0.01,
+                    }
+                action = world_pose_tracking_action(
+                    current_position, current_quaternion,
+                    target_position, target_quaternion,
+                    controller_fields, gripper_action=0.0,
+                ).astype(np.float32)
+                action_index = len(records)
+                _record_step(
+                    bridge, action, "pregrasp_joint_limit_OSC_recovery",
+                    "unheld_joint_limit_micro_recovery", action_index,
+                    target_binding, instruction, policy, recovery_monitor,
+                    records, frames,
+                    planning_tracking={
+                        "tracking_mode": "bounded_unheld_OSC_pose_recovery_from_joint_limit_violation",
+                        "target_eef_pose_world": np.r_[target_position, target_quaternion].tolist(),
+                        "world_z_correction_m": z_correction_m,
+                        "joint_limits_before": current_limit_state,
+                        "limiting_joint_wrist_unwind": recovery_rotation,
+                        "state_write": False,
+                        "safety_certified": False,
+                    },
+                )
+                recovery["action_indices"].append(action_index)
+                route_observation = bridge.request({
+                    "op": "observe", "include_snapshot_state": True,
+                })
+                limits = bridge.request({"op": "robot_joint_limit_inventory"})
+                after_limit_state = arm_joint_limit_diagnostics(limits)
+                recovery["latest_joint_limits"] = after_limit_state
+                if after_limit_state["within_limits"]:
+                    break
+                if (
+                    after_limit_state["maximum_excess_rad"] is None
+                    or after_limit_state["maximum_excess_rad"]
+                    >= current_limit_state["maximum_excess_rad"] - 1e-6
+                ):
+                    break
+            final_limit_state = arm_joint_limit_diagnostics(limits)
+            recovery["final_joint_limits"] = final_limit_state
+            recovery["status"] = (
+                "recovered_by_real_OSC"
+                if final_limit_state["within_limits"]
+                else "OSC_recovery_did_not_clear_joint_limit"
+            )
+            if recovery["action_indices"]:
+                exported_recovery = bridge.request({"op": "export_runtime_snapshot"})
+                if exported_recovery.get("status") != "complete" or not isinstance(exported_recovery.get("payload"), bytes):
+                    raise RuntimeError("pregrasp_joint_limit_recovery_snapshot_export_failed")
+                recovered_state = _snapshot_state_vector(exported_recovery.get("snapshot_state", {}))
+                observed_state = _snapshot_state_vector(route_observation.get("snapshot_state", {}))
+                if (
+                    exported_recovery.get("model_geometry_sha256") != model_sha
+                    or not np.array_equal(recovered_state, observed_state)
+                ):
+                    raise RuntimeError("pregrasp_joint_limit_recovery_snapshot_state_mismatch")
+                recovery_path = output_dir / "pregrasp_joint_limit_recovery_runtime_snapshot.pkl"
+                recovery_path.write_bytes(exported_recovery["payload"])
+                recovery["terminal_snapshot"] = {
+                    "path": str(recovery_path),
+                    "payload_sha256": _sha256_bytes(exported_recovery["payload"]),
+                    "integration_state_sha256": _state_sha(recovered_state),
+                }
+                search_start_payload = exported_recovery["payload"]
+                search_start_state = recovered_state
+                context = bridge.request({
+                    "op": "task_success_first_context",
+                    "expected_instruction": instruction,
+                    "target_predicate": args.target_predicate,
+                })
+                if context.get("status") != "complete" or context.get("native_goal_value") is not False:
+                    raise RuntimeError("pregrasp_joint_limit_recovery_changed_active_BDDL_goal_state")
+                report["pregrasp_joint_limit_recovery"] = recovery
+            else:
+                report["pregrasp_joint_limit_recovery"] = recovery
+
+        if (
+            not initial_limit_state["within_limits"]
+            and initial_limit_state["maximum_excess_rad"] is not None
+            and initial_limit_state["maximum_excess_rad"] <= 0.0002
+        ):
+            # At OAH/L1T3 t248, one-step +Z and -Z OSC probes both increased
+            # the joint5 excursion. Do not spend more physical actions on an
+            # uncalibrated retreat for this sub-0.2-mrad integration error;
+            # scratch-only IK screening may clip that tiny value, while the
+            # live Snapshot and every subsequent action remain untouched and
+            # fully audited.
+            report["pregrasp_joint_limit_recovery"] = {
+                "status": "micro_violation_deferred_to_physical_task_search",
+                "initial_joint_limits": initial_limit_state,
+                "physical_actions": 0,
+                "scratch_only_screen_tolerance_rad": 0.0002,
+                "robot_or_object_state_written_directly": False,
+                "safety_certified": False,
+            }
+
+        initial_safety = bridge.request({
+            "op": "safety_geometry_check", "safety_geometry_policy": policy,
+        })
         initial_contact_escape = robot_contact_escape_direction(
             initial_safety.get("contact_identities", []),
             ignore_object_id=str(context["target_object_id"]),
         )
         report["initial_robot_contact_escape"] = initial_contact_escape
+        route_obstacle_positions = _forbidden_object_root_positions(
+            policy,
+            route_observation.get("snapshot_state", {}),
+            active_target_object_id=str(context["target_object_id"]),
+        )
+        report["route_obstacle_positions_world"] = route_obstacle_positions
         candidate_generation_limit = _candidate_generation_limit(args)
+        required_geometry_ids = set(args.candidate_id)
+        required_geometry_ids.update(
+            candidate_id.split("__approach_axis", 1)[0]
+            for candidate_id in args.candidate_id
+            if "__approach_axis" in candidate_id
+        )
         candidate_pool, generation = generate_geometry_candidates(
-            context, maximum_candidates=candidate_generation_limit
+            context,
+            maximum_candidates=candidate_generation_limit,
+            required_candidate_ids=required_geometry_ids,
         )
         pool_offset = int(getattr(args, "geometry_candidate_pool_offset", 0))
-        candidates = candidate_pool[pool_offset:pool_offset + args.maximum_candidates]
-        generation["geometry_candidate_pool_window"] = {
-            "offset": pool_offset,
-            "count": len(candidates),
-            "generated_pool_count": len(candidate_pool),
-            "generation_limit": candidate_generation_limit,
-            "source": "active_scene_compiled_target_geometry",
-        }
+        if args.candidate_id:
+            requested_ids = set(args.candidate_id)
+            # A same-scene physical retry may pin a geometry candidate from an
+            # earlier branch even though the live robot pose changes its rank.
+            # Keep exact generated IDs addressable across the full active-scene
+            # pool instead of silently making the default ranked window a gate.
+            candidates = [
+                candidate for candidate in candidate_pool
+                if candidate.get("candidate_id") in requested_ids
+            ]
+            generation["geometry_candidate_pool_window"] = {
+                "offset": pool_offset,
+                "count": len(candidates),
+                "generated_pool_count": len(candidate_pool),
+                "generation_limit": candidate_generation_limit,
+                "source": "active_scene_compiled_target_geometry_exact_id_selection",
+                "requested_candidate_ids": sorted(requested_ids),
+            }
+        else:
+            candidates = candidate_pool[pool_offset:pool_offset + args.maximum_candidates]
+            generation["geometry_candidate_pool_window"] = {
+                "offset": pool_offset,
+                "count": len(candidates),
+                "generated_pool_count": len(candidate_pool),
+                "generation_limit": candidate_generation_limit,
+                "source": "active_scene_compiled_target_geometry",
+            }
         experience_use = {
             "library_path": str(args.experience_library) if args.experience_library else None,
             "library_loaded": False,
@@ -3111,7 +4874,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 base_candidates = {
                     str(candidate.get("candidate_id")): candidate
-                    for candidate in candidates
+                    for candidate in candidate_pool
                 }
                 regenerated = []
                 for requested_id in sorted(missing_ids):
@@ -3126,6 +4889,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         target_pose_world=target_pose_for_pin,
                         eef_position_world=eef_position_for_pin,
                         target_collision_geometries=context["target_collision_geometries"],
+                        depth_offset_fractions=(0.30, 0.60, 0.90, 1.20),
                     )
                     regenerated.extend(
                         candidate for candidate in expanded[1:]
@@ -3254,6 +5018,82 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 for candidate_id in sorted(screened_ids - feasible_ids)
             ]
+            live_eef_start_pose = _pose(
+                context["eef_pose_world"]["position_m"],
+                context["eef_pose_world"]["rotation"],
+            )
+            live_initial_grasp_state = bridge.request({
+                "op": "grasp_state",
+                "carried_binding": target_binding,
+                "expected_instruction": instruction,
+            })
+            live_initial_contact_sides = target_finger_contact_sides(
+                live_initial_grasp_state
+            )
+            near_surface_start_candidates: dict[str, dict[str, float]] = {}
+            near_pregrasp_start_candidates: dict[str, dict[str, float]] = {}
+            unilateral_contact_pose_candidates: dict[str, dict[str, Any]] = {}
+            for candidate in candidates:
+                candidate_grasp_pose = (
+                    target_pose_for_variants
+                    @ np.asarray(candidate["object_to_eef"], dtype=np.float64)
+                )
+                position_error, rotation_error = _pose_tracking_error_components(
+                    live_eef_start_pose, candidate_grasp_pose,
+                )
+                if (
+                    position_error <= NEAR_SURFACE_START_POSITION_M
+                    and rotation_error <= NEAR_SURFACE_START_ROTATION_RAD
+                ):
+                    near_surface_start_candidates[str(candidate["candidate_id"])] = {
+                        "eef_to_grasp_position_error_m": position_error,
+                        "eef_to_grasp_rotation_error_rad": rotation_error,
+                    }
+                if (
+                    len(live_initial_contact_sides) == 1
+                    and position_error <= args.stage_a_unilateral_close_probe_position_m
+                ):
+                    unilateral_contact_pose_candidates[str(candidate["candidate_id"])] = {
+                        "measured_target_finger_contact_sides": live_initial_contact_sides,
+                        "eef_to_grasp_position_error_m": position_error,
+                        "eef_to_grasp_rotation_error_rad": rotation_error,
+                        "position_threshold_m": args.stage_a_unilateral_close_probe_position_m,
+                        "candidate_rotation_error_ignored_after_measured_target_pad_contact": True,
+                        "requires_bounded_real_MuJoCo_close_and_stability_monitor": True,
+                        "live_state_modified": False,
+                    }
+                reachability = approach_rows[str(candidate["candidate_id"])].get(
+                    "joint_reachability", {}
+                )
+                pregrasp_endpoint_ik = bool(
+                    reachability.get("pregrasp", {}).get("reachable") is True
+                )
+                grasp_endpoint_ik = bool(
+                    reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                )
+                if grasp_endpoint_ik:
+                    _, candidate_pregrasp_pose = object_relative_grasp_targets(
+                        target_pose_for_variants,
+                        candidate["object_to_eef"],
+                        candidate["approach_direction_object"],
+                        float(candidate["approach_distance_m"]),
+                    )
+                    pregrasp_position_error, pregrasp_rotation_error = (
+                        _pose_tracking_error_components(
+                            live_eef_start_pose, candidate_pregrasp_pose,
+                        )
+                    )
+                    if (
+                        pregrasp_position_error <= NEAR_PREGRASP_START_POSITION_M
+                        and pregrasp_rotation_error <= NEAR_PREGRASP_START_ROTATION_RAD
+                    ):
+                        near_pregrasp_start_candidates[str(candidate["candidate_id"])] = {
+                            "eef_to_pregrasp_position_error_m": pregrasp_position_error,
+                            "eef_to_pregrasp_rotation_error_rad": pregrasp_rotation_error,
+                            "grasp_endpoint_IK_verified_by_task_approach_screen": True,
+                            "pregrasp_endpoint_IK_verified_by_task_approach_screen": pregrasp_endpoint_ik,
+                            "live_pose_near_pregrasp_is_a_physical_fallback": not pregrasp_endpoint_ik,
+                        }
             _write_json(output_dir / "task_approach_feasibility_screen.json", task_approach_screen)
             task_approach_pass_ids = set(feasible_ids)
             rejected_ids = screened_ids - feasible_ids
@@ -3281,7 +5121,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "candidate_count_excluded_for_missing_endpoint_ik": len(ik_unreachable_ids),
                 "stage_a_selection_policy": (
-                    "screen_pass_first_then_try_rejected_candidates_with_both_endpoint_IKs"
+                    "endpoint_IK_joint_travel_first_with_screen_outcome_only_as_tiebreaker"
                 ),
                 "screen_rejection_is_not_a_hard_stage_a_safety_gate": True,
                 "rejected_candidates": approach_rejections,
@@ -3290,9 +5130,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "safety_certified": False,
                 "screen_report": str(output_dir / "task_approach_feasibility_screen.json"),
             }
+            generation["near_surface_start_candidate_fallback"] = {
+                "candidate_ids": sorted(near_surface_start_candidates),
+                "diagnostics": near_surface_start_candidates,
+                "position_threshold_m": NEAR_SURFACE_START_POSITION_M,
+                "rotation_threshold_rad": NEAR_SURFACE_START_ROTATION_RAD,
+                "retained_even_if_pregrasp_endpoint_IK_unavailable": True,
+                "requires_real_MuJoCo_surface_approach_and_contact_close": True,
+                "live_state_modified": False,
+            }
+            generation["near_pregrasp_start_candidate_fallback"] = {
+                "candidate_ids": sorted(near_pregrasp_start_candidates),
+                "diagnostics": near_pregrasp_start_candidates,
+                "position_threshold_m": NEAR_PREGRASP_START_POSITION_M,
+                "rotation_threshold_rad": NEAR_PREGRASP_START_ROTATION_RAD,
+                "requires_task_approach_screen_grasp_endpoint_IK": True,
+                "pregrasp_endpoint_IK_failure_does_not_block_near_live_pose_fallback": True,
+                "requires_real_MuJoCo_pregrasp_and_surface_approach": True,
+                "live_state_modified": False,
+            }
+            generation["live_unilateral_contact_close_candidate_fallback"] = {
+                "candidate_ids": sorted(unilateral_contact_pose_candidates),
+                "diagnostics": unilateral_contact_pose_candidates,
+                "measured_target_finger_contact_sides": live_initial_contact_sides,
+                "candidate_pose_position_threshold_m": args.stage_a_unilateral_close_probe_position_m,
+                "candidate_pose_rotation_threshold_rad": NEAR_SURFACE_START_ROTATION_RAD,
+                "screen_and_endpoint_IK_rejections_do_not_suppress_this_physical_probe": True,
+                "live_state_modified": False,
+                "safety_certified": False,
+            }
             candidates = [
                 candidate for candidate in candidates
-                if candidate["candidate_id"] in feasible_ids | physically_reachable_reject_ids
+                if candidate["candidate_id"] in (
+                    feasible_ids
+                    | physically_reachable_reject_ids
+                    | set(near_surface_start_candidates)
+                    | set(near_pregrasp_start_candidates)
+                    | set(unilateral_contact_pose_candidates)
+                )
             ]
         else:
             generation["mechanical_opening_filter"] = {
@@ -3309,19 +5184,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if task_approach_pass_ids is None:
             candidates = diversify_candidates(candidates)
         else:
-            # Diversify within each evidence tier, then keep every scratch-screen
-            # pass ahead of collision/premature-contact fallbacks. Stage A does
-            # not discard a candidate solely because its open-surface screen
-            # predicts a safety violation.
-            passed = diversify_candidates([
-                candidate for candidate in candidates
-                if candidate["candidate_id"] in task_approach_pass_ids
-            ])
-            fallback = diversify_candidates([
-                candidate for candidate in candidates
-                if candidate["candidate_id"] not in task_approach_pass_ids
-            ])
-            candidates = passed + fallback
+            # Stage A seeks task completion and accepts physical contact. Keep
+            # screen passes as a tie-breaker, while endpoint IK and live-posture
+            # travel rank all reachable poses in one pool. This prevents a
+            # conservative open-path screen tier from promoting a much harder
+            # OSC joint winding above a lower-travel physical fallback.
+            live_arm_qpos = np.asarray(context.get("arm_qpos", []), dtype=np.float64)
+            candidates, posture_scores = _rank_by_endpoint_ik_joint_travel(
+                candidates, approach_rows, live_arm_qpos, task_approach_pass_ids,
+            )
+            generation["endpoint_ik_joint_travel_ranking"] = {
+                "applied": bool(posture_scores),
+                "joint_travel_precedes_screen_outcome": True,
+                "score": "L2(pregrasp_qpos-live_arm_qpos)+0.5*L2(grasp_qpos-pregrasp_qpos)",
+                "live_arm_qpos_rad": live_arm_qpos.tolist() if live_arm_qpos.shape == (7,) else None,
+                "ordered_candidates": posture_scores,
+                "physical_attempt_still_requires_real_MuJoCo_and_native_BDDL": True,
+                "safety_certified": False,
+            }
         if not args.strict_grasp_screen_only:
             candidates = candidates[:args.maximum_candidates]
         if not candidates:
@@ -3534,37 +5414,294 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 float(candidate["approach_distance_m"]),
             )
             pregrasp = pregrasp_pose[:3, 3]
-            rrt = bridge.request({
-                "op": "task_success_first_rrt",
-                "expected_instruction": instruction,
-                "model_geometry_sha256": model_sha,
-                "start_state_sha256": state_sha,
-                "goal_pose_world": {
-                    "position_world_m": pregrasp.tolist(),
-                    "quaternion_wxyz": _wxyz(target_pose[:3, :3]).tolist(),
-                },
-                "safety_geometry_policy": policy,
-                "planner_config": {
-                    "step_rad": 0.22,
-                    "connect_max_steps": 20,
-                    "goal_bias": 0.15,
-                    "max_iterations": 1200,
-                    "max_config_checks": 12000,
-                    # Keep several record-only alternatives and select the
-                    # one with the best diagnostic clearance before physical
-                    # execution. A failed physical route still rolls back.
-                    "max_candidate_routes": 3,
-                    "search_time_budget_s": args.rrt_time_budget_s,
-                    "shortcut_attempts": 40,
-                    "minimum_clearance_m": 0.0,
-                    "require_safe_configurations": False,
-                    "seed": planner_seed(
-                        int(args.seed),
-                        int(candidate["target_geom_id"]),
-                        len(report["candidates"]),
+            live_eef_pose = np.r_[
+                context["eef_pose_world"]["position_m"],
+                _wxyz(context["eef_pose_world"]["rotation"]),
+            ]
+            live_eef_transform = _pose(
+                live_eef_pose[:3],
+                Rotation.from_quat(live_eef_pose[3:][[1, 2, 3, 0]]).as_matrix(),
+            )
+            near_position_error, near_rotation_error = _pose_tracking_error_components(
+                live_eef_transform, target_pose,
+            )
+            approach_reachability = approach_rows.get(
+                str(candidate["candidate_id"]), {}
+            ).get("joint_reachability", {})
+            pregrasp_endpoint_ik_verified = bool(
+                approach_reachability.get("pregrasp", {}).get("reachable") is True
+                and approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+            )
+            candidate_pregrasp_ik = approach_reachability.get(
+                "pregrasp", {}
+            ).get("qpos") if pregrasp_endpoint_ik_verified else None
+            if (
+                not pregrasp_endpoint_ik_verified
+                and approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+            ):
+                original_approach_distance = float(candidate["approach_distance_m"])
+                short_approach_trials: list[dict[str, Any]] = []
+                tested_distances = list(dict.fromkeys(
+                    round(value, 6)
+                    for value in (
+                        max(0.045, original_approach_distance - 0.015),
+                        max(0.030, original_approach_distance - 0.030),
+                        max(0.015, original_approach_distance - 0.045),
+                    )
+                    if value < original_approach_distance - 1e-6
+                ))
+                seed_qpos_values = [
+                    np.asarray(context["arm_qpos"], dtype=np.float64).tolist()
+                ]
+                grasp_seed = approach_reachability.get(
+                    "grasp_open_gripper", {}
+                ).get("qpos")
+                if isinstance(grasp_seed, list) and len(grasp_seed) == 7:
+                    grasp_seed_array = np.asarray(grasp_seed, dtype=np.float64)
+                    if np.isfinite(grasp_seed_array).all():
+                        seed_qpos_values.append(grasp_seed_array.tolist())
+                for short_distance in tested_distances:
+                    trial_target, trial_pregrasp = object_relative_grasp_targets(
+                        object_pose,
+                        candidate["object_to_eef"],
+                        candidate["approach_direction_object"],
+                        short_distance,
+                    )
+                    ik_reply = bridge.request({
+                        "op": "task_success_first_ik_preflight",
+                        "expected_instruction": instruction,
+                        "model_geometry_sha256": model_sha,
+                        "start_state_sha256": state_sha,
+                        "goal_pose_world": {
+                            "position_world_m": trial_pregrasp[:3, 3].tolist(),
+                            "quaternion_wxyz": _wxyz(trial_pregrasp[:3, :3]).tolist(),
+                        },
+                        "ik_seed_qpos": seed_qpos_values,
+                        "ik_selection_seed_qpos": seed_qpos_values[0],
+                        "ik_solver_max_nfev": 120,
+                        "jointspace_reference_start_qpos": seed_qpos_values[0],
+                        "jointspace_reference_max_step_rad": 0.10,
+                        "safety_geometry_policy": policy,
+                    })
+                    trial_qpos = ik_reply.get("ik_goal_qpos")
+                    trial_passed = bool(
+                        ik_reply.get("status") == "goal_ik_preflight_passed"
+                        and ik_reply.get("live_state_unchanged") is True
+                        and isinstance(trial_qpos, list)
+                        and len(trial_qpos) == 7
+                        and np.isfinite(np.asarray(trial_qpos, dtype=np.float64)).all()
+                    )
+                    short_approach_trials.append({
+                        "approach_distance_m": short_distance,
+                        "status": "read_only_pregrasp_IK_passed" if trial_passed else "pregrasp_IK_unreachable",
+                        "failure_reason": ik_reply.get("failure_reason"),
+                        "live_state_unchanged": ik_reply.get("live_state_unchanged"),
+                    })
+                    if trial_passed:
+                        candidate["approach_distance_m"] = short_distance
+                        candidate["_short_approach_ik_seed_qpos"] = trial_qpos
+                        candidate["_short_approach_ik_trials"] = short_approach_trials
+                        target_pose, pregrasp_pose = trial_target, trial_pregrasp
+                        pregrasp_endpoint_ik_verified = True
+                        candidate_pregrasp_ik = trial_qpos
+                        approach_reachability["pregrasp"] = {
+                            "reachable": True,
+                            "qpos": trial_qpos,
+                            "approach_distance_m": short_distance,
+                            "source": "shortened_object_geometry_approach_distance_read_only_IK",
+                        }
+                        break
+                if candidate.get("_short_approach_ik_trials") is None:
+                    candidate["_short_approach_ik_trials"] = short_approach_trials
+            if candidate_pregrasp_ik is not None:
+                candidate_pregrasp_ik = np.asarray(candidate_pregrasp_ik, dtype=np.float64)
+                if candidate_pregrasp_ik.shape == (7,) and np.isfinite(candidate_pregrasp_ik).all():
+                    candidate["_pregrasp_ik_seed_qpos"] = candidate_pregrasp_ik.tolist()
+            pregrasp_position_error, pregrasp_rotation_error = (
+                _pose_tracking_error_components(live_eef_transform, pregrasp_pose)
+            )
+            near_pregrasp_start = bool(
+                approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                and pregrasp_position_error <= NEAR_PREGRASP_START_POSITION_M
+                and pregrasp_rotation_error <= NEAR_PREGRASP_START_ROTATION_RAD
+            )
+            near_surface_start = bool(
+                near_position_error <= NEAR_SURFACE_START_POSITION_M
+                and near_rotation_error <= NEAR_SURFACE_START_ROTATION_RAD
+            )
+            approach_route_strategy = str(
+                getattr(args, "approach_route_strategy", "auto")
+            )
+            explicit_geometry_high_approach = approach_route_strategy in {
+                "geometry_high_approach", "geometry_direct_approach",
+            }
+            if explicit_geometry_high_approach:
+                # This mode is an explicit physical experiment: the candidate
+                # pose came from active-scene geometry, and OSC will test its
+                # reachability while tracking. Do not let a broad "near enough"
+                # shortcut or a one-finger close probe bypass the requested
+                # direct or lifted OSC route.
+                rrt = {
+                    "status": "offline_feasible",
+                    "planner_source": (
+                        "explicit_active_geometry_direct_approach.v1"
+                        if approach_route_strategy == "geometry_direct_approach"
+                        else "explicit_active_geometry_high_approach.v1"
                     ),
-                },
-            })
+                    "planning_seconds": 0.0,
+                    "config_checks": 0,
+                    "iterations": 0,
+                    "selected_route_index": (
+                        "explicit_geometry_direct_approach"
+                        if approach_route_strategy == "geometry_direct_approach"
+                        else "explicit_geometry_high_approach"
+                    ),
+                    "minimum_forbidden_clearance_m": None,
+                    "live_state_unchanged": True,
+                    "eef_reference_poses_world": [],
+                    "route_candidates": [],
+                    "explicit_route_strategy": {
+                        "name": approach_route_strategy,
+                        "RRT_skipped_by_explicit_experiment_design": True,
+                        "pregrasp_endpoint_ik_verified_by_task_approach_screen": (
+                            pregrasp_endpoint_ik_verified
+                        ),
+                        "OSC_physical_reachability_test_required": True,
+                        "physical_state_modified": False,
+                    },
+                }
+            elif near_surface_start:
+                # A legal snapshot can already be at the grasp surface after a
+                # prior physical branch. Returning to pregrasp would waste a
+                # full RRT and duplicate the expensive prefix. Continue with a
+                # real MuJoCo OSC correction from the exact live pose instead.
+                rrt = {
+                    "status": "offline_feasible",
+                    "planner_source": "near_target_direct_surface_approach.v1",
+                    "planning_seconds": 0.0,
+                    "config_checks": 0,
+                    "iterations": 0,
+                    "selected_route_index": "near_surface_start",
+                    "minimum_forbidden_clearance_m": None,
+                    "live_state_unchanged": True,
+                    "eef_reference_poses_world": [live_eef_pose.tolist(), live_eef_pose.tolist()],
+                    "route_candidates": [{
+                        "route_index": "near_surface_start",
+                        "route_source": "near_target_direct_surface_approach",
+                        "metrics": {
+                            "direct_surface_approach_start": True,
+                            "eef_to_grasp_position_error_m": near_position_error,
+                            "eef_to_grasp_rotation_error_rad": near_rotation_error,
+                            "RRT_skipped_to_avoid_repeating_pregrasp_prefix": True,
+                        },
+                        "eef_reference_poses_world": [
+                            live_eef_pose.tolist(), live_eef_pose.tolist(),
+                        ],
+                    }],
+                    "near_surface_start_diagnostic": {
+                        "status": "pass",
+                        "position_error_m": near_position_error,
+                        "rotation_error_rad": near_rotation_error,
+                        "position_threshold_m": NEAR_SURFACE_START_POSITION_M,
+                        "rotation_threshold_rad": NEAR_SURFACE_START_ROTATION_RAD,
+                        "physical_state_modified": False,
+                    },
+                }
+            elif near_pregrasp_start:
+                # A restored failure snapshot can already be within a short,
+                # IK-verified final approach to pregrasp. Replan-free OSC from
+                # that exact live pose avoids repeating a long elevated prefix.
+                pregrasp_pose_7d = np.r_[
+                    pregrasp_pose[:3, 3], _wxyz(pregrasp_pose[:3, :3]),
+                ]
+                rrt = {
+                    "status": "offline_feasible",
+                    "planner_source": "near_target_direct_pregrasp_approach.v1",
+                    "planning_seconds": 0.0,
+                    "config_checks": 0,
+                    "iterations": 0,
+                    "selected_route_index": "near_pregrasp_start",
+                    "minimum_forbidden_clearance_m": None,
+                    "live_state_unchanged": True,
+                    "eef_reference_poses_world": [
+                        live_eef_pose.tolist(), pregrasp_pose_7d.tolist(),
+                    ],
+                    "route_candidates": [{
+                        "route_index": "near_pregrasp_start",
+                        "route_source": "near_target_direct_pregrasp_approach",
+                        "metrics": {
+                            "direct_pregrasp_approach_start": True,
+                            "eef_to_pregrasp_position_error_m": pregrasp_position_error,
+                            "eef_to_pregrasp_rotation_error_rad": pregrasp_rotation_error,
+                            "grasp_endpoint_IK_verified_by_task_approach_screen": (
+                                approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                            ),
+                            "pregrasp_endpoint_IK_verified_by_task_approach_screen": pregrasp_endpoint_ik_verified,
+                            "admitted_by_live_pregrasp_pose_and_physical_OSC_validation": True,
+                            "RRT_skipped_to_avoid_repeating_elevated_prefix": True,
+                        },
+                        "eef_reference_poses_world": [
+                            live_eef_pose.tolist(), pregrasp_pose_7d.tolist(),
+                        ],
+                    }],
+                    "near_pregrasp_start_diagnostic": {
+                        "status": "pass",
+                        "position_error_m": pregrasp_position_error,
+                        "rotation_error_rad": pregrasp_rotation_error,
+                        "position_threshold_m": NEAR_PREGRASP_START_POSITION_M,
+                        "rotation_threshold_rad": NEAR_PREGRASP_START_ROTATION_RAD,
+                        "grasp_endpoint_IK_verified_by_task_approach_screen": (
+                            approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                        ),
+                        "pregrasp_endpoint_IK_verified_by_task_approach_screen": pregrasp_endpoint_ik_verified,
+                        "admitted_by_live_pregrasp_pose_and_physical_OSC_validation": True,
+                        "physical_state_modified": False,
+                    },
+                }
+            else:
+                rrt = bridge.request({
+                    "op": "task_success_first_rrt",
+                    "expected_instruction": instruction,
+                    "model_geometry_sha256": model_sha,
+                    "start_state_sha256": state_sha,
+                    "goal_pose_world": {
+                        "position_world_m": pregrasp.tolist(),
+                        "quaternion_wxyz": _wxyz(target_pose[:3, :3]).tolist(),
+                    },
+                    "ik_seed_qpos": (
+                        [np.asarray(
+                            approach_reachability["pregrasp"]["qpos"],
+                            dtype=np.float64,
+                        ).tolist()]
+                        if pregrasp_endpoint_ik_verified else None
+                    ),
+                    "safety_geometry_policy": policy,
+                    "planner_config": {
+                        "step_rad": 0.22,
+                        "connect_max_steps": 20,
+                        "goal_bias": 0.15,
+                        "max_iterations": 1200,
+                        "max_config_checks": 12000,
+                        # Keep several record-only alternatives and select the
+                        # one with the best diagnostic clearance before physical
+                        # execution. A failed physical route still rolls back.
+                        "max_candidate_routes": 3,
+                        "search_time_budget_s": args.rrt_time_budget_s,
+                        "shortcut_attempts": 40,
+                        "minimum_clearance_m": 0.0,
+                        # A few microradians of OSC integration noise may place
+                        # the exact live start just outside a hard stop. The
+                        # planner projects only its private seed onto the limit;
+                        # live qpos stays untouched and IK goals remain strict.
+                        "start_joint_limit_tolerance_rad": 5e-6,
+                        "require_safe_configurations": False,
+                        "seed": planner_seed(
+                            int(args.seed),
+                            int(candidate["target_geom_id"]),
+                            len(report["candidates"]),
+                        ),
+                    },
+                })
             summary = {
                 "candidate_id": candidate["candidate_id"],
                 "candidate_geometry": candidate,
@@ -3576,8 +5713,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "rrt_minimum_diagnostic_clearance_m": rrt.get("minimum_forbidden_clearance_m"),
                 "rrt_route_candidates": rrt.get("route_candidates", []),
                 "rrt_live_state_unchanged": rrt.get("live_state_unchanged"),
+                "rrt_ik_seed_source": (
+                    "task_approach_screen_pregrasp_endpoint_ik"
+                    if (
+                        pregrasp_endpoint_ik_verified
+                        and not explicit_geometry_high_approach
+                        and not near_surface_start
+                        and not near_pregrasp_start
+                    ) else None
+                ),
+                "rrt_ik_selection_seed_source": (
+                    "planner_start_qpos_clipped_to_joint_limits"
+                    if (
+                        pregrasp_endpoint_ik_verified
+                        and not explicit_geometry_high_approach
+                        and not near_surface_start
+                        and not near_pregrasp_start
+                    ) else None
+                ),
                 "rrt_safety_certified": False,
                 "pregrasp_pose_world": np.r_[pregrasp, _wxyz(target_pose[:3, :3])].tolist(),
+                "near_surface_start_bypass": rrt.get("near_surface_start_diagnostic"),
                 "planner_response": rrt,
             }
             report["candidates"].append(summary)
@@ -3627,23 +5783,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
             if (
-                (not routes or len(live_contact_sides) == 2)
+                not explicit_geometry_high_approach
+                and (
+                    not routes
+                    or len(live_contact_sides) == 2
+                    or str(candidate["candidate_id"])
+                    in unilateral_contact_pose_candidates
+                )
                 and live_contact_sides
-                and live_pose_aligned
+                and (
+                    live_pose_aligned
+                    or str(candidate["candidate_id"])
+                    in unilateral_contact_pose_candidates
+                )
             ):
-                # Close only when measured opposing contacts coincide with the
-                # generated candidate pose; incidental contact elsewhere is not
-                # treated as a grasp-ready state.
+                # A measured unilateral target-pad contact near an orientation-
+                # aligned generated grasp frame also merits a bounded physical
+                # close probe.  This avoids replanning away from useful contact
+                # on low objects while retaining the live grasp monitor as the
+                # only success oracle.
                 routes = [{
                     "route_index": "live_contact_pose_aligned_close_probe",
                     "eef_reference_poses_world": [start_pose.tolist(), start_pose.tolist()],
                     "route_source": "live_target_contact_pose_aligned_close_probe",
                     "live_contact_sides": list(live_contact_sides),
                 }]
-                summary["live_contact_close_probe_admitted_after_RRT_failure"] = {
+                summary["live_contact_close_probe_admitted_from_measured_target_contact"] = {
                     "finger_sides": list(live_contact_sides),
                     "eef_to_migrated_grasp_pose_m": live_grasp_distance_m,
                     "eef_to_migrated_grasp_rotation_error_rad": live_grasp_rotation_error_rad,
+                    "configured_unilateral_candidate_position_threshold_m": (
+                        args.stage_a_unilateral_close_probe_position_m
+                    ),
                     "pose_alignment_tolerances": {
                         "position_m": LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
                         "rotation_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
@@ -3661,8 +5832,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     and summary.get("ik_candidates")
                     and summary.get("rrt_live_state_unchanged") is True
                 )
-                generated_geometry_route_available = _cold_start_geometry_fallback_allowed(
-                    cold_start, candidate, planner_response,
+                explicit_geometry_route_available = bool(
+                    explicit_geometry_high_approach
+                    and summary.get("rrt_live_state_unchanged") is True
+                )
+                generated_geometry_route_available = (
+                    explicit_geometry_route_available
+                    or _generated_geometry_fallback_allowed(candidate, planner_response)
                 )
                 if experience_route_available or generated_geometry_route_available:
                     object_pose = _pose(
@@ -3677,7 +5853,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     pregrasp_pose_7d = np.r_[pregrasp_pose[:3, 3], _wxyz(pregrasp_pose[:3, :3])]
                     route_start = escape_pose if escape_pose is not None else start_pose
-                    if generated_geometry_route_available:
+                    if explicit_geometry_route_available:
+                        route_source = "explicit_active_BDDL_geometry_high_OSC_approach"
+                    elif generated_geometry_route_available:
                         route_source = "active_BDDL_geometry_high_OSC_approach_after_RRT_failure"
                     else:
                         route_source = (
@@ -3685,15 +5863,97 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             if escape_pose is not None
                             else "object_relative_experience_high_OSC_approach_after_RRT_preflight_failure"
                         )
-                    routes = [{
-                        "route_index": "generated_geometry_high_approach" if generated_geometry_route_available else "historical_high_approach",
-                        "eef_reference_poses_world": high_approach_route(
+                    if explicit_geometry_route_available:
+                        # In an explicitly requested Stage A physical search,
+                        # intermediate scratch-IK failure is not evidence that
+                        # OSC cannot track the route.  The previous path
+                        # rejected every target before taking an action when
+                        # one of its conservative transit waypoints had no
+                        # bounded IK solution.  Keep the route grounded in the
+                        # active-scene grasp geometry, then let real MuJoCo
+                        # execution measure tracking and contact outcomes.
+                        # Automatic fallback mode retains its adaptive IK
+                        # preflight below.
+                        if approach_route_strategy == "geometry_direct_approach":
+                            # A fixed elevated transit can itself be outside
+                            # the live OSC workspace even when both endpoints
+                            # have IK.  From an exact Snapshot, test the
+                            # direct Cartesian segment with bounded OSC steps;
+                            # contact and BDDL remain the physical oracles.
+                            route_poses = [route_start.tolist(), pregrasp_pose_7d.tolist()]
+                            route_index = "explicit_geometry_direct_approach_physical_validation"
+                            route_source = "explicit_active_BDDL_geometry_direct_OSC_approach"
+                        else:
+                            route_poses = high_approach_route(
+                                route_start,
+                                pregrasp_pose_7d,
+                                elevation_m=0.10,
+                                lift_before_translate=True,
+                            )
+                            route_index = "explicit_geometry_high_approach_physical_validation"
+                            route_source = "explicit_active_BDDL_geometry_high_OSC_approach_without_intermediate_IK_veto"
+                        summary["adaptive_geometry_route_preflight"] = {
+                            "status": "bypassed_for_explicit_physical_validation",
+                            "reason": "read_only_intermediate_IK_preflight_would_prevent_any_MuJoCo_attempt",
+                            "route_waypoint_count": len(route_poses),
+                            "physical_OSC_tracking_is_required": True,
+                            "live_state_modified_during_preflight": False,
+                            "safety_certified": False,
+                        }
+                    elif generated_geometry_route_available:
+                        candidate_goal_ik = candidate.get("_pregrasp_ik_seed_qpos")
+                        if candidate_goal_ik is None:
+                            summary["adaptive_geometry_route_preflight"] = {
+                                "status": "missing_candidate_endpoint_ik_seed",
+                                "physical_actions": 0,
+                            }
+                            continue
+                        adaptive_route, adaptive_report = _adaptive_geometry_approach_route(
+                            bridge,
+                            start_pose=route_start,
+                            target_pose=pregrasp_pose_7d,
+                            forbidden_obstacle_positions_world=route_obstacle_positions,
+                            minimum_transit_height_m=(
+                                float(initial_contact_escape["contact_clearance_waypoint_z_m"])
+                                if initial_contact_escape is not None
+                                and initial_contact_escape.get("contact_clearance_waypoint_z_m") is not None
+                                else None
+                            ),
+                            approach_direction_world=(
+                                target_pose[:3, 3] - pregrasp_pose[:3, 3]
+                            ) / max(
+                                float(np.linalg.norm(
+                                    target_pose[:3, 3] - pregrasp_pose[:3, 3]
+                                )),
+                                1e-12,
+                            ),
+                            live_arm_qpos=np.asarray(context["arm_qpos"], dtype=np.float64),
+                            instruction=instruction,
+                            model_sha=model_sha,
+                            state_sha=state_sha,
+                            policy=policy,
+                        )
+                        summary["adaptive_geometry_route_preflight"] = adaptive_report
+                        if adaptive_route is None:
+                            continue
+                        route_poses = adaptive_route
+                        route_index = "adaptive_geometry_ik_waypoints"
+                        route_source = adaptive_report["route_source"]
+                    else:
+                        route_poses = high_approach_route(
                             route_start,
                             pregrasp_pose_7d,
                             elevation_m=0.18 if escape_pose is not None else 0.10,
-                        ),
+                            lift_before_translate=True,
+                        )
+                        route_index = "historical_high_approach"
+                    routes = [{
+                        "route_index": route_index,
+                        "eef_reference_poses_world": route_poses,
                         "route_source": route_source,
+                        "preserve_eef_waypoints": generated_geometry_route_available,
                         "contact_escape_prepended": escape_pose is not None,
+                        "defer_live_contact_close_until_route_end": explicit_geometry_route_available,
                     }]
                     if escape_pose is not None:
                         routes[0]["eef_reference_poses_world"] = [
@@ -3702,6 +5962,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         ]
                     summary["historical_direct_OSC_fallback_added"] = experience_route_available
                     summary["generated_geometry_high_approach_fallback_added"] = generated_geometry_route_available
+                    summary["explicit_geometry_high_approach_selected"] = bool(
+                        explicit_geometry_route_available
+                        and approach_route_strategy == "geometry_high_approach"
+                    )
+                    summary["explicit_geometry_physical_approach_strategy"] = (
+                        approach_route_strategy
+                        if explicit_geometry_route_available else None
+                    )
                 else:
                     continue
             if escape_pose is not None:
@@ -3733,12 +6001,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 poses = route.get("eef_reference_poses_world")
                 if not poses:
                     continue
-                signature = (
-                    f"{route.get('route_source', 'live_target_contact_close_probe')}_"
-                    + "_".join(route.get("live_contact_sides", []))
-                    if route.get("live_contact_sides")
-                    else route_signature(poses)
-                )
+                if route.get("route_source") == "near_target_direct_surface_approach":
+                    signature = f"near_target_direct_surface_approach:{candidate['candidate_id']}"
+                elif route.get("live_contact_sides"):
+                    signature = (
+                        f"{route.get('route_source', 'live_target_contact_close_probe')}_"
+                        + "_".join(route.get("live_contact_sides", []))
+                    )
+                else:
+                    signature = route_signature(poses)
                 route_id = f"rrt{route.get('route_index', 0)}:{signature}"
                 if not live_pose_aligned and not route.get("live_contact_sides"):
                     route_id = f"{route_id}:live_object_relative_target"
@@ -3772,6 +6043,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             planned_route["selected_route_index"] = route.get("route_index")
             planned_route["planner_source"] = route.get(
                 "route_source", planner_response.get("planner_source", "jointspace_rrt_connect.v1")
+            )
+            planned_route["preserve_eef_waypoints"] = bool(
+                route.get("preserve_eef_waypoints", False)
+            )
+            planned_route["defer_live_contact_close_until_route_end"] = bool(
+                route.get("defer_live_contact_close_until_route_end", False)
             )
             attempted_candidate = dict(candidate)
             attempted_candidate["geometry_candidate_id"] = candidate["candidate_id"]
@@ -3830,7 +6107,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     records=records,
                     frames=frames,
                     output_dir=output_dir,
-                    abort_target_displacement_m=0.015 if cold_start else None,
+                    local_replan_rrt_time_budget_s=args.local_replan_rrt_time_budget_s,
+                    abort_target_displacement_m=(
+                        0.015
+                        if cold_start and not bool(rrt.get("defer_live_contact_close_until_route_end"))
+                        else None
+                    ),
+                    force_route_before_contact_close=bool(
+                        rrt.get("defer_live_contact_close_until_route_end")
+                    ),
+                    stage_a_unilateral_close_probe_position_m=(
+                        args.stage_a_unilateral_close_probe_position_m
+                    ),
+                    stage_a_pregrasp_staged_clearance_height_m=(
+                        args.stage_a_pregrasp_staged_clearance_height_m
+                    ),
+                    stage_a_pregrasp_lateral_detour_m=(
+                        args.stage_a_pregrasp_lateral_detour_m
+                    ),
+                    stage_a_pregrasp_lift_before_lateral_detour=(
+                        args.stage_a_pregrasp_lift_before_lateral_detour
+                    ),
                 )
                 branch.update(result)
                 final_snapshot_payload = candidate_snapshot
@@ -3887,6 +6184,73 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     item for item in records if item.get("candidate_id") == candidate["candidate_id"]
                 ]
                 last_record = candidate_records[-1] if candidate_records else {}
+                # A grasp-search branch can complete the whole BDDL task by
+                # physically pushing an object into its goal. Preserve that
+                # terminal Episode instead of misclassifying MuJoCo's done
+                # signal as a failed grasp-only branch.
+                if (
+                    last_record.get("done") is True
+                    and last_record.get("task_success") is True
+                ):
+                    native_terminal = bridge.request({"op": "native_task_status"})
+                    if native_terminal.get("task_success") is True:
+                        terminal = bridge.request({"op": "export_runtime_snapshot"})
+                        if terminal.get("status") != "complete" or not isinstance(
+                            terminal.get("payload"), bytes
+                        ):
+                            raise RuntimeError(
+                                "native_task_success_terminal_snapshot_export_failed"
+                            )
+                        terminal_slug = "".join(
+                            char if char.isalnum() or char in "._-" else "_"
+                            for char in str(candidate.get("candidate_id", "candidate"))
+                        )[:120]
+                        terminal_path = output_dir / (
+                            f"{terminal_slug}__native_task_success_terminal_runtime_snapshot.pkl"
+                        )
+                        terminal_path.write_bytes(terminal["payload"])
+                        terminal_state = _snapshot_state_vector(
+                            terminal.get("snapshot_state", {})
+                        )
+                        terminal_snapshot = {
+                            "status": "saved_native_task_success_episode_terminal",
+                            "path": str(terminal_path),
+                            "payload_sha256": _sha256_bytes(terminal["payload"]),
+                            "integration_state_sha256": _state_sha(terminal_state),
+                            "model_geometry_sha256": model_sha,
+                            "timestep": native_terminal.get("timestep"),
+                            "task_success_candidate": False,
+                            "safety_certified": False,
+                        }
+                        branch.update({
+                            "status": "native_task_success_terminated_episode",
+                            "failure_reason": None,
+                            "task_success_candidate": False,
+                            "episode_native_task_success": True,
+                            "native_task_status": native_terminal,
+                            "stable_bilateral_grasp_observed": False,
+                            "final_snapshot": terminal_snapshot,
+                            "terminal_action_record_index": len(records) - 1,
+                        })
+                        report["episode_native_success"] = {
+                            "status": "native_task_success_terminated_episode",
+                            "native_task_status": native_terminal,
+                            "terminal_action": {
+                                "step_index": last_record.get("step_index"),
+                                "timestep": last_record.get("timestep"),
+                                "reward": last_record.get("reward"),
+                                "done": last_record.get("done"),
+                                "task_success": last_record.get("task_success"),
+                                "candidate_id": last_record.get("candidate_id"),
+                            },
+                            "stable_bilateral_grasp_observed": False,
+                            "snapshot": terminal_snapshot,
+                            "episode_action_count_from_legal_t0": native_terminal.get("timestep"),
+                            "safety_certified": False,
+                        }
+                        final_snapshot_payload = terminal["payload"]
+                        report["status"] = "native_task_success_terminated_episode"
+                        break
                 last_target = _object_state(
                     last_record.get("snapshot_state", {}), int(target_binding["body_id"])
                 ) if last_record else {}
@@ -4004,7 +6368,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     branch["failure_branch_recovery_error"] = f"{type(restore_exc).__name__}: {restore_exc}"
                     branch["bridge_unavailable_after_failure"] = True
                     break
-        if report.get("success") is None:
+        if report.get("success") is None and report.get("episode_native_success") is None:
             if not physical_candidates:
                 report["status"] = "no_record_only_RRT_route_for_physical_attempt"
                 report["failure_classification"] = Counter(
@@ -4045,32 +6409,58 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if recovery_reset.get("scene_metadata", {}).get("model_geometry_sha256") != model_sha:
                 raise RuntimeError("fresh_recovery_bridge_model_fingerprint_mismatch")
             restored = recovery.request({"op": "restore_runtime_snapshot", "payload": final_snapshot_payload})
-            expected = report["success"]["snapshot"]["snapshot_state"]
+            episode_native_success = report.get("episode_native_success")
             if restored.get("status") != "restored" or restored.get("model_geometry_sha256") != model_sha:
-                raise RuntimeError("fresh_bridge_could_not_restore_task_success_candidate_snapshot")
-            if not np.array_equal(
-                _snapshot_state_vector(restored.get("snapshot_state", {})),
-                _snapshot_state_vector(expected),
-            ):
-                raise RuntimeError("fresh_bridge_snapshot_integration_state_mismatch")
-            grasp = recovery.request({
-                "op": "grasp_state",
-                "carried_binding": report["preflight"].get("target_binding", {
-                    "object_id": report["active_target"]["object_id_from_native_BDDL"],
-                    "body_id": int(report["active_target"]["semantic_binding"]["root_body_id"]),
-                    "body_name": str(report["active_target"]["semantic_binding"]["root_body_name"]),
-                    "geom_ids": report["active_target"]["semantic_binding"]["root_geom_ids"],
-                    "geom_names": report["active_target"]["semantic_binding"]["root_geom_names"],
-                }),
-                "expected_instruction": report["active_target"]["instruction"],
-            })
-            report["snapshot_recovery_verification"] = {
-                "status": "pass",
-                "port": recovery_address[1],
-                "model_geometry_sha256": model_sha,
-                "integration_state_exact_match": True,
-                "restored_grasp_state": grasp,
-            }
+                raise RuntimeError("fresh_bridge_could_not_restore_terminal_snapshot")
+            if episode_native_success is not None:
+                recovered_state_sha = _state_sha(
+                    _snapshot_state_vector(restored.get("snapshot_state", {}))
+                )
+                if recovered_state_sha != episode_native_success["snapshot"].get(
+                    "integration_state_sha256"
+                ):
+                    raise RuntimeError("fresh_bridge_snapshot_integration_state_mismatch")
+                recovered_native = recovery.request({"op": "native_task_status"})
+                if (
+                    recovered_native.get("task_success") is not True
+                    or recovered_native.get("timestep")
+                    != episode_native_success["native_task_status"].get("timestep")
+                ):
+                    raise RuntimeError("restored_terminal_snapshot_native_success_mismatch")
+                episode_native_success["snapshot"]["integration_state_exact_match"] = True
+                episode_native_success["snapshot_recovery_native_task_status"] = recovered_native
+                report["snapshot_recovery_verification"] = {
+                    "status": "pass",
+                    "port": recovery_address[1],
+                    "model_geometry_sha256": model_sha,
+                    "integration_state_exact_match": True,
+                    "native_task_status": recovered_native,
+                }
+            else:
+                expected = report["success"]["snapshot"].get("snapshot_state")
+                if expected is None or not np.array_equal(
+                    _snapshot_state_vector(restored.get("snapshot_state", {})),
+                    _snapshot_state_vector(expected),
+                ):
+                    raise RuntimeError("fresh_bridge_snapshot_integration_state_mismatch")
+                grasp = recovery.request({
+                    "op": "grasp_state",
+                    "carried_binding": report["preflight"].get("target_binding", {
+                        "object_id": report["active_target"]["object_id_from_native_BDDL"],
+                        "body_id": int(report["active_target"]["semantic_binding"]["root_body_id"]),
+                        "body_name": str(report["active_target"]["semantic_binding"]["root_body_name"]),
+                        "geom_ids": report["active_target"]["semantic_binding"]["root_geom_ids"],
+                        "geom_names": report["active_target"]["semantic_binding"]["root_geom_names"],
+                    }),
+                    "expected_instruction": report["active_target"]["instruction"],
+                })
+                report["snapshot_recovery_verification"] = {
+                    "status": "pass",
+                    "port": recovery_address[1],
+                    "model_geometry_sha256": model_sha,
+                    "integration_state_exact_match": True,
+                    "restored_grasp_state": grasp,
+                }
         except Exception as exc:
             report["snapshot_recovery_verification"] = {
                 "status": "fail", "port": recovery_address[1],
@@ -4079,7 +6469,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["status"] = "task_success_candidate_snapshot_recovery_failed"
         finally:
             recovery.close()
-        report["artifacts"]["task_success_candidate_snapshot"] = report["success"]["snapshot"]["path"]
+        if report.get("episode_native_success") is not None:
+            report["artifacts"]["native_task_success_terminal_snapshot"] = (
+                report["episode_native_success"]["snapshot"]["path"]
+            )
+        else:
+            report["artifacts"]["task_success_candidate_snapshot"] = report["success"]["snapshot"]["path"]
         report["artifacts"]["dual_camera_video"] = report["artifacts"].get("dual_camera_video")
         _write_json(output_dir / "run_report.json", report)
 
@@ -4123,7 +6518,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidate-id", action="append", default=[],
-        help="limit a local retry to a previously generated candidate; repeat only in screen-only mode",
+        help="limit physical search to one or more deterministic generated candidate IDs",
     )
     parser.add_argument(
         "--candidate-tilt-degrees", type=float, action="append", default=[],
@@ -4168,7 +6563,52 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-rrt-preflights", type=int, default=MAX_RRT_PREFLIGHTS)
     parser.add_argument("--local-replan-rrt-time-budget-s", type=float, default=2.0)
     parser.add_argument("--maximum-physical-branches", type=int, default=MAX_PHYSICAL_BRANCHES)
+    parser.add_argument(
+        "--branch-control-action-budget", type=int, default=MAX_BRANCH_CONTROL_ACTIONS,
+        help=(
+            "maximum real MuJoCo control actions for each physical grasp branch; "
+            "use a short value for targeted contact/route validation"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-unilateral-close-probe-position-m", type=float, default=LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M,
+        help=(
+            "maximum candidate-pose error for a bounded physical close probe after a real unilateral target-pad contact; "
+            "the live MuJoCo grasp monitor must still verify closure"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-staged-clearance-height-m", type=float, default=0.0,
+        help=(
+            "optional absolute world-Z clearance for the physical pregrasp route: "
+            "lift with the live wrist orientation, translate above the candidate, "
+            "rotate, then descend; 0 disables it"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-lateral-detour-m", type=float, default=0.0,
+        help=(
+            "at staged clearance, offset the transit corridor to one side of the "
+            "direct wrist route, then return beyond the obstacle; signed meters"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-lift-before-lateral-detour", action="store_true",
+        help=(
+            "when a staged lateral detour is enabled, first lift vertically at the "
+            "live wrist pose, then sidestep at clearance height"
+        ),
+    )
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
+    parser.add_argument(
+        "--approach-route-strategy",
+        choices=("auto", "geometry_high_approach", "geometry_direct_approach"),
+        default="auto",
+        help=(
+            "use normal scratch RRT routing, or explicitly select a generated-geometry high-lift/direct "
+            "OSC route after endpoint IK verification"
+        ),
+    )
     parser.add_argument(
         "--contact-only-substep-audit", action="store_true",
         help="retain all per-substep contacts and skip exhaustive per-substep all-Geom clearance sweeps",
@@ -4199,6 +6639,23 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--geometry-candidate-pool-offset is available only for physical task-success search")
     if not 1 <= args.maximum_rrt_preflights <= MAX_RRT_PREFLIGHTS:
         parser.error(f"--maximum-rrt-preflights must be in 1..{MAX_RRT_PREFLIGHTS}")
+    if not np.isfinite(args.stage_a_unilateral_close_probe_position_m) or not (
+        0.010 <= args.stage_a_unilateral_close_probe_position_m <= 0.080
+    ):
+        parser.error("--stage-a-unilateral-close-probe-position-m must be in 0.010..0.080")
+    if (
+        not np.isfinite(args.stage_a_pregrasp_staged_clearance_height_m)
+        or args.stage_a_pregrasp_staged_clearance_height_m != 0.0
+            and not 0.20 <= args.stage_a_pregrasp_staged_clearance_height_m <= 2.50
+    ):
+        parser.error(
+            "--stage-a-pregrasp-staged-clearance-height-m must be 0 or in 0.20..2.50"
+        )
+    if (
+        not np.isfinite(args.stage_a_pregrasp_lateral_detour_m)
+        or not -0.40 <= args.stage_a_pregrasp_lateral_detour_m <= 0.40
+    ):
+        parser.error("--stage-a-pregrasp-lateral-detour-m must be in -0.40..0.40")
     if args.strict_grasp_screen_only:
         if args.candidate_start_index < 0 or (
             args.candidate_start_index + args.maximum_candidates
@@ -4212,8 +6669,6 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--candidate-start-index must select an index inside the geometry candidate budget")
     if args.candidate_id and args.candidate_start_index != 0:
         parser.error("--candidate-id requires --candidate-start-index 0")
-    if len(args.candidate_id) > 1 and not args.strict_grasp_screen_only:
-        parser.error("multiple --candidate-id values require --strict-grasp-screen-only")
     if args.candidate_tilt_degrees and args.candidate_roll_degrees:
         parser.error("choose either --candidate-tilt-degrees or --candidate-roll-degrees")
     perturbation_flags = sum(bool(values) for values in (
@@ -4234,25 +6689,23 @@ def _parse_args() -> argparse.Namespace:
         if values
     }
     if args.candidate_coupled_perturbations:
-        if orientation_family_count != 1 or not offset_families:
-            parser.error("--candidate-coupled-perturbations requires exactly one orientation family and at least one object-axis offset family")
+        if not offset_families:
+            parser.error("--candidate-coupled-perturbations requires at least one object-axis offset family")
     elif orientation_family_count + len(offset_families) > 1:
         parser.error("combine orientation and multiple contact-offset families only with --candidate-coupled-perturbations")
     if (
         args.candidate_tilt_degrees or args.candidate_roll_degrees
         or offset_families
     ):
-        if not args.strict_grasp_screen_only:
-            parser.error("candidate orientation perturbations require --strict-grasp-screen-only")
         if not args.candidate_id:
-            parser.error("candidate orientation perturbations require one or more --candidate-id base poses")
+            parser.error("candidate geometry perturbations require one or more generated --candidate-id base poses")
         orientation_count = len(args.candidate_tilt_degrees or args.candidate_roll_degrees)
         offset_count = 1
         for values in offset_families.values():
             offset_count *= len(values)
-        perturbation_count = orientation_count * offset_count if args.candidate_coupled_perturbations else (orientation_count or offset_count)
+        perturbation_count = (orientation_count or 1) * offset_count if args.candidate_coupled_perturbations else (orientation_count or offset_count)
         if len(args.candidate_id) * perturbation_count > MAX_OFFLINE_GEOMETRY_SCREEN_BATCH:
-            parser.error("selected base candidates and perturbations must fit one 24-candidate screen batch")
+            parser.error("selected base candidates and perturbations must fit one task-approach screen batch of at most 24")
     if args.historical_grasp_pose_priors_json is not None:
         if not args.strict_grasp_screen_only:
             parser.error("--historical-grasp-pose-priors-json requires --strict-grasp-screen-only")
@@ -4262,6 +6715,10 @@ def _parse_args() -> argparse.Namespace:
             parser.error("historical pose priors cannot be combined with orientation/contact perturbations")
     if not 1 <= args.maximum_physical_branches <= MAX_PHYSICAL_BRANCHES:
         parser.error(f"--maximum-physical-branches must be in 1..{MAX_PHYSICAL_BRANCHES}")
+    if not 1 <= args.branch_control_action_budget <= MAX_BRANCH_CONTROL_ACTIONS:
+        parser.error(
+            f"--branch-control-action-budget must be in 1..{MAX_BRANCH_CONTROL_ACTIONS}"
+        )
     if not 0.5 <= args.rrt_time_budget_s <= 60.0:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
     if not 0.5 <= args.local_replan_rrt_time_budget_s <= 60.0:
@@ -4283,12 +6740,17 @@ def _parse_args() -> argparse.Namespace:
         or args.strict_screen_reference_report is not None
         or (args.resume_from_runtime_snapshot is not None and not args.cold_start_continuation)
         or args.candidate_start_index != 0
-        or args.candidate_tilt_degrees
-        or args.candidate_roll_degrees
-        or args.candidate_offset_object_x_mm
-        or args.candidate_offset_object_y_mm
-        or args.candidate_offset_object_z_mm
+        or (
+            not args.cold_start_continuation
+            and (
+                args.candidate_tilt_degrees
+                or args.candidate_roll_degrees
+            )
+        )
     ):
+        # Object-local contact offsets are generated from the active BDDL
+        # collision geometry. They are valid fresh-t0 search candidates and do
+        # not import historical poses, actions, or partial-task state.
         parser.error("--cold-start cannot use historical experience or partial search inputs")
     if not 1000 <= args.demonstration_horizon <= MAX_DEMONSTRATION_HORIZON:
         parser.error(

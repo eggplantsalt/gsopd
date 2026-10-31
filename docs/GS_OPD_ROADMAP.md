@@ -1,13 +1,47 @@
-# SafeTRAIL Stage A 路线图状态（2026-10-30）
+# SafeTRAIL Stage A 路线图状态（2026-10-31）
 
-覆盖11/30（9项Standard、2项Extended）。OAH/L0T1已新增760动作完整原生成功Episode并通过连续性/接触/BDDL审计。当前定向验证OAH/L1T1：t578合法持物前缀的offset0放置路线推进220动作至t798、目标距离0.228m后在下一路点停滞；现从精确t798物理Snapshot分支测试offset1容器朝向和20mm OSC步距，Standard剩余202动作。证据与运行配置见Current Goal及任务矩阵。
+覆盖 **18/30：12项Standard、6项Extended**。
+
+### 当前搜索优先级更新（2026-10-31）
+
+本段覆盖下面较早的“当前优先任务”描述。OAH/L1T4在多个入口高度与路线尝试后仍被顶抓手掌—微波炉g6接触阻塞，暂时停放；不再重复direct入口或单纯高度调参。转到 obstacle_avoidance/L2/T3 的合法t0冷启动：旧两次错误发生在首个Safety Bridge动作应答之前，当前执行器重新验证审计动作链，并尝试两个原生In目标，horizon1800，最多一个物理抓取分支。完整MuJoCo动作、原生BDDL终态和连续Episode审计缺一不可。覆盖数在最终报告核验后才变化。
+
+通用效率改进：水平容器入口的外侧暂存不使用整台拥有fixture的包围半径绕行，改为按原生入口边界、目标物足迹和实测手部外伸量；本轮实测把微波炉入口暂存从0.611m缩到0.179m。入口物理验证继续保留MuJoCo接触与原生谓词，Stage A不加禁触门槛。
+
+## 最新阶段A突破与当前优先任务（2026-10-31）
+
+OAH/L2T3现有t1–1539完整原生成功Episode，38,475个接触子步、12个精确Runtime Snapshot边界；t1539两个篮中In目标为true。超过1000动作，只计Extended。selected manifest及动作记录位于`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_human_L2T3_freefall_settle_dev100/task_success_first_executor_obstacle_avoidance_human_L2T3_20261031_153634_314821669/`。新的通用突破是在原生In开口上方检测到真实碰撞包络进入后，接受抓持丢失并用5步真实开爪/重力沉降继续物理Episode；不以复杂withdrawal路线或Strict安全约束挡住Stage A成功。
+
+当前暂停OAH/L1T3同一汤罐抓取族：奶油奶酪In已true，但连续续接到t1796仍无汤罐指垫接触。dev17从精确t1638 Snapshot使用direct approach和另一腕翻转，记录RRT no_safe_path/planning_time_budget_exhausted及预抓OSC停滞；158动作后汤罐无位移。连续偏移/腕翻转没有新接触证据，保留失败Snapshot并切换任务。
+
+OAH/L1T4从合法t0以offset24窗口获得一次真实抓取突破：geom99候选205步后稳定双指抓持并抬升约30mm。随后374步原生Region Progress到t579，奶杯在t555碰到`microwave_1_g8`后停滞，In/Close仍false；14,475个物理接触子步完整。失败根因是本支surface-slide保留了物体接触却没有触发目标物接触法线逃逸，沿原路继续推向框边。
+
+下一支从精确t579 Snapshot续接，用实测外法线退让、reachability-biased抬高、keypose侧绕行及16mm推进步距，预期先离开g8框边再从水平开口进入；无需重跑t0抓取。运行归档仍在`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_human_L1T4_offset24_horizontal_aperture_dev01`，续接结果写入其`continuations`子目录。
+
+最新新增`obstacle_avoidance/L2T2`，t1370 Extended 原生成功；完整 Episode 为1,370动作、34,250个接触子步，pot1/pot2 On与stove Turnon均为true。清单：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_L2T2_t1367_live_contact_regrasp_low_clearance_dev_17/task_success_first_executor_obstacle_avoidance_L2T2_20261031_090038_778150614/selected_success_episode_manifest.json`。其后续新增`obstacle_avoidance_human/L0T2`：合法t0连续Episode在t1547满足pot1/pot2 On与炉灶Turnon，原生`task_success=true`、reward=1、done=true。超过1000动作，仅计Extended；逐段MuJoCo物理记录、精确Snapshot链与哈希清单见：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T2_cold_start_dev_01/v3_run/continuation_stages/stage_17_t1446_reachability_yaw90/task_success_first_executor_obstacle_avoidance_human_L0T2_20261031_063716_085548457/success_episode_manifest.json`。失败兄弟分支未并入成功轨迹；Stage A未声称安全认证。
+
+OA/L2T4本轮用真实Snapshot分支尝试“顶面先抬升”“按编译容器包络外移”“低位水平外移/接触逃逸”，串接前缀推进至t884但In/Close仍false。t884 mug双指抓持保持，OSC连续24步停滞且末段无碰撞/关节限位；暂停该direct-region路线，Snapshot与dev05–dev08失败报告留在`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_L2T4_*`。搜索转向OAH/L1T3。
+
+## 最新算法发现与执行目标（2026-10-31）
+
+这次L0T2连续失败先后暴露了预抓末端误差、首次指垫接触后闭合探针门槛、场景瓶体碰撞、waypoint误差累积、过高净空造成可达性下降和Panda wrist joint4饱和。定向修正均以精确MuJoCo Snapshot分支验证：预抓末端收紧到5mm/0.045rad；首个目标pad接触后停止表面接近并有界闭合；碰撞后从检查点规划高度绕行；放置时显式对齐目标x/y、把长下降拆段；On目标可切换等价90°yaw解除腕限位，最终采用reachability-biased净空。完整Native BDDL成功在t1547被报告，终端成功快照虽保留旧`failed_runtime_snapshot`命名，但原生done和三项谓词均核实为真。
+
+本轮从OA/L1T3停止重复碰撞筛查，改以合法Runtime Snapshot作短物理验证：screen拒绝但IK可达的geom82抓姿首次碰到目标soup；t154左右短暂双指接触，但夹爪仍高于名义帧约26mm，闭合把目标推移约7mm。继续向下因目标外壳而12步仅移动2mm；geom82/geom92侧抓路线又暴露低预抓位和OSC tracking停滞。没有原生目标成功，L1T3暂缓。通用改动允许记录并继续Stage A目标碰撞，区分远位单侧接触与近位闭合，并允许从同Episode Snapshot生成当前几何局部Y位移候选。代码和全部失败快照均保留。
+
+当前局部验证已由`obstacle_avoidance/L1T4`与OAH/L0T4的多种微波炉入口路线切换至OA/L2T3。L1T4 t1239附近重复24步退让仍未生成可跟踪escape waypoint；OAH/L0T4 dev35虽让mug向入口移动约45mm，但最后14步仅约2mm且抓持未失，按waypoint stagnation停机，先暂停该路由族。t1239 Snapshot短试反向/upright路线仍在首waypoint停滞，因为掌部在分支起点已接触g6，surface_slide当时未排机器人接触逃逸。通用修复从活动BDDL region名解析目标容器，并依据live contact点给出实际外向OSC退让waypoint，再走低位入口；从同一Snapshot单分支验证，若仍不跟踪即切换任务。成功只计Extended。此前从`obstacle_avoidance/L1T4` t1066失败Snapshot：微波炉任务的mug仍双侧稳定抓持，已走到入口外区域，但direct-region路径末24步无场景接触、无关节限位、EEF停滞在距下一waypoint约22.6mm处。下一支切换到正向keypose-side Region Progress与surface-slide近障碍模式，继续水平aperture入口；使用原始合法t0根并严格核对Snapshot，horizon1600，超过1000动作单列Extended。其他未完成部分抓持/运输进度保留在矩阵并按可复用Snapshot优先级排序。
+
+该历史段所处检查点为16/30；之后OA/L2T2与OAH/L2T3分别新增Extended原生成功，当前为18/30（12 Standard、6 Extended）。Stage A只用原生BDDL结果计数，安全违规可保留但不声称安全认证。
+
+## 先前通用效率与控制发现
+
+Stage A contact-only 审计保留每个MuJoCo子步真实接触、状态/动作、抓持和原生BDDL检查，跳过只用于安全结论的全Geom clearance扫掠；此前测得约26倍提速。endpoint-IK可达候选不再因保守碰撞screen而绝对拒绝有界物理分支。RRT失败但live状态未变时可使用生成几何高位OSC回退；继续任务也能从近预抓姿态直接启动笛卡尔路线。接近时的物理推/单侧接触可以完成Stage A目标，不要求Stage B的严格无接触约束。
 
 ## 2026-10-30 15:31 CST route00 real descent is progressing
 
 
 ## 当前执行状态（2026-10-30）
 
-覆盖12/30（10 Standard、2 Extended）。contact-only保留每子步接触和BDDL审计，精确Runtime Snapshot支持同Episode下游分支。L1T1预算保留修正已验证：最终插入路线成功时Stage A不再重复预留96步，避免剩余时限被固定扣除。下一项OA/L1T4已有t759持物状态，瓶颈是目标XY误差2.6mm后垂直OSC未跟踪、而非joint limit；计划尝试offset2 direct region route与20mm步距，并确保后续Close关节目标仍在Standard余量内。
+覆盖12/30（10项Standard、2项Extended）。contact-only保留每子步真实接触和BDDL审计，精确Runtime Snapshot支持同Episode局部续接。L1T1预算保留修正已验证，L1T4单路点上限128。OA/L0T4 t991 Snapshot尝试lift-before-translate以避开洗洁精瓶；OAH/L0T4 t775参数误传，仍跑compiled高位路线，已修复并从t866以reachability-biased低通道重试。
 覆盖11/30（9 Standard、2 Extended）。contact-only审计保留每子步真实接触与BDDL检查，省去Stage A不需要的全Geom clearance扫掠；精确Runtime Snapshot用于同Episode下游分支。L0T1已验证offset1原生区域OSC可完成放置。OAH/L1T1 offset0路线已从t578物理推进至t798，目标距离降至0.228m且抓持稳定，之后因24步OSC停滞结束；当前分支从t798 Snapshot测试offset1朝向并将步距由8mm提高到20mm，避免重复t1–t798。
 At t282,36 actions/900 monitored substeps complete; both finger contacts hold. Bowl root lowered ~54.9mm to z1.08937m; controller has entered horizontal region_progress with32.9mm to the current waypoint. XY goal distance has moved only4.4mm during the mostly vertical descent, so keep monitoring rather than classify stagnation. Native success remains false.
 
@@ -136,7 +170,9 @@ fresh t0冷启动完成后，首轮24抓取候选中1个可行。选定抓取+ha
 
 ## 2026-10-30局部路线状态
 
-dev14之前的首轮扫描覆盖30项，原生成功覆盖8/30。dev_11放置RRT在20秒内仅6次迭代/373次检查后超时；dev_12启动时因端口占用无物理动作。dev_13生成193点全几何放置路线（63.325秒、10迭代、1,185检查）并执行355个放置动作，但最终直线插入时mug持续接触微波结构，24动作位置/姿态进展低于停滞门槛；t=607时In/Close均false。总尝试审计607动作/15,175完整子步，安全监测记录412个unsafe动作，不计成功覆盖。dev14插入RRT和后续只读预检未找到可执行目标。之后L1T1 dev06以世界竖直清障修正完成Standard成功，当前覆盖9/30；L1T3 dev02仍在抓取筛查失败，下一配置为`obstacle_avoidance/L1T4`。详见`GS_OPD_PROGRESS.md`和`GS_OPD_CURRENT_GOAL.md`。
+Stage A当前覆盖13/30（11 Standard、2 Extended）。最新新增为`obstacle_avoidance/L2T1`：t846原生BDDL成功，完整连续846动作/21,150个接触子步，跨Snapshot边界精确核验通过；审计记录见`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T1_t648_wrist_unwind_layout1_dev_05/v3_run/task_success_first_executor_obstacle_avoidance_L2T1_20261030_201559_399882750/selected_success_episode_manifest.json`。突破来自有界真实抓取兜底绕过保守候选筛选、按高位跟踪/腕关节限位证据修正运输高度和目标朝向。
+
+OA/L2T2的t664失败Snapshot在通用预算修正后推进150动作至t814，pot1原生On=true并完成释放/稳定；但pot2抓取路线两种接近方向均失败：负Y直线路线撞到`white_place_box_1`，geom116斜向路线过screen后仍440步未到预抓位。L2T2暂停，t1254/t1694可恢复证据保留在`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T2_t814_pot2_extended_dev_05/v3_run/task_success_first_executor_obstacle_avoidance_L2T2_20261030_203741_704381777/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L2T2_20261030_203758_710786469/geom115_jaw0_approach2__1_flip-1__approach_axis2_-8.5mm__rrtgenerated_geometry_high_approach__failed_runtime_snapshot.pkl`与`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L2T2_t1254_geom116_range_tolerance_dev08/v3_run/task_success_first_executor_obstacle_avoidance_L2T2_20261030_205143_450781752/expert_grasp_search/task_success_first_grasp_obstacle_avoidance_L2T2_20261030_205158_646483472/geom116_jaw0_approach1_-1_flip_1__approach_axis1__4.2mm__rrtgenerated_geometry_high_approach__failed_runtime_snapshot.pkl`。下一项为OAH/L2T1合法t0冷启动，测试endpoint-IK候选的有界真实抓取兜底。L0T3、OAH/L0T4及OA/L1T4本轮分支未成功，暂停相同路线族。详见`GS_OPD_PROGRESS.md`和`GS_OPD_CURRENT_GOAL.md`。
 
 目标是在合法任务初始状态上自动搜索、真实执行并完成 LIBERO-Safety 原生 BDDL 任务，为 SafeTRAIL 安全避障轨迹生成建立物理可行数据。主实验范围是 `obstacle_avoidance` 和 `obstacle_avoidance_human` 两个 Suite，共30个 L0/L1/L2 × T0–T4 配置。每次成功要求完整连续的物理动作记录和原生 `task_success=true`；标准1000步与 demonstration-only 扩展分别统计。当前只推进 Stage A，不开展Near–Far、安全轨迹重构、Strict-10mm、LeRobot转换或Student训练。
 

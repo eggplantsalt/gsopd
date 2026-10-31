@@ -411,6 +411,7 @@ def _experience_task_success_command(
         "--seed", str(args.seed),
         "--demonstration-horizon", str(args.demonstration_horizon),
         "--maximum-physical-branches", str(args.maximum_physical_branches),
+        "--branch-control-action-budget", str(args.branch_control_action_budget),
         "--maximum-rrt-preflights", str(args.maximum_rrt_preflights),
         "--rrt-time-budget-s", str(args.rrt_time_budget_s),
         "--local-replan-rrt-time-budget-s", str(args.local_replan_rrt_time_budget_s),
@@ -427,6 +428,24 @@ def _experience_task_success_command(
     argv.extend([
         "--native-region-transit-clearance-mode", transit_clearance_mode,
     ])
+    transit_height_override_m = getattr(
+        args, "native_region_transit_height_override_m", None,
+    )
+    if transit_height_override_m is not None:
+        argv.extend([
+            "--native-region-transit-height-override-m",
+            str(transit_height_override_m),
+        ])
+    native_region_entry_mode = getattr(args, "native_region_entry_mode", "over_rim")
+    argv.extend(["--native-region-entry-mode", native_region_entry_mode])
+    native_region_aperture_tilt_degrees = float(
+        getattr(args, "native_region_aperture_tilt_degrees", 0.0)
+    )
+    argv.extend([
+        "--native-region-aperture-tilt-degrees",
+        str(native_region_aperture_tilt_degrees),
+    ])
+    argv.extend(["--maximum-candidates", str(getattr(args, "maximum_candidates", 16))])
     native_region_progress_max_step_m = float(
         getattr(args, "native_region_progress_max_step_m", 0.008)
     )
@@ -437,7 +456,11 @@ def _experience_task_success_command(
     if getattr(args, "contact_only_substep_audit", False):
         argv.append("--contact-only-substep-audit")
     if getattr(args, "stage_a_near_goal_release_probe", False):
-        argv.append("--stage-a-near-goal-release-probe")
+        argv.extend([
+            "--stage-a-near-goal-release-probe",
+            "--stage-a-near-goal-release-probe-max-error-m",
+            str(getattr(args, "stage_a_near_goal_release_probe_max_error_m", 0.012)),
+        ])
     if getattr(args, "skip_student_first", False):
         argv.append("--skip-student-first")
     if cold_start:
@@ -1411,7 +1434,11 @@ def _run_cold_start_native_goal_continuations(
 
     current = history_reports[-1]
     previous_stage_index = max(
-        (int(row.get("stage_index", 0)) for row in stage_records), default=len(stage_reports),
+        [
+            *(int(row.get("stage_index", 0)) for row in stage_records),
+            *(int(row.get("stage_index", 0)) for row in discarded_attempt_reports),
+        ],
+        default=len(stage_reports),
     )
     for stage_index in range(previous_stage_index + 1, maximum_stages + 1):
         if current.get("task_success") is True:
@@ -2435,6 +2462,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1600)
     parser.add_argument("--demonstration-horizon", type=int, default=1800)
     parser.add_argument("--maximum-physical-branches", type=int, default=2)
+    parser.add_argument(
+        "--branch-control-action-budget", type=int, default=440,
+        help="maximum real MuJoCo actions spent by one physical grasp branch",
+    )
     parser.add_argument("--maximum-rrt-preflights", type=int, default=3)
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
     parser.add_argument("--local-replan-rrt-time-budget-s", type=float, default=2.0)
@@ -2456,15 +2487,34 @@ def _parse_args() -> argparse.Namespace:
             "direct_region_progress",
             "keypose_side_region_progress",
             "keypose_side_region_progress_reverse",
+            "obstacle_aware_xy_region_progress",
         ),
         default=None,
         help="select a region-progress route variant for native-region OSC transport",
     )
     parser.add_argument(
         "--native-region-transit-clearance-mode",
-        choices=("compiled_obstacle", "reachability_biased"),
+        choices=("compiled_obstacle", "reachability_biased", "surface_slide", "low_clearance"),
         default="compiled_obstacle",
         help="choose obstacle-overflight or reachability-biased On transport height",
+    )
+    parser.add_argument(
+        "--native-region-transit-height-override-m",
+        dest="native_region_transit_height_override_m",
+        type=float,
+        default=None,
+        help="bounded Stage A physical probe for a measured low transit height",
+    )
+    parser.add_argument(
+        "--native-region-entry-mode",
+        choices=("over_rim", "horizontal_aperture"),
+        default="over_rim",
+        help="choose vertical over-rim entry or a horizontal aperture approach for enclosed regions",
+    )
+    parser.add_argument("--native-region-aperture-tilt-degrees", type=float, default=0.0)
+    parser.add_argument(
+        "--maximum-candidates", type=int, default=16,
+        help="maximum generated grasp candidates screened by the physical task executor",
     )
     parser.add_argument(
         "--native-region-progress-max-step-m", type=float, default=0.008,
@@ -2477,6 +2527,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage-a-near-goal-release-probe", action="store_true",
         help="enable physical release probes near unsatisfied native placement goals",
+    )
+    parser.add_argument(
+        "--stage-a-near-goal-release-probe-max-error-m", type=float, default=0.012,
+        help=(
+            "maximum distance for near-goal physical release probes; larger distances "
+            "are honored only for live aperture-aligned native In placements"
+        ),
     )
     args = parser.parse_args()
     if not 1.0 <= args.wall_time_budget_s <= 86400.0:
@@ -2528,12 +2585,24 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--pre-route-hold-actions must be in [0, 100]")
     if not 1 <= args.maximum_physical_branches <= 3:
         parser.error("--maximum-physical-branches must be in 1..3")
+    if not 1 <= args.branch_control_action_budget <= 440:
+        parser.error("--branch-control-action-budget must be in 1..440")
     if not 1 <= args.maximum_rrt_preflights <= 8:
         parser.error("--maximum-rrt-preflights must be in 1..8")
     if args.native_region_route_variant is not None and args.transport_strategy != "native_region_progress_osc":
         parser.error("--native-region-route-variant requires --transport-strategy native_region_progress_osc")
     if not 0.001 <= args.native_region_progress_max_step_m <= 0.02:
         parser.error("--native-region-progress-max-step-m must be in 0.001..0.02")
+    if not 1 <= args.maximum_candidates <= 16:
+        parser.error("--maximum-candidates must be in 1..16")
+    if (
+        not 0.0 <= args.native_region_aperture_tilt_degrees <= 90.0
+        or (args.native_region_entry_mode != "horizontal_aperture"
+            and args.native_region_aperture_tilt_degrees != 0.0)
+    ):
+        parser.error(
+            "--native-region-aperture-tilt-degrees requires horizontal_aperture and must be in 0..90"
+        )
     if args.candidate_start_index < 0:
         parser.error("--candidate-start-index must be nonnegative")
     if not 0 <= args.geometry_candidate_pool_offset <= 32:

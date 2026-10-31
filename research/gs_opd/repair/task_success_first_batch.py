@@ -622,6 +622,21 @@ def _run_stage(
         "--experience-library", str(args.experience_library),
         "--transport-strategy", args.transport_strategy,
     ]
+    if args.skip_student_first:
+        command.append("--skip-student-first")
+    if args.native_region_route_variant is not None:
+        command.extend(["--native-region-route-variant", args.native_region_route_variant])
+    command.extend([
+        "--native-region-candidate-offset", str(args.native_region_candidate_offset),
+        "--native-region-transit-clearance-mode", args.native_region_transit_clearance_mode,
+        "--native-region-entry-mode", args.native_region_entry_mode,
+        "--native-region-aperture-tilt-degrees", str(args.native_region_aperture_tilt_degrees),
+        "--native-region-progress-max-step-m", str(args.native_region_progress_max_step_m),
+    ])
+    if args.native_region_yaw_delta_degrees is not None:
+        command.extend([
+            "--native-region-yaw-delta-degrees", str(args.native_region_yaw_delta_degrees),
+        ])
     for keypose_path in args.keypose_experience:
         command.extend(["--keypose-experience", str(Path(keypose_path).resolve())])
     if stage_index == 0 and args.resume_from_runtime_snapshot is not None:
@@ -1018,6 +1033,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 actions_before_first_success = task_actions
             if current_native.get("task_success") is True:
                 break
+            # A stage can terminate its Safety Bridge after a hard simulator
+            # error (for example, restoring a Snapshot at the prior episode
+            # horizon). Preserve that stage's physical audit and stop goal
+            # scheduling cleanly; pending_object_goals requires a complete
+            # native predicate list and must not turn the bridge failure into
+            # an unrelated batch exception.
+            if not isinstance(current_native.get("native_goal_values"), list):
+                break
             next_predicate = _next_distinct_goal(current_native, predicate)
             # Continue multi-object tasks only after the current native goal
             # actually changed. A partial grasp/transport candidate must not
@@ -1189,6 +1212,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-port", type=int, default=39100)
     parser.add_argument("--camera-resolution", type=int, default=256)
     parser.add_argument("--student-actions", type=int, default=16)
+    parser.add_argument("--skip-student-first", action="store_true",
+                        help="skip the policy branch when starting from a verified physical Snapshot")
     parser.add_argument("--student-handoff-actions", type=int, default=8)
     parser.add_argument("--maximum-candidates", type=int, default=16)
     parser.add_argument("--rrt-preflights", type=int, default=6)
@@ -1205,6 +1230,28 @@ def _parse_args() -> argparse.Namespace:
         choices=("native_region_progress_osc", "legacy_rrt"),
         default="native_region_progress_osc",
     )
+    parser.add_argument(
+        "--native-region-route-variant",
+        choices=(
+            "direct_region_progress", "keypose_side_region_progress",
+            "keypose_side_region_progress_reverse",
+        ),
+        default=None,
+    )
+    parser.add_argument("--native-region-candidate-offset", type=int, default=0)
+    parser.add_argument(
+        "--native-region-transit-clearance-mode",
+        choices=("compiled_obstacle", "reachability_biased", "surface_slide", "low_clearance"),
+        default="compiled_obstacle",
+    )
+    parser.add_argument(
+        "--native-region-entry-mode",
+        choices=("over_rim", "horizontal_aperture"),
+        default="over_rim",
+    )
+    parser.add_argument("--native-region-aperture-tilt-degrees", type=float, default=0.0)
+    parser.add_argument("--native-region-yaw-delta-degrees", type=float, default=None)
+    parser.add_argument("--native-region-progress-max-step-m", type=float, default=0.008)
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.output_dir.exists() and not args.resume:

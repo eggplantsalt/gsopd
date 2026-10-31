@@ -1,12 +1,47 @@
-# SafeTRAIL Stage A 当前目标与局部进度（2026-10-30）
+# SafeTRAIL Stage A 当前目标与局部进度（2026-10-31）
 
-`GOAL_STATUS=ACTIVE`。唯一目标仍是为 LIBERO-Safety `obstacle_avoidance` 与 `obstacle_avoidance_human` 的30项任务各取得至少一条从合法 t0 出发、真实 MuJoCo 连续执行、并由原生 BDDL 判成功的完整轨迹。Standard 以1000动作计；Extended 单独标记。当前覆盖 **12/30：10项 Standard、2项 Extended**。Stage A只追求原生任务成功，`safety_certified=false`不构成阻断。
+`GOAL_STATUS=ACTIVE`。唯一验收仍是30项任务都具备合法t0来源、真实MuJoCo连续动作、原生BDDL成功及可审计完整Episode。目前核对为 **18/30：12 Standard、6 Extended**。Stage A不以Stage B禁触约束阻断任务成功；超过1000动作的成功单列Extended。
 
-## 当前局部目标：obstacle_avoidance/L1T4
+## 当前局部目标：OA/L2T3 验证 Safety Bridge 后完成双物体 In
 
-优先复用现成的t759合法物理Snapshot，继续任务`put the white yellow mug in the microwave and close it`，当前原生`In(mug,microwave)`与`Close(microwave)`均false，Standard剩余241动作。原t0冷启动路线已把mug运到微波炉目标区域上方并保持双侧抓持；失败证据显示，进入区域XY误差已降至2.6mm，但末端24动作的EEF几乎没有向下移动（EEF z约1.192m，目标z约1.025m），无关节限位，说明垂直OSC下降/入口方向是瓶颈。使用精确终态Snapshot分支，先尝试offset2同类yaw的direct region route、20mm最大步距，检查能否在剩余Standard时限内完成In；若完成，再从同一Episode成功插入后的Snapshot执行原生Close关节控制。
+此前两次合法t0冷启动均在首个 `step_monitored` 请求收到 EOFError，未保存任何动作来源，物理效果未知，不能算成功或失败Episode。本轮从任务自己的合法t0 Snapshot `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_L2T3_cold_start_dev_02/t0_capture/stage_snapshots/t0` 重新启动当前执行器；当前输出根为 `/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_L2T3_fresh_legal_t0_dev01`，horizon 1800，contact-only子步审计，跳过Student-first，最多一个物理分支。预期首先确认真实MuJoCo动作与审计记录可写；之后执行alphabet_soup与cream_cheese的原生In目标。t≤1000才标Standard，超过则单列Extended。运行中的报告未结束前不增加覆盖数。
 
-Snapshot：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T4_worldup_route_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T4_20261030_080609_990772570/expert_native_placement/placement_branch_02_region_layout_12_keypose_side_region_progress_reverse/native_goal_transport_failed_runtime_snapshot.pkl`。来源报告：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_L1T4_worldup_route_cold_start_dev_02/v3_run/task_success_engine/task_success_first_executor_obstacle_avoidance_L1T4_20261030_080609_990772570/run_report.json`。不重跑t0抓取、Student前缀或既有放置前缀；每个分支仍记录真实MuJoCo接触并调用原生BDDL。
+### OAH/L1T4暂停记录：水平入口处抓持手掌顶住微波炉
+
+任务仍未成功。围绕t921合法同Episode Snapshot开展了接触法线退让、入口高度、侧放、入口暂存与松爪试验。45mm抬升让杯子上沿撞到`microwave_1_g6`；90°侧放路线增大编译竖向碰撞包络并逼近腕关节6上限。此前入口暂存错误使用整个微波炉0.336m包围半径，导致外侧路点距离0.611m；已改用原生入口边界、物体足迹和实测手部外伸量，缩短至0.179m。20mm与8mm入口偏移都到达门口，但`t1045/t1047`的MuJoCo记录显示 `gripper0_hand_collision` 与 `microwave_1_g6` 接触约33N并阻止插入；32步真实松爪使杯子落在柜前台面，原生In仍false。当前顶抓EEF相对杯根高约89mm，入口中的手掌空间是主要障碍。dev16低位抓姿候选在卡住的当前姿态无可达IK。后续需更换抓持姿态或优先切换任务；所有这些分支均未计成功。归档根：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_human_L1T4_offset24_horizontal_aperture_dev01/continuations/`。
+
+### OA/L2T4 微波炉路线暂停点（t884，尚未原生成功）
+
+从原合法t0 Episode的t597抓持快照开展三次同链续接，当前串接前缀为t1–884：原选定t1–597 + dev06 t598–715（118步）+ dev07 t716–805（90步）+ dev08 t806–884（79步）。每个起点均精确Runtime Snapshot恢复；后3段使用contact-only物理审计，25/25接触子步/动作完整，几何全扫关闭，不作安全认证。终态t884 mug仍真实双指抓持，In/Close均false。dev05、以及与选定续接不兼容的分支尾部均不并入。
+
+失败假设逐步收敛：dev05证实顶面支撑物应先垂直抬起（11步，杯子由1.109升至1.156m且保持双侧抓持），再水平移动；dev06按编译微波炉包络延长外侧点后，证实高位OSC路点可达性不足；dev07从t715以较低实时高度续接，将杯子推进至约y=0.589m，记录到`gripper0_right_gripper–microwave_1`接触；dev08从t805继续，终止于t884的`region_progress_waypoint_stagnated_for_24_actions`，末24步无fixture接触、无关节限位但EEF/关节不动。完整失败报告与Snapshot链在`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_L2T4_t597_support_lift_first_dev05/`、`.../obstacle_avoidance_L2T4_t597_fixture_envelope_staging_dev06/`、`.../obstacle_avoidance_L2T4_t715_low_height_exterior_continue_dev07/`、`.../obstacle_avoidance_L2T4_t805_measured_hand_escape_continue_dev08/`。暂停重复direct-region路线；保留dev08的t884真实Snapshot，后续须先换腕姿/局部可达控制，再续接。该段为旧检查点；当前局部目标已切换至OAH/L1T4合法t0有界物理抓取验证。
+
+
+已暂停OA/L2T3 soup路线族：合法t432 Snapshot中的cream cheese原生In=true；geom77宽夹持候选高位路线在clean t432起点仍由robot0_link6碰到beer瓶，geom79到达目标但约3.54mm夹持宽度只形成右指擦碰。通用控制已改为表面路线遇到任一目标指垫接触即停，并在闭爪时反馈保持接触EEF姿态；该修正把一次分支从255步缩至29步、将闭爪漂移由约18mm降至约4mm，但geom79仍未能形成双侧夹持。t432合法部分Episode、失败报告与Contact Snapshot保留供后续更换接近侧时续接。OAH/L0T4的-90° yaw已在dev16实测到t1521仍In/Close=false；dev21关节余量路线t1533也失败，避免照旧矩阵计划重复这两支。
+
+OAH/L0T4暂时停放。dev35从同一Episode t1640真实执行39步至t1679；mug双侧抓持保持，EEF与mug向微波炉方向移动约45mm，但最后14步mug仅移动约2mm，最终因`region_progress_waypoint_stagnated_for_24_actions`停止，In/Close均false。接触记录只见指垫—mug，没有微波炉接触。该路由族已尝试多种yaw、入口、绕行和低位模式，本轮转向新任务，不增加同一控制预算。
+
+## 前一突破：OA/L2T2 t1370 Extended 原生成功
+
+合法t0同一Episode完整执行1,370动作、34,250个受监测MuJoCo接触子步；pot1/pot2均`On=true`，stove`Turnon=true`，BDDL`task_success=true`、reward=1、done=true。t1367 Snapshot中的pot2仍单侧接触；物理闭合/重抓后三步成功。成功轨迹及每段hash和Snapshot边界：[manifest](/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261031/obstacle_avoidance_L2T2_t1367_live_contact_regrasp_low_clearance_dev_17/task_success_first_executor_obstacle_avoidance_L2T2_20261031_090038_778150614/selected_success_episode_manifest.json)。超过1000动作，只计Extended。
+
+## 历史检查点：OAH/L0T2 Extended 成功
+
+`obstacle_avoidance_human/L0T2`在t1547原生成功：两只moka pot均满足On，炉灶满足Turnon，`task_success=true`、reward=1、done=true。合法t0 Episode的t667 Snapshot后精确续接，成功路径覆盖t1–1547，共1,547动作，超过Standard上限，只计Extended。冷启动、原生终态、逐段动作记录哈希及t667/t901/t991/t1016/t1105/t1312/t1355/t1446/t1547 Snapshot链见[success_episode_manifest.json](/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261029/obstacle_avoidance_human_L0T2_cold_start_dev_01/v3_run/continuation_stages/stage_17_t1446_reachability_yaw90/task_success_first_executor_obstacle_avoidance_human_L0T2_20261031_063716_085548457/success_episode_manifest.json)。Stage17在原生成功后记录抓持丢失异常；t1547 BDDL终态仍成功，终端Snapshot保留旧`failed_runtime_snapshot`文件名，清单中有说明。
+
+这次成功使用严格预抓末端、首个真实目标指垫接触后的有界闭合探针、碰撞证据驱动的可达净空、目标x/y显式对齐后分段下降，以及On目标的yaw冗余搜索。之后在相似任务复用这些改动；不再重复OAH/L0T2已失败的geom117/116预抓路线。
+
+## 已停放任务：OAH/L0T4 从 t=1490 Snapshot 解除过高清障与腕关节停滞
+
+同Episode t1490 Runtime Snapshot：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261030/obstacle_avoidance_human_L0T4_t1380_joint7_unwind_entry_dev_12/v3_run/task_success_first_executor_obstacle_avoidance_human_L0T4_20261030_212116_436021926/expert_native_goal_stage_control/placement_branch_00_region_layout_15_direct_region_progress/native_goal_transport_failed_runtime_snapshot.pkl`，SHA `29221ef221ae6c7ba4a3be4630e843cb7fdda30e2496dcf0f9dd0ca43ba2a3af`；原合法t0根在同一V3 run 的 `t0_capture/stage_snapshots/t0`。mug仍被真实双指夹持；In/Close均false。t1379附近joint7在下限外仅0.00034rad，先用真实OSC动作恢复；旧路随后估算25° aperture tilt所需清障高度为1.283m，把mug抬得远离目标，至入口姿态 waypoint停滞，终态joint7又回到下限附近。
+
+dev13低位upright/+90°路线未生成1.283m清障抬升，但t1524停滞。dev14收紧死区后，真实OSC动作将joint7的0.000141rad超限恢复至范围内；下降仍在t1523将其推回下限并停滞。原因是水平aperture路点顺序先下降、后转yaw。现已改通用In路线：非staged低位路线上，先在当前位置真实转至目标aperture朝向，再下降/横移。将从同一t1490 Snapshot单分支验证该顺序。若原位转姿不跟踪或下降仍回到腕限位则暂停微波炉任务。后续成功只计Extended。OA/L1T4已暂停：t1239附近反向/upright三次24步测试均未生成预期escape waypoint，mug与原生谓词状态未变；该容器接触发现保留为待修通用问题，不继续在同一状态重复路线。
+
+### OA/L1T3 本轮结论：真实目标接触，但未形成抓持
+
+初始24候选筛查0通过后，Stage A仍把IK可达但碰撞筛查拒绝的候选送进MuJoCo。geom82顶部路线在t=154产生真实左指垫接触，闭合时两侧曾短暂同时接触，但 soup 随闭合横移约7mm，最后只剩单侧。精确 Snapshot 分支确认单侧接触时 EEF 比抓持帧高约26mm；继续向下12步仅移动约2mm并停滞。随后geom82/geom92侧向候选的预抓路线也出现低位/OSC waypoint stagnation；geom92局部Y上移20mm分支未恢复运动。当前L1T3仍是两个In谓词false，不计成功。代码现区分近位单侧闭合与远位接触后继续表面接近；冷启动同Episode continuation可用当前编译几何生成±20mm局部Y位移，不引入历史动作/示范。
+
+OA/L2T2继续暂停：已有pot2稳定抓持Snapshot，但已试路线分别碰倒炉面物体、失去抓持或在侧向waypoint停滞；回访需先形成不同的障碍绕行路径。
 
 ## 最近新增：obstacle_avoidance_human/L1T1 Standard成功
 
@@ -28,7 +63,7 @@ L0T0已获得完整连续Episode：428个动作、10,700个接触审计子步；
 
 主要耗时根因是`step_monitored`对每次控制动作的25个MuJoCo物理子步都执行全场景Geom间隙扫描，约18,360个几何对排序；该RPC实测均值11.64秒/动作。Stage A contact-only profile 保留每个子步的真实接触样本、状态/动作、抓持和原生BDDL检查，跳过全几何扫描后实测约0.445秒/动作（约26倍提速）。JSON/fsync约0.062秒/动作，不是主要开销。该profile用于任务可行性搜索，不提供任何安全结论。
 
-目前通用改进包括：每子步接触审计保留、跳过Stage A不需要的全Geom clearance扫掠；endpoint-IK可达的几何候选即使被筛查碰撞拒绝，也可进入有界物理分支；精确Runtime Snapshot续接避免重复抓取前缀；Student被跳过时不再调用空模型handoff；放置候选可从排序offset直接开始；微量起点关节越界最多0.001rad可交由物理运输路线恢复，目标关节配置仍保持严格范围。OAH/L0T1已验证：碰撞筛查拒绝的抓姿仍可真实抓取，替代容器yaw加原生区域OSC可从腕关节停滞前缀续至BDDL成功。当前覆盖11/30，只有完整原生BDDL成功Episode才增加计数。
+目前通用改进包括：每子步接触审计保留、跳过Stage A不需要的全Geom clearance扫掠；endpoint-IK可达的几何候选即使被筛查碰撞拒绝，也可进入有界物理分支；精确Runtime Snapshot续接避免重复抓取前缀；Student被跳过时不再调用空模型handoff；放置候选可从排序offset直接开始；单个native-region路点有界为128动作，避免一个姿态/跟踪失败吞掉剩余Episode。OAH/L0T1已验证：screen拒绝的抓姿仍可真实抓取，替代容器yaw加原生区域OSC可从腕关节停滞前缀续至BDDL成功。当前覆盖15/30（12项Standard、3项Extended），只有完整原生BDDL成功Episode才增加计数。
 
 ## 持续验收
 

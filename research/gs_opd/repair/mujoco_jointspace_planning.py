@@ -15,6 +15,13 @@ from typing import Any
 
 import numpy as np
 
+
+# Panda gripper finger joints are prismatic and expressed in meters.  Contact
+# snapshots can retain sub-millimeter integration overshoot beyond a hard stop;
+# allow that only for scratch-state screening, then clip without modifying the
+# live MuJoCo episode.
+SCRATCH_GRIPPER_LIMIT_TOLERANCE_M = 5e-4
+
 from research.gs_opd.repair.jointspace_rrt import (
     ConfigurationCheck,
     JointSpacePlannerConfig,
@@ -223,8 +230,13 @@ def _candidate_closed_gripper_qpos(
             [joint_separation / 2.0, -joint_separation / 2.0], dtype=np.float64
         )
         source = "candidate_pad_width_with_active_MuJoCo_pad_gap_calibration"
-    if np.any(closed < limits[:, 0] - 1e-8) or np.any(closed > limits[:, 1] + 1e-8):
+    scratch_gripper_limit_tolerance = SCRATCH_GRIPPER_LIMIT_TOLERANCE_M
+    if (
+        np.any(closed < limits[:, 0] - scratch_gripper_limit_tolerance)
+        or np.any(closed > limits[:, 1] + scratch_gripper_limit_tolerance)
+    ):
         raise ValueError("candidate_closed_gripper_qpos_is_outside_gripper_joint_limits")
+    closed = np.clip(closed, limits[:, 0], limits[:, 1])
     return closed, source
 
 
@@ -374,6 +386,10 @@ def plan_current_scene(
     ik_selection_seed_qpos: list[float] | None = None,
     planner_config: dict[str, Any] | None = None,
     goal_configuration_preflight_only: bool = False,
+    goal_ik_only: bool = False,
+    ik_solver_max_nfev: int = 1000,
+    jointspace_reference_start_qpos: list[float] | None = None,
+    jointspace_reference_max_step_rad: float = 0.10,
     hypothetical_eef_to_object_transform: list[list[float]] | np.ndarray | None = None,
     scene_joint_qpos_overrides: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -406,6 +422,21 @@ def plan_current_scene(
         raise ValueError("start_joint_limit_tolerance_must_be_finite_and_non_negative")
     if not isinstance(goal_configuration_preflight_only, bool):
         raise ValueError("goal_configuration_preflight_only_must_be_boolean")
+    if not isinstance(goal_ik_only, bool):
+        raise ValueError("goal_ik_only_must_be_boolean")
+    if isinstance(ik_solver_max_nfev, bool) or not isinstance(ik_solver_max_nfev, int):
+        raise ValueError("ik_solver_max_nfev_must_be_an_integer")
+    if not 1 <= ik_solver_max_nfev <= 1000:
+        raise ValueError("ik_solver_max_nfev_must_be_in_1_to_1000")
+    if goal_ik_only and (goal_configuration_preflight_only or scene_joint_qpos_overrides is not None):
+        raise ValueError("goal_ik_only_is_incompatible_with_attached_scene_preflight")
+    if jointspace_reference_start_qpos is not None and not goal_ik_only:
+        raise ValueError("jointspace_reference_path_requires_goal_ik_only")
+    if (
+        not math.isfinite(float(jointspace_reference_max_step_rad))
+        or not 0.0 < float(jointspace_reference_max_step_rad) <= 0.5
+    ):
+        raise ValueError("jointspace_reference_max_step_rad_must_be_in_0_to_0_5")
     if scene_joint_qpos_overrides is not None and not goal_configuration_preflight_only:
         raise ValueError("scene_joint_qpos_overrides_are_diagnostic_goal_preflight_only")
     if goal_configuration_preflight_only:
@@ -507,6 +538,12 @@ def plan_current_scene(
         or np.any(q_start > upper + start_joint_limit_tolerance_rad)
     ):
         raise ValueError("current_real_qpos_is_outside_controller_joint_limits")
+    start_joint_limit_excess = np.maximum(lower - q_start, q_start - upper)
+    start_joint_limit_excess = np.maximum(start_joint_limit_excess, 0.0)
+    # MuJoCo's OSC integration can leave the live start a few microradians
+    # beyond a hard stop. Keep that real state untouched, but use its clipped
+    # projection as the offline planner seed. IK goals remain strictly bounded.
+    planner_q_start = np.clip(q_start, lower, upper)
 
     def set_scratch_qpos(qpos):
         scratch.qpos[qpos_addresses] = np.asarray(qpos, dtype=np.float64)
@@ -523,7 +560,7 @@ def plan_current_scene(
 
     goal_position = goal["position_world_m"]
     goal_quaternion = goal["quaternion_wxyz"]
-    seeds = [q_start]
+    seeds = [planner_q_start]
     if ik_seed_qpos is not None:
         for index, seed in enumerate(ik_seed_qpos):
             vector = _unit(seed, 7, f"ik_seed_{index}")
@@ -543,7 +580,7 @@ def plan_current_scene(
             np.clip(seed, lower + 1e-7, upper - 1e-7),
             bounds=(lower + 1e-7, upper - 1e-7),
             x_scale="jac",
-            max_nfev=1000,
+            max_nfev=ik_solver_max_nfev,
             ftol=1e-11,
             xtol=1e-11,
             gtol=1e-11,
@@ -563,7 +600,7 @@ def plan_current_scene(
             "qpos": q_goal_candidate,
             "position_error_m": position_error,
             "orientation_error_rad": rotation_error,
-            "joint_distance_rad": float(np.linalg.norm(q_goal_candidate - q_start)),
+            "joint_distance_rad": float(np.linalg.norm(q_goal_candidate - planner_q_start)),
             "solver_status": int(solution.status),
             "solver_evaluations": int(solution.nfev),
         })
@@ -573,7 +610,7 @@ def plan_current_scene(
     ]
     if not ik_valid:
         raise ValueError("task_goal_has_no_bounded_current_scene_inverse_kinematics_solution")
-    selection_seed = q_start
+    selection_seed = planner_q_start
     if ik_selection_seed_qpos is not None:
         selection_seed = _unit(ik_selection_seed_qpos, 7, "ik_selection_seed_qpos")
         if np.any(selection_seed < lower) or np.any(selection_seed > upper):
@@ -584,6 +621,55 @@ def plan_current_scene(
         )
     ik_valid.sort(key=lambda item: (item["selection_seed_distance_rad"], item["joint_distance_rad"]))
     q_goal = ik_valid[0]["qpos"]
+
+    if goal_ik_only:
+        live_state_after = np.zeros_like(integration_state)
+        mujoco.mj_getState(model, live_data, live_state_after, integration_spec)
+        unchanged = np.array_equal(integration_state, live_state_after)
+        if not unchanged:
+            raise RuntimeError("live_environment_mutated_during_endpoint_ik_preflight")
+        eef_jointspace_reference_path = None
+        if jointspace_reference_start_qpos is not None:
+            reference_start = _unit(
+                jointspace_reference_start_qpos, 7, "jointspace_reference_start_qpos"
+            )
+            if np.any(reference_start < lower) or np.any(reference_start > upper):
+                raise ValueError("jointspace_reference_start_qpos_is_outside_joint_limits")
+            maximum_joint_delta = float(np.max(np.abs(q_goal - reference_start)))
+            reference_steps = max(
+                1, int(math.ceil(maximum_joint_delta / float(jointspace_reference_max_step_rad)))
+            )
+            if reference_steps > 256:
+                raise ValueError("jointspace_reference_path_exceeds_256_waypoints")
+            eef_jointspace_reference_path = []
+            for step in range(reference_steps + 1):
+                alpha = float(step / reference_steps)
+                reference_qpos = reference_start + alpha * (q_goal - reference_start)
+                position, quaternion = pose_at(reference_qpos)
+                eef_jointspace_reference_path.append(
+                    np.r_[position, quaternion].tolist()
+                )
+        return {
+            "status": "goal_ik_preflight_passed",
+            "planner_source": "mujoco_scratch_endpoint_ik.v1",
+            "planning_seconds": time.monotonic() - planning_started,
+            "config_checks": 0,
+            "iterations": 0,
+            "selected_ik_seed_index": int(ik_valid[0]["seed_index"]),
+            "ik_goal_qpos": q_goal.tolist(),
+            "eef_jointspace_reference_path_world": eef_jointspace_reference_path,
+            "jointspace_reference_max_step_rad": float(jointspace_reference_max_step_rad),
+            "ik_candidates": [
+                {key: value.tolist() if isinstance(value, np.ndarray) else value
+                 for key, value in item.items()}
+                for item in ik_candidates
+            ],
+            "route_candidates": [],
+            "live_state_unchanged": unchanged,
+            "goal_ik_only": True,
+            "physical_actions": 0,
+            "safety_certified": False,
+        }
 
     def kinematics(qpos):
         position, quaternion = pose_at(qpos)
@@ -882,7 +968,7 @@ def plan_current_scene(
             "safety_certified": False,
         }
     planner = JointSpaceRRTConnect(lower, upper, check_configuration, kinematics, config=planner_cfg)
-    result = planner.plan(q_start, q_goal)
+    result = planner.plan(planner_q_start, q_goal)
     live_state_after = np.zeros_like(integration_state)
     mujoco.mj_getState(model, live_data, live_state_after, integration_spec)
     unchanged = np.array_equal(integration_state, live_state_after)
@@ -903,6 +989,13 @@ def plan_current_scene(
             ],
             "route_candidates": result.candidates,
             "live_state_unchanged": unchanged,
+            "start_joint_limit_validation": {
+                "maximum_live_excess_rad": float(np.max(start_joint_limit_excess)),
+                "offline_start_projection_applied": bool(np.any(start_joint_limit_excess > 0.0)),
+                "offline_planner_start_qpos": planner_q_start.tolist(),
+                "live_qpos_modified": False,
+                "goal_ik_bounds_strict": True,
+            },
         }
     def eef_path_for(qpos_path):
         path = []
@@ -939,6 +1032,13 @@ def plan_current_scene(
         ],
         "route_candidates": route_candidates,
         "live_state_unchanged": unchanged,
+        "start_joint_limit_validation": {
+            "maximum_live_excess_rad": float(np.max(start_joint_limit_excess)),
+            "offline_start_projection_applied": bool(np.any(start_joint_limit_excess > 0.0)),
+            "offline_planner_start_qpos": planner_q_start.tolist(),
+            "live_qpos_modified": False,
+            "goal_ik_bounds_strict": True,
+        },
     }
 
 
@@ -1002,8 +1102,17 @@ def screen_grasp_candidates(
         [sim.model.joint_name2id(name) for name in robot.gripper_joints], dtype=np.int64
     )
     gripper_limits = np.asarray(model.jnt_range[gripper_joint_ids], dtype=np.float64)
-    if np.any(closed_gripper < gripper_limits[:, 0] - 1e-8) or np.any(closed_gripper > gripper_limits[:, 1] + 1e-8):
+    closed_gripper_limit_excess = np.maximum(
+        np.maximum(gripper_limits[:, 0] - closed_gripper, closed_gripper - gripper_limits[:, 1]),
+        0.0,
+    )
+    # MuJoCo/OSC integration can leave a gripper joint a few microradians
+    # beyond its nominal stop. Validate with a scratch-only tolerance, then
+    # clip the screening posture; the live episode state is never modified.
+    gripper_limit_tolerance = SCRATCH_GRIPPER_LIMIT_TOLERANCE_M
+    if np.any(closed_gripper < gripper_limits[:, 0] - gripper_limit_tolerance) or np.any(closed_gripper > gripper_limits[:, 1] + gripper_limit_tolerance):
         raise ValueError("historical_closed_gripper_qpos_is_outside_gripper_joint_limits")
+    closed_gripper = np.clip(closed_gripper, gripper_limits[:, 0], gripper_limits[:, 1])
     integration_spec = mujoco.mjtState.mjSTATE_INTEGRATION
     integration = np.zeros(mujoco.mj_stateSize(model, integration_spec), dtype=np.float64)
     mujoco.mj_getState(model, live, integration, integration_spec)
@@ -1012,7 +1121,6 @@ def screen_grasp_candidates(
         raise ValueError("live_state_changed_before_candidate_screen")
     scratch = mujoco.MjData(model)
     mujoco.mj_setState(model, scratch, integration, integration_spec)
-    mujoco.mj_forward(model, scratch)
     eef_site_id = int(robot.eef_site_id)
     root_body_id = int(target_root_body_id)
     root_joints = [
@@ -1026,8 +1134,25 @@ def screen_grasp_candidates(
     target_qadr = int(model.jnt_qposadr[root_joints[0]])
     lower = np.asarray(model.jnt_range[arm_ids, 0], dtype=np.float64)
     upper = np.asarray(model.jnt_range[arm_ids, 1], dtype=np.float64)
-    if np.any(live.qpos[qadr] < lower - 1e-8) or np.any(live.qpos[qadr] > upper + 1e-8):
+    # Offline task-success feasibility screening operates on an isolated
+    # scratch state and never writes the live Snapshot. Allow tiny
+    # MuJoCo/controller integration excursions up to 0.2 mrad here, then clip
+    # only the scratch IK start. The physical episode retains its measured
+    # qpos and validates every attempted route through real control.
+    arm_limit_tolerance_rad = 2e-4
+    live_arm_qpos = np.asarray(live.qpos[qadr], dtype=np.float64).copy()
+    arm_limit_excess_rad = float(max(
+        np.max(np.maximum(lower - live_arm_qpos, 0.0), initial=0.0),
+        np.max(np.maximum(live_arm_qpos - upper, 0.0), initial=0.0),
+    ))
+    if arm_limit_excess_rad > arm_limit_tolerance_rad:
         raise ValueError("active_arm_qpos_is_outside_joint_limits")
+    # Keep the live Episode untouched. Numerical integration can leave an arm
+    # joint slightly beyond its nominal range; clip that value in the offline
+    # scratch copy so a tiny boundary excursion does not suppress all endpoint
+    # IK candidates.
+    scratch.qpos[qadr] = np.clip(scratch.qpos[qadr], lower, upper)
+    mujoco.mj_forward(model, scratch)
 
     robot_geoms = np.asarray(sorted(normalized_safety_policy["robot_geom_ids"]), dtype=np.int64)
     robot_bodies = set(normalized_safety_policy["robot_body_ids"])
@@ -1073,13 +1198,25 @@ def screen_grasp_candidates(
     open_gripper = np.asarray(live.qpos[gripper_qadr], dtype=np.float64).copy()
     if (
         not np.isfinite(open_gripper).all()
-        or np.any(open_gripper < gripper_limits[:, 0] - 1e-8)
-        or np.any(open_gripper > gripper_limits[:, 1] + 1e-8)
+        or np.any(open_gripper < gripper_limits[:, 0] - gripper_limit_tolerance)
+        or np.any(open_gripper > gripper_limits[:, 1] + gripper_limit_tolerance)
     ):
         raise ValueError("active_open_gripper_qpos_is_outside_gripper_joint_limits")
+    open_gripper_limit_excess = np.maximum(
+        np.maximum(gripper_limits[:, 0] - open_gripper, open_gripper - gripper_limits[:, 1]),
+        0.0,
+    )
+    open_gripper = np.clip(open_gripper, gripper_limits[:, 0], gripper_limits[:, 1])
 
     def set_arm(q):
-        scratch.qpos[qadr] = np.asarray(q, dtype=np.float64)
+        arm_qpos = np.asarray(q, dtype=np.float64)
+        if (
+            arm_qpos.shape != lower.shape or not np.isfinite(arm_qpos).all()
+            or np.any(arm_qpos < lower - arm_limit_tolerance_rad)
+            or np.any(arm_qpos > upper + arm_limit_tolerance_rad)
+        ):
+            raise ValueError("scratch_candidate_arm_qpos_exceeds_joint_limit_tolerance")
+        scratch.qpos[qadr] = np.clip(arm_qpos, lower, upper)
         mujoco.mj_forward(model, scratch)
 
     def set_gripper(qpos):
@@ -1093,12 +1230,15 @@ def screen_grasp_candidates(
 
     def solve_ik(position, quaternion, seeds):
         best = None
+        valid_seeds = []
         for seed in seeds:
             seed = np.asarray(seed, dtype=np.float64)
             if seed.shape != (7,) or not np.isfinite(seed).all():
                 continue
             seed = np.clip(seed, lower_all, upper_all)
+            valid_seeds.append(seed.copy())
 
+        def solve_from_seed(seed, *, max_nfev):
             def residual(q):
                 set_arm(q)
                 p, quat = eef_pose()
@@ -1109,7 +1249,7 @@ def screen_grasp_candidates(
 
             solution = least_squares(
                 residual, seed, bounds=(lower_all, upper_all), x_scale="jac",
-                max_nfev=300, ftol=1e-9, xtol=1e-9, gtol=1e-9,
+                max_nfev=max_nfev, ftol=1e-9, xtol=1e-9, gtol=1e-9,
             )
             q = np.asarray(solution.x)
             p, quat = eef_pose()
@@ -1117,9 +1257,35 @@ def screen_grasp_candidates(
             re = float(np.linalg.norm(quaternion_to_rotation_vector(
                 quaternion_multiply(quaternion, quaternion_conjugate(quat))
             )))
-            score = pe + 0.15 * re
-            if pe <= 0.003 and re <= 0.035 and (best is None or score < best[0]):
-                best = (score, q.copy(), pe, re)
+            if pe <= 0.003 and re <= 0.035:
+                return (pe + 0.15 * re, q.copy(), pe, re)
+            return None
+
+        for seed in valid_seeds:
+            candidate = solve_from_seed(seed, max_nfev=300)
+            if candidate is not None and (best is None or candidate[0] < best[0]):
+                best = candidate
+
+        # A single live-posture seed can falsely reject valid grasps in the
+        # Panda's redundant elbow/wrist space.  Only after all supplied seeds
+        # fail, retry four deterministic nearby configurations.  This bounds
+        # the cost while exposing the two strongest elbow redundancy axes;
+        # scratch-state solves never touch the physical MuJoCo episode.
+        if best is None and valid_seeds:
+            base = valid_seeds[0]
+            for joint_index, delta in ((2, 0.55), (2, -0.55), (4, 0.55), (4, -0.55)):
+                seed = base.copy()
+                seed[joint_index] = np.clip(
+                    seed[joint_index] + delta,
+                    lower_all[joint_index] + 1e-4,
+                    upper_all[joint_index] - 1e-4,
+                )
+                if any(np.linalg.norm(seed - prior) < 1e-4 for prior in valid_seeds):
+                    continue
+                candidate = solve_from_seed(seed, max_nfev=180)
+                if candidate is not None:
+                    best = candidate
+                    break
         return best
 
     def apply_carried_pose(eef_to_object):
@@ -1358,6 +1524,7 @@ def screen_grasp_candidates(
     results = []
     forbidden_object_ids = {item["object_id"] for item in forbidden_groups}
     mujoco.mj_setState(model, scratch, integration, integration_spec)
+    scratch.qpos[qadr] = np.clip(scratch.qpos[qadr], lower, upper)
     mujoco.mj_forward(model, scratch)
     set_gripper(open_gripper)
     t0_baseline_check = evaluate(live.qpos[qadr].copy())
@@ -1452,6 +1619,7 @@ def screen_grasp_candidates(
         }
         try:
             mujoco.mj_setState(model, scratch, integration, integration_spec)
+            scratch.qpos[qadr] = np.clip(scratch.qpos[qadr], lower, upper)
             mujoco.mj_forward(model, scratch)
             if task_approach_only:
                 candidate_closed_gripper = open_gripper.copy()
@@ -1806,6 +1974,23 @@ def screen_grasp_candidates(
             if task_approach_only else "offline_scratch_only_not_physical_execution"
         ),
         "task_approach_only": task_approach_only,
+        "active_arm_joint_limit_validation": {
+            "maximum_live_qpos_excess_rad": arm_limit_excess_rad,
+            "scratch_tolerance_rad": arm_limit_tolerance_rad,
+            "scratch_boundary_clipping_applied": arm_limit_excess_rad > 0.0,
+            "live_qpos_modified": False,
+            "IK_solution_bounds_remain_strictly_inside_limits": True,
+        },
+        "active_gripper_joint_limit_validation": {
+            "maximum_live_open_qpos_excess_m": float(np.max(open_gripper_limit_excess)),
+            "maximum_input_posture_excess_m": float(np.max(closed_gripper_limit_excess)),
+            "scratch_tolerance_m": gripper_limit_tolerance,
+            "scratch_boundary_clipping_applied": bool(
+                np.any(open_gripper_limit_excess > 0.0)
+                or np.any(closed_gripper_limit_excess > 0.0)
+            ),
+            "live_qpos_modified": False,
+        },
         "target_contact_policy": {
             "mode": (
                 "pad_only_zero_penetration_task_feasibility"
