@@ -1004,14 +1004,41 @@ def plan_current_scene(
             path.append(np.r_[position, quaternion].tolist())
         return path
 
+    def dense_joint_path_for(qpos_path):
+        """Return the same adaptive samples used to validate each RRT edge.
+
+        RRT candidates retain their compact tree vertices for OSC waypoint
+        execution. A torque controller must instead receive the intervening
+        collision-checked samples; otherwise a single physical control action
+        may jump across a large, dynamically untrackable joint-space edge.
+        """
+        compact = [np.asarray(q, dtype=np.float64) for q in qpos_path]
+        if len(compact) < 2:
+            raise RuntimeError("joint_space_RRT_candidate_path_has_fewer_than_two_vertices")
+        dense = [compact[0].copy()]
+        for start, end in zip(compact[:-1], compact[1:]):
+            edge_samples = planner._dense_edge(start, end)
+            if edge_samples is None:
+                raise RuntimeError("joint_space_RRT_dense_candidate_edge_validation_incomplete")
+            dense.extend(sample.copy() for sample in edge_samples[1:])
+        return np.stack(dense)
+
     eef_path = eef_path_for(result.qpos_path)
     route_candidates = []
     for route in result.candidates:
+        compact_route = np.asarray(route["path"], dtype=np.float64)
+        dense_route = dense_joint_path_for(compact_route)
         route_candidates.append({
             "route_index": int(route["route_index"]),
             "iterations": int(route["iterations"]),
             "metrics": route["metrics"],
-            "eef_reference_poses_world": eef_path_for(route["path"]),
+            "joint_space_qpos_path_rad": dense_route.tolist(),
+            "joint_space_compact_vertex_count": int(len(compact_route)),
+            "joint_space_dense_sample_count": int(len(dense_route)),
+            "joint_space_maximum_sample_delta_rad": float(max(
+                np.max(np.abs(b - a)) for a, b in zip(dense_route[:-1], dense_route[1:])
+            )),
+            "eef_reference_poses_world": eef_path_for(compact_route),
         })
     return {
         "status": result.status,
@@ -1267,19 +1294,38 @@ def screen_grasp_candidates(
                 best = candidate
 
         # A single live-posture seed can falsely reject valid grasps in the
-        # Panda's redundant elbow/wrist space.  Only after all supplied seeds
-        # fail, retry four deterministic nearby configurations.  This bounds
-        # the cost while exposing the two strongest elbow redundancy axes;
-        # scratch-state solves never touch the physical MuJoCo episode.
+        # Panda's redundant shoulder/elbow/wrist space, especially after a
+        # long physical branch has left the arm in an unusual posture.  Only
+        # after all supplied seeds fail, retry a small deterministic portfolio
+        # around the active posture.  Include coupled elbow/wrist changes so
+        # the optimizer can escape local minima that one-joint perturbations
+        # cannot reach.  These scratch-state solves never touch the physical
+        # MuJoCo episode and every solution remains strictly inside joint
+        # limits.
         if best is None and valid_seeds:
             base = valid_seeds[0]
-            for joint_index, delta in ((2, 0.55), (2, -0.55), (4, 0.55), (4, -0.55)):
+            seed_deltas = (
+                ((2, 0.55),),
+                ((2, -0.55),),
+                ((4, 0.55),),
+                ((4, -0.55),),
+                ((2, 0.65), (4, -0.65)),
+                ((2, -0.65), (4, 0.65)),
+                ((2, 0.65), (4, 0.65)),
+                ((2, -0.65), (4, -0.65)),
+                ((0, 0.65),),
+                ((0, -0.65),),
+                ((6, 1.0),),
+                ((6, -1.0),),
+            )
+            for deltas in seed_deltas:
                 seed = base.copy()
-                seed[joint_index] = np.clip(
-                    seed[joint_index] + delta,
-                    lower_all[joint_index] + 1e-4,
-                    upper_all[joint_index] - 1e-4,
-                )
+                for joint_index, delta in deltas:
+                    seed[joint_index] = np.clip(
+                        seed[joint_index] + delta,
+                        lower_all[joint_index] + 1e-4,
+                        upper_all[joint_index] - 1e-4,
+                    )
                 if any(np.linalg.norm(seed - prior) < 1e-4 for prior in valid_seeds):
                     continue
                 candidate = solve_from_seed(seed, max_nfev=180)

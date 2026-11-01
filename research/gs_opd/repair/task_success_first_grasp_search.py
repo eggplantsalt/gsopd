@@ -95,6 +95,8 @@ NEAR_SURFACE_START_POSITION_M = 0.025
 NEAR_SURFACE_START_ROTATION_RAD = 0.08
 NEAR_PREGRASP_START_POSITION_M = 0.075
 NEAR_PREGRASP_START_ROTATION_RAD = 0.08
+PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M = 0.010
+PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD = 0.02
 LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S = 0.015
 LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S = 0.08
 LIVE_CONTACT_SETTLE_REQUIRED_SAMPLES = 3
@@ -341,19 +343,20 @@ def _rank_by_endpoint_ik_joint_travel(
     start_arm_qpos: np.ndarray,
     screen_pass_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Prefer reachable grasp poses whose IK posture is close to the live arm.
+    """Rank screen-pass grasp poses first, then minimize live-arm joint travel.
 
     A Cartesian-nearest pregrasp can require a large wrist/elbow winding from
     the current posture. OSC then may stall at an intermediate pose even when
-    both endpoint IK checks pass. Rank within the existing screen evidence
-    tier by estimated joint travel; this only changes search order and does not
-    certify or gate a physical attempt.
+    both endpoint IK checks pass. Prefer endpoint-IK candidates that pass the
+    active task-approach screen, then rank by estimated joint travel. This only
+    changes search order: screen failures remain eligible for Stage A physical
+    attempts, and neither tier certifies or gates a physical attempt.
     """
     start = np.asarray(start_arm_qpos, dtype=np.float64)
     screen_pass_ids = set(screen_pass_ids or ())
     if start.shape != (7,) or not np.isfinite(start).all():
         return list(candidates), []
-    scored: list[tuple[tuple[float, int, float, float, str], dict[str, Any], dict[str, Any]]] = []
+    scored: list[tuple[tuple[int, float, float, float, str], dict[str, Any], dict[str, Any]]] = []
     diagnostics: list[dict[str, Any]] = []
     for candidate in candidates:
         candidate_id = str(candidate.get("candidate_id", ""))
@@ -392,10 +395,12 @@ def _rank_by_endpoint_ik_joint_travel(
             "pregrasp_eef_distance_m": float(candidate.get("pregrasp_eef_distance_m") or 0.0),
         }
         diagnostics.append(row)
-        # Candidates without endpoint IK retain their prior relative order.
+        # Keep every candidate eligible; use the task-approach result as a
+        # search-order tier before comparing joint travel. Stage A does not
+        # reject screen-failed candidates on that basis.
         key = (
-            score,
             0 if candidate_id in screen_pass_ids else 1,
+            score,
             maximum_joint_delta if maximum_joint_delta is not None else float("inf"),
             float(candidate.get("pregrasp_eef_distance_m") or 0.0),
             candidate_id,
@@ -1139,7 +1144,7 @@ class BridgeSession:
         "task_scene_object_collision_envelopes",
         "robot_joint_limit_inventory", "compiled_model_fingerprint_details",
         "trajectory_tracking_capabilities", "scratch_robot_fk_audit",
-        "scratch_carried_geom_distance_audit",
+        "scratch_carried_geom_distance_audit", "planning_geometry",
     })
 
     def __init__(self, address: tuple[str, int], log_path: Path, args: argparse.Namespace):
@@ -1493,6 +1498,7 @@ def _learned_grasp_template(
         phase = str(item.get("phase", ""))
         if phase not in {
             "task_success_first_rrt_osc_pregrasp_route",
+            "task_success_first_jointspace_rrt_pregrasp_route",
             "migrated_object_relative_approach",
             "migrated_object_relative_grasp_endpoint",
         }:
@@ -1909,6 +1915,111 @@ def _record_step(
         raise RuntimeError("environment_done_during_grasp_only_branch")
 
 
+def _record_joint_trajectory_step(
+    bridge: BridgeSession,
+    joint_target_qpos_rad: np.ndarray,
+    phase: str,
+    candidate_id: str,
+    action_index: int,
+    target_binding: dict[str, Any],
+    instruction: str,
+    policy: dict[str, Any],
+    monitor,
+    records: list[dict[str, Any]],
+    frames: list[dict[str, Any]],
+    *,
+    raise_on_done: bool = True,
+) -> None:
+    """Execute and archive one measured joint-space RRT trajectory sample."""
+    if action_index >= MAX_BRANCH_CONTROL_ACTIONS:
+        raise RuntimeError("physical_branch_control_action_budget_exhausted_before_joint_step")
+    target = np.asarray(joint_target_qpos_rad, dtype=np.float64)
+    if target.shape != (7,) or not np.isfinite(target).all():
+        raise ValueError("joint_space_RRT_target_must_be_finite_7D")
+    started = time.perf_counter()
+    reply = bridge.request({
+        "op": "joint_trajectory_step",
+        "action_index": int(action_index),
+        "joint_target_qpos_rad": target.tolist(),
+        "gripper_action": 0.0,
+        "joint_position_kp": 50.0,
+        "safety_geometry_policy": (
+            None if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else policy
+        ),
+    })
+    joint_step_wall_s = time.perf_counter() - started
+    if reply.get("status") == "failed" or reply.get("error"):
+        raise RuntimeError(
+            f"joint_space_RRT_physical_step_failed:{reply.get('error', reply.get('status'))}"
+        )
+    grasp_started = time.perf_counter()
+    try:
+        grasp = bridge.request({
+            "op": "grasp_state",
+            "carried_binding": target_binding,
+            "expected_instruction": instruction,
+        })
+    except Exception as exc:
+        grasp = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
+    grasp_state_wall_s = time.perf_counter() - grasp_started
+    sample = monitor.update(grasp, rollout_step=action_index)
+    contact_monitoring = reply.get("contact_monitoring", {})
+    contact_complete = _contact_substep_monitoring_complete(
+        contact_monitoring, require_geometry=False
+    )
+    clearance_complete = _contact_substep_monitoring_complete(
+        contact_monitoring, require_geometry=True
+    )
+    snapshot_state = reply.get("snapshot_state", {})
+    records.append({
+        "candidate_id": candidate_id,
+        "step_index": len(records),
+        "phase": phase,
+        "action_7d": None,
+        "joint_target_qpos_rad": target.tolist(),
+        "control_mode": "joint_space_mass_matrix_PD_torque",
+        "control_action_space": "7D_joint_target_qpos_rad",
+        "state": reply.get("state", {}),
+        "snapshot_state": snapshot_state,
+        "target_body_id": int(target_binding["body_id"]),
+        "grasp_state_source": "separate_read_only_grasp_state_rpc",
+        "contacts": reply.get("contacts", {}),
+        "start_contacts": {"status": "not_returned_by_joint_trajectory_step"},
+        "contact_monitoring": contact_monitoring,
+        "substep_monitoring_complete": contact_complete,
+        "substep_contact_monitoring_complete": contact_complete,
+        "substep_clearance_monitoring_complete": clearance_complete,
+        "physics_audit_profile": {
+            "substep_contacts": "complete_per_MuJoCo_step",
+            "substep_clearance_sweeps": (
+                "disabled_for_stage_a_search"
+                if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else "enabled"
+            ),
+            "safety_certified": False,
+        },
+        "safety_geometry": None,
+        "grasp_state": grasp,
+        "grasp_monitor_sample": sample,
+        "reward": reply.get("reward", 0.0),
+        "done": reply.get("done", False),
+        "task_success": reply.get("task_success"),
+        "timestep": reply.get("timestep"),
+        "execution_timing_s": {
+            "joint_trajectory_step_rpc": joint_step_wall_s,
+            "grasp_state_rpc": grasp_state_wall_s,
+        },
+    })
+    frames.append({
+        "candidate_id": candidate_id,
+        "step_index": len(records) - 1,
+        "phase": phase,
+        "agentview_rgb": _image(reply, "agentview_image"),
+        "wrist_rgb": _image(reply, "robot0_eye_in_hand_image"),
+    })
+    if reply.get("done") and raise_on_done:
+        raise RuntimeError("environment_done_during_grasp_only_joint_route")
+
+
 def _contact_substep_monitoring_complete(
     contact_monitoring: dict[str, Any], *, require_geometry: bool = True
 ) -> bool:
@@ -1978,10 +2089,14 @@ def _advance_pose(
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
     max_translation_step_m: float = 0.008,
+    max_rotation_step_rad: float = 0.10,
     planning_tracking: dict[str, Any] | None = None,
     target_pose_provider: Callable[
         [dict[str, Any]], tuple[np.ndarray, np.ndarray]
     ] | None = None,
+    object_progress_reached_condition: Callable[[dict[str, Any]], bool] | None = None,
+    translation_axes: tuple[int, ...] | None = None,
+    minimum_vertical_translation_fraction: float = 0.0,
     object_progress_target_world: np.ndarray | None = None,
     object_progress_rotation_only: bool = False,
     object_progress_horizontal_only: bool = False,
@@ -2010,6 +2125,13 @@ def _advance_pose(
     ):
         raise ValueError("pose_tracking_max_translation_step_must_be_in_0.001_to_0.02")
     if (
+        isinstance(max_rotation_step_rad, bool)
+        or not isinstance(max_rotation_step_rad, (int, float))
+        or not np.isfinite(float(max_rotation_step_rad))
+        or not 0.005 <= float(max_rotation_step_rad) <= 0.10
+    ):
+        raise ValueError("pose_tracking_max_rotation_step_rad_must_be_in_0.005_to_0.10")
+    if (
         isinstance(gripper_action, bool)
         or not isinstance(gripper_action, (int, float))
         or not np.isfinite(float(gripper_action))
@@ -2020,10 +2142,27 @@ def _advance_pose(
         raise ValueError("pose_tracking_object_rotation_only_must_be_boolean")
     if not isinstance(object_progress_horizontal_only, bool):
         raise ValueError("pose_tracking_object_horizontal_only_must_be_boolean")
+    if translation_axes is not None and (
+        not translation_axes
+        or len(set(translation_axes)) != len(translation_axes)
+        or any(isinstance(axis, bool) or axis not in (0, 1, 2) for axis in translation_axes)
+    ):
+        raise ValueError("pose_tracking_translation_axes_must_be_unique_world_axes")
+    if (
+        isinstance(minimum_vertical_translation_fraction, bool)
+        or not isinstance(minimum_vertical_translation_fraction, (int, float))
+        or not np.isfinite(float(minimum_vertical_translation_fraction))
+        or not 0.0 <= float(minimum_vertical_translation_fraction) <= 1.0
+    ):
+        raise ValueError("pose_tracking_vertical_translation_fraction_must_be_in_0_to_1")
     if absolute_action_limit is None:
         absolute_action_limit = MAX_BRANCH_CONTROL_ACTIONS
     if object_progress_rotation_only and object_progress_target_world is None:
         raise ValueError("pose_tracking_rotation_only_requires_an_object_progress_target")
+    if object_progress_reached_condition is not None and not callable(
+        object_progress_reached_condition
+    ):
+        raise ValueError("pose_tracking_object_progress_reached_condition_must_be_callable")
     progress_history: list[tuple[float, float]] = []
     object_progress_history: list[tuple[float, float]] = []
     object_progress_target = None
@@ -2067,7 +2206,14 @@ def _advance_pose(
         current_position = np.asarray(robot["eef_pos"], dtype=np.float64)
         current_quaternion = np.asarray(robot["eef_quat"], dtype=np.float64)
         position_error = target_position - current_position
-        distance = float(np.linalg.norm(position_error))
+        # Axis-selective waypoints must keep the other world axes at their
+        # requested coordinates.  Treating them as zero-command axes lets
+        # OSC tracking drift accumulate during a wrist rotation or an A* leg;
+        # that can move the EEF far from the route while the selected axis
+        # appears to make progress.  Include every axis in convergence and
+        # stagnation checks, then explicitly servo the non-progress axes below.
+        tracking_position_error = position_error
+        distance = float(np.linalg.norm(tracking_position_error))
         rotation_error = quaternion_to_rotation_vector(
             quaternion_multiply(target_quaternion, quaternion_conjugate(current_quaternion))
         )
@@ -2089,13 +2235,19 @@ def _advance_pose(
             object_rotation_error = float(np.linalg.norm(Rotation.from_matrix(
                 object_progress_target[:3, :3] @ live_object_world[:3, :3].T
             ).as_rotvec()))
-            if (
+            object_progress_within_tolerance = (
                 object_rotation_error <= rotation_tolerance_rad
                 if object_progress_rotation_only
                 else _pose_tracking_error_within_tolerance(
                     object_position_error, object_rotation_error,
                     position_tolerance_m, rotation_tolerance_rad,
                 )
+            )
+            if object_progress_within_tolerance and (
+                object_progress_reached_condition is None
+                or bool(object_progress_reached_condition(
+                    records[-1] if records else {},
+                ))
             ):
                 return True
         elif object_progress_target is None and _pose_tracking_error_within_tolerance(
@@ -2128,13 +2280,73 @@ def _advance_pose(
                 object_minimum_rotation_progress_rad=0.02,
                 rotation_only=object_progress_rotation_only,
             ):
+                diagnostic = (
+                    f";eef_error_m={distance:.7f};eef_rotation_error_rad={rotation_norm:.7f}"
+                    f";position_tolerance_m={position_tolerance_m:.7f}"
+                    f";rotation_tolerance_rad={rotation_tolerance_rad:.7f}"
+                    f";bilateral_grasp_for_tracking={bilateral_for_tracking}"
+                    f";object_position_error_m={object_position_error!r}"
+                    f";object_rotation_error_rad={object_rotation_error!r}"
+                    f";object_progress_rotation_only={object_progress_rotation_only}"
+                    f";object_progress_horizontal_only={object_progress_horizontal_only}"
+                    f";object_completion_gate_configured="
+                    f"{object_progress_reached_condition is not None}"
+                    f";object_live_position_world_m="
+                    f"{live_object_world[:3, 3].tolist() if object_progress_target is not None and bilateral_for_tracking else None}"
+                    f";object_target_position_world_m="
+                    f"{object_progress_target[:3, 3].tolist() if object_progress_target is not None else None}"
+                )
                 raise RuntimeError(
                     f"{phase}_waypoint_stagnated_for_{stagnation_window_actions}_actions"
+                    f"{diagnostic}"
                 )
-        delta_position = position_error * min(
-            1.0, float(max_translation_step_m) / max(distance, 1e-12),
+        if translation_axes is None:
+            step_limit = float(max_translation_step_m)
+            vertical_fraction = float(minimum_vertical_translation_fraction)
+            if vertical_fraction > 0.0 and abs(float(position_error[2])) > 1e-12:
+                # Keep a bounded share of each carried-object step available
+                # for world-Z clearance correction while traversing an XY
+                # waypoint. A single Euclidean norm clamp otherwise lets a
+                # long diagonal XY residual starve Z feedback as a held load
+                # sags under gravity. The combined command remains within the
+                # original per-action translation bound.
+                vertical_reserve = min(
+                    abs(float(position_error[2])), step_limit * vertical_fraction,
+                )
+                horizontal_budget = math.sqrt(max(
+                    0.0, step_limit * step_limit - vertical_reserve * vertical_reserve,
+                ))
+                horizontal_distance = float(np.linalg.norm(position_error[:2]))
+                delta_position = np.zeros(3, dtype=np.float64)
+                if horizontal_distance > horizontal_budget and horizontal_distance > 1e-12:
+                    delta_position[:2] = (
+                        position_error[:2] * horizontal_budget / horizontal_distance
+                    )
+                else:
+                    delta_position[:2] = position_error[:2]
+                horizontal_step = float(np.linalg.norm(delta_position[:2]))
+                vertical_budget = math.sqrt(max(
+                    0.0, step_limit * step_limit - horizontal_step * horizontal_step,
+                ))
+                vertical_step = min(abs(float(position_error[2])), vertical_budget)
+                delta_position[2] = math.copysign(vertical_step, float(position_error[2]))
+            else:
+                delta_position = position_error * min(
+                    1.0, step_limit / max(distance, 1e-12),
+                )
+        else:
+            # The A* / axis-aligned waypoint sequence already defines the
+            # intended route direction.  Track the full Cartesian waypoint
+            # here so measured cross-axis OSC error is corrected immediately
+            # instead of being inherited by the next route segment.  The
+            # resulting chord remains bounded by the original per-action
+            # translation limit and physical contact monitoring stays active.
+            delta_position = position_error * min(
+                1.0, float(max_translation_step_m) / max(distance, 1e-12),
+            )
+        delta_rotation = rotation_error * min(
+            1.0, float(max_rotation_step_rad) / max(rotation_norm, 1e-12),
         )
-        delta_rotation = rotation_error * min(1.0, 0.10 / max(rotation_norm, 1e-12))
         next_quaternion_xyzw = Rotation.from_rotvec(delta_rotation).as_quat()
         next_quaternion = quaternion_multiply(
             next_quaternion_xyzw[[3, 0, 1, 2]], current_quaternion
@@ -2192,6 +2404,51 @@ def _advance_pose(
             raise RuntimeError("actual_EEF_displacement_exceeded_30mm_per_control_action")
         if stop_condition is not None and stop_condition():
             return False
+        # The monitored action record contains the exact post-step MuJoCo
+        # integration snapshot. Check convergence against that physical state
+        # before the next RPC/stagnation pass so a waypoint completed by the
+        # most recent action cannot be mislabeled as stationary at its target.
+        if object_progress_target is not None:
+            latest_grasp = records[-1].get("grasp_state", {})
+            latest_fingers = latest_grasp.get("finger_contacts", {})
+            latest_bilateral = bool(
+                latest_grasp.get("grasp_confirmed") is True
+                and latest_fingers.get("left") is True
+                and latest_fingers.get("right") is True
+            )
+            if latest_bilateral:
+                latest_object = _object_state(
+                    records[-1].get("snapshot_state", {}),
+                    int(target_binding["body_id"]),
+                )
+                latest_object_world = _runtime_object_pose(latest_object)
+                object_delta = (
+                    object_progress_target[:2, 3] - latest_object_world[:2, 3]
+                    if object_progress_horizontal_only
+                    else object_progress_target[:3, 3] - latest_object_world[:3, 3]
+                )
+                latest_position_error = (
+                    0.0 if object_progress_rotation_only
+                    else float(np.linalg.norm(object_delta))
+                )
+                latest_rotation_error = float(np.linalg.norm(Rotation.from_matrix(
+                    object_progress_target[:3, :3]
+                    @ latest_object_world[:3, :3].T
+                ).as_rotvec()))
+                latest_pose_reached = (
+                    latest_rotation_error <= rotation_tolerance_rad
+                    if object_progress_rotation_only
+                    else _pose_tracking_error_within_tolerance(
+                        latest_position_error, latest_rotation_error,
+                        position_tolerance_m, rotation_tolerance_rad,
+                    )
+                )
+                latest_completion_evidence = (
+                    object_progress_reached_condition is None
+                    or bool(object_progress_reached_condition(records[-1]))
+                )
+                if latest_pose_reached and latest_completion_evidence:
+                    return True
     raise TimeoutError(f"{phase}_did_not_reach_pose_within_{maximum_steps}_actions")
 
 
@@ -2324,12 +2581,17 @@ def _run_physical_branch(
     frames: list[dict[str, Any]],
     output_dir: Path,
     local_replan_rrt_time_budget_s: float = 2.0,
+    pregrasp_route_waypoint_position_tolerance_m: float = 0.004,
+    pregrasp_route_control_mode: str = "eef_osc",
     abort_target_displacement_m: float | None = None,
     force_route_before_contact_close: bool = False,
     stage_a_unilateral_close_probe_position_m: float = LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M,
     stage_a_pregrasp_staged_clearance_height_m: float = 0.0,
     stage_a_pregrasp_lateral_detour_m: float = 0.0,
     stage_a_pregrasp_lift_before_lateral_detour: bool = False,
+    stage_a_pregrasp_axis_aligned_high_transit: bool = False,
+    stage_a_pregrasp_obstacle_aware_high_transit: bool = False,
+    stage_a_obstacle_components: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], bytes | None]:
     from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
 
@@ -2624,11 +2886,78 @@ def _run_physical_branch(
         or unilateral_close_probe_position_match
         or contact_free_candidate_pose_close_probe
     )
-    close_from_live_contact = bool(
-        close_from_live_contact_evidence and not force_route_before_contact_close
+    # Explicit geometry routes normally defer live-contact closure because
+    # their purpose is to physically validate the generated approach. A
+    # recovered Snapshot that already contains measured target-pad contact is
+    # different: re-running the full route can push the object away or lose
+    # the useful unilateral contact. If that contact is within the configured
+    # bounded close-probe radius, let the live MuJoCo contact trigger closure
+    # at the measured EEF pose; the grasp monitor and lift still decide whether
+    # it worked.
+    live_contact_close_overrode_explicit_route = bool(
+        force_route_before_contact_close
+        and close_from_live_contact_evidence
+        and (
+            unilateral_close_probe_position_match
+            or preclosed_bilateral_contact
+            or (live_bilateral_target_contact and bilateral_contact_surfaces_admissible)
+        )
     )
+    close_from_live_contact = bool(
+        close_from_live_contact_evidence
+        and (
+            not force_route_before_contact_close
+            or live_contact_close_overrode_explicit_route
+        )
+    )
+    _, candidate_pregrasp_pose = object_relative_grasp_targets(
+        _runtime_object_pose(initial_object),
+        np.asarray(candidate["object_to_eef"], dtype=np.float64),
+        np.asarray(candidate["approach_direction_object"], dtype=np.float64),
+        float(candidate["approach_distance_m"]),
+    )
+    pregrasp_start_position_error_m, pregrasp_start_rotation_error_rad = (
+        _pose_tracking_error_components(initial_eef_world, candidate_pregrasp_pose)
+    )
+    near_pregrasp_start_contacts: dict[str, Any] = {"status": "not_queried"}
+    near_pregrasp_start_robot_contact_count = None
+    near_pregrasp_start_bypass = False
+    if (
+        pregrasp_start_position_error_m <= PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M
+        and pregrasp_start_rotation_error_rad
+        <= PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD
+    ):
+        near_pregrasp_start_contacts = bridge.request({"op": "inspect_contacts"})
+        contact_rows = near_pregrasp_start_contacts.get("contacts", [])
+        robot_contact_rows = []
+        if isinstance(contact_rows, list):
+            for contact in contact_rows:
+                names = " ".join(
+                    str(contact.get(side, {}).get("name", ""))
+                    for side in ("geom1", "geom2", "body1", "body2")
+                    if isinstance(contact.get(side, {}), dict)
+                ).lower()
+                if any(marker in names for marker in ("robot0", "gripper0", "panda")):
+                    robot_contact_rows.append(contact)
+        near_pregrasp_start_robot_contact_count = len(robot_contact_rows)
+        near_pregrasp_start_bypass = bool(
+            near_pregrasp_start_contacts.get("status") in {"no_contact", "contact"}
+            and not robot_contact_rows
+        )
+    branch["near_pregrasp_snapshot_start_bypass"] = {
+        "admitted": near_pregrasp_start_bypass,
+        "eef_to_candidate_pregrasp_position_error_m": pregrasp_start_position_error_m,
+        "eef_to_candidate_pregrasp_rotation_error_rad": pregrasp_start_rotation_error_rad,
+        "position_limit_m": PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M,
+        "rotation_limit_rad": PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD,
+        "contact_inspection": near_pregrasp_start_contacts,
+        "robot_scene_contact_count": near_pregrasp_start_robot_contact_count,
+        "surface_approach_and_live_grasp_checks_still_required": True,
+        "route_skip_only": True,
+    }
+    contact_based_route_skip = bool(close_from_live_contact or unilateral_surface_approach_start)
     skip_pregrasp_route = bool(
-        close_from_live_contact or unilateral_surface_approach_start
+        contact_based_route_skip or near_pregrasp_start_bypass
     )
     branch["initial_target_finger_contact_sides"] = list(initial_contact_sides)
     branch["live_bilateral_target_contact_observed"] = live_bilateral_target_contact
@@ -2695,9 +3024,17 @@ def _run_physical_branch(
         "position_error_max_m": LIVE_CONTACT_CLOSE_POSITION_TOLERANCE_M,
         "rotation_error_max_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
     }
-    branch["pregrasp_route_skipped_due_to_live_target_contact"] = skip_pregrasp_route
+    branch["pregrasp_route_skipped_due_to_live_target_contact"] = contact_based_route_skip
+    branch["pregrasp_route_skipped_due_to_verified_near_pregrasp_start"] = (
+        near_pregrasp_start_bypass
+    )
     branch["live_contact_close_deferred_until_selected_route_end"] = bool(
-        force_route_before_contact_close and close_from_live_contact_evidence
+        force_route_before_contact_close
+        and close_from_live_contact_evidence
+        and not live_contact_close_overrode_explicit_route
+    )
+    branch["live_contact_close_overrode_explicit_route"] = (
+        live_contact_close_overrode_explicit_route
     )
     if close_from_live_contact:
         if live_bilateral_target_contact and not preclosed_bilateral_contact:
@@ -2994,7 +3331,45 @@ def _run_physical_branch(
         minimum_actions=74,
         maximum_actions=MAX_PREFIX_CONTROL_ACTIONS,
     )
+    joint_space_qpos_path = None
+    if pregrasp_route_control_mode == "joint_space_rrt" and not skip_pregrasp_route:
+        raw_joint_path = rrt.get("joint_space_qpos_path_rad")
+        if raw_joint_path is None:
+            raise RuntimeError(
+                "joint_space_RRT_route_requested_but_selected_route_has_no_qpos_path"
+            )
+        joint_space_qpos_path = np.asarray(raw_joint_path, dtype=np.float64)
+        if (
+            joint_space_qpos_path.ndim != 2
+            or joint_space_qpos_path.shape[1] != 7
+            or len(joint_space_qpos_path) < 2
+            or not np.isfinite(joint_space_qpos_path).all()
+        ):
+            raise RuntimeError("selected_joint_space_RRT_qpos_path_is_malformed")
+        dense_joint_actions = len(joint_space_qpos_path) - 1
+        if dense_joint_actions > MAX_PREFIX_CONTROL_ACTIONS:
+            raise RuntimeError(
+                "dense_joint_space_RRT_path_exceeds_bounded_pregrasp_action_budget:"
+                f"{dense_joint_actions}>{MAX_PREFIX_CONTROL_ACTIONS}"
+            )
+        route_action_budget = max(route_action_budget, dense_joint_actions)
     branch["pregrasp_route_action_budget"] = route_action_budget
+    branch["pregrasp_route_control_mode"] = pregrasp_route_control_mode
+    if joint_space_qpos_path is not None:
+        branch["pregrasp_joint_space_RRT_path"] = {
+            "status": "validated_for_physical_tracking",
+            "waypoint_count_including_start": int(len(joint_space_qpos_path)),
+            "required_physical_actions": int(len(joint_space_qpos_path) - 1),
+            "action_budget": int(route_action_budget),
+            "controller": "joint_space_mass_matrix_PD_torque",
+            "path_source": "active_current_scene_jointspace_RRT_route_candidate",
+            "maximum_allowed_tracking_error_l2_rad": 0.15,
+            "maximum_joint_sample_delta_rad": float(np.max(np.abs(
+                np.diff(joint_space_qpos_path, axis=0)
+            ))),
+            "route_was_safety_certified": False,
+        }
+        candidate["_joint_space_RRT_execution"] = branch["pregrasp_joint_space_RRT_path"]
     branch["local_replans"] = []
     # Keep screen-derived IK with the candidate before crossing into this
     # branch helper.  approach_rows is owned by the caller's screening scope
@@ -3025,6 +3400,7 @@ def _run_physical_branch(
         rotation_tolerance_rad: float = 0.045,
         step_callback=None,
         stop_condition=None,
+        translation_axes: tuple[int, ...] | None = None,
     ) -> bool | None:
         try:
             reached = _advance_pose(
@@ -3039,6 +3415,7 @@ def _run_physical_branch(
                 rotation_tolerance_rad=rotation_tolerance_rad,
                 max_translation_step_m=max_translation_step_m,
                 target_pose_provider=target_pose_provider,
+                translation_axes=translation_axes,
                 step_callback=step_callback,
             )
             return reached
@@ -3192,11 +3569,104 @@ def _run_physical_branch(
                     position_tolerance_m=position_tolerance_m,
                     rotation_tolerance_rad=rotation_tolerance_rad,
                     max_translation_step_m=max_translation_step_m,
+                    translation_axes=translation_axes,
                 )
             branch["local_replans"][-1]["status"] = "physical_replan_segment_reached"
             candidate["_local_replans"] = list(branch["local_replans"])
 
-    if not skip_pregrasp_route:
+    if not skip_pregrasp_route and pregrasp_route_control_mode == "joint_space_rrt":
+        if (
+            stage_a_pregrasp_staged_clearance_height_m > 0.0
+            or abs(stage_a_pregrasp_lateral_detour_m) > 1e-8
+            or stage_a_pregrasp_axis_aligned_high_transit
+            or stage_a_pregrasp_obstacle_aware_high_transit
+        ):
+            raise RuntimeError(
+                "joint_space_RRT_pregrasp_mode_cannot_combine_with_EEF_staged_route_modifiers"
+            )
+        start_joint_state = records[-1].get("snapshot_state", {})
+        start_robot = start_joint_state.get("robot_states", [{}])[0]
+        actual_start_qpos = np.asarray(start_robot.get("joint_qpos", []), dtype=np.float64)
+        if (
+            actual_start_qpos.shape != (7,)
+            or not np.isfinite(actual_start_qpos).all()
+            or float(np.max(np.abs(actual_start_qpos - joint_space_qpos_path[0]))) > 0.01
+        ):
+            raise RuntimeError(
+                "joint_space_RRT_path_start_does_not_match_live_robot_after_open_gripper"
+            )
+        route_start_action_count = action_counter[0]
+        target_start_position = np.asarray(initial_object["root_pos"], dtype=np.float64)
+        maximum_joint_tracking_error_rad = 0.0
+        maximum_target_displacement_m = 0.0
+        for joint_target in joint_space_qpos_path[1:]:
+            if action_counter[0] - route_start_action_count >= route_action_budget:
+                raise RuntimeError("dense_joint_space_RRT_pregrasp_route_action_budget_exhausted")
+            _record_joint_trajectory_step(
+                bridge,
+                joint_target,
+                "task_success_first_jointspace_rrt_pregrasp_route",
+                candidate_id,
+                action_counter[0],
+                target_binding,
+                context["instruction"],
+                policy,
+                monitor,
+                records,
+                frames,
+            )
+            action_counter[0] += 1
+            record_robot_obstacle_contact()
+            after_robot = records[-1].get("snapshot_state", {}).get("robot_states", [{}])[0]
+            after_qpos = np.asarray(after_robot.get("joint_qpos", []), dtype=np.float64)
+            if after_qpos.shape != (7,) or not np.isfinite(after_qpos).all():
+                raise RuntimeError("joint_space_RRT_physical_arm_qpos_unavailable")
+            joint_error = float(np.linalg.norm(after_qpos - joint_target))
+            maximum_joint_tracking_error_rad = max(
+                maximum_joint_tracking_error_rad, joint_error
+            )
+            branch["pregrasp_joint_space_RRT_path"].update({
+                "executed_actions": int(action_counter[0] - route_start_action_count),
+                "maximum_tracking_error_l2_rad": maximum_joint_tracking_error_rad,
+                "latest_tracking_error_l2_rad": joint_error,
+            })
+            if joint_error > 0.15:
+                branch["pregrasp_joint_space_RRT_path"]["status"] = (
+                    "aborted_physical_tracking_diverged"
+                )
+                branch["pregrasp_joint_space_RRT_path"]["failure_reason"] = (
+                    f"actual_joint_target_error_l2_rad={joint_error:.6f}>0.150000"
+                )
+                raise RuntimeError(
+                    "joint_space_RRT_physical_tracking_diverged:"
+                    f"qpos_error_l2_rad={joint_error:.6f}>0.150000"
+                )
+            after_object = _object_state(
+                records[-1].get("snapshot_state", {}), int(target_binding["body_id"])
+            )
+            target_displacement = float(np.linalg.norm(
+                np.asarray(after_object["root_pos"], dtype=np.float64) - target_start_position
+            ))
+            maximum_target_displacement_m = max(
+                maximum_target_displacement_m, target_displacement
+            )
+            if (
+                abort_target_displacement_m is not None
+                and target_displacement > abort_target_displacement_m
+            ):
+                raise RuntimeError(
+                    "joint_space_RRT_pregrasp_route_target_displaced_before_grasp_contact:"
+                    f"{target_displacement:.6f}m>{abort_target_displacement_m:.6f}m"
+                )
+        branch["pregrasp_joint_space_RRT_path"].update({
+            "status": "physical_joint_route_completed",
+            "executed_actions": int(action_counter[0] - route_start_action_count),
+            "maximum_tracking_error_l2_rad": maximum_joint_tracking_error_rad,
+            "maximum_target_displacement_m": maximum_target_displacement_m,
+            "target_displacement_abort_threshold_m": abort_target_displacement_m,
+        })
+
+    if not skip_pregrasp_route and pregrasp_route_control_mode == "eef_osc":
         route_source = str(rrt.get("planner_source", ""))
         adaptive_jointspace_route = bool(
             rrt.get("preserve_eef_waypoints") is True
@@ -3219,6 +3689,12 @@ def _run_physical_branch(
         )
         branch["pregrasp_route_max_translation_step_m"] = route_translation_step_m
         route_waypoints = route[1:]
+        # These route annotations are only populated by the optional staged
+        # clearance path. Ordinary RRT routes still pass through the same
+        # waypoint executor below, so define their neutral values before the
+        # conditional to keep that shared path valid.
+        staged_waypoint_translation_axes: list[tuple[int, ...] | None] | None = None
+        axis_order_names: list[str] = []
         if stage_a_pregrasp_staged_clearance_height_m > 0.0 and len(route) >= 2:
             # A grasp can start with the wrist above a container after an
             # earlier predicate was completed. Moving directly toward the
@@ -3239,7 +3715,230 @@ def _run_physical_branch(
             held_orientation_start = np.r_[
                 live_eef[:2, 3], clearance_z, live_quaternion,
             ]
-            if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6:
+            orientation_at_clearance = np.r_[
+                pregrasp[:2], clearance_z, pregrasp[3:],
+            ]
+            rotation_height = clearance_z
+            rotation_height_search: dict[str, Any] | None = None
+            staged_waypoint_order = [
+                "vertical_lift_with_live_wrist_orientation",
+                "horizontal_transit_with_live_wrist_orientation",
+                "rotate_at_clearance_over_candidate_pregrasp",
+                "descend_to_candidate_pregrasp",
+            ]
+            axis_aligned_transit_waypoints = []
+            axis_aligned_transit_order = []
+            axis_order_names = []
+            obstacle_aware_transit_waypoints = []
+            obstacle_aware_transit_axes: list[tuple[int, ...]] = []
+            obstacle_aware_transit_order = []
+            obstacle_aware_plan = None
+            if stage_a_pregrasp_obstacle_aware_high_transit:
+                if not stage_a_obstacle_components:
+                    raise RuntimeError("obstacle_aware_high_transit_compiled_obstacle_geometry_unavailable")
+                # The high A* transit can be clear while its wrist orientation
+                # endpoint is outside the Panda workspace. Select a rotation
+                # height from read-only, live-model IK checks: retain maximum
+                # clearance whenever possible, and descend only as far as the
+                # candidate pose requires. This is a kinematic screen, not a
+                # collision/safety gate; every selected waypoint is still
+                # executed and audited in MuJoCo.
+                preflight_observation = bridge.request({
+                    "op": "observe", "include_snapshot_state": True,
+                })
+                preflight_state = preflight_observation.get("snapshot_state", {})
+                preflight_state_vector = _snapshot_state_vector(preflight_state)
+                preflight_state_sha = _state_sha(preflight_state_vector)
+                preflight_robot = preflight_state.get("robot_states", [{}])[0]
+                preflight_arm_qpos = np.asarray(
+                    preflight_robot.get("joint_qpos", []), dtype=np.float64,
+                )
+                if preflight_arm_qpos.shape != (7,) or not np.isfinite(preflight_arm_qpos).all():
+                    raise RuntimeError("rotation_height_ik_preflight_live_arm_qpos_unavailable")
+                rotation_heights = [float(clearance_z)]
+                next_height = float(clearance_z) - 0.04
+                while next_height > float(pregrasp[2]) + 1e-6:
+                    rotation_heights.append(next_height)
+                    next_height -= 0.04
+                if abs(rotation_heights[-1] - float(pregrasp[2])) > 1e-6:
+                    rotation_heights.append(float(pregrasp[2]))
+                rotation_height_search = {
+                    "method": "descending_40mm_height_samples_with_exact_pregrasp_endpoint",
+                    "goal_xy_world_m": pregrasp[:2].tolist(),
+                    "live_wrist_quaternion_wxyz": live_quaternion.tolist(),
+                    "target_wrist_quaternion_wxyz": pregrasp[3:].tolist(),
+                    "attempts": [],
+                    "state_sha256": preflight_state_sha,
+                    "model_geometry_sha256": model_sha,
+                    "physical_actions": 0,
+                    "diagnostic_only": True,
+                    "safety_certified": False,
+                }
+                ik_seeds = [preflight_arm_qpos.tolist()]
+                if candidate_pregrasp_ik_seed_qpos is not None:
+                    ik_seeds.append(candidate_pregrasp_ik_seed_qpos.tolist())
+                for height in rotation_heights:
+                    target_rotation_pose = np.r_[pregrasp[:2], height, pregrasp[3:]]
+                    try:
+                        ik_reply = bridge.request({
+                            "op": "task_success_first_ik_preflight",
+                            "expected_instruction": context["instruction"],
+                            "model_geometry_sha256": model_sha,
+                            "start_state_sha256": preflight_state_sha,
+                            "goal_pose_world": {
+                                "position_world_m": target_rotation_pose[:3].tolist(),
+                                "quaternion_wxyz": target_rotation_pose[3:].tolist(),
+                            },
+                            "ik_seed_qpos": ik_seeds,
+                            "ik_selection_seed_qpos": preflight_arm_qpos.tolist(),
+                            "ik_solver_max_nfev": 120,
+                            "jointspace_reference_start_qpos": preflight_arm_qpos.tolist(),
+                            "jointspace_reference_max_step_rad": 0.10,
+                            "safety_geometry_policy": policy,
+                        })
+                    except Exception as exc:
+                        ik_reply = {
+                            "status": "request_exception",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "live_state_unchanged": None,
+                        }
+                    ik_qpos = ik_reply.get("ik_goal_qpos")
+                    passed = bool(
+                        ik_reply.get("status") == "goal_ik_preflight_passed"
+                        and ik_reply.get("live_state_unchanged") is True
+                        and isinstance(ik_qpos, list)
+                        and len(ik_qpos) == 7
+                        and np.isfinite(np.asarray(ik_qpos, dtype=np.float64)).all()
+                    )
+                    attempt = {
+                        "height_world_m": height,
+                        "status": "IK_passed_live_state_unchanged" if passed else "IK_unavailable",
+                        "failure_reason": ik_reply.get("failure_reason"),
+                        "live_state_unchanged": ik_reply.get("live_state_unchanged"),
+                        "ik_goal_qpos": ik_qpos if passed else None,
+                    }
+                    rotation_height_search["attempts"].append(attempt)
+                    if passed:
+                        rotation_height = height
+                        rotation_height_search.update({
+                            "status": "highest_sampled_rotation_pose_with_bounded_IK_selected",
+                            "selected_height_world_m": rotation_height,
+                            "selected_ik_goal_qpos": ik_qpos,
+                        })
+                        break
+                if rotation_height_search.get("status") is None:
+                    rotation_height_search.update({
+                        "status": "no_sampled_rotation_pose_has_bounded_IK",
+                        "selected_height_world_m": None,
+                    })
+                    branch["pregrasp_rotation_height_ik_search"] = rotation_height_search
+                    raise RuntimeError("obstacle_aware_rotation_height_has_no_bounded_ik_solution")
+                branch["pregrasp_rotation_height_ik_search"] = rotation_height_search
+                path = None
+                route_attempts = []
+                for robot_radius_m in (0.055, 0.040, 0.025, 0.0):
+                    path, plan_diagnostics = _stage_a_obstacle_aware_high_xy_path(
+                        live_eef[:2, 3],
+                        pregrasp[:2],
+                        stage_a_obstacle_components,
+                        clearance_height_m=clearance_z,
+                        robot_radius_m=robot_radius_m,
+                    )
+                    # Store a detached diagnostic copy: the selected plan is
+                    # also present as a standalone field, so retaining the
+                    # same dict object here would make route_attempts point
+                    # back to the list containing it when report metadata is
+                    # assembled.
+                    route_attempts.append(dict(plan_diagnostics))
+                    if path is not None:
+                        obstacle_aware_plan = plan_diagnostics
+                        break
+                if path is None:
+                    branch["pregrasp_obstacle_aware_astar"] = {
+                        "status": "all_endpoint_relaxation_routes_failed",
+                        "attempts": route_attempts,
+                        "safety_certified": False,
+                    }
+                    raise RuntimeError("obstacle_aware_high_xy_astar_found_no_route")
+                obstacle_aware_plan["route_attempts"] = route_attempts
+                obstacle_aware_plan["planner_role"] = "Stage_A_physical_route_guidance_only"
+                obstacle_aware_plan["compiled_obstacle_component_count"] = len(
+                    stage_a_obstacle_components
+                )
+                previous_xy = live_eef[:2, 3].copy()
+                for point in path[1:]:
+                    point = np.asarray(point, dtype=np.float64)
+                    delta = point - previous_xy
+                    if float(np.linalg.norm(delta)) <= 1e-8:
+                        continue
+                    axis_index = int(np.argmax(np.abs(delta)))
+                    axis_name = {0: "x", 1: "y"}[axis_index]
+                    obstacle_aware_transit_waypoints.append(np.r_[
+                        point, clearance_z, live_quaternion,
+                    ])
+                    obstacle_aware_transit_axes.append((axis_index,))
+                    obstacle_aware_transit_order.append(
+                        f"astar_axis_{axis_name}_transit_at_clearance_with_live_wrist_orientation"
+                    )
+                    previous_xy = point
+                rotation_live_orientation = np.r_[
+                    pregrasp[:2], rotation_height, live_quaternion,
+                ]
+                rotation_at_selected_height = np.r_[
+                    pregrasp[:2], rotation_height, pregrasp[3:],
+                ]
+                route_waypoints = [
+                    held_orientation_start,
+                    *obstacle_aware_transit_waypoints,
+                    rotation_live_orientation,
+                    rotation_at_selected_height,
+                    pregrasp,
+                ]
+                staged_waypoint_translation_axes = [
+                    (2,),
+                    *obstacle_aware_transit_axes,
+                    (2,),
+                    (2,),
+                    None,
+                ]
+                staged_waypoint_order = [
+                    "vertical_lift_with_live_wrist_orientation",
+                    *obstacle_aware_transit_order,
+                    "lower_at_candidate_xy_with_live_wrist_orientation_to_ik_reachable_rotation_height",
+                    "rotate_at_ik_preflighted_height_over_candidate_pregrasp",
+                    "descend_to_candidate_pregrasp",
+                ]
+                branch["pregrasp_obstacle_aware_astar"] = obstacle_aware_plan
+            elif stage_a_pregrasp_axis_aligned_high_transit:
+                displacement_xy = pregrasp[:2] - live_eef[:2, 3]
+                axis_order = (
+                    [1, 0] if abs(displacement_xy[1]) >= abs(displacement_xy[0])
+                    else [0, 1]
+                )
+                cursor_xy = live_eef[:2, 3].copy()
+                axis_names = {0: "x", 1: "y"}
+                axis_order_names = [axis_names[index] for index in axis_order]
+                for axis_index in axis_order:
+                    cursor_xy[axis_index] = pregrasp[axis_index]
+                    axis_aligned_transit_waypoints.append(np.r_[
+                        cursor_xy.copy(), clearance_z, live_quaternion,
+                    ])
+                    axis_aligned_transit_order.append(
+                        f"axis_{axis_names[axis_index]}_transit_at_clearance_with_live_wrist_orientation"
+                    )
+                route_waypoints = [
+                    held_orientation_start,
+                    *axis_aligned_transit_waypoints,
+                    orientation_at_clearance,
+                    pregrasp,
+                ]
+                staged_waypoint_order = [
+                    "vertical_lift_with_live_wrist_orientation",
+                    *axis_aligned_transit_order,
+                    "rotate_at_clearance_over_candidate_pregrasp",
+                    "descend_to_candidate_pregrasp",
+                ]
+            elif abs(stage_a_pregrasp_lateral_detour_m) > 1e-6:
                 displacement_xy = pregrasp[:2] - live_eef[:2, 3]
                 displacement_norm = float(np.linalg.norm(displacement_xy))
                 if displacement_norm <= 1e-6:
@@ -3287,6 +3986,7 @@ def _run_physical_branch(
                         "lateral_return_to_candidate_at_clearance",
                         "descend_to_candidate_pregrasp",
                     ]
+                    staged_waypoint_order = detour_waypoint_order
                 else:
                     route_waypoints = [
                         # Move the wrist sideways before lifting. Prior physical
@@ -3308,12 +4008,10 @@ def _run_physical_branch(
                         "lateral_return_to_candidate_at_clearance",
                         "descend_to_candidate_pregrasp",
                     ]
+                    staged_waypoint_order = detour_waypoint_order
             else:
                 horizontal_transit = np.r_[
                     pregrasp[:2], clearance_z, live_quaternion,
-                ]
-                orientation_at_clearance = np.r_[
-                    pregrasp[:2], clearance_z, pregrasp[3:],
                 ]
                 route_waypoints = [
                     held_orientation_start,
@@ -3324,19 +4022,30 @@ def _run_physical_branch(
             branch["pregrasp_staged_clearance_route"] = {
                 "enabled": True,
                 "clearance_height_world_m": clearance_z,
+                "rotation_height_world_m": float(rotation_height),
+                "rotation_height_ik_search": rotation_height_search,
                 "lateral_detour_signed_m": float(stage_a_pregrasp_lateral_detour_m),
                 "lift_before_lateral_detour": bool(
                     stage_a_pregrasp_lift_before_lateral_detour
+                    or stage_a_pregrasp_axis_aligned_high_transit
                 ),
-                "waypoint_order": (
-                    detour_waypoint_order
-                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6 else [
-                        "vertical_lift_with_live_wrist_orientation",
-                        "horizontal_transit_with_live_wrist_orientation",
-                        "rotate_at_clearance_over_candidate_pregrasp",
-                        "descend_to_candidate_pregrasp",
-                    ]
+                "axis_aligned_high_transit_enabled": bool(
+                    stage_a_pregrasp_axis_aligned_high_transit
                 ),
+                "axis_aligned_high_transit_order": axis_order_names,
+                "axis_aligned_high_transit_waypoints_world": [
+                    waypoint.tolist() for waypoint in axis_aligned_transit_waypoints
+                ],
+                "obstacle_aware_high_transit_enabled": bool(
+                    stage_a_pregrasp_obstacle_aware_high_transit
+                ),
+                "obstacle_aware_high_transit_waypoints_world": [
+                    waypoint.tolist() for waypoint in obstacle_aware_transit_waypoints
+                ],
+                "obstacle_aware_transit_axis_sequence": [
+                    int(axes[0]) for axes in obstacle_aware_transit_axes
+                ],
+                "waypoint_order": staged_waypoint_order,
                 "lateral_detour_start_waypoint_world": (
                     (
                         start_side_clearance
@@ -3347,7 +4056,8 @@ def _run_physical_branch(
                 ),
                 "lateral_detour_target_waypoint_world": (
                     target_side.tolist()
-                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6 else None
+                    if abs(stage_a_pregrasp_lateral_detour_m) > 1e-6
+                    and not stage_a_pregrasp_axis_aligned_high_transit else None
                 ),
                 "start_eef_pose_world": [
                     live_eef[:3, 3].tolist(), live_quaternion.tolist(),
@@ -3356,6 +4066,123 @@ def _run_physical_branch(
                 "state_changes_only_through_recorded_MuJoCo_OSC_actions": True,
                 "safety_certified": False,
             }
+            if stage_a_pregrasp_obstacle_aware_high_transit:
+                candidate["_partial_pregrasp_route_diagnostics"] = {
+                    "pregrasp_obstacle_aware_astar": branch.get(
+                        "pregrasp_obstacle_aware_astar"
+                    ),
+                    "pregrasp_staged_clearance_route": branch.get(
+                        "pregrasp_staged_clearance_route"
+                    ),
+                    "endpoint_xy_corrections": [],
+                    "safety_certified": False,
+                }
+
+                def align_astar_endpoint_xy(target_quaternion: np.ndarray, phase: str) -> None:
+                    correction_history = candidate[
+                        "_partial_pregrasp_route_diagnostics"
+                    ]["endpoint_xy_corrections"]
+                    latest_error = np.full(2, np.inf, dtype=np.float64)
+                    for correction_round in range(4):
+                        before = bridge.request({
+                            "op": "observe", "include_snapshot_state": True,
+                        })
+                        robot = before["snapshot_state"]["robot_states"][0]
+                        before_xy = np.asarray(robot["eef_pos"][:2], dtype=np.float64)
+                        latest_error = pregrasp[:2] - before_xy
+                        if float(np.max(np.abs(latest_error))) <= 0.008:
+                            correction_history.append({
+                                "round": correction_round,
+                                "status": "endpoint_xy_within_8mm",
+                                "eef_xy_before_m": before_xy.tolist(),
+                                "target_xy_m": pregrasp[:2].tolist(),
+                                "error_xy_m": latest_error.tolist(),
+                                "safety_certified": False,
+                            })
+                            break
+                        round_row = {
+                            "round": correction_round,
+                            "status": "axis_selective_xy_correction_in_progress",
+                            "eef_xy_before_m": before_xy.tolist(),
+                            "target_xy_m": pregrasp[:2].tolist(),
+                            "error_xy_before_m": latest_error.tolist(),
+                            "axis_steps": [],
+                            "safety_certified": False,
+                        }
+                        correction_history.append(round_row)
+                        for axis_index in (0, 1):
+                            live_observation = bridge.request({
+                                "op": "observe", "include_snapshot_state": True,
+                            })
+                            live_robot = live_observation["snapshot_state"]["robot_states"][0]
+                            live_position = np.asarray(
+                                live_robot["eef_pos"], dtype=np.float64,
+                            )
+                            axis_target = live_position.copy()
+                            axis_target[axis_index] = pregrasp[axis_index]
+                            axis_target[2] = rotation_height
+                            before_axis_error = float(
+                                pregrasp[axis_index] - live_position[axis_index]
+                            )
+                            if abs(before_axis_error) <= 0.004:
+                                round_row["axis_steps"].append({
+                                    "axis": axis_index,
+                                    "status": "already_within_axis_tolerance",
+                                    "before_error_m": before_axis_error,
+                                })
+                                continue
+                            reached_axis = advance_with_local_replan(
+                                axis_target,
+                                target_quaternion,
+                                phase,
+                                max(1, route_action_budget - action_counter[0]),
+                                max_translation_step_m=0.02,
+                                position_tolerance_m=0.004,
+                                rotation_tolerance_rad=0.045,
+                                stop_condition=record_robot_obstacle_contact,
+                                translation_axes=(axis_index,),
+                            )
+                            after_axis = bridge.request({
+                                "op": "observe", "include_snapshot_state": True,
+                            })
+                            after_position = np.asarray(
+                                after_axis["snapshot_state"]["robot_states"][0]["eef_pos"],
+                                dtype=np.float64,
+                            )
+                            round_row["axis_steps"].append({
+                                "axis": axis_index,
+                                "status": "reached" if reached_axis else "stopped_by_contact_or_guard",
+                                "before_error_m": before_axis_error,
+                                "after_error_m": float(
+                                    pregrasp[axis_index] - after_position[axis_index]
+                                ),
+                                "eef_position_after_m": after_position.tolist(),
+                            })
+                        after_round = bridge.request({
+                            "op": "observe", "include_snapshot_state": True,
+                        })
+                        after_xy = np.asarray(
+                            after_round["snapshot_state"]["robot_states"][0]["eef_pos"][:2],
+                            dtype=np.float64,
+                        )
+                        latest_error = pregrasp[:2] - after_xy
+                        round_row.update({
+                            "status": "round_complete",
+                            "eef_xy_after_m": after_xy.tolist(),
+                            "error_xy_after_m": latest_error.tolist(),
+                        })
+                    if float(np.max(np.abs(latest_error))) > 0.010:
+                        candidate["_partial_pregrasp_route_diagnostics"][
+                            "endpoint_xy_alignment_failure"
+                        ] = {
+                            "phase": phase,
+                            "final_error_xy_m": latest_error.tolist(),
+                        }
+                        raise RuntimeError(
+                            "obstacle_aware_high_transit_endpoint_xy_alignment_failed:"
+                            f"{phase}:{latest_error.tolist()}"
+                        )
+
             route_translation_step_m = 0.02
         else:
             branch["pregrasp_staged_clearance_route"] = {
@@ -3365,10 +4192,40 @@ def _run_physical_branch(
                 ),
             }
         for route_waypoint_index, waypoint in enumerate(route_waypoints):
+            if (
+                stage_a_pregrasp_obstacle_aware_high_transit
+                and route_waypoint_index == len(route_waypoints) - 2
+            ):
+                align_astar_endpoint_xy(
+                    live_quaternion,
+                    "task_success_first_astar_clearance_endpoint_xy_alignment_before_rotation",
+                )
+            elif (
+                stage_a_pregrasp_obstacle_aware_high_transit
+                and route_waypoint_index == len(route_waypoints) - 1
+            ):
+                align_astar_endpoint_xy(
+                    pregrasp[3:],
+                    "task_success_first_astar_clearance_endpoint_xy_alignment_after_rotation",
+                )
             final_adaptive_endpoint = bool(
                 adaptive_jointspace_route
                 and route_waypoint_index == len(route_waypoints) - 1
             )
+            waypoint_translation_axes = None
+            if (
+                staged_waypoint_translation_axes is not None
+                and route_waypoint_index < len(staged_waypoint_translation_axes)
+            ):
+                waypoint_translation_axes = staged_waypoint_translation_axes[
+                    route_waypoint_index
+                ]
+            elif (
+                stage_a_pregrasp_axis_aligned_high_transit
+                and 1 <= route_waypoint_index <= len(axis_order_names)
+            ):
+                axis_index = {"x": 0, "y": 1}[axis_order_names[route_waypoint_index - 1]]
+                waypoint_translation_axes = (axis_index,)
             reached = advance_with_local_replan(
                 waypoint[:3],
                 waypoint[3:],
@@ -3380,7 +4237,7 @@ def _run_physical_branch(
                     if final_adaptive_endpoint
                     else 0.025
                     if adaptive_jointspace_route
-                    else 0.004
+                    else float(pregrasp_route_waypoint_position_tolerance_m)
                 ),
                 rotation_tolerance_rad=(
                     0.045
@@ -3390,11 +4247,15 @@ def _run_physical_branch(
                     else 0.045
                 ),
                 stop_condition=record_robot_obstacle_contact,
+                translation_axes=waypoint_translation_axes,
             )
             if action_counter[0] > route_action_budget:
                 raise RuntimeError("RRT_OSC_pregrasp_route_action_budget_exceeded")
     branch["pregrasp_route_reached"] = not skip_pregrasp_route
-    branch["pregrasp_route_skipped_due_to_live_target_contact"] = skip_pregrasp_route
+    branch["pregrasp_route_skipped_due_to_live_target_contact"] = contact_based_route_skip
+    branch["pregrasp_route_skipped_due_to_verified_near_pregrasp_start"] = (
+        near_pregrasp_start_bypass
+    )
     if not skip_pregrasp_route:
         pregrasp_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
         checkpoint_runtime_snapshot("pregrasp", pregrasp_observation.get("snapshot_state", {}))
@@ -3754,7 +4615,15 @@ def _write_recording(output_dir: Path, records: list[dict[str, Any]], frames: li
         for row in records:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=lambda item: item.tolist() if isinstance(item, np.ndarray) else str(item)))
             handle.write("\n")
-    actions = np.asarray([item["action_7d"] for item in records], dtype=np.float32).reshape(-1, 7)
+    actions = np.asarray([
+        item["action_7d"]
+        if item.get("action_7d") is not None else [np.nan] * 7
+        for item in records
+    ], dtype=np.float32).reshape(-1, 7)
+    joint_targets = np.asarray([
+        item.get("joint_target_qpos_rad", [np.nan] * 7)
+        for item in records
+    ], dtype=np.float64).reshape(-1, 7)
     robot_states = [item.get("snapshot_state", {}).get("robot_states", [{}])[0] for item in records]
     targets = []
     for row in records:
@@ -3770,6 +4639,10 @@ def _write_recording(output_dir: Path, records: list[dict[str, Any]], frames: li
         "candidate_ids": np.asarray([item["candidate_id"] for item in records]),
         "phases": np.asarray([item["phase"] for item in records]),
         "actions_7d": actions,
+        "joint_target_qpos_rad": joint_targets,
+        "control_modes": np.asarray([
+            item.get("control_mode", "osc_7d_action") for item in records
+        ]),
         "eef_position_world_m": np.asarray([item.get("eef_pos", [np.nan] * 3) for item in robot_states], dtype=np.float64).reshape(-1, 3),
         "eef_quaternion_wxyz": np.asarray([item.get("eef_quat", [np.nan] * 4) for item in robot_states], dtype=np.float64).reshape(-1, 4),
         "arm_joint_qpos_rad": np.asarray([item.get("joint_qpos", [np.nan] * 7) for item in robot_states], dtype=np.float64).reshape(-1, 7),
@@ -3857,6 +4730,194 @@ def _forbidden_object_root_positions(
             "position_source": "read_only_live_runtime_snapshot_object_root",
         })
     return rows
+
+
+def _stage_a_obstacle_aware_high_xy_path(
+    start_world_xy: np.ndarray,
+    goal_world_xy: np.ndarray,
+    obstacle_components: list[dict[str, Any]],
+    *,
+    clearance_height_m: float,
+    resolution_m: float = 0.018,
+    robot_radius_m: float = 0.055,
+    endpoint_relaxation_m: float = 0.045,
+    vertical_envelope_m: float = 0.08,
+) -> tuple[list[np.ndarray] | None, dict[str, Any]]:
+    """Plan a high-plane open-gripper route around active compiled geom spheres."""
+    import heapq
+
+    start = np.asarray(start_world_xy, dtype=np.float64)
+    goal = np.asarray(goal_world_xy, dtype=np.float64)
+    if (
+        start.shape != (2,) or goal.shape != (2,)
+        or not np.isfinite(start).all() or not np.isfinite(goal).all()
+        or not np.isfinite(clearance_height_m)
+        or not np.isfinite(resolution_m) or resolution_m <= 0.0
+        or not np.isfinite(robot_radius_m) or robot_radius_m < 0.0
+        or not np.isfinite(endpoint_relaxation_m) or endpoint_relaxation_m < 0.0
+        or not np.isfinite(vertical_envelope_m) or vertical_envelope_m < 0.0
+    ):
+        return None, {"status": "invalid_inputs", "safety_certified": False}
+    circles = []
+    for row in obstacle_components:
+        center = np.asarray(row.get("center_world_m", []), dtype=np.float64)
+        radius = row.get("radius_m")
+        if (
+            center.shape != (3,) or not np.isfinite(center).all()
+            or not isinstance(radius, (int, float)) or not np.isfinite(float(radius))
+            or float(radius) <= 0.0
+        ):
+            continue
+        radius = float(radius)
+        if (
+            center[2] + radius < clearance_height_m - vertical_envelope_m
+            or center[2] - radius > clearance_height_m + vertical_envelope_m
+        ):
+            continue
+        circles.append({
+            "object_id": str(row.get("object_id", "unknown")),
+            "geom_name": str(row.get("geom_name", "unknown")),
+            "center_xy": center[:2],
+            "radius": radius + robot_radius_m,
+        })
+    if not circles:
+        route = [start.copy()]
+        delta = goal - start
+        if abs(delta[0]) > 1e-8 and abs(delta[1]) > 1e-8:
+            route.append(np.asarray([goal[0], start[1]], dtype=np.float64))
+        route.append(goal.copy())
+        return route, {
+            "status": "complete_no_intersecting_compiled_obstacles",
+            "obstacle_component_count": 0,
+            "expanded_nodes": 0,
+            "route_world_xy_m": [point.tolist() for point in route],
+            "resolution_m": float(resolution_m),
+            "robot_radius_m": float(robot_radius_m),
+            "uses_only_axis_aligned_route_segments": True,
+            "safety_certified": False,
+        }
+
+    all_points = [start, goal]
+    for circle in circles:
+        center = circle["center_xy"]
+        radius = circle["radius"]
+        all_points.extend((center - radius, center + radius))
+    points = np.asarray(all_points, dtype=np.float64)
+    lower = points.min(axis=0) - 0.08
+    upper = points.max(axis=0) + 0.08
+    shape = np.maximum(3, np.ceil((upper - lower) / resolution_m).astype(int) + 1)
+    if int(shape[0] * shape[1]) > 40000:
+        return None, {
+            "status": "grid_too_large",
+            "grid_shape": shape.tolist(),
+            "obstacle_component_count": len(circles),
+            "safety_certified": False,
+        }
+
+    def to_index(point: np.ndarray) -> tuple[int, int]:
+        index = np.rint((point - lower) / resolution_m).astype(int)
+        return int(index[0]), int(index[1])
+
+    def to_point(index: tuple[int, int]) -> np.ndarray:
+        return lower + resolution_m * np.asarray(index, dtype=np.float64)
+
+    start_index, goal_index = to_index(start), to_index(goal)
+    width, height = int(shape[0]), int(shape[1])
+
+    def blocked(index: tuple[int, int]) -> bool:
+        point = to_point(index)
+        if (
+            float(np.linalg.norm(point - start)) <= endpoint_relaxation_m
+            or float(np.linalg.norm(point - goal)) <= endpoint_relaxation_m
+        ):
+            return False
+        return any(
+            float(np.linalg.norm(point - circle["center_xy"])) < circle["radius"]
+            for circle in circles
+        )
+
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start_index)]
+    came_from: dict[tuple[int, int], tuple[int, int] | None] = {start_index: None}
+    cost_so_far = {start_index: 0.0}
+    expansions = 0
+    while frontier and expansions < 40000:
+        _, current = heapq.heappop(frontier)
+        expansions += 1
+        if current == goal_index:
+            break
+        for dx, dy in neighbors:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not (0 <= nxt[0] < width and 0 <= nxt[1] < height) or blocked(nxt):
+                continue
+            next_cost = cost_so_far[current] + resolution_m
+            if next_cost >= cost_so_far.get(nxt, float("inf")):
+                continue
+            cost_so_far[nxt] = next_cost
+            came_from[nxt] = current
+            heuristic = float(np.abs(to_point(nxt) - goal).sum())
+            heapq.heappush(frontier, (next_cost + heuristic, nxt))
+    if goal_index not in came_from:
+        return None, {
+            "status": "path_not_found",
+            "grid_shape": shape.tolist(),
+            "expanded_nodes": expansions,
+            "obstacle_component_count": len(circles),
+            "safety_certified": False,
+        }
+
+    indices = []
+    cursor: tuple[int, int] | None = goal_index
+    while cursor is not None:
+        indices.append(cursor)
+        cursor = came_from[cursor]
+
+    def orthogonalize(points: list[np.ndarray]) -> list[np.ndarray]:
+        result = [np.asarray(points[0], dtype=np.float64).copy()]
+        for value in points[1:]:
+            point = np.asarray(value, dtype=np.float64)
+            prior = result[-1]
+            delta = point - prior
+            if abs(delta[0]) > 1e-8 and abs(delta[1]) > 1e-8:
+                # X then Y keeps every OSC segment on one world axis.
+                result.append(np.asarray([point[0], prior[1]], dtype=np.float64))
+            if float(np.linalg.norm(point - result[-1])) > 1e-8:
+                result.append(point.copy())
+        compressed = [result[0]]
+        for point in result[1:]:
+            if len(compressed) >= 2:
+                before = compressed[-2]
+                current = compressed[-1]
+                if (
+                    abs(before[0] - current[0]) <= 1e-8
+                    and abs(current[0] - point[0]) <= 1e-8
+                    or abs(before[1] - current[1]) <= 1e-8
+                    and abs(current[1] - point[1]) <= 1e-8
+                ):
+                    compressed[-1] = point
+                    continue
+            compressed.append(point)
+        return compressed
+
+    grid_route = [to_point(index) for index in reversed(indices)]
+    axis_aligned = orthogonalize([start, *grid_route, goal])
+    return axis_aligned, {
+        "status": "obstacle_aware_axis_aligned_astar_path_found",
+        "grid_shape": shape.tolist(),
+        "expanded_nodes": expansions,
+        "obstacle_component_count": len(circles),
+        "obstacle_ids": sorted({circle["object_id"] for circle in circles}),
+        "clearance_height_world_m": float(clearance_height_m),
+        "resolution_m": float(resolution_m),
+        "robot_radius_m": float(robot_radius_m),
+        "endpoint_relaxation_m": float(endpoint_relaxation_m),
+        "route_world_xy_m": [point.tolist() for point in axis_aligned],
+        "route_length_m": float(sum(
+            np.linalg.norm(b - a) for a, b in zip(axis_aligned[:-1], axis_aligned[1:])
+        )),
+        "uses_only_axis_aligned_route_segments": True,
+        "safety_certified": False,
+    }
 
 
 def _adaptive_geometry_approach_route(
@@ -4315,6 +5376,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "geometry_candidates_max": args.maximum_candidates,
             "candidate_start_index": int(args.candidate_start_index),
             "geometry_candidate_pool_offset": int(getattr(args, "geometry_candidate_pool_offset", 0)),
+            "pregrasp_route_waypoint_position_tolerance_m": float(
+                args.pregrasp_route_waypoint_position_tolerance_m
+            ),
+            "pregrasp_route_control_mode": str(args.pregrasp_route_control_mode),
             "candidate_generation_limit": (
                 int(args.candidate_start_index + args.maximum_candidates)
                 if args.strict_grasp_screen_only else _candidate_generation_limit(args)
@@ -4715,6 +5780,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             active_target_object_id=str(context["target_object_id"]),
         )
         report["route_obstacle_positions_world"] = route_obstacle_positions
+        stage_a_planning_geometry = None
+        stage_a_obstacle_components: list[dict[str, Any]] = []
+        if args.stage_a_pregrasp_obstacle_aware_high_transit:
+            obstacle_bindings = []
+            for object_id, binding in semantic.get("bindings", {}).items():
+                if object_id == target_id or binding.get("mapping_name") != "objects_dict":
+                    continue
+                obstacle_bindings.append({
+                    "object_id": str(object_id),
+                    "body_id": int(binding["root_body_id"]),
+                    "body_name": str(binding["root_body_name"]),
+                    "geom_ids": sorted(int(value) for value in binding["root_geom_ids"]),
+                    "geom_names": list(binding["root_geom_names"]),
+                })
+            if not obstacle_bindings:
+                raise RuntimeError("obstacle_aware_high_transit_has_no_registered_scene_object_obstacles")
+            stage_a_planning_geometry = bridge.request({
+                "op": "planning_geometry",
+                "carried_binding": target_binding,
+                "obstacle_bindings": obstacle_bindings,
+                "expected_instruction": instruction,
+            })
+            if (
+                stage_a_planning_geometry.get("status") != "complete"
+                or stage_a_planning_geometry.get("query_complete") is not True
+                or stage_a_planning_geometry.get("physical_state_unchanged") is not True
+                or stage_a_planning_geometry.get("model_geometry_sha256") != model_sha
+            ):
+                raise RuntimeError(
+                    "obstacle_aware_transit_planning_geometry_unavailable_or_unverified:"
+                    f"{stage_a_planning_geometry.get('error')}"
+                )
+            for obstacle_id in stage_a_planning_geometry.get("obstacle_object_ids", []):
+                obstacle = stage_a_planning_geometry.get("objects", {}).get(obstacle_id, {})
+                for component in obstacle.get("components", []):
+                    stage_a_obstacle_components.append({
+                        "object_id": str(obstacle_id),
+                        "geom_name": str(component.get("geom_name", "unknown")),
+                        "center_world_m": component.get("center_world_m"),
+                        "radius_m": component.get("radius_m"),
+                    })
+            if not stage_a_obstacle_components:
+                raise RuntimeError("obstacle_aware_transit_geometry_has_no_compiled_collision_components")
+        report["stage_a_obstacle_aware_planning_geometry"] = stage_a_planning_geometry
         candidate_generation_limit = _candidate_generation_limit(args)
         required_geometry_ids = set(args.candidate_id)
         required_geometry_ids.update(
@@ -5184,18 +6293,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if task_approach_pass_ids is None:
             candidates = diversify_candidates(candidates)
         else:
-            # Stage A seeks task completion and accepts physical contact. Keep
-            # screen passes as a tie-breaker, while endpoint IK and live-posture
-            # travel rank all reachable poses in one pool. This prevents a
-            # conservative open-path screen tier from promoting a much harder
-            # OSC joint winding above a lower-travel physical fallback.
+            # Stage A seeks task completion and accepts physical contact. Rank
+            # active task-approach screen passes first, then by endpoint IK and
+            # live-posture travel. Screen failures stay eligible as physical
+            # fallbacks; this is ordering, not a Stage B safety gate.
             live_arm_qpos = np.asarray(context.get("arm_qpos", []), dtype=np.float64)
             candidates, posture_scores = _rank_by_endpoint_ik_joint_travel(
                 candidates, approach_rows, live_arm_qpos, task_approach_pass_ids,
             )
             generation["endpoint_ik_joint_travel_ranking"] = {
                 "applied": bool(posture_scores),
-                "joint_travel_precedes_screen_outcome": True,
+                "screen_pass_precedes_joint_travel": True,
+                "screen_pass_is_ordering_only_not_a_hard_gate": True,
                 "score": "L2(pregrasp_qpos-live_arm_qpos)+0.5*L2(grasp_qpos-pregrasp_qpos)",
                 "live_arm_qpos_rad": live_arm_qpos.tolist() if live_arm_qpos.shape == (7,) else None,
                 "ordered_candidates": posture_scores,
@@ -5983,6 +7092,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         ]
                         route["contact_escape_prepended"] = True
                         route["route_source"] = "MuJoCo_contact_normal_escape_then_planner_route"
+                        route["joint_space_qpos_path_rad"] = None
             elif (
                 not candidate_route_preflight_admitted(
                     summary.get("rrt_status"),
@@ -6040,6 +7150,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             planned_route = dict(planner_response)
             planned_route["eef_reference_poses_world"] = route["eef_reference_poses_world"]
+            planned_route["joint_space_qpos_path_rad"] = (
+                route.get("joint_space_qpos_path_rad")
+                if not route.get("contact_escape_prepended") else None
+            )
             planned_route["selected_route_index"] = route.get("route_index")
             planned_route["planner_source"] = route.get(
                 "route_source", planner_response.get("planner_source", "jointspace_rrt_connect.v1")
@@ -6077,6 +7191,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "active_gripper_geometry_inventory": gripper,
                 "joint_limit_inventory": limits,
                 "model_fingerprint_components": fingerprint.get("component_digests"),
+                "stage_a_planning_geometry": stage_a_planning_geometry,
                 "safety_policy_is_diagnostic_only": True,
             },
         })
@@ -6108,6 +7223,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     frames=frames,
                     output_dir=output_dir,
                     local_replan_rrt_time_budget_s=args.local_replan_rrt_time_budget_s,
+                    pregrasp_route_waypoint_position_tolerance_m=(
+                        args.pregrasp_route_waypoint_position_tolerance_m
+                    ),
+                    pregrasp_route_control_mode=args.pregrasp_route_control_mode,
                     abort_target_displacement_m=(
                         0.015
                         if cold_start and not bool(rrt.get("defer_live_contact_close_until_route_end"))
@@ -6128,6 +7247,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     stage_a_pregrasp_lift_before_lateral_detour=(
                         args.stage_a_pregrasp_lift_before_lateral_detour
                     ),
+                    stage_a_pregrasp_axis_aligned_high_transit=(
+                        args.stage_a_pregrasp_axis_aligned_high_transit
+                    ),
+                    stage_a_pregrasp_obstacle_aware_high_transit=(
+                        args.stage_a_pregrasp_obstacle_aware_high_transit
+                    ),
+                    stage_a_obstacle_components=stage_a_obstacle_components,
                 )
                 branch.update(result)
                 final_snapshot_payload = candidate_snapshot
@@ -6180,6 +7306,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 if candidate.get("_local_replans"):
                     branch["local_replans"] = candidate["_local_replans"]
+                if isinstance(candidate.get("_joint_space_RRT_execution"), dict):
+                    branch["pregrasp_joint_space_RRT_path"] = dict(
+                        candidate["_joint_space_RRT_execution"]
+                    )
+                    branch["pregrasp_route_control_mode"] = str(
+                        args.pregrasp_route_control_mode
+                    )
+                if isinstance(candidate.get("_partial_pregrasp_route_diagnostics"), dict):
+                    branch["pregrasp_route_diagnostics"] = candidate[
+                        "_partial_pregrasp_route_diagnostics"
+                    ]
                 candidate_records = [
                     item for item in records if item.get("candidate_id") == candidate["candidate_id"]
                 ]
@@ -6571,6 +7708,26 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pregrasp-route-waypoint-position-tolerance-m",
+        "--pregrasp-endpoint-position-tolerance-m",
+        dest="pregrasp_route_waypoint_position_tolerance_m",
+        type=float,
+        default=0.004,
+        help=(
+            "position tolerance for OSC waypoints throughout the RRT pregrasp route; "
+            "the following live object-relative surface approach and MuJoCo grasp check still apply"
+        ),
+    )
+    parser.add_argument(
+        "--pregrasp-route-control-mode",
+        choices=("eef_osc", "joint_space_rrt"),
+        default="eef_osc",
+        help=(
+            "execute the selected collision-checked pregrasp route as OSC EEF "
+            "waypoints or its dense joint-space RRT qpos path"
+        ),
+    )
+    parser.add_argument(
         "--stage-a-unilateral-close-probe-position-m", type=float, default=LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M,
         help=(
             "maximum candidate-pose error for a bounded physical close probe after a real unilateral target-pad contact; "
@@ -6597,6 +7754,20 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "when a staged lateral detour is enabled, first lift vertically at the "
             "live wrist pose, then sidestep at clearance height"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-axis-aligned-high-transit", action="store_true",
+        help=(
+            "at staged clearance, move along the dominant world XY axis first, "
+            "then the remaining axis, preserving the live wrist orientation"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-obstacle-aware-high-transit", action="store_true",
+        help=(
+            "use read-only active compiled object geometry to plan a high-plane "
+            "axis-aligned A* pregrasp transit; route is physical guidance only"
         ),
     )
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
@@ -6656,6 +7827,23 @@ def _parse_args() -> argparse.Namespace:
         or not -0.40 <= args.stage_a_pregrasp_lateral_detour_m <= 0.40
     ):
         parser.error("--stage-a-pregrasp-lateral-detour-m must be in -0.40..0.40")
+    if args.stage_a_pregrasp_axis_aligned_high_transit and (
+        args.stage_a_pregrasp_staged_clearance_height_m <= 0.0
+        or abs(args.stage_a_pregrasp_lateral_detour_m) > 1e-6
+    ):
+        parser.error(
+            "--stage-a-pregrasp-axis-aligned-high-transit requires staged clearance "
+            "and cannot be combined with a lateral detour"
+        )
+    if args.stage_a_pregrasp_obstacle_aware_high_transit and (
+        args.stage_a_pregrasp_staged_clearance_height_m <= 0.0
+        or abs(args.stage_a_pregrasp_lateral_detour_m) > 1e-6
+        or args.stage_a_pregrasp_axis_aligned_high_transit
+    ):
+        parser.error(
+            "--stage-a-pregrasp-obstacle-aware-high-transit requires staged clearance "
+            "and cannot be combined with a lateral detour or axis-aligned transit"
+        )
     if args.strict_grasp_screen_only:
         if args.candidate_start_index < 0 or (
             args.candidate_start_index + args.maximum_candidates
@@ -6719,6 +7907,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             f"--branch-control-action-budget must be in 1..{MAX_BRANCH_CONTROL_ACTIONS}"
         )
+    if not np.isfinite(args.pregrasp_route_waypoint_position_tolerance_m) or not (
+        0.004 <= args.pregrasp_route_waypoint_position_tolerance_m <= 0.025
+    ):
+        parser.error("--pregrasp-route-waypoint-position-tolerance-m must be in 0.004..0.025")
     if not 0.5 <= args.rrt_time_budget_s <= 60.0:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
     if not 0.5 <= args.local_replan_rrt_time_budget_s <= 60.0:
