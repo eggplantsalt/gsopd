@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -67,8 +68,15 @@ NATIVE_REGION_PROGRESS_LOW_STEP_RESPONSE_FRACTION = 0.18
 NATIVE_REGION_PROGRESS_LOW_STEP_SETTLE_ACTIONS = 16
 NATIVE_REGION_HORIZONTAL_APERTURE_POSTURE_TOLERANCE_RAD = 0.05
 NATIVE_REGION_SURFACE_SLIDE_SUPPORT_BIAS_M = 0.001
-ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M = 0.010
+# Stage A requires physical task success, not a certified clearance margin.
+# Keep the complete scene geometry and reject actual penetration/self-contact,
+# while allowing the RRT to start from a measured, non-penetrating near-contact
+# pose and plan the fixture approach without a blanket safety buffer.
+ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M = 0.0
+ARTICULATED_FIXTURE_HISTORICAL_CONTACT_INSET_M = 0.002
+ARTICULATED_FIXTURE_HISTORICAL_CONTACT_PAIR_PENETRATION_M = 0.002
 ARTICULATED_FIXTURE_PRECONTACT_APPROACH_DISTANCE_M = 0.180
+ARTICULATED_FIXTURE_HINGE_CLOSE_PRECONTACT_APPROACH_DISTANCE_M = 0.080
 ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M = 0.140
 ARTICULATED_FIXTURE_SLIDE_PRECONTACT_HEIGHT_M = 0.220
 ARTICULATED_FIXTURE_SLIDE_UNDER_TOP_HEIGHT_OFFSET_M = 0.094
@@ -95,7 +103,7 @@ ARTICULATED_FIXTURE_SWITCH_TURN_GRIPPER_ACTION = 1.0
 def _articulated_fixture_rrt_policy(
     policy: dict[str, Any], fixture_id: str,
 ) -> dict[str, Any]:
-    """Keep a small route-following cushion from the articulated target fixture."""
+    """Use full geometry with zero safety buffer for Stage A physical routing."""
     result = copy.deepcopy(policy)
     matches = []
     for group_name in ("forbidden_objects", "allowed_target_objects", "other_scene_objects"):
@@ -103,6 +111,8 @@ def _articulated_fixture_rrt_policy(
         if not isinstance(groups, list):
             raise ValueError("articulated_fixture_route_policy_geometry_groups_must_be_lists")
         for group in groups:
+            if isinstance(group, dict):
+                group["minimum_clearance_m"] = 0.0
             if isinstance(group, dict) and group.get("object_id") == fixture_id:
                 group["minimum_clearance_m"] = ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M
                 matches.append(group_name)
@@ -113,9 +123,129 @@ def _articulated_fixture_rrt_policy(
         )
     result["source"] = (
         f"{policy.get('source', 'active_verified_geometry')}:"
-        "articulated_fixture_OSC_tracking_clearance"
+        "stage_a_full_geometry_zero_clearance_physical_route"
     )
+    result["stage_a_clearance_policy"] = {
+        "minimum_clearance_m": 0.0,
+        "full_robot_and_scene_geometry_retained": True,
+        "physical_penetration_and_self_contact_rejected": True,
+        "safety_certified": False,
+    }
     return result
+
+
+def _allow_measured_native_in_support_pair(
+    bridge, policy: dict[str, Any], fixture_id: str,
+) -> dict[str, Any]:
+    """Permit only a live-measured target/fixture pair named by native In."""
+    native = bridge.request({"op": "native_task_status"})
+    native_in_predicate = None
+    support_query = None
+    for row in native.get("native_goal_values", []):
+        candidate = row.get("predicate") if isinstance(row, dict) else None
+        if (
+            not isinstance(candidate, list) or len(candidate) != 3
+            or str(candidate[0]).lower() != "in"
+        ):
+            continue
+        query = bridge.request({"op": "native_goal_query", "predicate": candidate})
+        region = query.get("region", {}) if isinstance(query, dict) else {}
+        if (
+            query.get("predicate_is_native_goal") is True
+            and region.get("parent_name") == fixture_id
+        ):
+            native_in_predicate = list(candidate)
+            support_query = query
+            break
+    if native_in_predicate is None or support_query is None:
+        return {"status": "not_applicable", "reason": "no_native_In_goal_for_fixture"}
+
+    semantic = bridge.request({"op": "task_semantic_geometry_bindings"})
+    bindings = semantic.get("bindings", {}) if isinstance(semantic, dict) else {}
+    target_binding = bindings.get(str(native_in_predicate[1]), {})
+    fixture_binding = bindings.get(fixture_id, {})
+    target_body_ids = set(int(value) for value in target_binding.get(
+        "collision_body_ids", target_binding.get("body_ids", []),
+    ))
+    fixture_body_ids = set(int(value) for value in fixture_binding.get(
+        "collision_body_ids", fixture_binding.get("body_ids", []),
+    ))
+    if semantic.get("status") != "complete" or not target_body_ids or not fixture_body_ids:
+        return {
+            "status": "not_applied",
+            "reason": "native_In_target_or_fixture_geometry_binding_unavailable",
+            "native_In_predicate": native_in_predicate,
+        }
+
+    contact_reply = bridge.request({"op": "inspect_contacts"})
+    measured_contacts = []
+    for contact in contact_reply.get("contacts", []):
+        body1 = contact.get("body1", {})
+        body2 = contact.get("body2", {})
+        body_id1, body_id2 = body1.get("id"), body2.get("id")
+        pair_matches = (
+            body_id1 in target_body_ids and body_id2 in fixture_body_ids
+        ) or (
+            body_id2 in target_body_ids and body_id1 in fixture_body_ids
+        )
+        distance = contact.get("signed_contact_distance_m")
+        wrench = contact.get("force_and_torque", [])
+        force_norm = (
+            float(np.linalg.norm(np.asarray(wrench[:3], dtype=np.float64)))
+            if isinstance(wrench, list) and len(wrench) >= 3
+            and np.isfinite(np.asarray(wrench[:3], dtype=np.float64)).all()
+            else 0.0
+        )
+        if (
+            pair_matches
+            and isinstance(distance, (int, float)) and np.isfinite(float(distance))
+            and abs(float(distance)) <= 0.002
+            and force_norm >= 0.01
+        ):
+            measured_contacts.append({
+                "body1": body1.get("name"),
+                "body2": body2.get("name"),
+                "geom1": contact.get("geom1", {}).get("name"),
+                "geom2": contact.get("geom2", {}).get("name"),
+                "signed_contact_distance_m": float(distance),
+                "force_norm_n": force_norm,
+            })
+    if not measured_contacts:
+        return {
+            "status": "not_applied",
+            "reason": "no_live_target_fixture_support_contact_within_2mm_and_measured_force",
+            "native_In_predicate": native_in_predicate,
+            "native_In_value": support_query.get("value", support_query.get("predicate_value")),
+        }
+
+    original_pairs = policy.get("forbidden_object_pairs", [])
+    support_pair_rows = [
+        pair for pair in original_pairs
+        if isinstance(pair, dict)
+        and {str(pair.get("object_id_a", "")), str(pair.get("object_id_b", ""))}
+        == {str(native_in_predicate[1]), fixture_id}
+    ]
+    if len(support_pair_rows) != 1:
+        return {
+            "status": "not_applied",
+            "reason": "native_In_target_fixture_pair_not_unique_in_collision_policy",
+            "native_In_predicate": native_in_predicate,
+            "matched_forbidden_pair_count": len(support_pair_rows),
+            "live_measured_contacts": measured_contacts,
+        }
+    policy["forbidden_object_pairs"] = [
+        pair for pair in original_pairs if pair is not support_pair_rows[0]
+    ]
+    return {
+        "status": "applied_exact_measured_native_In_target_fixture_pair",
+        "native_In_predicate": native_in_predicate,
+        "native_In_value": support_query.get("value", support_query.get("predicate_value")),
+        "fixture_parent": fixture_id,
+        "live_measured_contacts": measured_contacts,
+        "removed_forbidden_object_pair": support_pair_rows[0],
+        "scope": "target-fixture object pair only; all robot-object, robot-robot, and other object-pair checks remain active",
+        "safety_certified": False,
+    }
 
 
 def _articulated_fixture_press_quaternion(
@@ -157,6 +287,51 @@ def _articulated_fixture_press_quaternion(
     result /= np.linalg.norm(result)
     current_unit = current / np.linalg.norm(current)
     if float(np.dot(result, current_unit)) < 0.0:
+        result = -result
+    return result
+
+
+def _articulated_fixture_minimum_twist_press_quaternion(
+    current_quaternion_wxyz: np.ndarray,
+    outward_direction_world: np.ndarray,
+) -> np.ndarray:
+    """Aim the palm into a fixture while preserving the current tool roll."""
+    from scipy.spatial.transform import Rotation
+
+    current = np.asarray(current_quaternion_wxyz, dtype=np.float64)
+    outward = np.asarray(outward_direction_world, dtype=np.float64)
+    if (
+        current.shape != (4,) or outward.shape != (3,)
+        or not np.isfinite(current).all() or not np.isfinite(outward).all()
+        or float(np.linalg.norm(current)) <= 1e-12
+        or float(np.linalg.norm(outward)) <= 1e-12
+    ):
+        raise ValueError("articulated_fixture_minimum_twist_requires_finite_pose_and_direction")
+    current_rotation = Rotation.from_quat(
+        current[[1, 2, 3, 0]] / np.linalg.norm(current),
+    )
+    outward /= np.linalg.norm(outward)
+    tool_z_world = -outward
+    current_axes = current_rotation.as_matrix()
+    tool_x_world = current_axes[:, 0] - tool_z_world * float(
+        np.dot(current_axes[:, 0], tool_z_world)
+    )
+    if float(np.linalg.norm(tool_x_world)) <= 1e-8:
+        tool_x_world = current_axes[:, 1] - tool_z_world * float(
+            np.dot(current_axes[:, 1], tool_z_world)
+        )
+    if float(np.linalg.norm(tool_x_world)) <= 1e-8:
+        reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        tool_x_world = reference - tool_z_world * float(np.dot(reference, tool_z_world))
+    tool_x_world /= np.linalg.norm(tool_x_world)
+    tool_y_world = np.cross(tool_z_world, tool_x_world)
+    tool_y_world /= np.linalg.norm(tool_y_world)
+    tool_x_world = np.cross(tool_y_world, tool_z_world)
+    rotation = Rotation.from_matrix(
+        np.column_stack([tool_x_world, tool_y_world, tool_z_world]),
+    )
+    result = rotation.as_quat()[[3, 0, 1, 2]]
+    if float(np.dot(result, current / np.linalg.norm(current))) < 0.0:
         result = -result
     return result
 
@@ -299,6 +474,228 @@ def _articulated_fixture_follow_pose(
     return target_position, target_quaternion
 
 
+def _articulated_fixture_hinge_panel_axes(
+    articulation_context: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Recover microwave door radial/face axes from its live g17 box geometry."""
+    fixture_id = str(articulation_context.get("fixture_id_from_active_BDDL", ""))
+    panel = next((geom for geom in articulation_context.get(
+        "selected_contact_geometries", []
+    ) if geom.get("is_box") is True
+        and str(geom.get("geom_name", "")).endswith("_g17")), None)
+    if panel is None or not fixture_id.startswith("microwave"):
+        return None
+    origin = np.asarray(articulation_context.get("joint_origin_world_m"), dtype=np.float64)
+    axis = np.asarray(articulation_context.get("joint_axis_world"), dtype=np.float64)
+    center = np.asarray(panel.get("center_world_m"), dtype=np.float64)
+    half_size = np.asarray(panel.get("size_m"), dtype=np.float64)
+    if (
+        origin.shape != (3,) or axis.shape != (3,) or center.shape != (3,)
+        or half_size.shape != (3,) or not np.isfinite(origin).all()
+        or not np.isfinite(axis).all() or not np.isfinite(center).all()
+        or not np.isfinite(half_size).all() or float(np.linalg.norm(axis)) <= 1e-12
+        or float(half_size[0]) <= 0.0
+    ):
+        return None
+    axis /= np.linalg.norm(axis)
+    center_from_hinge = center - origin
+    # microwave.xml places g17 at local [half_length, -half_thickness-.001, 0].
+    # Undo that offset to recover the door body's true local x axis; the
+    # selected g15 handle center is rotated relative to this axis.
+    thickness_center_offset = abs(float(half_size[1])) + 0.001
+    denominator = float(half_size[0] ** 2 + thickness_center_offset ** 2)
+    radial_axis = (
+        float(half_size[0]) * center_from_hinge
+        + thickness_center_offset * np.cross(axis, center_from_hinge)
+    ) / denominator
+    radial_norm = float(np.linalg.norm(radial_axis))
+    if radial_norm <= 1e-12 or not np.isfinite(radial_axis).all():
+        return None
+    radial_axis /= radial_norm
+    face_normal = np.cross(axis, radial_axis)
+    face_norm = float(np.linalg.norm(face_normal))
+    if face_norm <= 1e-12 or not np.isfinite(face_normal).all():
+        return None
+    face_normal /= face_norm
+    return radial_axis, face_normal, center
+
+
+def _historical_fixture_contact_pose(
+    history_root: Path | None, fixture_id: str,
+) -> dict[str, Any] | None:
+    """Recover the latest measured robot pose at this fixture's real contact."""
+    if history_root is None or not history_root.exists():
+        return None
+    import gzip
+
+    contact_rows = []
+    record_paths = sorted(
+        history_root.rglob("physical_step_records.jsonl.gz"),
+        key=lambda path: (path.stat().st_mtime_ns, str(path)),
+    )
+    for record_path in record_paths:
+        try:
+            with gzip.open(record_path, "rt", encoding="utf-8") as stream:
+                for line in stream:
+                    if fixture_id not in line or "robot0_link6_collision" not in line:
+                        continue
+                    record = json.loads(line)
+                    articulation = record.get("articulation_tracking", {})
+                    pairs = articulation.get("robot_fixture_contact_pairs", [])
+                    matching_pair = next((pair for pair in pairs
+                        if fixture_id in str(pair.get("fixture_geom", ""))
+                        and "robot0_link6_collision" in str(pair.get("robot_geom", ""))
+                    ), None)
+                    if matching_pair is None:
+                        continue
+                    normal = None
+                    matching_contact = None
+                    for contact in record.get("contacts", {}).get("contacts", []):
+                        geom1 = str(contact.get("geom1", {}).get("name", ""))
+                        geom2 = str(contact.get("geom2", {}).get("name", ""))
+                        raw_normal = contact.get("normal_geom1_to_geom2")
+                        if not isinstance(raw_normal, list) or len(raw_normal) != 3:
+                            continue
+                        if fixture_id in geom1 and "robot0_link6_collision" in geom2:
+                            normal = np.asarray(raw_normal, dtype=np.float64)
+                            matching_contact = contact
+                            break
+                        if fixture_id in geom2 and "robot0_link6_collision" in geom1:
+                            normal = -np.asarray(raw_normal, dtype=np.float64)
+                            matching_contact = contact
+                            break
+                    snapshot_state = record.get("snapshot_state", {})
+                    robots = snapshot_state.get("robot_states", [])
+                    if not robots or normal is None or matching_contact is None:
+                        continue
+                    contact_geom1 = matching_contact.get("geom1", {})
+                    contact_geom2 = matching_contact.get("geom2", {})
+                    if fixture_id in str(contact_geom1.get("name", "")):
+                        fixture_geom_id = contact_geom1.get("id")
+                        robot_geom_id = contact_geom2.get("id")
+                    else:
+                        fixture_geom_id = contact_geom2.get("id")
+                        robot_geom_id = contact_geom1.get("id")
+                    robot = robots[0]
+                    position = np.asarray(robot.get("eef_pos", []), dtype=np.float64)
+                    quaternion = np.asarray(robot.get("eef_quat", []), dtype=np.float64)
+                    joint_qpos = np.asarray(robot.get("joint_qpos", []), dtype=np.float64)
+                    joint_position = articulation.get("joint_position_after")
+                    norm = float(np.linalg.norm(normal))
+                    if (
+                        position.shape != (3,) or quaternion.shape != (4,)
+                        or joint_qpos.shape != (7,)
+                        or isinstance(fixture_geom_id, bool)
+                        or not isinstance(fixture_geom_id, int)
+                        or isinstance(robot_geom_id, bool)
+                        or not isinstance(robot_geom_id, int)
+                        or not np.isfinite(position).all() or not np.isfinite(quaternion).all()
+                        or not np.isfinite(joint_qpos).all()
+                        or not isinstance(joint_position, (int, float))
+                        or not np.isfinite(float(joint_position))
+                        or not np.isfinite(normal).all() or norm <= 1e-12
+                    ):
+                        continue
+                    contact_rows.append({
+                        "record_path": str(record_path),
+                        "record_mtime_ns": record_path.stat().st_mtime_ns,
+                        "step_index": int(record.get("step_index", -1)),
+                        "phase": record.get("phase"),
+                        "fixture_contact_pair": matching_pair,
+                        "fixture_geom_id": fixture_geom_id,
+                        "robot_geom_id": robot_geom_id,
+                        "eef_position_world_m": position.tolist(),
+                        "eef_quaternion_wxyz": quaternion.tolist(),
+                        "robot_joint_qpos_rad": joint_qpos.tolist(),
+                        "fixture_joint_position": float(joint_position),
+                        "contact_normal_fixture_to_robot_world": (normal / norm).tolist(),
+                    })
+        except (OSError, EOFError, json.JSONDecodeError):
+            continue
+    if not contact_rows:
+        return None
+    return max(
+        contact_rows,
+        key=lambda row: (row["record_mtime_ns"], row["step_index"]),
+    )
+
+
+def _historical_safe_goal_ik_seeds(
+    history_root: Path | None,
+    *,
+    instruction: str,
+    model_sha: str,
+    goal_pose_world: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Reuse prior safe IK solutions only as seeds, with current-scene revalidation."""
+    if history_root is None or not history_root.exists():
+        return []
+    target_position = np.asarray(goal_pose_world.get("position_world_m"), dtype=np.float64)
+    target_quaternion = np.asarray(goal_pose_world.get("quaternion_wxyz"), dtype=np.float64)
+    if (
+        target_position.shape != (3,) or target_quaternion.shape != (4,)
+        or not np.isfinite(target_position).all() or not np.isfinite(target_quaternion).all()
+    ):
+        return []
+    found: list[dict[str, Any]] = []
+    for report_path in sorted(history_root.rglob("run_report.json")):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task = report.get("task", {})
+        if (
+            task.get("instruction") != instruction
+            or task.get("model_geometry_sha256") != model_sha
+        ):
+            continue
+        for segment in report.get("segments", []):
+            if segment.get("type") != "expert_articulated_fixture_goal":
+                continue
+            route = segment.get("precontact_route", {})
+            prior_goal = route.get("goal_pose_world", {})
+            prior_position = np.asarray(
+                prior_goal.get("position_world_m", []), dtype=np.float64,
+            )
+            prior_quaternion = np.asarray(
+                prior_goal.get("quaternion_wxyz", []), dtype=np.float64,
+            )
+            if (
+                prior_position.shape != (3,) or prior_quaternion.shape != (4,)
+                or np.linalg.norm(prior_position - target_position) > 1e-6
+                or abs(float(np.dot(
+                    prior_quaternion / max(np.linalg.norm(prior_quaternion), 1e-12),
+                    target_quaternion / max(np.linalg.norm(target_quaternion), 1e-12),
+                ))) < 1.0 - 1e-6
+                or route.get("status") != "offline_feasible"
+                or route.get("live_state_unchanged") is not True
+            ):
+                continue
+            for row in route.get("ik_candidates", []):
+                qpos = np.asarray(row.get("qpos", []), dtype=np.float64)
+                if (
+                    row.get("goal_configuration_safe") is not True
+                    or qpos.shape != (7,) or not np.isfinite(qpos).all()
+                ):
+                    continue
+                q5_margin = min(float(qpos[4] + 2.8973), float(2.8973 - qpos[4]))
+                found.append({
+                    "qpos": qpos.tolist(),
+                    "joint5_limit_margin_rad": q5_margin,
+                    "joint_distance_rad": row.get("joint_distance_rad"),
+                    "source_report": str(report_path),
+                    "source_ik_seed_index": row.get("seed_index"),
+                    "source_goal_minimum_clearance_m": route.get(
+                        "minimum_forbidden_clearance_m"
+                    ),
+                })
+    found.sort(key=lambda row: (
+        -float(row["joint5_limit_margin_rad"]),
+        float(row["joint_distance_rad"] or 0.0),
+    ))
+    return found[:8]
+
+
 def _articulated_fixture_robot_contact_pairs(
     record: dict[str, Any], fixture_id: str, articulated_geom_names: list[str] | None = None,
 ) -> list[dict[str, str]]:
@@ -416,12 +813,23 @@ def _task_success_first_grasp_search_command(
         "--local-replan-rrt-time-budget-s", str(args.local_replan_rrt_time_budget_s),
         "--maximum-physical-branches", str(args.maximum_physical_branches),
         "--branch-control-action-budget", str(args.branch_control_action_budget),
+        "--stage-a-close-action-budget", str(args.stage_a_close_action_budget),
         "--pregrasp-route-waypoint-position-tolerance-m",
         str(getattr(args, "pregrasp_route_waypoint_position_tolerance_m", 0.004)),
+        "--pregrasp-route-waypoint-rotation-tolerance-rad",
+        str(getattr(args, "pregrasp_route_waypoint_rotation_tolerance_rad", 0.045)),
         "--pregrasp-route-control-mode",
         str(getattr(args, "pregrasp_route_control_mode", "eef_osc")),
+        "--joint-space-rrt-max-tracking-error-l2-rad",
+        str(getattr(args, "joint_space_rrt_max_tracking_error_l2_rad", 0.15)),
         "--stage-a-unilateral-close-probe-position-m",
         str(getattr(args, "stage_a_unilateral_close_probe_position_m", 0.010)),
+        "--stage-a-near-pregrasp-bypass-position-m",
+        str(getattr(args, "stage_a_near_pregrasp_bypass_position_m", 0.010)),
+        "--stage-a-near-pregrasp-bypass-rotation-rad",
+        str(getattr(args, "stage_a_near_pregrasp_bypass_rotation_rad", 0.02)),
+        "--stage-a-pregrasp-high-transit-axis-tolerance-m",
+        str(getattr(args, "stage_a_pregrasp_high_transit_axis_tolerance_m", 0.004)),
         "--stage-a-pregrasp-staged-clearance-height-m",
         str(getattr(args, "stage_a_pregrasp_staged_clearance_height_m", 0.0)),
         "--stage-a-pregrasp-lateral-detour-m",
@@ -1109,6 +1517,7 @@ def _recover_joint_limits_with_osc(
     output_dir: Path,
     fallback_snapshot: dict[str, Any] | None,
     defer_micro_violation_to_transport: bool = False,
+    allow_micro_violation_handoff: bool = False,
 ) -> dict[str, Any]:
     """Try a short physical OSC retreat from a near-limit state, then restore a verified hold."""
     from research.gs_opd.repair.task_success_first_grasp_search import (
@@ -1135,26 +1544,6 @@ def _recover_joint_limits_with_osc(
             "actions": 0,
             "safety_certified": False,
         }
-    if (
-        defer_micro_violation_to_transport
-        # Native live-IK rejects any out-of-range qpos before it can select a
-        # route. Even a 0.097 mrad joint7 excess left grasped-object posture
-        # search with zero verified waypoints and caused OSC stagnation. Defer
-        # only sub-0.05 mrad integration noise; physically recover larger
-        # excess before route generation. The 0.05 mrad boundary was already
-        # physically verified on a 0.141 mrad joint7 excess.
-        and initial_limits["maximum_excess_rad"] <= 0.00005
-    ):
-        return {
-            "status": "micro_violation_deferred_to_transport_route",
-            "initial_joint_limits": initial_limits,
-            "actions": 0,
-            "physical_actions": 0,
-            "deferred_limit_rad": 0.00005,
-            "bilateral_grasp_must_remain_confirmed_during_physical_transport": True,
-            "safety_certified": False,
-        }
-
     start_snapshot = bridge.request({"op": "export_runtime_snapshot"})
     if start_snapshot.get("status") != "complete" or not isinstance(start_snapshot.get("payload"), bytes):
         raise RuntimeError("out_of_limit_recovery_start_snapshot_export_failed")
@@ -1188,12 +1577,23 @@ def _recover_joint_limits_with_osc(
                 current_robot = current["snapshot_state"]["robot_states"][0]
                 current_pos = np.asarray(current_robot["eef_pos"], dtype=np.float64)
                 current_quat = np.asarray(current_robot["eef_quat"], dtype=np.float64)
-                target_pos = current_pos + np.asarray([0.0, 0.0, 0.002], dtype=np.float64)
                 before = _joint_limit_diagnostics(
                     current_robot.get("joint_qpos"), joint_names, joint_ranges,
                 )
                 limiting_joint = max(
                     before["joints"], key=lambda row: float(row["excess_rad"]),
+                )
+                recovery_lift_m = (
+                    0.004
+                    if (
+                        defer_micro_violation_to_transport
+                        and str(limiting_joint["joint_name"]).lower().endswith("joint4")
+                        and limiting_joint["lower_excess_rad"] > 0.0
+                    )
+                    else 0.002
+                )
+                target_pos = current_pos + np.asarray(
+                    [0.0, 0.0, recovery_lift_m], dtype=np.float64,
                 )
                 target_quat = current_quat.copy()
                 recovery_rotation = None
@@ -1265,6 +1665,12 @@ def _recover_joint_limits_with_osc(
                     raise RuntimeError("joint_limit_recovery_dual_camera_frame_write_failed")
                 if after["within_limits"]:
                     break
+                if (
+                    allow_micro_violation_handoff
+                    and after["maximum_excess_rad"] <= 0.00005
+                ):
+                    reason = "physical_OSC_recovery_ready_for_pretransport_yaw_micro_handoff"
+                    break
                 if after["maximum_excess_rad"] >= max_excess - 1e-6:
                     reason = "OSC_recovery_did_not_reduce_joint_limit_excess"
                     break
@@ -1298,6 +1704,30 @@ def _recover_joint_limits_with_osc(
             "start_snapshot": str(start_path),
             "recovered_snapshot": str(recovered_path) if recovered_path.is_file() else None,
             "reason": reason,
+            "safety_certified": False,
+            "artifacts": {
+                "records": str(output_dir / "physical_step_records.jsonl.gz"),
+                "actions_states": str(output_dir / "task_success_first_actions_states.npz"),
+                "video": str(output_dir / "dual_camera_agentview_wrist_20fps.mp4"),
+                "durable_records": str(durable_records),
+                "durable_frames": str(durable_frames),
+            },
+        }
+
+    if (
+        allow_micro_violation_handoff
+        and current_limits["maximum_excess_rad"] <= 0.00005
+        and current_grasp.get("grasp_confirmed") is True
+    ):
+        return {
+            "status": "micro_violation_deferred_to_physical_pretransport_yaw",
+            "initial_joint_limits": initial_limits,
+            "final_joint_limits": current_limits,
+            "physical_actions": len(records),
+            "physical_recovery_actions": len(records),
+            "bilateral_grasp_retained": True,
+            "reason": reason,
+            "deferred_limit_rad": 0.00005,
             "safety_certified": False,
             "artifacts": {
                 "records": str(output_dir / "physical_step_records.jsonl.gz"),
@@ -2307,6 +2737,8 @@ def _native_region_obstacle_aware_xy_path(
     *,
     obstacle_clearance_geometry: dict[str, Any] | None,
     goal_region_object_id: str | None,
+    transit_height_world_m: float | None = None,
+    carried_object_lowest_offset_world_m: float | None = None,
     collision_margin_m: float = 0.008,
     resolution_m: float = 0.012,
 ) -> tuple[list[np.ndarray] | None, dict[str, Any]]:
@@ -2330,6 +2762,17 @@ def _native_region_obstacle_aware_xy_path(
     if isinstance(goal_region_object_id, str) and goal_region_object_id:
         target_region_owner = goal_region_object_id
     circles: list[dict[str, Any]] = []
+    vertically_cleared_obstacles: list[dict[str, Any]] = []
+    vertical_filter_active = bool(
+        transit_height_world_m is not None
+        and carried_object_lowest_offset_world_m is not None
+        and np.isfinite(float(transit_height_world_m))
+        and np.isfinite(float(carried_object_lowest_offset_world_m))
+    )
+    carried_object_bottom_world_m = (
+        float(transit_height_world_m) + float(carried_object_lowest_offset_world_m)
+        if vertical_filter_active else None
+    )
     for row in obstacle_clearance_geometry.get("intersecting_objects", []):
         object_id = str(row.get("object_id", ""))
         if target_region_owner and object_id == target_region_owner:
@@ -2342,14 +2785,55 @@ def _native_region_obstacle_aware_xy_path(
             or float(radius) <= 0.0
         ):
             continue
+        obstacle_top = row.get("top_world_m")
+        if (
+            vertical_filter_active
+            and isinstance(obstacle_top, (int, float))
+            and np.isfinite(float(obstacle_top))
+            and carried_object_bottom_world_m is not None
+            and float(obstacle_top) + 0.01 < carried_object_bottom_world_m
+        ):
+            vertically_cleared_obstacles.append({
+                "object_id": object_id,
+                "top_world_m": float(obstacle_top),
+                "carried_object_bottom_world_m": carried_object_bottom_world_m,
+                "vertical_separation_m": carried_object_bottom_world_m - float(obstacle_top),
+            })
+            continue
         circles.append({
             "object_id": object_id,
             "center_world_xy_m": center[:2],
             "inflated_radius_m": float(radius) + carried_radius + float(collision_margin_m),
             "source_radius_m": float(radius),
+            "top_world_m": float(obstacle_top)
+            if isinstance(obstacle_top, (int, float)) and np.isfinite(float(obstacle_top))
+            else None,
         })
     if not circles:
-        return None, {"status": "no_intersecting_obstacles", "obstacle_count": 0}
+        segment_count = max(
+            1, int(np.ceil(float(np.linalg.norm(goal - start)) / 0.045)),
+        )
+        direct_path = [
+            start + (goal - start) * (index / segment_count)
+            for index in range(segment_count + 1)
+        ]
+        return direct_path, {
+            "status": "obstacle_aware_xy_path_found",
+            "obstacle_count": 0,
+            "obstacles": [],
+            "resolution_m": float(resolution_m),
+            "collision_margin_m": float(collision_margin_m),
+            "expanded_nodes": 0,
+            "path_world_xy_m": [point.tolist() for point in direct_path],
+            "maximum_path_segment_length_m": 0.045,
+            "vertical_filter_active": vertical_filter_active,
+            "transit_height_world_m": transit_height_world_m,
+            "carried_object_bottom_world_m": carried_object_bottom_world_m,
+            "vertically_cleared_obstacles": vertically_cleared_obstacles,
+            "uses_physical_MuJoCo_for_execution": True,
+            "object_or_robot_state_written_directly": False,
+            "safety_certified": False,
+        }
 
     # The live object can be physically contact-free while its conservative
     # 2D carried-footprint disk still overlaps a tall obstacle's horizontal
@@ -2529,6 +3013,17 @@ def _native_region_obstacle_aware_xy_path(
             next_index -= 1
         compressed.append(raw[next_index])
         current_index = next_index
+    segmented = [compressed[0]]
+    for segment_start, segment_goal in zip(compressed[:-1], compressed[1:]):
+        segment_count = max(
+            1,
+            int(np.ceil(float(np.linalg.norm(segment_goal - segment_start)) / 0.045)),
+        )
+        segmented.extend(
+            segment_start + (segment_goal - segment_start) * (index / segment_count)
+            for index in range(1, segment_count + 1)
+        )
+    compressed = segmented
     return compressed, {
         "status": "obstacle_aware_xy_path_found",
         "obstacle_count": len(circles),
@@ -2544,6 +3039,11 @@ def _native_region_obstacle_aware_xy_path(
         "resolution_m": float(resolution_m),
         "collision_margin_m": float(collision_margin_m),
         "expanded_nodes": expansions,
+        "maximum_path_segment_length_m": 0.045,
+        "vertical_filter_active": vertical_filter_active,
+        "transit_height_world_m": transit_height_world_m,
+        "carried_object_bottom_world_m": carried_object_bottom_world_m,
+        "vertically_cleared_obstacles": vertically_cleared_obstacles,
         "path_world_xy_m": [point.tolist() for point in compressed],
         "start_escape": start_escape_diagnostic,
         "uses_physical_MuJoCo_for_execution": True,
@@ -2575,12 +3075,14 @@ def _native_region_progress_route(
     side_detour_offset_m: float | None = None,
     preclearance_side_escape: bool = True,
     aperture_start_contact_free: bool = False,
+    allow_surface_slide_descent_with_live_palm_contact: bool = False,
     pretransport_yaw_delta_degrees: float | None = None,
 ) -> dict[str, Any]:
     """Build a task-equivalent object-space route from live and native goal poses."""
     from scipy.spatial.transform import Rotation
 
     start = np.asarray(start_object_world, dtype=np.float64).copy()
+    live_start_rotation = start[:3, :3].copy()
     goal = np.asarray(goal_object_world, dtype=np.float64).copy()
     region_position = np.asarray(region.get("site_position_world_m"), dtype=np.float64)
     region_rotation = np.asarray(region.get("site_rotation_world"), dtype=np.float64)
@@ -2746,6 +3248,10 @@ def _native_region_progress_route(
         # band when the compiled envelope is unreachable for the live grasp.
         # MuJoCo contacts and the native predicate still decide feasibility.
         transit_height = float(transit_height_override_world_m)
+    pretransport_after_clearance = bool(
+        pretransport_pose is not None
+        and transit_height - float(start[2, 3]) > 0.012
+    )
     # A native region frame can be rotated with a tipped container. Treating
     # its local z coordinate as world height becomes singular when that axis is
     # nearly horizontal: a 0.19 m world lift can turn into multi-metre local
@@ -2767,6 +3273,12 @@ def _native_region_progress_route(
                 start[:2, 3], goal[:2, 3],
                 obstacle_clearance_geometry=obstacle_clearance_geometry,
                 goal_region_object_id=goal_region_object_id,
+                transit_height_world_m=transit_height,
+                carried_object_lowest_offset_world_m=(
+                    obstacle_clearance_geometry.get(
+                        "carried_object_lowest_offset_world_m"
+                    ) if isinstance(obstacle_clearance_geometry, dict) else None
+                ),
                 collision_margin_m=(
                     0.0 if preserve_live_orientation_for_on else 0.008
                 ),
@@ -2798,11 +3310,35 @@ def _native_region_progress_route(
         ))
         outside_position = goal[:3, 3] - inward * side_entry_offset
         transit_z = float(transit_height)
+        if (
+            route_variant == "obstacle_aware_xy_region_progress"
+            and entry_mode == "horizontal_aperture"
+        ):
+            obstacle_aware_xy_path_world_m, obstacle_aware_xy_path_diagnostic = (
+                _native_region_obstacle_aware_xy_path(
+                    start[:2, 3], outside_position[:2],
+                    obstacle_clearance_geometry=obstacle_clearance_geometry,
+                    goal_region_object_id=goal_region_object_id,
+                    transit_height_world_m=transit_z,
+                    carried_object_lowest_offset_world_m=(
+                        obstacle_clearance_geometry.get(
+                            "carried_object_lowest_offset_world_m"
+                        ) if isinstance(obstacle_clearance_geometry, dict) else None
+                    ),
+                    collision_margin_m=0.008,
+                )
+            )
+        tilted_default_entry_offset = min(
+            0.03, max(0.01, 0.5 * float(entry_clearance_radius_m)),
+        )
+        tilted_entry_offset = (
+            tilted_default_entry_offset
+            if horizontal_entry_height_offset_m is None
+            else float(horizontal_entry_height_offset_m)
+        )
         entry_z = max(
             float(goal[2, 3]),
-            min(transit_z - 0.01, float(goal[2, 3]) + min(
-                0.03, max(0.01, 0.5 * float(entry_clearance_radius_m)),
-            )),
+            min(transit_z - 0.01, float(goal[2, 3]) + tilted_entry_offset),
         )
 
         def world_pose(position: np.ndarray, pose_rotation: np.ndarray) -> np.ndarray:
@@ -2822,25 +3358,35 @@ def _native_region_progress_route(
         outside_high_position[2] = transit_z
         rotation_start = Rotation.from_matrix(start[:3, :3])
         rotation_delta = (Rotation.from_matrix(goal[:3, :3]) * rotation_start.inv()).as_rotvec()
-        high_distance = float(np.linalg.norm(outside_high_position - start_high_position))
-        high_steps = max(1, int(np.ceil(high_distance / 0.045)))
-        for index in range(1, high_steps + 1):
-            fraction = index / high_steps
-            position = start_high_position + fraction * (
-                outside_high_position - start_high_position
-            )
-            # A tilted native In-region can demand a very different final
-            # object orientation from the stable grasp orientation. Spreading
-            # that rotation over every long-range carry waypoint couples wrist
-            # torque to translation and has physically unseated fragile Soup
-            # before any fixture contact. Preserve the live object orientation
-            # throughout the world-horizontal transfer, then make the required
-            # aperture posture change at the measured outside-high staging pose
-            # where the object is no longer translating through the scene.
-            points.append((
-                world_pose(position, rotation_start.as_matrix()),
-                "region_progress",
-            ))
+        if obstacle_aware_xy_path_world_m is not None:
+            for xy in obstacle_aware_xy_path_world_m[1:]:
+                position = np.asarray(
+                    [float(xy[0]), float(xy[1]), transit_z], dtype=np.float64,
+                )
+                points.append((
+                    world_pose(position, rotation_start.as_matrix()),
+                    "obstacle_aware_region_progress",
+                ))
+        else:
+            high_distance = float(np.linalg.norm(outside_high_position - start_high_position))
+            high_steps = max(1, int(np.ceil(high_distance / 0.045)))
+            for index in range(1, high_steps + 1):
+                fraction = index / high_steps
+                position = start_high_position + fraction * (
+                    outside_high_position - start_high_position
+                )
+                # A tilted native In-region can demand a very different final
+                # object orientation from the stable grasp orientation. Spreading
+                # that rotation over every long-range carry waypoint couples wrist
+                # torque to translation and has physically unseated fragile Soup
+                # before any fixture contact. Preserve the live object orientation
+                # throughout the world-horizontal transfer, then make the required
+                # aperture posture change at the measured outside-high staging pose
+                # where the object is no longer translating through the scene.
+                points.append((
+                    world_pose(position, rotation_start.as_matrix()),
+                    "region_progress",
+                ))
         if float(np.linalg.norm(rotation_delta)) > 1e-3:
             points.append((
                 world_pose(outside_high_position, goal[:3, :3]),
@@ -2975,14 +3521,25 @@ def _native_region_progress_route(
         # center has already cleared the aperture. Stage A permits contact;
         # every descent and insertion remains a real MuJoCo action and BDDL
         # remains the only success oracle.
-        aperture_boundary_clearance_m = boundary_distance + 0.02
-        required_exterior_projection_m = max(
-            float(aperture_boundary_clearance_m),
-            float(horizontal_entry_minimum_offset_m)
-            if horizontal_entry_minimum_offset_m is not None else 0.0,
+        # If the live carried object is already free of the fixture and the
+        # robot has no scene contact, use its measured staging projection
+        # instead of insisting on another 20 mm of modeled clearance. This
+        # lets a continuation resume from a physically verified aperture
+        # approach pose without routing the hand back through the fixture.
+        aperture_boundary_clearance_m = max(
+            0.0,
+            boundary_distance + (-0.01 if aperture_start_contact_free else 0.02),
         )
+        required_exterior_projection_m = float(aperture_boundary_clearance_m)
+        if not aperture_start_contact_free:
+            required_exterior_projection_m = max(
+                required_exterior_projection_m,
+                float(horizontal_entry_minimum_offset_m)
+                if horizontal_entry_minimum_offset_m is not None else 0.0,
+            )
         start_is_exterior_to_aperture = bool(
-            aperture_start_contact_free
+            (aperture_start_contact_free
+             or allow_surface_slide_descent_with_live_palm_contact)
             and exterior_projection_m >= required_exterior_projection_m
         )
         if (
@@ -3039,7 +3596,7 @@ def _native_region_progress_route(
                 local_goal[:2] - entry_direction_local[:2] * entry_offset_m
             )
     points: list[tuple[np.ndarray, str]] = []
-    if pretransport_pose is not None:
+    if pretransport_pose is not None and not pretransport_after_clearance:
         points.append((pretransport_pose.copy(), "native_region_pretransport_posture"))
     reachability_transition_local = None
     staged_reachability_transition = bool(
@@ -3187,7 +3744,15 @@ def _native_region_progress_route(
         ])
         if rotate_before_aperture_transit:
             lifted[:3, :3] = goal[:3, :3]
+        elif pretransport_after_clearance:
+            # Preserve the live grasp orientation during the clearance lift;
+            # rotate only after the object is physically above nearby fixtures.
+            lifted[:3, :3] = live_start_rotation
         points.append((lifted, "adaptive_clearance"))
+        if pretransport_after_clearance and pretransport_pose is not None:
+            posture = pretransport_pose.copy()
+            posture[:3, 3] = lifted[:3, 3]
+            points.append((posture, "native_region_pretransport_posture"))
     elif needs_descent and not horizontal_aperture_stage_before_descent:
         lowered = start.copy()
         lowered[:3, 3] = region_position + rotation @ np.asarray([
@@ -3480,6 +4045,9 @@ def _native_region_progress_route(
         "adaptive_clearance_delta_m": clearance_delta,
         "transit_clearance_mode": transit_clearance_mode,
         "entry_mode": entry_mode,
+        "allow_surface_slide_descent_with_live_palm_contact": (
+            allow_surface_slide_descent_with_live_palm_contact
+        ),
         "requested_side_detour_offset_m": side_detour_offset_m,
         "applied_side_detour_offset_m": applied_side_detour_offset_m,
         "staged_reachability_transition": (
@@ -3526,6 +4094,9 @@ def _native_region_progress_route(
             "outside_starts_descend_before_horizontal_transit": start_is_exterior_to_aperture,
             "physical_contact_free_status_is_verified_by_live_MuJoCo_contacts": bool(
                 aperture_start_contact_free
+            ),
+            "surface_slide_descent_with_live_palm_contact_allowed": (
+                allow_surface_slide_descent_with_live_palm_contact
             ),
         },
         "horizontal_entry_height_offset_m": (
@@ -3651,6 +4222,7 @@ def _native_region_progress_tracking_tolerances(
     *,
     native_goal_operator: str | None = None,
     clearance_lift_delta_m: float | None = None,
+    in_transit_position_tolerance_m: float = 0.020,
 ) -> tuple[float, float]:
     """Set route-following tolerances; native BDDL remains the task-success gate."""
     if role in {
@@ -3678,6 +4250,14 @@ def _native_region_progress_tracking_tolerances(
             else 0.020
         )
         tolerance = 0.020 if delta >= 0.040 else max(0.006, 0.5 * delta)
+        if native_goal_operator == "in":
+            # This remains an intermediate carried-object waypoint. For a
+            # tilted open container, MuJoCo traces showed a roughly 11 mm
+            # residual against a 9 mm adaptive-clearance tolerance even when
+            # the held object already had extra vertical clearance. Let that
+            # route continue; entry, final placement, and native BDDL checks
+            # remain the physical success gates.
+            tolerance = max(tolerance, 0.012)
         return tolerance, 0.65
     if role == "keypose_side_clearance_escape":
         # This waypoint must physically clear the near fixture before the
@@ -3701,6 +4281,12 @@ def _native_region_progress_tracking_tolerances(
         # native predicate remain the physical placement checks.
         tolerance = 0.015 if native_goal_operator == "on" else 0.005
         return tolerance, 0.65 if native_goal_operator in {"on", "in"} else 0.12
+    if role == "native_region_entry_approach" and native_goal_operator == "in":
+        # This is the exterior staging point before the object crosses the
+        # aperture. Treat it as carried-object transit: physically observed
+        # residuals here may be retargeted by the following strict
+        # entry-alignment waypoint. Native placement and BDDL stay unchanged.
+        return float(in_transit_position_tolerance_m), 0.65
     if role == "native_region_preplacement_descent":
         return 0.012, 0.12
     if role == "reachability_descent":
@@ -3729,7 +4315,7 @@ def _native_region_progress_tracking_tolerances(
         # residual and retarget the next segment from the live grasp transform;
         # this remains below the route segment length and does not relax final
         # entry, placement, or native BDDL success checks.
-        return 0.020, 0.65
+        return float(in_transit_position_tolerance_m), 0.65
     if role in {"region_progress", "obstacle_aware_region_progress"}:
         # On has no orientation predicate. The former 40 mm position radius
         # let each ~45 mm carry segment advance only a few millimetres, leaving
@@ -3908,6 +4494,7 @@ def _native_region_corridor_obstacle_clearance(
         "corridor_radius_m": corridor_radius,
         "clearance_margin_m": float(clearance_margin_m),
         "intersecting_objects": intersecting,
+        "carried_object_lowest_offset_world_m": lowest_target_offset,
         "maximum_intersecting_obstacle_top_world_m": (
             maximum_obstacle_top if np.isfinite(maximum_obstacle_top) else None
         ),
@@ -4090,8 +4677,14 @@ def _generate_native_region_placement_candidates(
             # Prefer room from completed objects, a collision-envelope fit for
             # In goals, and then the shortest physical transfer from the live pose.
             travel = float(np.linalg.norm(position - target_root))
+            # For a multi-object On goal, centering the next object can place
+            # it directly on a completed sibling. Let measured footprint
+            # clearance dominate in that case; keep the centering preference
+            # for an empty support and the existing In-envelope behavior.
             support_centering_penalty = (
-                2.0 * float(np.linalg.norm(local_xy))
+                0.0
+                if verb == "on" and occupied
+                else 2.0 * float(np.linalg.norm(local_xy))
                 if (
                     verb == "on"
                     or region.get("support_geometry_kind") == "compiled_object_collision_envelope"
@@ -4396,7 +4989,9 @@ def _rank_native_region_candidates_by_live_ik_margin(
                         eef_target[:3, :3],
                     ).as_quat()[[3, 0, 1, 2]].tolist(),
                 },
-                "ik_seed_qpos": [row.tolist() for row in seed_rows],
+                "ik_seed_qpos": [
+                    np.asarray(row, dtype=np.float64).tolist() for row in seed_rows
+                ],
                 "ik_selection_seed_qpos": arm_qpos.tolist(),
                 "ik_solver_max_nfev": 80,
                 "safety_geometry_policy": safety_policy,
@@ -4633,6 +5228,7 @@ def _stage_a_unheld_in_freefall_probe(
     output_dir: Path,
     maximum_actions: int,
     allow_near_aperture_release: bool = False,
+    allow_anywhere_unheld_settle: bool = False,
 ) -> dict[str, Any]:
     """Run a short physical release probe near an active native In region.
 
@@ -4760,6 +5356,13 @@ def _stage_a_unheld_in_freefall_probe(
             "direct_state_write": False,
             "safety_certified": False,
         }
+    default_release_eligible = horizontal_inside and vertically_above_opening
+    near_aperture_release_eligible = (
+        allow_near_aperture_release and near_aperture
+    )
+    anywhere_unheld_settle_eligible = bool(
+        allow_anywhere_unheld_settle and not bilateral_grasp_remains
+    )
     geometry_gate = {
         "object_position_world_m": object_position.tolist(),
         "object_position_region_local_m": object_local.tolist(),
@@ -4780,18 +5383,20 @@ def _stage_a_unheld_in_freefall_probe(
         "explicit_near_aperture_mode_allows_physical_gripper_open": bool(
             allow_near_aperture_release
         ),
+        "explicit_anywhere_unheld_settle_mode": bool(allow_anywhere_unheld_settle),
         "eligibility": (
             "eligible_above_opening" if horizontal_inside and vertically_above_opening
             else "eligible_near_aperture" if allow_near_aperture_release and near_aperture
+            else "eligible_unheld_object_settle" if anywhere_unheld_settle_eligible
             else "outside_opening_or_not_overhead"
         ),
         "read_only_physical_state_sha256": before_digest,
     }
-    default_release_eligible = horizontal_inside and vertically_above_opening
-    near_aperture_release_eligible = (
-        allow_near_aperture_release and near_aperture
-    )
-    if not default_release_eligible and not near_aperture_release_eligible:
+    if (
+        not default_release_eligible
+        and not near_aperture_release_eligible
+        and not anywhere_unheld_settle_eligible
+    ):
         return {
             "status": "not_eligible_object_not_fitting_above_native_opening",
             "geometry_gate": geometry_gate,
@@ -4847,7 +5452,11 @@ def _stage_a_unheld_in_freefall_probe(
             break
     recording = _write_recording(output_dir, records, frames)
     terminal = bridge.request({"op": "export_runtime_snapshot"})
-    snapshot_path = output_dir / "unheld_in_region_settle_terminal_runtime_snapshot.pkl"
+    snapshot_path = output_dir / (
+        "unheld_object_settle_terminal_runtime_snapshot.pkl"
+        if anywhere_unheld_settle_eligible
+        else "unheld_in_region_settle_terminal_runtime_snapshot.pkl"
+    )
     snapshot_sha = None
     state_sha = None
     if terminal.get("status") == "complete" and isinstance(terminal.get("payload"), bytes):
@@ -4867,7 +5476,10 @@ def _stage_a_unheld_in_freefall_probe(
         "native_task_success": success,
         "release_probe_mode": (
             "near_aperture_physical_release"
-            if near_aperture_release_eligible else "overhead_freefall_settle"
+            if near_aperture_release_eligible else (
+                "unheld_object_physics_settle"
+                if anywhere_unheld_settle_eligible else "overhead_freefall_settle"
+            )
         ),
         "recording": recording,
         "terminal_snapshot": str(snapshot_path) if snapshot_sha else None,
@@ -4894,16 +5506,24 @@ def _run_articulated_fixture_goal(
     controller_fields: dict[str, Any],
     output_dir: Path,
     model_sha: str,
+    history_root: Path | None = None,
+    ik_seed_history_root: Path | None = None,
+    dynamic_scene_hold_actions: int = 0,
+    dynamic_scene_clearance_lift_m: float = 0.0,
     rrt_time_budget_s: float = NATIVE_PLACEMENT_RRT_BUDGET_S,
+    stage_a_contact_permissive_precontact: bool = False,
 ) -> dict[str, Any]:
     """Physically push a native articulated fixture goal through OSC_POSE."""
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _advance_pose,
+        _record_joint_trajectory_step,
+        _record_step,
         _snapshot_state_vector,
         _state_sha,
         _write_recording,
     )
     from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
+    from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
 
     if articulation_context.get("status") != "complete" or not articulation_context.get("read_only"):
         raise RuntimeError(f"articulated_fixture_context_unavailable:{articulation_context.get('error')}")
@@ -4915,8 +5535,212 @@ def _run_articulated_fixture_goal(
     frames: list[dict[str, Any]] = []
     monitor = GraspStabilityMonitor(required_samples=3)
     observed = bridge.request({"op": "observe", "include_snapshot_state": True})
-    start_state_sha = _state_sha(_snapshot_state_vector(observed.get("snapshot_state", {})))
+    osc_handoff = bridge.request({"op": "sync_osc_controller_goal_to_live_state"})
+    if (osc_handoff.get("status") != "complete"
+            or osc_handoff.get("physical_state_unchanged") is not True):
+        raise RuntimeError("articulated_fixture_OSC_handoff_sync_failed")
+    counter = [0]
     current = observed["snapshot_state"]["robot_states"][0]
+    dynamic_scene_wait_initial = observed.get("snapshot_state", {})
+    dynamic_scene_wait_actions_executed = 0
+    dynamic_scene_clearance_lift_actions = 0
+    dynamic_scene_clearance_lift_reached = None
+    _advance_pose.controller_fields = controller_fields
+    if dynamic_scene_clearance_lift_m > 0.0:
+        lift_target = np.asarray(current["eef_pos"], dtype=np.float64) + np.asarray(
+            [0.0, 0.0, float(dynamic_scene_clearance_lift_m)], dtype=np.float64,
+        )
+        lift_error = None
+        try:
+            dynamic_scene_clearance_lift_reached = _advance_pose(
+                bridge,
+                lift_target,
+                np.asarray(current["eef_quat"], dtype=np.float64),
+                "stage_a_dynamic_scene_clearance_lift",
+                "articulated_fixture_dynamic_obstacle_clearance_lift",
+                counter,
+                60,
+                target_binding,
+                instruction,
+                policy,
+                monitor,
+                records,
+                frames,
+                position_tolerance_m=0.005,
+                rotation_tolerance_rad=0.03,
+                gripper_action=0.0,
+                planning_tracking={
+                    "tracking_mode": "physical_vertical_clearance_lift_before_dynamic_scene_wait",
+                    "native_goal_predicate": list(predicate),
+                    "lift_distance_world_m": float(dynamic_scene_clearance_lift_m),
+                },
+            )
+        except Exception as exc:
+            # A failed physical pose segment must still leave an auditable
+            # action stream and legal Runtime Snapshot. Previously this
+            # timeout escaped before the in-memory records were serialized.
+            lift_error = f"{type(exc).__name__}: {exc}"
+            dynamic_scene_clearance_lift_reached = False
+        dynamic_scene_clearance_lift_actions = counter[0]
+        if not dynamic_scene_clearance_lift_reached:
+            final_native = bridge.request({"op": "native_task_status"})
+            articulation_after = bridge.request({
+                "op": "task_success_first_articulation_context",
+                "expected_instruction": instruction,
+                "predicate": predicate,
+            })
+            final_contacts = bridge.request({"op": "inspect_contacts"})
+            recording = _write_recording(output_dir, records, frames)
+            final_snapshot = bridge.request({"op": "export_runtime_snapshot"})
+            snapshot_path = output_dir / "articulated_fixture_terminal_runtime_snapshot.pkl"
+            snapshot_sha = None
+            integration_sha = None
+            if final_snapshot.get("status") == "complete" and isinstance(
+                final_snapshot.get("payload"), bytes,
+            ):
+                snapshot_path.write_bytes(final_snapshot["payload"])
+                snapshot_sha = _sha(final_snapshot["payload"])
+                integration_sha = _state_digest(_integration_state(
+                    final_snapshot.get("snapshot_state", {}),
+                ))
+            predicate_value = next(
+                (row.get("value") for row in final_native.get("native_goal_values", [])
+                 if row.get("predicate") == predicate), None
+            )
+            return {
+                "status": "articulated_fixture_precontact_incomplete",
+                "failure_reason": lift_error or "articulated_fixture_dynamic_scene_clearance_lift_not_reached",
+                "termination_reason": "dynamic_scene_clearance_lift_pose_unreached",
+                "failed_waypoint_index": -1,
+                "precontact_route": {
+                    "status": "not_started_due_clearance_lift_failure",
+                    "live_state_unchanged": False,
+                    "route_source": "physical_clearance_lift_did_not_reach_target",
+                    "clearance_lift_distance_m": float(dynamic_scene_clearance_lift_m),
+                    "clearance_lift_actions": int(dynamic_scene_clearance_lift_actions),
+                    "clearance_lift_target_world_m": lift_target.tolist(),
+                    "clearance_lift_reached": False,
+                },
+                "fixture_contact_tracking": {
+                    "active": False,
+                    "final_contact_inspection": final_contacts,
+                },
+                "native_goal_predicate": predicate,
+                "native_goal_value": predicate_value,
+                "native_task_success": final_native.get("task_success"),
+                "final_native_task_status": final_native,
+                "articulation_before": articulation_context,
+                "articulation_after": articulation_after,
+                "OSC_handoff_sync": osc_handoff,
+                "recorded_actions": len(records),
+                "recorded_physics_substeps": int(sum(
+                    item.get("contact_monitoring", {}).get("captured_physics_substeps", 0)
+                    for item in records
+                )),
+                "physical_action_continuity": {
+                    "all_recorded_actions_are_real_MuJoCo_steps": True,
+                    "all_contact_substeps_complete": all(
+                        item.get("substep_contact_monitoring_complete") is True
+                        for item in records
+                    ),
+                    "safety_certified": False,
+                },
+                "terminal_snapshot": (
+                    {
+                        "path": str(snapshot_path),
+                        "payload_sha256": snapshot_sha,
+                        "integration_state_sha256": integration_sha,
+                    } if snapshot_sha is not None else None
+                ),
+                "safety_certified": False,
+                "artifacts": {
+                    "records": recording.get("per_action_records_gzip"),
+                    "npz": recording.get("actions_and_robot_states_npz"),
+                    "video": recording.get("dual_camera_video"),
+                },
+            }
+        observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+        current = observed["snapshot_state"]["robot_states"][0]
+    if dynamic_scene_hold_actions > 0:
+        hold_action = world_pose_tracking_action(
+            np.asarray(current["eef_pos"], dtype=np.float64),
+            np.asarray(current["eef_quat"], dtype=np.float64),
+            np.asarray(current["eef_pos"], dtype=np.float64),
+            np.asarray(current["eef_quat"], dtype=np.float64),
+            controller_fields,
+            gripper_action=0.0,
+        )
+        for _ in range(int(dynamic_scene_hold_actions)):
+            _record_step(
+                bridge,
+                hold_action,
+                "stage_a_stationary_robot_dynamic_scene_wait",
+                "articulated_fixture_dynamic_obstacle_wait",
+                counter[0],
+                target_binding,
+                instruction,
+                policy,
+                monitor,
+                records,
+                frames,
+                raise_on_done=False,
+                planning_tracking={
+                    "tracking_mode": "physical_zero_arm_delta_wait_for_moving_scene",
+                    "native_goal_predicate": list(predicate),
+                    "robot_pose_held_world_m": np.r_[
+                        np.asarray(current["eef_pos"], dtype=np.float64),
+                        np.asarray(current["eef_quat"], dtype=np.float64),
+                    ].tolist(),
+                    "physical_action_count_in_wait": dynamic_scene_wait_actions_executed + 1,
+                },
+            )
+            counter[0] += 1
+            dynamic_scene_wait_actions_executed += 1
+            current_record = records[-1]
+            if current_record.get("task_success") is True:
+                break
+        observed = bridge.request({"op": "observe", "include_snapshot_state": True})
+        current = observed["snapshot_state"]["robot_states"][0]
+        refreshed_context = bridge.request({
+            "op": "task_success_first_articulation_context",
+            "expected_instruction": instruction,
+            "predicate": predicate,
+        })
+        if refreshed_context.get("status") == "complete":
+            articulation_context = refreshed_context
+    start_state_sha = _state_sha(_snapshot_state_vector(observed.get("snapshot_state", {})))
+    approach_action_budget_start = counter[0]
+    initial_objects = dynamic_scene_wait_initial.get("object_states", {})
+    final_objects = observed.get("snapshot_state", {}).get("object_states", {})
+    dynamic_scene_wait_objects = []
+    for object_id, initial_object in initial_objects.items():
+        final_object = final_objects.get(object_id, {})
+        initial_position = np.asarray(initial_object.get("root_pos", []), dtype=np.float64)
+        final_position = np.asarray(final_object.get("root_pos", []), dtype=np.float64)
+        initial_velocity = np.asarray(initial_object.get("joint_qvel", []), dtype=np.float64)
+        if (
+            initial_position.shape != (3,) or final_position.shape != (3,)
+            or not np.isfinite(initial_position).all() or not np.isfinite(final_position).all()
+        ):
+            continue
+        displacement = float(np.linalg.norm(final_position - initial_position))
+        speed = (
+            float(np.linalg.norm(initial_velocity[:3]))
+            if initial_velocity.ndim == 1 and len(initial_velocity) >= 3
+            and np.isfinite(initial_velocity[:3]).all() else None
+        )
+        if displacement > 1e-5 or (speed is not None and speed > 1e-4):
+            dynamic_scene_wait_objects.append({
+                "object_id": object_id,
+                "initial_root_position_world_m": initial_position.tolist(),
+                "final_root_position_world_m": final_position.tolist(),
+                "initial_root_linear_velocity_m_s": (
+                    initial_velocity[:3].tolist()
+                    if initial_velocity.ndim == 1 and len(initial_velocity) >= 3
+                    and np.isfinite(initial_velocity[:3]).all() else None
+                ),
+                "observed_displacement_m": displacement,
+            })
     joint = articulation_context.get("joint", {})
     joint_type = str(joint.get("joint_type", "")).lower()
     quaternion = (
@@ -4927,7 +5751,6 @@ def _run_articulated_fixture_goal(
         )
     )
     _advance_pose.controller_fields = controller_fields
-    counter = [0]
     contact_state: dict[str, Any] = {
         "active": False,
         "last_action_has_fixture_contact": False,
@@ -4939,15 +5762,132 @@ def _run_articulated_fixture_goal(
         "anchor_joint_position": None,
         "anchor_joint_axis_world": None,
         "anchor_joint_origin_world_m": None,
+        "latest_fixture_contact_measurements": [],
+        "surface_reseat": None,
         "follow_chunks": [],
         "switch_bilateral_contact_observed": False,
         "switch_gripper_close_commanded": False,
         "fixture_gripper_close_commanded": False,
     }
     contact_phase_start_action: int | None = None
-    precontact = path[0] + outward * (
+    initial_contact_report = bridge.request({"op": "inspect_contacts"})
+    initial_contact_pairs = _articulated_fixture_robot_contact_pairs(
+        {"contacts": initial_contact_report.get("contacts", [])},
+        str(articulation_context.get("fixture_id_from_active_BDDL", "")),
+        list(articulation_context.get("articulated_moving_collision_geom_names", [])),
+    )
+    snapshot_contact_resume = bool(initial_contact_pairs)
+    if snapshot_contact_resume:
+        contact_state.update({
+            "active": True,
+            "last_action_has_fixture_contact": True,
+            "first_action_index": 0,
+            "contact_pairs": initial_contact_pairs,
+            "anchor_eef_position_world_m": current.get("eef_pos"),
+            "anchor_eef_quaternion_wxyz": current.get("eef_quat"),
+            "anchor_joint_position": joint.get("position"),
+            "anchor_joint_axis_world": articulation_context.get("joint_axis_world"),
+            "anchor_joint_origin_world_m": articulation_context.get("joint_origin_world_m"),
+        })
+        contact_phase_start_action = 0
+    hinge_close = (
+        str(predicate[0]).lower() == "close" and joint_type == "hinge"
+    )
+    history_contact_recovery = None
+    if hinge_close and not snapshot_contact_resume:
+        historical_contact = _historical_fixture_contact_pose(
+            history_root,
+            str(articulation_context.get("fixture_id_from_active_BDDL", "")),
+        )
+        if historical_contact is not None:
+            try:
+                from scipy.spatial.transform import Rotation
+
+                source_joint_position = float(
+                    historical_contact["fixture_joint_position"]
+                )
+                live_joint_position = float(joint.get("position"))
+                joint_axis = np.asarray(
+                    articulation_context.get("joint_axis_world"), dtype=np.float64,
+                )
+                axis_norm = float(np.linalg.norm(joint_axis))
+                if (
+                    joint_axis.shape != (3,) or not np.isfinite(joint_axis).all()
+                    or axis_norm <= 1e-12
+                ):
+                    raise ValueError("historical_contact_joint_axis_is_invalid")
+                joint_axis /= axis_norm
+                delta_rotation = Rotation.from_rotvec(
+                    joint_axis * (live_joint_position - source_joint_position)
+                )
+                contact_position, contact_quaternion = _articulated_fixture_follow_pose(
+                    np.asarray(historical_contact["eef_position_world_m"], dtype=np.float64),
+                    np.asarray(historical_contact["eef_quaternion_wxyz"], dtype=np.float64),
+                    articulation_context,
+                    joint_position_at_anchor=source_joint_position,
+                    follow_lead=0.0,
+                )
+                contact_normal = delta_rotation.apply(np.asarray(
+                    historical_contact[
+                        "contact_normal_fixture_to_robot_world"
+                    ], dtype=np.float64,
+                ))
+                contact_normal_norm = float(np.linalg.norm(contact_normal))
+                if not np.isfinite(contact_normal_norm) or contact_normal_norm <= 1e-12:
+                    raise ValueError("historical_contact_normal_is_invalid")
+                contact_normal /= contact_normal_norm
+                contact_target_position = (
+                    contact_position
+                    - contact_normal * ARTICULATED_FIXTURE_HISTORICAL_CONTACT_INSET_M
+                )
+                history_contact_recovery = {
+                    **historical_contact,
+                    "live_fixture_joint_position": live_joint_position,
+                    "transformed_contact_position_world_m": contact_position.tolist(),
+                    "transformed_contact_quaternion_wxyz": contact_quaternion.tolist(),
+                    "transformed_contact_normal_fixture_to_robot_world": (
+                        contact_normal.tolist()
+                    ),
+                    "physical_contact_inset_m": (
+                        ARTICULATED_FIXTURE_HISTORICAL_CONTACT_INSET_M
+                    ),
+                    "physical_contact_target_position_world_m": (
+                        contact_target_position.tolist()
+                    ),
+                    "precontact_clearance_offset_m": 0.020,
+                    "precontact_position_world_m": (
+                        contact_position + contact_normal * 0.020
+                    ).tolist(),
+                }
+                quaternion = contact_quaternion
+            except (TypeError, ValueError, ZeroDivisionError):
+                history_contact_recovery = None
+    hinge_contact_axis_offset = np.zeros(3, dtype=np.float64)
+    if hinge_close and history_contact_recovery is None:
+        panel_axes = _articulated_fixture_hinge_panel_axes(articulation_context)
+        joint_axis = np.asarray(
+            articulation_context.get("joint_axis_world"), dtype=np.float64,
+        )
+        if panel_axes is not None and joint_axis.shape == (3,):
+            axis_norm = float(np.linalg.norm(joint_axis))
+            if np.isfinite(joint_axis).all() and axis_norm > 1e-12:
+                joint_axis /= axis_norm
+                panel_center = np.asarray(panel_axes[2], dtype=np.float64)
+                hinge_contact_axis_offset = joint_axis * float(
+                    np.dot(panel_center - path[0], joint_axis)
+                )
+    approach_distance = (
         ARTICULATED_FIXTURE_SLIDE_PRECONTACT_OUTWARD_M if joint_type == "slide"
-        else ARTICULATED_FIXTURE_PRECONTACT_APPROACH_DISTANCE_M
+        else 0.020 if history_contact_recovery is not None
+        else ARTICULATED_FIXTURE_HINGE_CLOSE_PRECONTACT_APPROACH_DISTANCE_M
+        if hinge_close else ARTICULATED_FIXTURE_PRECONTACT_APPROACH_DISTANCE_M
+    )
+    precontact = (
+        np.asarray(
+            history_contact_recovery["precontact_position_world_m"], dtype=np.float64,
+        )
+        if history_contact_recovery is not None
+        else path[0] + hinge_contact_axis_offset + outward * approach_distance
     )
     if joint_type == "slide":
         precontact = precontact + np.asarray(
@@ -4969,26 +5909,57 @@ def _run_articulated_fixture_goal(
     else:
         slide_clearance_waypoints = []
         slide_clearance_phase_names = []
-        contact_offset = outward * 0.035
-        contact_height_offset = np.zeros(3, dtype=np.float64)
-    contact_waypoints = [
-        point + contact_offset + contact_height_offset for point in path
-    ]
+        contact_offset = (
+            np.zeros(3, dtype=np.float64)
+            if history_contact_recovery is not None else outward * 0.035
+        )
+        contact_height_offset = (
+            np.zeros(3, dtype=np.float64)
+            if history_contact_recovery is not None else hinge_contact_axis_offset
+        )
+    contact_waypoints = (
+        [np.asarray(
+            history_contact_recovery["physical_contact_target_position_world_m"],
+            dtype=np.float64,
+        )]
+        if history_contact_recovery is not None
+        else [point + contact_offset + contact_height_offset for point in path]
+    )
     failure_reason = None
     failed_waypoint_index = None
+    jointspace_history_contact_path: np.ndarray | None = None
+    native_in_support_pair_policy: dict[str, Any] = {"status": "not_evaluated"}
     route_tracking: dict[str, Any] = {
         "status": "not_started",
         "live_state_unchanged": None,
         "route_source": None,
         "fixture_target_clearance_m": ARTICULATED_FIXTURE_PRECONTACT_CLEARANCE_M,
+        "precontact_approach_distance_m": float(approach_distance),
+        "hinge_contact_axis_offset_world_m": hinge_contact_axis_offset.tolist(),
+        "history_contact_recovery": history_contact_recovery,
+        "native_In_support_pair_policy": native_in_support_pair_policy,
+        "dynamic_scene_wait": {
+            "requested_actions": int(dynamic_scene_hold_actions),
+            "executed_actions": int(dynamic_scene_wait_actions_executed),
+            "clearance_lift_distance_m": float(dynamic_scene_clearance_lift_m),
+            "clearance_lift_actions": int(dynamic_scene_clearance_lift_actions),
+            "clearance_lift_reached": dynamic_scene_clearance_lift_reached,
+            "precontact_action_budget_start_index": int(approach_action_budget_start),
+            "moving_or_displaced_objects": dynamic_scene_wait_objects,
+            "robot_pose_held_with_zero_arm_delta": dynamic_scene_wait_actions_executed > 0,
+        },
         "approach_waypoints_world_m": [
             precontact.tolist(),
             *[point.tolist() for point in slide_clearance_waypoints],
         ],
         "plan_goal_role": (
+            "RRT_precontact_from_historically_measured_link6_fixture_contact"
+            if history_contact_recovery is not None
+            else (
             "full_geometry_high_front_on_precontact_then_enter_below_cabinet_top_for_slide_handle_contact"
             if joint_type == "slide"
             else "full_geometry_low_precontact_before_fixture_contact"
+            )
         ),
         "press_orientation_quaternion_wxyz": quaternion.tolist(),
         "press_orientation_tool_axis_world": None,
@@ -4997,6 +5968,15 @@ def _run_articulated_fixture_goal(
         "tracked_pose_count": 0,
         "eef_reference_poses_world": [],
     }
+    if snapshot_contact_resume:
+        route_tracking.update({
+            "status": "existing_snapshot_fixture_contact",
+            "route_source": "exact_runtime_snapshot_contact_resume_no_replanning",
+            "live_state_unchanged": True,
+            "reported_live_state_unchanged": True,
+            "snapshot_contact_pairs": initial_contact_pairs,
+            "planner_source": "not_run_existing_measured_fixture_contact",
+        })
 
     def record_articulation_feedback(record, _frame):
         nonlocal contact_phase_start_action
@@ -5013,6 +5993,27 @@ def _run_articulated_fixture_goal(
             if isinstance(feedback, dict) else None,
         )
         current_joint = feedback.get("joint", {}) if isinstance(feedback, dict) else {}
+        fixture_contact_measurements = []
+        if contact_pairs:
+            fixture_name = str(articulation_context.get("fixture_id_from_active_BDDL", ""))
+            for row in record.get("contacts", {}).get("contacts", []):
+                geom_names = (
+                    str(row.get("geom1", {}).get("name", "")),
+                    str(row.get("geom2", {}).get("name", "")),
+                )
+                if (
+                    fixture_name in "".join(geom_names)
+                    and any("gripper0" in name for name in geom_names)
+                ):
+                    fixture_contact_measurements.append({
+                        "geom1": geom_names[0],
+                        "geom2": geom_names[1],
+                        "position_world_m": row.get("position"),
+                        "normal_geom1_to_geom2": row.get("normal_geom1_to_geom2"),
+                        "signed_contact_distance_m": row.get("signed_contact_distance_m"),
+                        "force_and_torque": row.get("force_and_torque"),
+                    })
+        contact_state["latest_fixture_contact_measurements"] = fixture_contact_measurements
         if contact_pairs:
             if not contact_state["active"]:
                 contact_state["first_action_index"] = counter[0]
@@ -5066,21 +6067,298 @@ def _run_articulated_fixture_goal(
         maximum_iterations=1200,
         maximum_config_checks=12000,
     )
-    # This route is executed directly around movable scene geometry. Require
-    # every sampled configuration to pass the active per-object policy before
-    # allowing OSC to follow it. This is a route feasibility gate, not a safety
-    # certification of the resulting physical episode.
-    planner_config["require_safe_configurations"] = True
+    # Stage A normally requires a collision-free precontact RRT. A measured
+    # contact-permissive route can be selected for task completion when the
+    # strict route has exhausted its search budget; it still uses full-scene
+    # geometry diagnostics and all physical MuJoCo substeps remain audited.
+    # This mode is not a safety certification.
+    planner_config["require_safe_configurations"] = not bool(
+        stage_a_contact_permissive_precontact
+    )
+    # Even in Stage A's contact-permissive route mode, keep the terminal IK
+    # configuration collision-free. Only transit samples may contain contact.
+    planner_config["require_safe_goal_configurations"] = True
     planner_config["minimum_clearance_m"] = 0.0
+    route_tracking["planning_mode"] = (
+        "stage_a_contact_permissive_full_scene_RRT_physical_execution"
+        if stage_a_contact_permissive_precontact
+        else "full_scene_RRT_rejecting_colliding_configurations"
+    )
+    # The live snapshot can sit a few microradians beyond a hard stop after
+    # contact. Allow only a narrow offline start projection; keep all IK goals
+    # strictly inside the model limits and leave the live MuJoCo state intact.
+    planner_config["start_joint_limit_tolerance_rad"] = 5e-5
     route_policy = _articulated_fixture_rrt_policy(
         policy, str(articulation_context.get("fixture_id_from_active_BDDL")),
     )
+    native_in_support_pair_policy = (
+        _allow_measured_native_in_support_pair(
+            bridge,
+            route_policy,
+            str(articulation_context.get("fixture_id_from_active_BDDL", "")),
+        )
+        if hinge_close else {"status": "not_applicable"}
+    )
+    route_tracking["native_In_support_pair_policy"] = native_in_support_pair_policy
+    press_roll_search = {
+        "status": "not_applicable",
+        "physical_actions": 0,
+    }
+    if hinge_close and (
+        history_contact_recovery is None or stage_a_contact_permissive_precontact
+    ):
+        from scipy.spatial.transform import Rotation
+
+        base_rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]])
+        seed_rows = _placement_ik_seed_portfolio(current)
+        selection_seed = np.asarray(current["joint_qpos"], dtype=np.float64)
+        roll_preflight_config = copy.deepcopy(planner_config)
+        roll_preflight_config["require_safe_configurations"] = True
+        roll_preflight_config["require_safe_goal_configurations"] = True
+        ranked_orientations = []
+        roll_results = []
+        live_state_stable = True
+        for roll_degrees in (0.0, 90.0, -90.0, 180.0):
+            candidate_rotation = base_rotation * Rotation.from_euler(
+                "z", roll_degrees, degrees=True,
+            )
+            candidate_xyzw = candidate_rotation.as_quat()
+            candidate_quaternion = candidate_xyzw[[3, 0, 1, 2]]
+            if float(np.dot(candidate_quaternion, quaternion)) < 0.0:
+                candidate_quaternion *= -1.0
+            candidate_goal = {
+                "position_world_m": precontact.tolist(),
+                "quaternion_wxyz": candidate_quaternion.tolist(),
+            }
+            ik_reply = bridge.request({
+                "op": "task_success_first_ik_preflight",
+                "expected_instruction": instruction,
+                "model_geometry_sha256": model_sha,
+                "start_state_sha256": start_state_sha,
+                "goal_pose_world": candidate_goal,
+                "ik_seed_qpos": [
+                    np.asarray(row, dtype=np.float64).tolist() for row in seed_rows
+                ],
+                "ik_selection_seed_qpos": selection_seed.tolist(),
+                "ik_solver_max_nfev": 120,
+                "planner_config": roll_preflight_config,
+                "safety_geometry_policy": route_policy,
+            })
+            live_state_stable = live_state_stable and (
+                ik_reply.get("live_state_unchanged") is True
+            )
+            valid_rows = []
+            if ik_reply.get("status") == "goal_ik_preflight_passed":
+                for ik_row in ik_reply.get("ik_candidates", []):
+                    qpos = np.asarray(ik_row.get("qpos", []), dtype=np.float64)
+                    if (
+                        qpos.shape != (7,) or not np.isfinite(qpos).all()
+                        or float(ik_row.get("position_error_m", float("inf"))) > 0.003
+                        or float(ik_row.get("orientation_error_rad", float("inf"))) > 0.03
+                    ):
+                        continue
+                    q5_margin = min(qpos[4] + 2.8973, 2.8973 - qpos[4])
+                    travel = float(np.linalg.norm(qpos - selection_seed))
+                    valid_rows.append((q5_margin, -travel, ik_row))
+            best_row = max(valid_rows, default=None, key=lambda row: (row[0], row[1]))
+            roll_results.append({
+                "roll_offset_degrees": roll_degrees,
+                "status": ik_reply.get("status"),
+                "failure_reason": ik_reply.get("failure_reason"),
+                "evaluated_IK_solutions": len(valid_rows),
+                "best_joint5_position_rad": (
+                    float(np.asarray(best_row[2]["qpos"], dtype=np.float64)[4])
+                    if best_row is not None else None
+                ),
+                "best_joint5_limit_margin_rad": (
+                    float(best_row[0]) if best_row is not None else None
+                ),
+                "best_joint_travel_l2_rad": (
+                    float(-best_row[1]) if best_row is not None else None
+                ),
+            })
+            if best_row is not None:
+                ranked_orientations.append((
+                    (float(best_row[0]), float(best_row[1]), -abs(roll_degrees)),
+                    candidate_quaternion,
+                    roll_degrees,
+                    best_row,
+                ))
+        if not live_state_stable:
+            raise RuntimeError("articulated_fixture_press_roll_IK_preflight_changed_live_state")
+        press_roll_search = {
+            "status": "ranked_by_live_IK_joint5_limit_margin_and_joint_travel",
+            "source_orientation": (
+                "transformed_measured_link6_contact_orientation"
+                if history_contact_recovery is not None
+                else "active_live_EEF_orientation"
+            ),
+            "joint5_limit_rad": [-2.8973, 2.8973],
+            "start_joint_limit_tolerance_rad": planner_config[
+                "start_joint_limit_tolerance_rad"
+            ],
+            "candidates": roll_results,
+            "physical_actions": 0,
+        }
+        if ranked_orientations:
+            ranked_orientations.sort(key=lambda row: row[0], reverse=True)
+            _, quaternion, selected_roll, selected_ik = ranked_orientations[0]
+            press_roll_search.update({
+                "selected_roll_offset_degrees": selected_roll,
+                "selected_goal_quaternion_wxyz": quaternion.tolist(),
+                "selected_goal_joint5_position_rad": float(
+                    np.asarray(selected_ik[2]["qpos"], dtype=np.float64)[4]
+                ),
+                "selected_goal_joint5_limit_margin_rad": float(selected_ik[0]),
+                "selected_goal_joint_travel_l2_rad": float(-selected_ik[1]),
+            })
+        else:
+            press_roll_search["status"] = "no_candidate_had_bounded_live_IK"
+    elif hinge_close:
+        press_roll_search = {
+            "status": "reused_historically_measured_link6_contact_orientation",
+            "joint5_limit_rad": [-2.8973, 2.8973],
+            "start_joint_limit_tolerance_rad": planner_config[
+                "start_joint_limit_tolerance_rad"
+            ],
+            "source_record_path": history_contact_recovery.get("record_path"),
+            "source_step_index": history_contact_recovery.get("step_index"),
+            "source_fixture_joint_position": history_contact_recovery.get(
+                "fixture_joint_position"
+            ),
+            "live_fixture_joint_position": history_contact_recovery.get(
+                "live_fixture_joint_position"
+            ),
+            "physical_actions": 0,
+        }
+    route_tracking["press_orientation_roll_search"] = press_roll_search
+    route_tracking["press_orientation_quaternion_wxyz"] = quaternion.tolist()
+    # The target dictionary is initialized before the roll portfolio runs;
+    # propagate its selected, collision-checked orientation into the actual RRT
+    # request rather than leaving the pre-search quaternion in place.
+    goal_pose["quaternion_wxyz"] = quaternion.tolist()
+    near_contact_reacquisition = False
+    near_contact_target_pose: np.ndarray | None = None
+    near_contact_geometry: dict[str, Any] | None = None
+    near_contact_candidate_geometry: dict[str, Any] | None = None
+    if (
+        snapshot_contact_resume
+        and str(predicate[0]).lower() == "close"
+        and joint_type == "hinge"
+    ):
+        panel_axes = _articulated_fixture_hinge_panel_axes(articulation_context)
+        if panel_axes is not None:
+            panel_radial = np.asarray(panel_axes[0], dtype=np.float64)
+            contact_diagnostics = []
+            has_broad_face_contact = False
+            fixture_id = str(articulation_context.get("fixture_id_from_active_BDDL", ""))
+            for row in initial_contact_report.get("contacts", []):
+                geom_names = (
+                    str(row.get("geom1", {}).get("name", "")),
+                    str(row.get("geom2", {}).get("name", "")),
+                )
+                if (
+                    not any(fixture_id in name and name.endswith("_g17") for name in geom_names)
+                    or not any("gripper0" in name for name in geom_names)
+                ):
+                    continue
+                normal = np.asarray(row.get("normal_geom1_to_geom2"), dtype=np.float64)
+                normal_norm = float(np.linalg.norm(normal))
+                if normal.shape != (3,) or not np.isfinite(normal).all() or normal_norm <= 1e-12:
+                    continue
+                normal /= normal_norm
+                radial_alignment = abs(float(np.dot(normal, panel_radial)))
+                vertical_alignment = abs(float(normal[2]))
+                diagnostic = {
+                    "contact": row,
+                    "hinge_radial_normal_alignment": radial_alignment,
+                    "vertical_normal_alignment": vertical_alignment,
+                }
+                contact_diagnostics.append(diagnostic)
+                if radial_alignment <= 0.60 and vertical_alignment <= 0.50:
+                    has_broad_face_contact = True
+            if contact_diagnostics and not has_broad_face_contact:
+                near_contact_reacquisition = True
+                near_contact_geometry = {
+                    "status": "snapshot_contact_requires_physical_broad_face_reseat",
+                    "reason": "measured_snapshot_contact_is_radial_or_panel_edge_aligned",
+                    "measured_contacts": contact_diagnostics,
+                    "probe_is_physical_and_not_planner_certified": True,
+                }
+    if (
+        not snapshot_contact_resume
+        and str(predicate[0]).lower() == "close"
+        and joint_type == "hinge"
+    ):
+        fixture_id = str(articulation_context.get("fixture_id_from_active_BDDL", ""))
+        eef_z = float(current["eef_pos"][2])
+        moving_z_bands = []
+        for geom in articulation_context.get("selected_contact_geometries", []):
+            center = np.asarray(geom.get("center_world_m"), dtype=np.float64)
+            size = np.asarray(geom.get("size_m"), dtype=np.float64)
+            if (
+                center.shape == (3,) and size.shape == (3,)
+                and np.isfinite(center).all() and np.isfinite(size).all()
+            ):
+                moving_z_bands.append((
+                    float(center[2] - abs(size[2]) - 0.02),
+                    # The live EEF site can sit above the panel while the
+                    # gripper hand collision body still reaches its top edge.
+                    # dev469 measured g17 contact with the EEF 118.5 mm above
+                    # the panel top, so include a 130 mm downward hand extent
+                    # when admitting only the later <=2 mm physical probe.
+                    float(center[2] + abs(size[2]) + 0.13),
+                ))
+        eef_over_moving_fixture = any(
+            low <= eef_z <= high for low, high in moving_z_bands
+        )
+        if eef_over_moving_fixture:
+            from scipy.spatial.transform import Rotation
+
+            direction = float(np.sign(
+                float(joint.get("target_position")) - float(joint.get("position"))
+            ))
+            step_rad = 0.008 * (direction if direction else 1.0)
+            axis = np.asarray(articulation_context.get("joint_axis_world"), dtype=np.float64)
+            axis /= np.linalg.norm(axis)
+            origin = np.asarray(articulation_context.get("joint_origin_world_m"), dtype=np.float64)
+            eef_position = np.asarray(current["eef_pos"], dtype=np.float64)
+            stepped_position = origin + Rotation.from_rotvec(axis * step_rad).apply(
+                eef_position - origin
+            )
+            panel_axes = _articulated_fixture_hinge_panel_axes(articulation_context)
+            face_probe_inset_m = 0.0
+            if panel_axes is not None:
+                _, panel_face_normal, panel_center = panel_axes
+                if float(np.dot(panel_face_normal, eef_position - panel_center)) < 0.0:
+                    panel_face_normal *= -1.0
+                # The RRT diagnostic has already bounded this to <=2 mm
+                # from the named fixture with no self-collision. The 8 mrad
+                # hinge arc itself moves the EEF about 2 mm along the face
+                # normal, so a 5 mm physical inset leaves a few millimeters
+                # of approach after that measured arc displacement.
+                face_probe_inset_m = 0.005
+                stepped_position -= face_probe_inset_m * panel_face_normal
+            near_contact_target_pose = np.r_[
+                stepped_position,
+                np.asarray(current["eef_quat"], dtype=np.float64),
+            ]
+            near_contact_candidate_geometry = {
+                "fixture_id": fixture_id,
+                "eef_height_over_moving_fixture": True,
+                "physical_reacquisition_joint_step_rad": step_rad,
+                "physical_reacquisition_face_probe_inset_m": face_probe_inset_m,
+                "physical_reacquisition_target_pose_world": near_contact_target_pose.tolist(),
+            }
     route_forbidden_thresholds = [
         float(item.get("minimum_clearance_m", 0.0))
         for item in route_policy.get("forbidden_objects", [])
         if isinstance(item, dict)
     ]
-    reported_clearance_threshold_m = min(route_forbidden_thresholds, default=0.0)
+    reported_clearance_threshold_m = (
+        0.0 if snapshot_contact_resume or near_contact_reacquisition
+        else min(route_forbidden_thresholds, default=0.0)
+    )
     from scipy.spatial.transform import Rotation
 
     press_rotation = Rotation.from_quat(quaternion[[1, 2, 3, 0]])
@@ -5091,16 +6369,63 @@ def _run_articulated_fixture_goal(
         press_rotation.as_matrix()[:, 0].tolist()
     )
     try:
-        planned = bridge.request({
-            "op": "task_success_first_rrt",
-            "expected_instruction": instruction,
-            "model_geometry_sha256": model_sha,
-            "start_state_sha256": start_state_sha,
-            "goal_pose_world": goal_pose,
-            "safety_geometry_policy": route_policy,
-            "planner_config": planner_config,
-            "ik_seed_qpos": _placement_ik_seed_portfolio(current),
-        })
+        if snapshot_contact_resume:
+            current_pose = np.r_[
+                np.asarray(current["eef_pos"], dtype=np.float64),
+                np.asarray(current["eef_quat"], dtype=np.float64),
+            ]
+            current_qpos = np.asarray(current["joint_qpos"], dtype=np.float64)
+            planned = {
+                "status": "offline_feasible",
+                "live_state_unchanged": True,
+                "planner_source": "not_run_existing_measured_fixture_contact",
+                "minimum_forbidden_clearance_m": 0.0,
+                "require_safe_configurations": True,
+                "planner_minimum_clearance_m": 0.0,
+                "eef_reference_poses_world": [current_pose.tolist(), current_pose.tolist()],
+                "qpos_path": [current_qpos.tolist(), current_qpos.tolist()],
+            }
+        else:
+            base_ik_seeds = _placement_ik_seed_portfolio(current)
+            historical_safe_ik_seeds = (
+                _historical_safe_goal_ik_seeds(
+                    ik_seed_history_root,
+                    instruction=instruction,
+                    model_sha=model_sha,
+                    goal_pose_world=goal_pose,
+                )
+                if history_contact_recovery is not None else []
+            )
+            rrt_request = {
+                "op": "task_success_first_rrt",
+                "expected_instruction": instruction,
+                "model_geometry_sha256": model_sha,
+                "start_state_sha256": start_state_sha,
+                "goal_pose_world": goal_pose,
+                "safety_geometry_policy": route_policy,
+                "planner_config": planner_config,
+                "ik_seed_qpos": [
+                    *base_ik_seeds,
+                    *[row["qpos"] for row in historical_safe_ik_seeds],
+                    *([history_contact_recovery["robot_joint_qpos_rad"]]
+                      if history_contact_recovery is not None else []),
+                ],
+            }
+            if history_contact_recovery is not None:
+                selection_seed = np.asarray(
+                    history_contact_recovery["robot_joint_qpos_rad"], dtype=np.float64,
+                )
+                rrt_request["ik_selection_seed_qpos"] = selection_seed.tolist()
+                route_tracking["ik_solution_selection_reference"] = {
+                    "joint_qpos": selection_seed.tolist(),
+                    "historical_contact_configuration_priority": True,
+                    "note": (
+                        "measured_contact_qpos_is_an_offline_IK_selection_seed_only; "
+                        "live_state_unchanged"
+                    ),
+                }
+                route_tracking["historical_safe_ik_seed_reuse"] = historical_safe_ik_seeds
+            planned = bridge.request(rrt_request)
         after_plan = bridge.request({"op": "observe", "include_snapshot_state": True})
         after_plan_sha = _state_sha(_snapshot_state_vector(after_plan.get("snapshot_state", {})))
         unchanged = after_plan_sha == start_state_sha
@@ -5121,6 +6446,9 @@ def _run_articulated_fixture_goal(
             ),
             "minimum_forbidden_clearance_required_m": reported_clearance_threshold_m,
             "require_safe_configurations": planned.get("require_safe_configurations"),
+            "require_safe_goal_configurations": planned.get(
+                "require_safe_goal_configurations"
+            ),
             "planner_minimum_clearance_m": planned.get("planner_minimum_clearance_m"),
             "start_state_sha256": start_state_sha,
             "goal_pose_world": goal_pose,
@@ -5132,14 +6460,20 @@ def _run_articulated_fixture_goal(
                 "articulated_fixture_precontact_RRT_not_feasible:"
                 f"{planned.get('status')}:{planned.get('failure_reason')}"
             )
-        if planned.get("require_safe_configurations") is not True:
-            raise RuntimeError("articulated_fixture_precontact_RRT_safe_configuration_gate_not_applied")
+        expected_safe_gate = not bool(stage_a_contact_permissive_precontact)
+        if planned.get("require_safe_configurations") is not expected_safe_gate:
+            raise RuntimeError("articulated_fixture_precontact_RRT_configuration_gate_mismatch")
+        if planned.get("require_safe_goal_configurations") is not True:
+            raise RuntimeError("articulated_fixture_precontact_goal_IK_safety_gate_not_applied")
         minimum_forbidden_clearance = planned.get("minimum_forbidden_clearance_m")
         if (
             isinstance(minimum_forbidden_clearance, bool)
             or not isinstance(minimum_forbidden_clearance, (int, float))
             or not np.isfinite(float(minimum_forbidden_clearance))
-            or float(minimum_forbidden_clearance) < reported_clearance_threshold_m
+            or (
+                expected_safe_gate
+                and float(minimum_forbidden_clearance) < reported_clearance_threshold_m
+            )
         ):
             raise RuntimeError(
                 "articulated_fixture_precontact_RRT_forbidden_clearance_below_policy:"
@@ -5158,6 +6492,8 @@ def _run_articulated_fixture_goal(
         ):
             raise RuntimeError("articulated_fixture_precontact_RRT_returned_invalid_qpos_path")
         route, route_raw_indices = _thin_articulated_fixture_rrt_route(raw_route, stride=2)
+        if history_contact_recovery is not None:
+            jointspace_history_contact_path = raw_qpos_path.copy()
         route_tracking.update({
             "raw_pose_count": int(len(raw_route)),
             "tracked_pose_count": int(len(route)),
@@ -5165,16 +6501,456 @@ def _run_articulated_fixture_goal(
             "tracked_pose_raw_indices": route_raw_indices,
             "qpos_path_rad": raw_qpos_path.tolist(),
             "eef_reference_poses_world": route.tolist(),
-            "route_source": "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC",
+            "route_source": (
+                "exact_runtime_snapshot_contact_resume_no_replanning"
+                if snapshot_contact_resume
+                else "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC"
+            ),
         })
-        precontact_waypoints = route[1:]
+        if snapshot_contact_resume:
+            route_tracking["status"] = "existing_snapshot_fixture_contact"
+            route_tracking["planner_source"] = "not_run_existing_measured_fixture_contact"
+        precontact_waypoints = (
+            [] if jointspace_history_contact_path is not None else route[1:]
+        )
     except Exception as exc:
         failure_reason = f"{type(exc).__name__}: {exc}"
         failed_waypoint_index = -1
         precontact_waypoints = []
+        # A resumed near-contact Snapshot can sit just outside MuJoCo's active
+        # contact threshold while still inside the RRT fixture-clearance
+        # margin. Permit one small, physically executed hinge-arc probe only
+        # when the planner's own diagnostic identifies exactly this fixture,
+        # reports <=2 mm distance, and reports no self collision. The RRT
+        # rejection remains in the report; this does not mark the route safe.
+        if (
+            not snapshot_contact_resume
+            and near_contact_candidate_geometry is not None
+            and near_contact_target_pose is not None
+            and "start_configuration_is_unsafe" in str(exc)
+        ):
+            import ast
+
+            reason_text = str(exc)
+            forbidden_match = re.search(
+                r"forbidden_contacts=(\[.*?\]);self_contacts=(\[.*?\])",
+                reason_text,
+            )
+            try:
+                forbidden_rows = ast.literal_eval(forbidden_match.group(1)) if forbidden_match else None
+                self_rows = ast.literal_eval(forbidden_match.group(2)) if forbidden_match else None
+            except (SyntaxError, ValueError):
+                forbidden_rows, self_rows = None, None
+            fixture_id = str(near_contact_candidate_geometry["fixture_id"])
+            fixture_rows = [
+                row for row in (forbidden_rows or [])
+                if isinstance(row, dict) and row.get("object_id") == fixture_id
+            ]
+            if (
+                isinstance(forbidden_rows, list)
+                and len(forbidden_rows) == 1
+                and len(fixture_rows) == 1
+                and isinstance(self_rows, list)
+                and not self_rows
+                and isinstance(fixture_rows[0].get("distance_m"), (int, float))
+                and 0.0 <= float(fixture_rows[0]["distance_m"]) <= 0.002
+            ):
+                near_contact_reacquisition = True
+                near_contact_geometry = {
+                    **near_contact_candidate_geometry,
+                    "rrt_start_rejection": reason_text,
+                    "measured_fixture_clearance_m": float(fixture_rows[0]["distance_m"]),
+                    "measured_self_contacts": self_rows,
+                    "probe_is_physical_and_not_planner_certified": True,
+                }
+
+    if near_contact_reacquisition and near_contact_target_pose is not None:
+        route_tracking["rrt_precontact_diagnostic"] = {
+            "status": route_tracking.get("status"),
+            "failure_reason": route_tracking.get("failure_reason"),
+            "planner_source": route_tracking.get("planner_source"),
+        }
+        route_tracking.update({
+            "status": "near_snapshot_fixture_contact_physical_reacquisition",
+            "route_source": "measured_clearance_then_short_physical_hinge_arc_step",
+            "planner_source": "short_physical_contact_reacquisition_after_RRT_start_gate",
+            "near_contact_geometry": near_contact_geometry,
+            "physical_contact_reacquisition_waypoint_world": near_contact_target_pose.tolist(),
+        })
+        failure_reason = None
+        failed_waypoint_index = None
+        precontact_waypoints = [near_contact_target_pose]
 
     approach_route_waypoint_count = len(precontact_waypoints) + len(slide_clearance_waypoints)
-    waypoints = [*precontact_waypoints, *slide_clearance_waypoints, *contact_waypoints]
+    waypoints = (
+        precontact_waypoints
+        if near_contact_reacquisition
+        else [*precontact_waypoints, *slide_clearance_waypoints, *contact_waypoints]
+    )
+    if jointspace_history_contact_path is not None:
+        route_tracking["precontact_execution_mode"] = (
+            "collision_checked_dense_jointspace_RRT_tracked_by_physical_mass_matrix_PD"
+        )
+        route_tracking["precontact_joint_path_waypoint_count"] = int(
+            len(jointspace_history_contact_path)
+        )
+        route_tracking["precontact_joint_path_seed_qpos_rad"] = (
+            history_contact_recovery["robot_joint_qpos_rad"]
+        )
+        route_tracking["precontact_joint_path_endpoint_qpos_rad"] = (
+            jointspace_history_contact_path[-1].tolist()
+        )
+        for path_index, joint_target in enumerate(jointspace_history_contact_path[1:], start=1):
+            if counter[0] - approach_action_budget_start >= ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET:
+                raise TimeoutError("articulated_fixture_jointspace_precontact_action_budget_exhausted")
+            joint_tracking = {
+                "tracking_mode": "physical_mass_matrix_PD_tracking_of_fixture_contact_RRT_path",
+                "route_source": route_tracking.get("route_source"),
+                "rrt_source_path_index": int(path_index),
+                "rrt_reference_qpos_rad": joint_target.tolist(),
+                "historical_contact_seed_qpos_rad": history_contact_recovery[
+                    "robot_joint_qpos_rad"
+                ],
+                "physical_collision_response_enabled": True,
+                "object_or_robot_state_written_directly": False,
+                "safety_certified": False,
+            }
+            _record_joint_trajectory_step(
+                bridge,
+                joint_target,
+                "articulated_fixture_jointspace_RRT_precontact",
+                "native_articulated_fixture_goal",
+                counter[0],
+                target_binding,
+                instruction,
+                policy,
+                monitor,
+                records,
+                frames,
+                planning_tracking=joint_tracking,
+                raise_on_done=False,
+            )
+            counter[0] += 1
+            record_articulation_feedback(records[-1], frames[-1])
+            if records[-1].get("done"):
+                raise RuntimeError("environment_done_during_articulated_fixture_jointspace_RRT")
+            if contact_state["active"]:
+                break
+        if not contact_state["active"]:
+            endpoint_q = jointspace_history_contact_path[-1]
+            endpoint_error = float("inf")
+            for settle_index in range(21):
+                observed_endpoint = bridge.request({"op": "observe", "include_snapshot_state": True})
+                actual_q = np.asarray(
+                    observed_endpoint["snapshot_state"]["robot_states"][0]["joint_qpos"],
+                    dtype=np.float64,
+                )
+                endpoint_error = float(np.linalg.norm(actual_q - endpoint_q))
+                if endpoint_error <= 0.03:
+                    break
+                if settle_index == 20:
+                    raise RuntimeError(
+                        "articulated_fixture_jointspace_RRT_endpoint_tracking_error_exceeded:" 
+                        f"{endpoint_error:.6f}rad"
+                    )
+                if counter[0] - approach_action_budget_start >= ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET:
+                    raise TimeoutError("articulated_fixture_jointspace_precontact_action_budget_exhausted")
+                _record_joint_trajectory_step(
+                    bridge,
+                    endpoint_q,
+                    "articulated_fixture_jointspace_RRT_precontact_settle",
+                    "native_articulated_fixture_goal",
+                    counter[0],
+                    target_binding,
+                    instruction,
+                    policy,
+                    monitor,
+                    records,
+                    frames,
+                    planning_tracking={
+                        "tracking_mode": "physical_mass_matrix_PD_RRT_endpoint_settle",
+                        "rrt_reference_qpos_rad": endpoint_q.tolist(),
+                        "measured_endpoint_error_before_action_l2_rad": endpoint_error,
+                        "object_or_robot_state_written_directly": False,
+                        "safety_certified": False,
+                    },
+                    raise_on_done=False,
+                )
+                counter[0] += 1
+                record_articulation_feedback(records[-1], frames[-1])
+                if records[-1].get("done"):
+                    raise RuntimeError("environment_done_during_articulated_fixture_jointspace_settle")
+                if contact_state["active"]:
+                    break
+            route_tracking["precontact_joint_endpoint_error_l2_rad"] = endpoint_error
+            if not contact_state["active"]:
+                post_route_sync = bridge.request({"op": "sync_osc_controller_goal_to_live_state"})
+                if (
+                    post_route_sync.get("status") != "complete"
+                    or post_route_sync.get("physical_state_unchanged") is not True
+                ):
+                    raise RuntimeError("articulated_fixture_post_jointspace_OSC_handoff_sync_failed")
+                route_tracking["post_jointspace_OSC_handoff_sync"] = post_route_sync
+                if history_contact_recovery is not None:
+                    contact_start = bridge.request({
+                        "op": "observe", "include_snapshot_state": True,
+                    })
+                    contact_start_state = contact_start.get("snapshot_state", {})
+                    contact_start_sha = _state_sha(
+                        _snapshot_state_vector(contact_start_state)
+                    )
+                    contact_route_policy = copy.deepcopy(route_policy)
+                    fixture_id = str(
+                        articulation_context.get("fixture_id_from_active_BDDL", "")
+                    )
+                    target_fixture_rows = [
+                        row for row in contact_route_policy.get(
+                            "allowed_target_objects", []
+                        ) if row.get("object_id") == fixture_id
+                    ]
+                    if len(target_fixture_rows) != 1:
+                        raise RuntimeError(
+                            "articulated_fixture_contact_route_requires_one_verified_target_binding"
+                        )
+                    # This short final route deliberately reaches the BDDL target
+                    # fixture. Keep self, bottle, mug, and environment checks;
+                    # permit only zero-clearance contact with the microwave.
+                    target_fixture_rows[0]["minimum_clearance_m"] = 0.0
+                    contact_route_policy["minimum_clearance_m"] = 0.0
+                    contact_pair = {
+                        "robot_geom_id": int(
+                            history_contact_recovery["robot_geom_id"]
+                        ),
+                        "scene_geom_id": int(
+                            history_contact_recovery["fixture_geom_id"]
+                        ),
+                        "minimum_clearance_m": -(
+                            ARTICULATED_FIXTURE_HISTORICAL_CONTACT_PAIR_PENETRATION_M
+                        ),
+                    }
+                    existing_contact_pairs = contact_route_policy.get(
+                        "allowed_contact_pairs", []
+                    )
+                    if not isinstance(existing_contact_pairs, list):
+                        raise RuntimeError(
+                            "articulated_fixture_contact_route_allowed_pairs_are_invalid"
+                        )
+                    if not any(
+                        row.get("robot_geom_id") == contact_pair["robot_geom_id"]
+                        and row.get("scene_geom_id") == contact_pair["scene_geom_id"]
+                        for row in existing_contact_pairs if isinstance(row, dict)
+                    ):
+                        existing_contact_pairs.append(contact_pair)
+                    contact_rrt_request = {
+                        "op": "task_success_first_rrt",
+                        "expected_instruction": instruction,
+                        "model_geometry_sha256": model_sha,
+                        "start_state_sha256": contact_start_sha,
+                        "goal_pose_world": {
+                            "position_world_m": np.asarray(
+                                history_contact_recovery[
+                                    "physical_contact_target_position_world_m"
+                                ], dtype=np.float64,
+                            ).tolist(),
+                            "quaternion_wxyz": np.asarray(
+                                history_contact_recovery[
+                                    "transformed_contact_quaternion_wxyz"
+                                ], dtype=np.float64,
+                            ).tolist(),
+                        },
+                        "safety_geometry_policy": contact_route_policy,
+                        "planner_config": copy.deepcopy(planner_config),
+                        "ik_seed_qpos": [
+                            endpoint_q.tolist(),
+                            history_contact_recovery["robot_joint_qpos_rad"],
+                            *[row["qpos"] for row in route_tracking.get(
+                                "historical_safe_ik_seed_reuse", []
+                            )],
+                        ],
+                        "ik_selection_seed_qpos": history_contact_recovery[
+                            "robot_joint_qpos_rad"
+                        ],
+                    }
+                    contact_plan = bridge.request(contact_rrt_request)
+                    after_contact_plan = bridge.request({
+                        "op": "observe", "include_snapshot_state": True,
+                    })
+                    contact_unchanged = _state_sha(_snapshot_state_vector(
+                        after_contact_plan.get("snapshot_state", {})
+                    )) == contact_start_sha
+                    contact_route_tracking = {
+                        "status": contact_plan.get("status"),
+                        "failure_reason": contact_plan.get("failure_reason"),
+                        "live_state_unchanged": contact_unchanged,
+                        "reported_live_state_unchanged": contact_plan.get(
+                            "live_state_unchanged"
+                        ),
+                        "planner_source": contact_plan.get("planner_source"),
+                        "planning_seconds": contact_plan.get("planning_seconds"),
+                        "config_checks": contact_plan.get("config_checks"),
+                        "selected_ik_seed_index": contact_plan.get(
+                            "selected_ik_seed_index"
+                        ),
+                        "minimum_forbidden_clearance_m": contact_plan.get(
+                            "minimum_forbidden_clearance_m"
+                        ),
+                        "target_fixture_minimum_clearance_m": 0.0,
+                        "physical_contact_inset_m": history_contact_recovery[
+                            "physical_contact_inset_m"
+                        ],
+                        "authorized_contact_pair": contact_pair,
+                        "contact_ik_candidates": contact_plan.get(
+                            "ik_candidates", []
+                        ),
+                        "self_collision_checked": True,
+                        "other_scene_clearance_policy_preserved": True,
+                        "native_goal_predicate": list(predicate),
+                    }
+                    if not contact_unchanged:
+                        raise RuntimeError(
+                            "articulated_fixture_contact_RRT_changed_live_state"
+                        )
+                    if (
+                        contact_plan.get("status") == "offline_feasible"
+                        and contact_plan.get("live_state_unchanged") is True
+                        and contact_plan.get("require_safe_configurations") is True
+                    ):
+                        contact_qpath = np.asarray(
+                            contact_plan.get("qpos_path"), dtype=np.float64,
+                        )
+                        if (
+                            contact_qpath.ndim != 2
+                            or contact_qpath.shape[1:] != (7,)
+                            or len(contact_qpath) < 2
+                            or not np.isfinite(contact_qpath).all()
+                        ):
+                            raise RuntimeError(
+                                "articulated_fixture_contact_RRT_returned_invalid_joint_path"
+                            )
+                        contact_route_tracking["joint_path_waypoint_count"] = int(
+                            len(contact_qpath)
+                        )
+                        contact_route_tracking["joint_path_endpoint_qpos_rad"] = (
+                            contact_qpath[-1].tolist()
+                        )
+                        contact_phase_start_action = counter[0]
+                        for contact_path_index, contact_joint_target in enumerate(
+                            contact_qpath[1:], start=1,
+                        ):
+                            if counter[0] - int(contact_phase_start_action) >= (
+                                ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET
+                            ):
+                                raise TimeoutError(
+                                    "articulated_fixture_contact_jointspace_action_budget_exhausted"
+                                )
+                            _record_joint_trajectory_step(
+                                bridge,
+                                contact_joint_target,
+                                "articulated_fixture_contact_jointspace_RRT",
+                                "native_articulated_fixture_contact",
+                                counter[0],
+                                target_binding,
+                                instruction,
+                                contact_route_policy,
+                                monitor,
+                                records,
+                                frames,
+                                planning_tracking={
+                                    "tracking_mode": (
+                                        "physical_mass_matrix_PD_tracking_of_"
+                                        "target_fixture_contact_RRT_path"
+                                    ),
+                                    "rrt_source_path_index": int(contact_path_index),
+                                    "rrt_reference_qpos_rad": contact_joint_target.tolist(),
+                                    "target_fixture_contact_permitted": True,
+                                    "object_or_robot_state_written_directly": False,
+                                    "safety_certified": False,
+                                },
+                                raise_on_done=False,
+                            )
+                            counter[0] += 1
+                            record_articulation_feedback(records[-1], frames[-1])
+                            if records[-1].get("done"):
+                                raise RuntimeError(
+                                    "environment_done_during_articulated_fixture_contact_RRT"
+                                )
+                            if contact_state["active"]:
+                                break
+                        if not contact_state["active"]:
+                            contact_endpoint = contact_qpath[-1]
+                            contact_endpoint_error = float("inf")
+                            for settle_index in range(13):
+                                latest = bridge.request({
+                                    "op": "observe", "include_snapshot_state": True,
+                                })
+                                actual_q = np.asarray(
+                                    latest["snapshot_state"]["robot_states"][0]["joint_qpos"],
+                                    dtype=np.float64,
+                                )
+                                contact_endpoint_error = float(np.linalg.norm(
+                                    actual_q - contact_endpoint
+                                ))
+                                if contact_endpoint_error <= 0.02:
+                                    break
+                                if settle_index == 12:
+                                    raise RuntimeError(
+                                        "articulated_fixture_contact_RRT_endpoint_tracking_error_exceeded:"
+                                        f"{contact_endpoint_error:.6f}rad"
+                                    )
+                                _record_joint_trajectory_step(
+                                    bridge,
+                                    contact_endpoint,
+                                    "articulated_fixture_contact_jointspace_RRT_settle",
+                                    "native_articulated_fixture_contact",
+                                    counter[0],
+                                    target_binding,
+                                    instruction,
+                                    contact_route_policy,
+                                    monitor,
+                                    records,
+                                    frames,
+                                    planning_tracking={
+                                        "tracking_mode": (
+                                            "physical_mass_matrix_PD_contact_RRT_endpoint_settle"
+                                        ),
+                                        "rrt_reference_qpos_rad": contact_endpoint.tolist(),
+                                        "measured_endpoint_error_before_action_l2_rad": (
+                                            contact_endpoint_error
+                                        ),
+                                        "target_fixture_contact_permitted": True,
+                                        "object_or_robot_state_written_directly": False,
+                                        "safety_certified": False,
+                                    },
+                                    raise_on_done=False,
+                                )
+                                counter[0] += 1
+                                record_articulation_feedback(records[-1], frames[-1])
+                                if records[-1].get("done"):
+                                    raise RuntimeError(
+                                        "environment_done_during_articulated_fixture_contact_settle"
+                                    )
+                                if contact_state["active"]:
+                                    break
+                            contact_route_tracking[
+                                "joint_path_endpoint_error_l2_rad"
+                            ] = contact_endpoint_error
+                        if not contact_state["active"]:
+                            contact_sync = bridge.request({
+                                "op": "sync_osc_controller_goal_to_live_state"
+                            })
+                            if (
+                                contact_sync.get("status") != "complete"
+                                or contact_sync.get("physical_state_unchanged") is not True
+                            ):
+                                raise RuntimeError(
+                                    "articulated_fixture_contact_RRT_OSC_handoff_sync_failed"
+                                )
+                            contact_route_tracking["post_jointspace_OSC_handoff_sync"] = (
+                                contact_sync
+                            )
+                    route_tracking["fixture_contact_jointspace_RRT"] = (
+                        contact_route_tracking
+                    )
     for waypoint_index, waypoint in enumerate(waypoints):
         if failure_reason is not None:
             break
@@ -5194,7 +6970,11 @@ def _run_articulated_fixture_goal(
         if not is_approach_waypoint and contact_phase_start_action is None:
             contact_phase_start_action = counter[0]
         if is_rrt_waypoint:
-            waypoint_phase = "RRT_low_precontact"
+            waypoint_phase = (
+                "RRT_historical_link6_contact_prepose"
+                if history_contact_recovery is not None
+                else "RRT_low_precontact"
+            )
             eef_outward_offset_m = None
             contact_point_index = 0
         elif is_slide_clearance_waypoint:
@@ -5210,7 +6990,8 @@ def _run_articulated_fixture_goal(
             waypoint_phase = "fixture_contact"
             eef_outward_offset_m = (
                 ARTICULATED_FIXTURE_SLIDE_CONTACT_OUTWARD_OFFSET_M
-                if joint_type == "slide" else 0.035
+                if joint_type == "slide" else
+                0.0 if history_contact_recovery is not None else 0.035
             )
             contact_point_index = waypoint_index - approach_route_waypoint_count
         target_position = np.asarray(waypoint[:3] if is_rrt_waypoint else waypoint, dtype=np.float64)
@@ -5219,10 +7000,14 @@ def _run_articulated_fixture_goal(
         )
         distance_to_articulation_path = float(np.min(np.linalg.norm(path - target_position, axis=1)))
         position_tolerance_m = (
-            ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M
-            if is_rrt_waypoint
-            and distance_to_articulation_path <= ARTICULATED_FIXTURE_CONTACT_TRACKING_REGION_M
-            else ARTICULATED_FIXTURE_ROUTE_POSITION_TOLERANCE_M
+            0.0008 if history_contact_recovery is not None and not is_rrt_waypoint
+            else 0.001 if near_contact_reacquisition
+            else (
+                ARTICULATED_FIXTURE_CONTACT_POSITION_TOLERANCE_M
+                if is_rrt_waypoint
+                and distance_to_articulation_path <= ARTICULATED_FIXTURE_CONTACT_TRACKING_REGION_M
+                else ARTICULATED_FIXTURE_ROUTE_POSITION_TOLERANCE_M
+            )
         )
         tracking = {
             "tracking_mode": (
@@ -5269,7 +7054,8 @@ def _run_articulated_fixture_goal(
 
         try:
             remaining_actions = (
-                ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET - counter[0] if is_approach_waypoint
+                ARTICULATED_FIXTURE_PRECONTACT_ACTION_BUDGET
+                - (counter[0] - approach_action_budget_start) if is_approach_waypoint
                 else ARTICULATED_FIXTURE_CONTACT_ACTION_BUDGET
                 - (counter[0] - int(contact_phase_start_action or 0))
             )
@@ -5289,6 +7075,7 @@ def _run_articulated_fixture_goal(
                 step_callback=record_articulation_feedback,
                 position_tolerance_m=position_tolerance_m,
                 target_pose_provider=route_target_provider,
+                target_pose_provider_requires_bilateral_grasp=False,
                 absolute_action_limit=ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
             )
         except Exception as exc:
@@ -5313,6 +7100,412 @@ def _run_articulated_fixture_goal(
             failed_waypoint_index = waypoint_index
             break
     if (
+        near_contact_reacquisition
+        and failure_reason is None
+        and contact_state["active"]
+        and contact_state["latest_context"].get("native_goal_value") is not True
+    ):
+        # The initial palm arc can reacquire the door at its narrow free edge.
+        # That edge's radial normal produces little moment about the hinge.
+        # Lift over the top edge, move inward along the door, rotate the tool
+        # normal to the broad face, and descend into a new physical contact.
+        last_robot = (
+            records[-1]["snapshot_state"]["robot_states"][0]
+            if records else current
+        )
+        current_context = contact_state["latest_context"]
+        fixture_id = str(articulation_context.get("fixture_id_from_active_BDDL", ""))
+        panel_axes = _articulated_fixture_hinge_panel_axes(current_context)
+        exact_panel_axes_available = panel_axes is not None
+        if panel_axes is not None:
+            radial_axis, panel_face_normal, panel_center_world = panel_axes
+        else:
+            radial_axis = np.asarray(
+                current_context.get("outward_direction_world", outward), dtype=np.float64,
+            )
+            panel_face_normal = np.cross(
+                np.asarray(current_context.get("joint_axis_world"), dtype=np.float64),
+                radial_axis,
+            )
+            panel_center_world = np.asarray(
+                current_context.get("joint_origin_world_m"), dtype=np.float64,
+            )
+        radial_norm = float(np.linalg.norm(radial_axis))
+        if radial_axis.shape != (3,) or not np.isfinite(radial_axis).all() or radial_norm <= 1e-12:
+            failure_reason = "RuntimeError: near_contact_surface_reseat_missing_radial_axis"
+        else:
+            radial_axis /= radial_norm
+            current_eef_position = np.asarray(last_robot["eef_pos"], dtype=np.float64)
+            current_eef_quaternion = np.asarray(last_robot["eef_quat"], dtype=np.float64)
+            face_outward = np.asarray(panel_face_normal, dtype=np.float64)
+            face_outward_norm = float(np.linalg.norm(face_outward))
+            if face_outward_norm <= 1e-10 or not np.isfinite(face_outward).all():
+                failure_reason = "RuntimeError: near_contact_surface_reseat_missing_face_normal"
+                face_quaternion = current_eef_quaternion
+            else:
+                face_outward /= face_outward_norm
+                if float(np.dot(face_outward, current_eef_position - panel_center_world)) < 0.0:
+                    face_outward *= -1.0
+                face_quaternion = _articulated_fixture_minimum_twist_press_quaternion(
+                    current_eef_quaternion, face_outward,
+                )
+            panel_top_world_m = max((
+                float(np.asarray(geom.get("center_world_m"), dtype=np.float64)[2])
+                + abs(float(np.asarray(geom.get("size_m"), dtype=np.float64)[2]))
+                for geom in articulation_context.get("selected_contact_geometries", [])
+                if geom.get("is_box") is True
+                and np.asarray(geom.get("center_world_m"), dtype=np.float64).shape == (3,)
+                and np.asarray(geom.get("size_m"), dtype=np.float64).shape == (3,)
+            ), default=float(current_eef_position[2]))
+            clearance_z = max(float(current_eef_position[2]) + 0.12, panel_top_world_m + 0.18)
+            lift_pose = np.r_[
+                np.asarray([current_eef_position[0], current_eef_position[1], clearance_z]),
+                current_eef_quaternion,
+            ]
+            radial_reseat_position = current_eef_position - 0.115 * radial_axis
+            radial_reseat_pose = np.r_[
+                np.asarray([radial_reseat_position[0], radial_reseat_position[1], clearance_z]),
+                current_eef_quaternion,
+            ]
+            from scipy.spatial.transform import Rotation
+
+            start_rotation = Rotation.from_quat(current_eef_quaternion[[1, 2, 3, 0]])
+            target_rotation = Rotation.from_quat(face_quaternion[[1, 2, 3, 0]])
+            rotation_delta = (start_rotation.inv() * target_rotation).as_rotvec()
+            orientation_stages = []
+            previous_quaternion = current_eef_quaternion.copy()
+            for rotation_index in range(1, 7):
+                stage_rotation = start_rotation * Rotation.from_rotvec(
+                    rotation_delta * (rotation_index / 6.0)
+                )
+                stage_xyzw = stage_rotation.as_quat()
+                stage_quaternion = stage_xyzw[[3, 0, 1, 2]]
+                if float(np.dot(stage_quaternion, previous_quaternion)) < 0.0:
+                    stage_quaternion = -stage_quaternion
+                previous_quaternion = stage_quaternion
+                orientation_stages.append((
+                    f"rotate_tool_broad_face_normal_segment_{rotation_index}_of_6",
+                    np.r_[radial_reseat_pose[:3], stage_quaternion],
+                ))
+            face_contact_height = (
+                float(panel_center_world[2] + 0.015)
+                if exact_panel_axes_available
+                else float(current_eef_position[2] - 0.050)
+            )
+            postrotation_radial_shift_m = 0.0
+            face_precontact_offset_m = 0.025
+            initial_contact_rows = (
+                records[-1].get("contacts", {}).get("contacts", [])
+                if records else initial_contact_report.get("contacts", [])
+            )
+            initial_fixture_contact = next((row for row in initial_contact_rows
+                if fixture_id in str(row.get("geom1", {}).get("name", ""))
+                + str(row.get("geom2", {}).get("name", ""))
+                and "gripper0" in str(row.get("geom1", {}).get("name", ""))
+                + str(row.get("geom2", {}).get("name", ""))), None)
+            reseat_tracking = {
+                "tracking_mode": "physical_lift_over_edge_radial_reposition_and_broad_face_recontact",
+                "fixture_id": fixture_id,
+                "source_contact_pairs": contact_state["contact_pairs"],
+                "measured_radial_axis_world": radial_axis.tolist(),
+                "measured_broad_face_outward_world": face_outward.tolist(),
+                "inward_reposition_distance_m": 0.115,
+                "postrotation_inward_shift_m": postrotation_radial_shift_m,
+                "contact_height_offset_m": float(face_contact_height - panel_center_world[2]),
+                "snapshot_contact_geometry_diagnostic": near_contact_geometry,
+                "clearance_height_world_m": clearance_z,
+                "face_contact_height_world_m": face_contact_height,
+                "contact_before_slide": initial_fixture_contact,
+                "stages": [],
+            }
+            reseat_stages = [
+                ("lift_clear_of_moving_fixture_edge", lift_pose),
+                ("move_inward_over_fixture_edge", radial_reseat_pose),
+                ("hold_radial_position_for_face_alignment", radial_reseat_pose),
+                *orientation_stages,
+                ("move_outward_to_face_precontact_high", radial_reseat_pose),
+                ("lower_to_face_precontact_height", radial_reseat_pose),
+                ("approach_broad_face_until_measured_contact", radial_reseat_pose),
+            ]
+            def verified_broad_face_contact():
+                if not contact_state["last_action_has_fixture_contact"]:
+                    return False
+                latest_axes = _articulated_fixture_hinge_panel_axes(
+                    contact_state["latest_context"],
+                )
+                radial = np.asarray(
+                    latest_axes[0] if latest_axes is not None else contact_state[
+                        "latest_context"
+                    ].get("outward_direction_world"), dtype=np.float64,
+                )
+                radial_norm = float(np.linalg.norm(radial))
+                if radial.shape != (3,) or not np.isfinite(radial).all() or radial_norm <= 1e-12:
+                    return False
+                radial /= radial_norm
+                for measurement in contact_state["latest_fixture_contact_measurements"]:
+                    normal = np.asarray(
+                        measurement.get("normal_geom1_to_geom2"), dtype=np.float64,
+                    )
+                    normal_norm = float(np.linalg.norm(normal))
+                    if normal.shape != (3,) or not np.isfinite(normal).all() or normal_norm <= 1e-12:
+                        continue
+                    normal /= normal_norm
+                    radial_alignment = abs(float(np.dot(normal, radial)))
+                    vertical_alignment = abs(float(normal[2]))
+                    if radial_alignment <= 0.60 and vertical_alignment <= 0.50:
+                        measurement["hinge_radial_normal_alignment"] = radial_alignment
+                        measurement["vertical_normal_alignment"] = vertical_alignment
+                        reseat_tracking["verified_broad_face_contact"] = measurement
+                        return True
+                return False
+
+            orientation_anchor_position = None
+            for stage_index, (stage_name, stage_pose) in enumerate(reseat_stages):
+                if failure_reason is not None:
+                    break
+                stage_target_pose_provider = None
+                if stage_name.startswith("rotate_tool_broad_face_normal_segment_"):
+                    measured_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                    if stage_name.endswith("segment_1_of_6"):
+                        # Recompute which side of the door the arm occupies
+                        # after the high-clearance radial move. The wrist can
+                        # shift to the opposite side while remaining collision
+                        # free above the panel, so the initial-side normal is
+                        # not reliable for face approach.
+                        measured_context = contact_state["latest_context"]
+                        measured_axes = _articulated_fixture_hinge_panel_axes(
+                            measured_context,
+                        )
+                        if measured_axes is not None:
+                            measured_radial, measured_face_outward, measured_panel_center = (
+                                measured_axes
+                            )
+                        else:
+                            measured_radial = np.asarray(
+                                measured_context.get("outward_direction_world"),
+                                dtype=np.float64,
+                            )
+                            measured_radial /= np.linalg.norm(measured_radial)
+                            measured_axis = np.asarray(
+                                measured_context.get("joint_axis_world"), dtype=np.float64,
+                            )
+                            measured_face_outward = np.cross(
+                                measured_axis, measured_radial,
+                            )
+                            measured_face_outward /= np.linalg.norm(measured_face_outward)
+                            measured_panel_center = np.asarray(
+                                measured_context.get("joint_origin_world_m"),
+                                dtype=np.float64,
+                            )
+                        measured_position = np.asarray(
+                            measured_robot["eef_pos"], dtype=np.float64,
+                        )
+                        if float(np.dot(
+                            measured_face_outward, measured_position - measured_panel_center,
+                        )) < 0.0:
+                            measured_face_outward *= -1.0
+                        face_outward = measured_face_outward
+                        face_quaternion = _articulated_fixture_minimum_twist_press_quaternion(
+                            np.asarray(measured_robot["eef_quat"], dtype=np.float64),
+                            face_outward,
+                        )
+                        from scipy.spatial.transform import Rotation
+
+                        measured_quaternion = np.asarray(
+                            measured_robot["eef_quat"], dtype=np.float64,
+                        )
+                        orientation_anchor_position = np.asarray(
+                            measured_robot["eef_pos"], dtype=np.float64,
+                        ).copy()
+                        rotation_start = Rotation.from_quat(
+                            measured_quaternion[[1, 2, 3, 0]],
+                        )
+                        rotation_goal = Rotation.from_quat(face_quaternion[[1, 2, 3, 0]])
+                        rotation_vector = (rotation_start.inv() * rotation_goal).as_rotvec()
+                        prior_quaternion = measured_quaternion.copy()
+                        for rotation_index in range(1, 7):
+                            rotation_stage = rotation_start * Rotation.from_rotvec(
+                                rotation_vector * (rotation_index / 6.0)
+                            )
+                            stage_xyzw = rotation_stage.as_quat()
+                            stage_quaternion = stage_xyzw[[3, 0, 1, 2]]
+                            if float(np.dot(stage_quaternion, prior_quaternion)) < 0.0:
+                                stage_quaternion *= -1.0
+                            prior_quaternion = stage_quaternion
+                            reseat_stages[stage_index + rotation_index - 1] = (
+                                f"rotate_tool_broad_face_normal_segment_{rotation_index}_of_6",
+                                np.r_[
+                                    np.asarray(measured_robot["eef_pos"], dtype=np.float64),
+                                    stage_quaternion,
+                                ],
+                            )
+                        reseat_tracking["measured_broad_face_outward_world"] = (
+                            face_outward.tolist()
+                        )
+                    stage_pose = reseat_stages[stage_index][1]
+                    stage_pose = np.r_[
+                        orientation_anchor_position,
+                        np.asarray(stage_pose[3:], dtype=np.float64),
+                    ]
+                    orientation_target_position = orientation_anchor_position.copy()
+                    orientation_target_quaternion = np.asarray(
+                        stage_pose[3:], dtype=np.float64,
+                    )
+
+                    def stage_target_pose_provider(snapshot_state):
+                        return (
+                            orientation_target_position,
+                            orientation_target_quaternion,
+                        )
+
+                    stage_target_pose_provider = stage_target_pose_provider
+                elif stage_name == "hold_radial_position_for_face_alignment":
+                    measured_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                    measured_position = np.asarray(
+                        measured_robot["eef_pos"], dtype=np.float64,
+                    ) - postrotation_radial_shift_m * radial_axis
+                    stage_pose = np.r_[
+                        measured_position,
+                        np.asarray(measured_robot["eef_quat"], dtype=np.float64),
+                    ]
+                elif stage_name == "move_outward_to_face_precontact_high":
+                    measured_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                    measured_position = (
+                        np.asarray(measured_robot["eef_pos"], dtype=np.float64)
+                        + face_precontact_offset_m * face_outward
+                    )
+                    stage_pose = np.r_[measured_position, face_quaternion]
+                elif stage_name == "lower_to_face_precontact_height":
+                    measured_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                    measured_position = np.asarray(
+                        measured_robot["eef_pos"], dtype=np.float64,
+                    )
+                    measured_position[2] = face_contact_height
+                    stage_pose = np.r_[measured_position, face_quaternion]
+                elif stage_name == "approach_broad_face_until_measured_contact":
+                    measured_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                    measured_contact_position = np.asarray(
+                        measured_robot["eef_pos"], dtype=np.float64,
+                    )
+                    measured_contact_position -= face_precontact_offset_m * face_outward
+                    measured_contact_position[2] = face_contact_height
+                    stage_pose = np.r_[measured_contact_position, face_quaternion]
+                    reseat_tracking["contact_target_pose_world"] = stage_pose.tolist()
+                try:
+                    remaining_reseat_actions = min(
+                        128 if stage_name == "lower_to_face_precontact_height" else 80,
+                        ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET - counter[0],
+                    )
+                    if remaining_reseat_actions <= 0:
+                        raise TimeoutError("articulated_fixture_surface_reseat_action_budget_exhausted")
+                    before_actions = counter[0]
+                    _advance_pose(
+                        bridge,
+                        np.asarray(stage_pose[:3], dtype=np.float64),
+                        np.asarray(stage_pose[3:], dtype=np.float64),
+                        f"articulated_fixture_close_{stage_name}",
+                        f"native_{predicate[0].lower()}_{predicate[1]}",
+                        counter,
+                        remaining_reseat_actions,
+                        target_binding,
+                        instruction,
+                        policy,
+                        monitor,
+                        records,
+                        frames,
+                        stop_condition=lambda: (
+                            contact_state["latest_context"].get("native_goal_value") is True
+                            or (
+                                stage_name == "approach_broad_face_until_measured_contact"
+                                and verified_broad_face_contact()
+                            )
+                        ),
+                        planning_tracking={
+                            **reseat_tracking,
+                            "surface_reseat_stage": stage_name,
+                            "target_pose_world": np.asarray(stage_pose).tolist(),
+                        },
+                        step_callback=record_articulation_feedback,
+                        position_tolerance_m=0.003,
+                        target_pose_provider=stage_target_pose_provider,
+                        target_pose_provider_requires_bilateral_grasp=False,
+                        absolute_action_limit=ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
+                    )
+                    reseat_tracking["stages"].append({
+                        "stage": stage_name,
+                        "actions": counter[0] - before_actions,
+                        "reached": True,
+                    })
+                except Exception as exc:
+                    reseat_tracking["stages"].append({
+                        "stage": stage_name,
+                        "actions": counter[0] - before_actions,
+                        "reached": False,
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                    })
+                    failure_reason = f"{type(exc).__name__}: {exc}"
+            final_contact_rows = (
+                records[-1].get("contacts", {}).get("contacts", [])
+                if records else initial_contact_report.get("contacts", [])
+            )
+            final_fixture_contacts = [row for row in final_contact_rows
+                if fixture_id in str(row.get("geom1", {}).get("name", ""))
+                + str(row.get("geom2", {}).get("name", ""))
+                and "gripper0" in str(row.get("geom1", {}).get("name", ""))
+                + str(row.get("geom2", {}).get("name", ""))]
+            reseat_tracking.update({
+                "actions_executed": sum(stage["actions"] for stage in reseat_tracking["stages"]),
+                "last_action_has_fixture_contact": contact_state[
+                    "last_action_has_fixture_contact"
+                ],
+                "contact_after_slide": final_fixture_contacts,
+                "latest_fixture_contact_measurements": contact_state[
+                    "latest_fixture_contact_measurements"
+                ],
+            })
+            contact_state["surface_reseat"] = reseat_tracking
+            if (
+                failure_reason is None
+                and not contact_state["last_action_has_fixture_contact"]
+                and contact_state["latest_context"].get("native_goal_value") is not True
+            ):
+                failure_reason = (
+                    "RuntimeError: near_contact_surface_reseat_lost_measured_fixture_contact"
+                )
+            if (
+                failure_reason is None
+                and contact_state["latest_context"].get("native_goal_value") is not True
+                and not verified_broad_face_contact()
+            ):
+                failure_reason = (
+                    "RuntimeError: near_contact_surface_reseat_did_not_measure_broad_face_contact"
+                )
+            if failure_reason is None and contact_state["latest_context"].get(
+                "native_goal_value"
+            ) is not True:
+                last_robot = records[-1]["snapshot_state"]["robot_states"][0]
+                current_context = contact_state["latest_context"]
+                # Count the close-follow budget from the newly measured broad
+                # face contact. Clearance moves and wrist alignment are setup
+                # actions; the overall 1000-action fixture cap still applies.
+                contact_phase_start_action = counter[0]
+                contact_state.update({
+                    "anchor_eef_position_world_m": last_robot["eef_pos"],
+                    "anchor_eef_quaternion_wxyz": last_robot["eef_quat"],
+                    "anchor_joint_position": current_context.get("joint", {}).get("position"),
+                    "anchor_joint_axis_world": current_context.get("joint_axis_world"),
+                    "anchor_joint_origin_world_m": current_context.get("joint_origin_world_m"),
+                })
+    if (
+        near_contact_reacquisition
+        and failure_reason is None
+        and not contact_state["active"]
+        and contact_state["latest_context"].get("native_goal_value") is not True
+    ):
+        failure_reason = (
+            "RuntimeError: near_snapshot_fixture_contact_reacquisition_did_not_measure_contact"
+        )
+    if (
         failure_reason is None
         and contact_state["active"]
         and contact_state["latest_context"].get("native_goal_value") is not True
@@ -5325,15 +7518,23 @@ def _run_articulated_fixture_goal(
         if remaining_contact_actions <= 0:
             failure_reason = "TimeoutError: articulated_fixture_control_action_budget_exhausted"
         else:
-            last_robot = records[-1]["snapshot_state"]["robot_states"][0]
+            last_robot = (
+                records[-1]["snapshot_state"]["robot_states"][0]
+                if records else current
+            )
             joint_type = str(joint.get("joint_type", "")).lower()
+            close_hinge_palm_follow = (
+                str(predicate[0]).lower() == "close" and joint_type == "hinge"
+            )
             follow_lead = {
                 "value": (
-                    ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD
+                    0.006 if close_hinge_palm_follow
+                    else ARTICULATED_FIXTURE_HINGE_FOLLOW_LEAD_RAD
                     if joint_type == "hinge" else ARTICULATED_FIXTURE_SLIDE_FOLLOW_LEAD_M
                 ),
                 "maximum": (
-                    ARTICULATED_FIXTURE_HINGE_FOLLOW_MAX_LEAD_RAD
+                    0.012 if close_hinge_palm_follow
+                    else ARTICULATED_FIXTURE_HINGE_FOLLOW_MAX_LEAD_RAD
                     if joint_type == "hinge" else 0.009
                 ),
             }
@@ -5358,7 +7559,10 @@ def _run_articulated_fixture_goal(
                         str(predicate[0]).lower() in {"turnon", "turnoff"}
                         or joint_type == "slide"
                     )
-                    else "neutral_hold"
+                    else (
+                        "open_finger_palm_follow_for_close_hinge"
+                        if close_hinge_palm_follow else "neutral_hold"
+                    )
                 ),
                 "gripper_action_command": (
                     ARTICULATED_FIXTURE_SWITCH_TURN_GRIPPER_ACTION
@@ -5447,6 +7651,7 @@ def _run_articulated_fixture_goal(
                         step_callback=record_articulation_feedback,
                         position_tolerance_m=ARTICULATED_FIXTURE_FOLLOW_POSITION_TOLERANCE_M,
                         target_pose_provider=live_articulation_target_provider,
+                        target_pose_provider_requires_bilateral_grasp=False,
                         gripper_action=follow_gripper_action,
                         absolute_action_limit=ARTICULATED_FIXTURE_TOTAL_ACTION_BUDGET,
                     )
@@ -5484,9 +7689,13 @@ def _run_articulated_fixture_goal(
                     no_joint_progress_chunks += 1
                 else:
                     no_joint_progress_chunks = 0
-                step = 0.015 if joint_type == "hinge" else 0.0015
+                step = (
+                    0.004 if close_hinge_palm_follow
+                    else 0.015 if joint_type == "hinge" else 0.0015
+                )
                 ramp_step = (
-                    ARTICULATED_FIXTURE_HINGE_FOLLOW_RAMP_STEP_RAD
+                    0.002 if close_hinge_palm_follow
+                    else ARTICULATED_FIXTURE_HINGE_FOLLOW_RAMP_STEP_RAD
                     if joint_type == "hinge"
                     else ARTICULATED_FIXTURE_SLIDE_FOLLOW_RAMP_STEP_M
                 )
@@ -5561,6 +7770,10 @@ def _run_articulated_fixture_goal(
             "contact_anchor_joint_origin_world_m": contact_state["anchor_joint_origin_world_m"],
             "contact_anchor_joint_position": contact_state["anchor_joint_position"],
             "contact_anchor_eef_position_world_m": contact_state["anchor_eef_position_world_m"],
+            "surface_reseat": contact_state.get("surface_reseat"),
+            "latest_fixture_contact_measurements": contact_state[
+                "latest_fixture_contact_measurements"
+            ],
             "follow_chunks": contact_state["follow_chunks"],
         },
         "native_goal_predicate": predicate,
@@ -5568,6 +7781,7 @@ def _run_articulated_fixture_goal(
         "native_task_success": final_native.get("task_success"),
         "final_native_task_status": final_native,
         "articulation_before": articulation_context,
+        "OSC_handoff_sync": osc_handoff,
         "articulation_after": articulation_after,
         "recorded_actions": len(records),
         "recorded_physics_substeps": int(sum(
@@ -5605,14 +7819,26 @@ def _native_place_single(
     native_region_transit_clearance_mode: str = "compiled_obstacle",
     native_region_transit_height_override_m: float | None = None,
     native_region_progress_max_step_m: float = 0.008,
+    native_region_in_transit_position_tolerance_m: float = 0.020,
     native_region_entry_mode: str = "over_rim",
     native_region_aperture_tilt_degrees: float = 0.0,
+    native_region_preserve_live_orientation: bool = False,
     native_region_entry_height_offset_m: float | None = None,
     native_region_pretransport_yaw_delta_degrees: float | None = None,
+    native_region_goal_local_offset_m: tuple[float, float, float] | None = None,
     continue_horizontal_aperture_alignment: bool = False,
+    native_rrt_execution_mode: str = "eef_osc",
 ) -> dict[str, Any]:
     if not isinstance(continue_horizontal_aperture_alignment, bool):
         raise ValueError("continue_horizontal_aperture_alignment_must_be_boolean")
+    if not isinstance(native_region_preserve_live_orientation, bool):
+        raise ValueError("native_region_preserve_live_orientation_must_be_boolean")
+    if native_region_preserve_live_orientation and native_region_entry_mode != "horizontal_aperture":
+        raise ValueError("native_region_preserve_live_orientation_requires_horizontal_aperture")
+    if native_region_preserve_live_orientation and native_region_aperture_tilt_degrees != 0.0:
+        raise ValueError("native_region_preserve_live_orientation_cannot_reapply_aperture_tilt")
+    if native_rrt_execution_mode not in {"eef_osc", "joint_space_pd"}:
+        raise ValueError("native_rrt_execution_mode_must_be_eef_osc_or_joint_space_pd")
     if (
         isinstance(native_region_progress_max_step_m, bool)
         or not isinstance(native_region_progress_max_step_m, (int, float))
@@ -5634,6 +7860,16 @@ def _native_place_single(
         or not -180.0 <= float(native_region_pretransport_yaw_delta_degrees) <= 180.0
     ):
         raise ValueError("native_region_pretransport_yaw_delta_degrees_must_be_in_minus180_to_180")
+    if native_region_goal_local_offset_m is not None:
+        goal_local_offset = np.asarray(native_region_goal_local_offset_m, dtype=np.float64)
+        if (
+            goal_local_offset.shape != (3,)
+            or not np.isfinite(goal_local_offset).all()
+            or str(predicate[0]).lower() != "in"
+        ):
+            raise ValueError("native_region_goal_local_offset_requires_finite_xyz_for_in_predicate")
+    else:
+        goal_local_offset = None
     if native_region_entry_mode not in {"over_rim", "horizontal_aperture"}:
         raise ValueError("native_region_entry_mode_must_be_over_rim_or_horizontal_aperture")
     if (
@@ -5665,6 +7901,7 @@ def _native_place_single(
     from research.gs_opd.repair.task_success_first_grasp_search import (
         _advance_pose,
         _compress_eef_route,
+        _record_joint_trajectory_step,
         _record_step,
         _snapshot_state_vector,
         _state_sha,
@@ -5710,6 +7947,25 @@ def _native_place_single(
     else:
         goal_object[:3, :3] = np.asarray(placement_candidate["rotation_world"], dtype=np.float64)
         goal_object[:3, 3] = np.asarray(placement_candidate["position_world_m"], dtype=np.float64)
+    if goal_local_offset is not None:
+        placement_candidate = dict(placement_candidate or {})
+        nominal_position = goal_object[:3, 3].copy()
+        region_position = np.asarray(region["site_position_world_m"], dtype=np.float64)
+        region_rotation = np.asarray(region["site_rotation_world"], dtype=np.float64)
+        if (
+            region_position.shape != (3,)
+            or region_rotation.shape != (3, 3)
+            or not np.isfinite(region_position).all()
+            or not np.isfinite(region_rotation).all()
+        ):
+            raise ValueError("native_region_goal_local_offset_requires_valid_region_pose")
+        goal_object[:3, 3] = nominal_position + region_rotation @ goal_local_offset
+        placement_candidate["nominal_position_world_m"] = nominal_position.tolist()
+        placement_candidate["position_world_m"] = goal_object[:3, 3].tolist()
+        placement_candidate["goal_local_offset_m"] = goal_local_offset.tolist()
+        placement_candidate["goal_position_region_local_m"] = (
+            region_rotation.T @ (goal_object[:3, 3] - region_position)
+        ).tolist()
     goal_eef = goal_object @ object_to_eef
     near_goal_release_probe = None
     release_probe_alignment = None
@@ -5749,12 +8005,82 @@ def _native_place_single(
                     and np.all(current_geometry_lower >= -region_size[:2] - 0.015)
                     and np.all(current_geometry_upper <= region_size[:2] + 0.015)
                 )
+                # A tipped or moving basket can leave a held object touching its
+                # rim while its root is just outside the static local XY test.
+                # Permit a real gravity-drop probe only when live MuJoCo contact
+                # confirms object-to-container contact and the measured
+                # world-gravity ray intersects the native BDDL box (with a small
+                # geometry tolerance). This never declares success: opening the
+                # gripper and settling are physical actions, and native BDDL is
+                # still queried afterward.
+                target_region_name = str(predicate[-1])
+                target_fixture_name = target_region_name
+                for suffix in (
+                    "_heating_region", "_back_contain_region",
+                    "_front_contain_region", "_contain_region",
+                ):
+                    if target_fixture_name.endswith(suffix):
+                        target_fixture_name = target_fixture_name[:-len(suffix)]
+                        break
+                live_contact_report = bridge.request({"op": "inspect_contacts"})
+                target_body_id = int(target_binding.get("body_id", -1))
+                fixture_contact_pairs = []
+                for contact in live_contact_report.get("contacts", []):
+                    body1 = contact.get("body1", {})
+                    body2 = contact.get("body2", {})
+                    body1_id = int(body1.get("id", -1))
+                    body2_id = int(body2.get("id", -1))
+                    body1_name = str(body1.get("name", ""))
+                    body2_name = str(body2.get("name", ""))
+                    if (
+                        body1_id == target_body_id
+                        and target_fixture_name in body2_name
+                    ) or (
+                        body2_id == target_body_id
+                        and target_fixture_name in body1_name
+                    ):
+                        fixture_contact_pairs.append({
+                            "body1": body1,
+                            "body2": body2,
+                            "signed_contact_distance_m": contact.get(
+                                "signed_contact_distance_m"
+                            ),
+                        })
+                gravity_projection_tolerance_m = 0.012
+                gravity_drop_projection = None
+                gravity_local_direction = region_rotation.T @ np.asarray(
+                    [0.0, 0.0, -1.0], dtype=np.float64,
+                )
+                if region_size.shape == (3,) and np.isfinite(current_local).all():
+                    for drop_distance_m in np.linspace(0.0, 0.30, 151):
+                        projected_local = (
+                            current_local + gravity_local_direction * float(drop_distance_m)
+                        )
+                        excess = np.maximum(
+                            np.abs(projected_local) - region_size, 0.0,
+                        )
+                        if float(np.max(excess)) <= gravity_projection_tolerance_m:
+                            gravity_drop_projection = {
+                                "drop_distance_world_m": float(drop_distance_m),
+                                "projected_root_position_region_local_m": projected_local.tolist(),
+                                "maximum_axis_excess_m": float(np.max(excess)),
+                            }
+                            break
+                contact_supported_gravity_drop = bool(
+                    fixture_contact_pairs and gravity_drop_projection is not None
+                )
                 release_probe_alignment = {
                     "status": "eligible" if (
-                        0.0 < vertical_drop <= configured_probe_max_error
-                        and root_center_within_region
+                        (
+                            0.0 < vertical_drop <= configured_probe_max_error
+                            and root_center_within_region
+                        ) or contact_supported_gravity_drop
                     ) else "not_eligible",
-                    "basis": "live object root center projected into native In site; Stage A physical drop permits collisions",
+                    "basis": (
+                        "live target-container contact plus measured world-gravity projection through native In box"
+                        if contact_supported_gravity_drop else
+                        "live object root center projected into native In site; Stage A physical drop permits collisions"
+                    ),
                     "native_region_site_position_world_m": region_position.tolist(),
                     "native_region_site_rotation_world": region_rotation.tolist(),
                     "native_region_half_extents_m": region_size.tolist(),
@@ -5775,6 +8101,12 @@ def _native_place_single(
                     "root_center_within_native_region_xy": root_center_within_region,
                     "footprint_within_aperture_with_15mm_tolerance": footprint_within_aperture,
                     "footprint_gate_is_safety_only_and_not_used_in_stage_a": True,
+                    "target_fixture_body_name": target_fixture_name,
+                    "live_target_fixture_contact_pairs": fixture_contact_pairs,
+                    "gravity_local_direction": gravity_local_direction.tolist(),
+                    "gravity_projection_tolerance_m": gravity_projection_tolerance_m,
+                    "contact_supported_gravity_drop_eligible": contact_supported_gravity_drop,
+                    "gravity_drop_projection": gravity_drop_projection,
                     "direct_state_write": False,
                     "native_BDDL_success_still_required": True,
                 }
@@ -5809,7 +8141,10 @@ def _native_place_single(
             if release_probe_alignment is not None:
                 near_goal_release_probe["aperture_alignment"] = release_probe_alignment
                 near_goal_release_probe["probe_mode"] = (
-                    "gravity_drop_inside_native_In_aperture"
+                    "contact_supported_gravity_projection"
+                    if release_probe_alignment.get(
+                        "contact_supported_gravity_drop_eligible"
+                    ) is True else "gravity_drop_inside_native_In_aperture"
                     if release_probe_alignment.get("status") == "eligible"
                     else "euclidean_near_goal"
                 )
@@ -6052,6 +8387,90 @@ def _native_place_single(
         if route_strategy == "jointspace_rrt":
             planned["planning_mode"] = "stage_a_full_geometry_RRT_contact_diagnostics_without_collision_rejection"
             planned["safety_certified"] = False
+            if (
+                planned.get("status") == "no_safe_path"
+                and planned.get("failure_reason") == "planning_time_budget_exhausted"
+                and planning_policy.get("carried_object") is not None
+            ):
+                # Stage A accepts contact and records it in physical MuJoCo
+                # execution. If the carried-object envelope makes a bounded
+                # full-geometry RRT time out before finding a route, retry once
+                # with the same robot geometry and goal while leaving carried
+                # object interactions to the physical controller and substep
+                # audit. This is a planner-cost fallback, never a success or
+                # safety claim.
+                first_attempt = {
+                    "status": planned.get("status"),
+                    "failure_reason": planned.get("failure_reason"),
+                    "planning_seconds": planned.get("planning_seconds"),
+                    "iterations": planned.get("iterations"),
+                    "configuration_checks": planned.get("configuration_checks"),
+                    "planning_mode": planned.get("planning_mode"),
+                    "carried_object_geometry_included": True,
+                    "physical_actions": 0,
+                }
+                before_fallback = bridge.request({
+                    "op": "observe", "include_snapshot_state": True,
+                })
+                before_fallback_sha = _state_sha(
+                    _snapshot_state_vector(before_fallback.get("snapshot_state", {}))
+                )
+                first_verification = _verify_planner_live_state(
+                    planned, before_fallback_sha, state_sha,
+                )
+                if not first_verification["live_state_unchanged"]:
+                    raise RuntimeError(
+                        "native_goal_transport_full_geometry_RRT_changed_live_integration_state"
+                    )
+                robot_only_policy = copy.deepcopy(planning_policy)
+                robot_only_policy.pop("carried_object", None)
+                robot_only_policy["source"] = (
+                    f"{planning_policy.get('source', 'active_verified_geometry')}:"
+                    "stage_a_robot_geometry_only_RRT_object_contacts_deferred_to_physics"
+                )
+                robot_only = bridge.request({
+                    "op": "rrt_connect",
+                    "expected_instruction": instruction,
+                    "model_geometry_sha256": model_sha,
+                    "start_state_sha256": state_sha,
+                    "goal_pose_world": {
+                        "position_world_m": rrt_goal_eef[:3, 3].tolist(),
+                        "quaternion_wxyz": _wxyz(rrt_goal_eef[:3, :3]).tolist(),
+                    },
+                    "safety_geometry_policy": robot_only_policy,
+                    "planner_config": {
+                        "step_rad": 0.22, "connect_max_steps": 20, "goal_bias": 0.15,
+                        "max_iterations": NATIVE_PLACEMENT_RRT_MAX_ITERATIONS,
+                        "max_config_checks": NATIVE_PLACEMENT_RRT_MAX_CONFIG_CHECKS,
+                        "max_candidate_routes": 2,
+                        "search_time_budget_s": rrt_time_budget_s,
+                        "shortcut_attempts": 24, "minimum_clearance_m": 0.0,
+                        "start_joint_limit_tolerance_rad": 0.001,
+                        "require_safe_configurations": False, "seed": 74104,
+                    },
+                    "ik_seed_qpos": _placement_ik_seed_portfolio(robot),
+                })
+                planned = dict(robot_only)
+                planned["planning_mode"] = (
+                    "stage_a_robot_geometry_RRT_object_contacts_deferred_to_physics"
+                )
+                planned["carried_object_geometry_included"] = False
+                planned["safety_certified"] = False
+                planned["stage_a_planning_attempts"] = [
+                    first_attempt,
+                    {
+                        "status": robot_only.get("status"),
+                        "failure_reason": robot_only.get("failure_reason"),
+                        "planning_seconds": robot_only.get("planning_seconds"),
+                        "iterations": robot_only.get("iterations"),
+                        "configuration_checks": robot_only.get("config_checks"),
+                        "planning_mode": planned["planning_mode"],
+                        "carried_object_geometry_included": False,
+                        "object_contacts_deferred_to_real_MuJoCo_execution": True,
+                        "seed": 74104,
+                        "physical_actions": 0,
+                    },
+                ]
     planned["goal_role"] = rrt_goal_role
     planned["route_strategy"] = route_strategy
     planner_state_verification = {"status": "not_required_resume_at_release", "live_state_unchanged": True}
@@ -6093,12 +8512,29 @@ def _native_place_single(
             "planner_source": planned.get("planner_source"),
             "planner_mode": planned.get("planning_mode"),
             "collision_constraint": (
+                "full robot geometry checked for diagnostics; carried-object "
+                "geometry omitted after full-geometry RRT budget exhaustion; "
+                "object contacts are deferred to real MuJoCo execution"
+                if planned.get("planning_mode") == (
+                    "stage_a_robot_geometry_RRT_object_contacts_deferred_to_physics"
+                )
+                else
                 "full robot and carried-object geometry checked for diagnostics; "
                 "Stage A route search does not reject collision configurations; "
                 "real MuJoCo contact substeps remain recorded"
             ),
+            "carried_object_geometry_included": bool(
+                planned.get("planning_mode") != (
+                    "stage_a_robot_geometry_RRT_object_contacts_deferred_to_physics"
+                )
+            ),
             "qpos_path_rad": planned.get("qpos_path"),
             "eef_reference_poses_world": planned.get("eef_reference_poses_world"),
+            "execution_policy": (
+                "measured_joint_space_mass_matrix_PD_torque_tracking"
+                if native_rrt_execution_mode == "joint_space_pd"
+                else "native_OSC_feedback_tracking_of_dense_RRT_EEF_references"
+            ),
             "planning_seconds": planned.get("planning_seconds"),
             "configuration_checks": planned.get("config_checks"),
             "iterations": planned.get("iterations"),
@@ -6300,7 +8736,11 @@ def _native_place_single(
         route = np.asarray(planned.get("eef_reference_poses_world"), dtype=np.float64)
         if route.ndim != 2 or route.shape[1:] != (7,) or not np.isfinite(route).all():
             raise RuntimeError("collision_aware_RRT_returned_an_invalid_EEF_reference_path")
-        transport_route_source = "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC"
+        transport_route_source = (
+            "MuJoCo_7D_RRT_joint_qpos_path_tracked_by_mass_matrix_PD_torque"
+            if native_rrt_execution_mode == "joint_space_pd"
+            else "MuJoCo_7D_RRT_full_geometry_EEF_path_tracked_by_native_OSC"
+        )
     elif route_strategy == "elevated_osc_waypoints":
         start_pose = np.r_[robot["eef_pos"], _wxyz(eef_world[:3, :3])]
         vertically_lifted = start_pose.copy()
@@ -6595,6 +9035,61 @@ def _native_place_single(
                         "ranked_layout_preserved_because_live_start_is_exterior": candidate_is_exterior,
                         "physical_entry_direction_is_a_hypothesis_not_a_safety_certificate": True,
                     }
+            # The target fixture is intentionally excluded from the carried
+            # object's obstacle-envelope list above, so a small movable
+            # container may leave `fixture` unset.  In that case a ranked
+            # aperture direction can point from the live object back toward
+            # the object, rather than from the live exterior into the region.
+            # That reverses the measured hand-clearance waypoint and pushes
+            # the grasp through the basket wall.  When the live start projects
+            # decisively behind the ranked exterior side, flip only that
+            # unverified layout direction; measured contact normals and a
+            # valid fixture-derived direction retain priority.
+            if (
+                route_entry_direction is not None
+                and candidate_exterior_projection_m is not None
+                and candidate_exterior_projection_m <= -0.04
+                and aperture_entry_direction_selection.get("source")
+                    == "ranked_native_region_layout"
+            ):
+                original_direction = route_entry_direction.copy()
+                route_entry_direction = -route_entry_direction
+                candidate_exterior_projection_m = -candidate_exterior_projection_m
+                candidate_is_exterior = candidate_exterior_projection_m >= 0.06
+                aperture_entry_direction_selection = {
+                    **aperture_entry_direction_selection,
+                    "source": "ranked_layout_flipped_to_keep_live_start_exterior",
+                    "original_inward_direction_world": original_direction.tolist(),
+                    "original_exterior_projection_m": -candidate_exterior_projection_m,
+                    "inward_direction_world": route_entry_direction.tolist(),
+                    "ranked_layout_exterior_projection_m": candidate_exterior_projection_m,
+                    "direction_flipped_because_live_start_was_on_wrong_side": True,
+                    "physical_entry_direction_is_a_hypothesis_not_a_safety_certificate": True,
+                }
+            if target_region_fixture_id:
+                door_context = bridge.request({
+                    "op": "task_success_first_articulation_context",
+                    "expected_instruction": instruction,
+                    "predicate": ["close", target_region_fixture_id],
+                })
+                door_aperture = door_context.get("closed_door_aperture")
+                if (door_context.get("status") == "complete"
+                        and door_context.get("read_only") is True
+                        and isinstance(door_aperture, dict)):
+                    door_inward = np.asarray(door_aperture.get("inward_direction_world"), dtype=np.float64)
+                    if door_inward.shape == (3,) and np.isfinite(door_inward).all():
+                        route_entry_direction = door_inward / np.linalg.norm(door_inward)
+                        aperture_fixture_object_id = target_region_fixture_id
+                        candidate_exterior_projection_m = float(np.dot(
+                            object_world[:3, 3] - goal_object[:3, 3], -route_entry_direction,
+                        ))
+                        candidate_is_exterior = candidate_exterior_projection_m >= 0.06
+                        aperture_entry_direction_selection = {
+                            **door_aperture,
+                            "fixture_object_id": target_region_fixture_id,
+                            "overrides_open_door_envelope_and_contact_side_heuristics": True,
+                            "physical_entry_direction_is_a_hypothesis_not_a_safety_certificate": True,
+                        }
             aperture_entry_direction_selection.update({
                 "ranked_layout_exterior_projection_m": candidate_exterior_projection_m,
                 "ranked_layout_preserved_because_live_start_is_exterior": candidate_is_exterior,
@@ -6713,6 +9208,43 @@ def _native_place_single(
                 "native_BDDL_remains_success_oracle": True,
             }
         route_region_rotation = np.asarray(region["site_rotation_world"], dtype=np.float64)
+        live_orientation_preservation = None
+        if native_region_preserve_live_orientation:
+            previous_rotation = goal_object[:3, :3].copy()
+            live_rotation = object_world[:3, :3].copy()
+            goal_object[:3, :3] = live_rotation
+            live_lower, live_upper = _placement_collision_bounds_in_region(
+                target_context, route_region_rotation, live_rotation,
+            )
+            region_position = np.asarray(
+                region["site_position_world_m"], dtype=np.float64,
+            )
+            region_size = np.asarray(region["site_size_m"], dtype=np.float64)
+            live_local_position = route_region_rotation.T @ (
+                goal_object[:3, 3] - region_position
+            )
+            support_local_z = (
+                -float(np.sign(route_region_rotation[2, 2])) * float(region_size[2])
+            )
+            live_local_position[2] = support_local_z - float(live_lower[2])
+            goal_object[:3, 3] = (
+                region_position + route_region_rotation @ live_local_position
+            )
+            live_orientation_preservation = {
+                "status": "preserved_exact_live_held_object_orientation_for_horizontal_entry",
+                "source": "identity_verified_runtime_snapshot_live_MuJoCo_pose",
+                "live_object_rotation_world": live_rotation.tolist(),
+                "discarded_candidate_rotation_world": previous_rotation.tolist(),
+                "recomputed_native_support_root_position_world_m": goal_object[:3, 3].tolist(),
+                "collision_bounds_in_region_local_m": {
+                    "lower": live_lower.tolist(),
+                    "upper": live_upper.tolist(),
+                },
+                "candidate_ik_preflight_used_original_candidate_orientation": True,
+                "physical_state_written_directly": False,
+                "native_BDDL_remains_success_oracle": True,
+            }
+        route_region_rotation = np.asarray(region["site_rotation_world"], dtype=np.float64)
         route_goal_object = goal_object.copy()
         aperture_tilt_report = None
         route_obstacle_clearance_height = obstacle_clearance.get(
@@ -6756,6 +9288,7 @@ def _native_place_single(
             )
         horizontal_entry_height_offset = None
         contact_derived_entry_height_clearance_m = 0.0
+        surface_slide_palm_descent_deferred = False
         if native_region_entry_mode == "horizontal_aperture":
             # Place the object at its exact native support height before sliding
             # through a low front aperture. A positive clearance lift makes the
@@ -7091,20 +9624,71 @@ def _native_place_single(
                                 for row in robot_contact_rows
                             ) + 0.025 + measured_rotation_sweep_m),
                         )
-                        robot_escape_object = route_start_object.copy()
-                        robot_escape_object[:3, 3] += (
-                            aperture_outward * aperture_hand_extension_m
+                        # The wrist can be wedged against a tilted basket rim
+                        # even when the measured horizontal outward vector is
+                        # correct.  A same-height lateral move then drives the
+                        # held object into the wall and the contact normal
+                        # pushes it back toward the region.  Lift the verified
+                        # grasp above the observed rim first, then perform the
+                        # measured outward translation as a second real
+                        # waypoint.  Both poses are tracked through MuJoCo;
+                        # native BDDL remains the only success oracle.
+                        # Microwave contact evidence can place Panda link5/6
+                        # underneath the fixed upper panel.  A 60 mm lift
+                        # left those links in contact in the L2T4 physical
+                        # trace, so give measured horizontal-aperture fixture
+                        # contacts at least 120 mm of real OSC clearance before
+                        # the outward escape.  Cap the contact-derived request
+                        # to keep this Stage A recovery bounded; MuJoCo still
+                        # decides whether the robot can physically clear it.
+                        measured_fixture_contact_height_m = max(
+                            float(row["contact_position_world_m"][2])
+                            for row in robot_contact_rows
                         )
+                        robot_fixture_vertical_clearance_m = float(np.clip(
+                            max(
+                                0.12,
+                                measured_fixture_contact_height_m
+                                - float(robot["eef_pos"][2]) + 0.08,
+                            ),
+                            0.12,
+                            0.18,
+                        ))
+                        # Once the held object and wrist are lifted above the
+                        # measured panel contact, the old contact-point lever
+                        # arm no longer implies that the whole mug must travel
+                        # another 18–24 cm outward.  That target was outside
+                        # the Panda's reachable workspace in the L2T4 trace.
+                        # Keep a short real horizontal separation after the
+                        # vertical clearance, then let MuJoCo determine whether
+                        # the subsequent exterior descent and insertion clear
+                        # the panel.
+                        aperture_hand_extension_m = min(
+                            aperture_hand_extension_m, 0.10,
+                        )
+                        robot_fixture_lifted_object = route_start_object.copy()
+                        robot_fixture_lifted_object[2, 3] += (
+                            robot_fixture_vertical_clearance_m
+                        )
+                        robot_escape_object = robot_fixture_lifted_object.copy()
+                        robot_escape_object[:3, 3] += aperture_outward * aperture_hand_extension_m
                         route_start_object = robot_escape_object
-                        robot_contact_escape_waypoints = [{
-                            "object_pose_world": robot_escape_object.tolist(),
-                            "role": "robot_fixture_aperture_outward_escape",
-                        }]
+                        robot_contact_escape_waypoints = [
+                            {
+                                "object_pose_world": robot_fixture_lifted_object.tolist(),
+                                "role": "robot_fixture_aperture_vertical_clearance",
+                            },
+                            {
+                                "object_pose_world": robot_escape_object.tolist(),
+                                "role": "robot_fixture_aperture_outward_escape",
+                            },
+                        ]
                         robot_contact_escape = {
-                            "status": "measured_panda_palm_aperture_escape_scheduled",
+                            "status": "vertical_clearance_then_measured_panda_palm_aperture_escape_scheduled",
                             "fixture_object_id": aperture_fixture_object_id,
                             "outward_direction_world": aperture_outward.tolist(),
                             "measured_hand_extension_m": aperture_hand_extension_m,
+                            "vertical_clearance_before_outward_m": robot_fixture_vertical_clearance_m,
                             "margin_m": 0.025,
                             "planned_rotation_sweep_into_aperture_m": (
                                 measured_rotation_sweep_m
@@ -7213,34 +9797,70 @@ def _native_place_single(
                                     "inward_projection_from_EEF_m": inward_extension,
                                 })
                     if robot_contact_rows:
-                        aperture_hand_extension_m = min(
-                            0.18,
-                            max(0.06, max(
-                                row["inward_projection_from_EEF_m"]
-                                for row in robot_contact_rows
-                            ) + 0.025),
+                        contact_height_above_eef_m = max(
+                            float(row["contact_position_world_m"][2])
+                            - float(robot["eef_pos"][2])
+                            for row in robot_contact_rows
                         )
-                        robot_escape_object = object_world.copy()
-                        robot_escape_object[:3, 3] += (
-                            aperture_outward * aperture_hand_extension_m
+                        surface_slide_palm_descent_deferred = bool(
+                            native_region_transit_clearance_mode == "surface_slide"
+                            and candidate_is_exterior
+                            and contact_height_above_eef_m >= 0.04
                         )
-                        route_start_object = robot_escape_object
-                        robot_contact_escape_waypoints = [{
-                            "object_pose_world": robot_escape_object.tolist(),
-                            "role": "robot_fixture_aperture_outward_escape",
-                        }]
-                        robot_contact_escape = {
-                            "status": "measured_panda_palm_aperture_escape_scheduled",
-                            "fixture_object_id": robot_contact_fixture_id,
-                            "outward_direction_world": aperture_outward.tolist(),
-                            "measured_hand_extension_m": aperture_hand_extension_m,
-                            "margin_m": 0.025,
-                            "live_robot_fixture_contacts": robot_contact_rows,
-                            "route_uses_real_OSC_MuJoCo_actions": True,
-                            "object_or_robot_state_written_directly": False,
-                            "safety_certified": False,
-                        }
-                        aperture_start_contact_free = True
+                        if surface_slide_palm_descent_deferred:
+                            # In this measured state, the mug already begins
+                            # outside the microwave aperture, while the live
+                            # link6 contact is well above the EEF. A long
+                            # outward object translation would drive the grasp
+                            # beyond the reachable workspace before the planned
+                            # surface descent can happen. Keep the exact live
+                            # object pose as the route start and let the first
+                            # real surface-slide descent test whether lowering
+                            # clears the upper-panel contact. MuJoCo contact,
+                            # support evidence, and native BDDL remain the
+                            # physical acceptance criteria.
+                            robot_contact_escape = {
+                                "status": "surface_slide_descent_before_high_palm_escape",
+                                "fixture_object_id": robot_contact_fixture_id,
+                                "contact_height_above_eef_m": contact_height_above_eef_m,
+                                "start_is_exterior_to_aperture": candidate_is_exterior,
+                                "outward_escape_waypoint_scheduled": False,
+                                "live_robot_fixture_contacts": robot_contact_rows,
+                                "next_action": "real_surface_slide_descent_at_live_xy",
+                                "route_uses_real_OSC_MuJoCo_actions": True,
+                                "object_or_robot_state_written_directly": False,
+                                "safety_certified": False,
+                            }
+                            aperture_start_contact_free = False
+                        else:
+                            aperture_hand_extension_m = min(
+                                0.18,
+                                max(0.06, max(
+                                    row["inward_projection_from_EEF_m"]
+                                    for row in robot_contact_rows
+                                ) + 0.025),
+                            )
+                            robot_escape_object = object_world.copy()
+                            robot_escape_object[:3, 3] += (
+                                aperture_outward * aperture_hand_extension_m
+                            )
+                            route_start_object = robot_escape_object
+                            robot_contact_escape_waypoints = [{
+                                "object_pose_world": robot_escape_object.tolist(),
+                                "role": "robot_fixture_aperture_outward_escape",
+                            }]
+                            robot_contact_escape = {
+                                "status": "measured_panda_palm_aperture_escape_scheduled",
+                                "fixture_object_id": robot_contact_fixture_id,
+                                "outward_direction_world": aperture_outward.tolist(),
+                                "measured_hand_extension_m": aperture_hand_extension_m,
+                                "margin_m": 0.025,
+                                "live_robot_fixture_contacts": robot_contact_rows,
+                                "route_uses_real_OSC_MuJoCo_actions": True,
+                                "object_or_robot_state_written_directly": False,
+                                "safety_certified": False,
+                            }
+                            aperture_start_contact_free = True
                     else:
                         object_environment_contacts = [
                             name for name in other_contact_geometries
@@ -7257,6 +9877,7 @@ def _native_place_single(
             predicate[0].lower() in {"in", "on"}
             and not robot_contact_escape_waypoints
             and not contact_escape_waypoints
+            and not surface_slide_palm_descent_deferred
         ):
             # Container-specific aperture escape logic above is not enough
             # for an open-top/over-rim route: a wrist link may already be
@@ -7473,6 +10094,9 @@ def _native_place_single(
                 and requested_transit_clearance_mode != "low_clearance"
             ),
             "aperture_start_contact_free": aperture_start_contact_free,
+            "allow_surface_slide_descent_with_live_palm_contact": (
+                surface_slide_palm_descent_deferred
+            ),
         }
         region_progress_route = _native_region_progress_route(
             route_start_object, route_goal_object, region=region,
@@ -7568,13 +10192,19 @@ def _native_place_single(
                     live_height_error <= 0.025
                     and live_rotation_error <= 0.12
                     and live_xy_distance <= 0.50
+                    and not contact_escape_waypoints
+                    and not robot_contact_escape_waypoints
+                    and not surface_slide_palm_descent_deferred
                 ):
                     # A prior legal physical branch already carried the mug to
                     # the low exterior entry pose. Continue from that exact
                     # held-object state instead of repeating outward escape,
-                    # clearance lift, and descent. Stage A permits fixture
-                    # contact; MuJoCo collision response and native BDDL remain
-                    # the physical and task-success authorities.
+                    # clearance lift, and descent. Preserve any measured live
+                    # object/robot fixture-contact escape scheduled above: a
+                    # pose near the entry is not a valid continuation point
+                    # while the wrist is physically wedged against the rim.
+                    # MuJoCo collision response and native BDDL remain the
+                    # physical and task-success authorities.
                     region_progress_route["waypoints"] = [
                         alignment_waypoint, placement_waypoint,
                     ]
@@ -7602,6 +10232,8 @@ def _native_place_single(
             aperture_tilt_report["original_goal_object_world_pose"] = goal_object.tolist()
             aperture_tilt_report["aperture_goal_object_world_pose"] = route_goal_object.tolist()
             region_progress_route["aperture_posture"] = aperture_tilt_report
+        if live_orientation_preservation is not None:
+            region_progress_route["live_orientation_preservation"] = live_orientation_preservation
         region_progress_route["aperture_entry_direction_selection"] = aperture_entry_direction_selection
         region_progress_route["obstacle_aware_entry_staging"] = obstacle_aware_entry_staging
         region_progress_route["compiled_obstacle_clearance"] = obstacle_clearance
@@ -7785,6 +10417,12 @@ def _native_place_single(
                     waypoint_row["object_pose_world"], dtype=np.float64,
                 ).copy()
                 role = str(waypoint_row["role"])
+                staged_horizontal_aperture_height_hold = bool(
+                    role == "region_progress"
+                    and region_progress_route.get(
+                        "horizontal_aperture_staged_outward_before_descent", {}
+                    ).get("enabled") is True
+                )
                 distance_before = flat_distance(live_object_world[:3, 3])
                 contact_escape_completion_evidence: dict[str, Any] = {
                     "status": "not_applicable",
@@ -7951,9 +10589,14 @@ def _native_place_single(
                     role == "native_region_entry_alignment"
                     and predicate[0].lower() == "in"
                     and region_progress_route.get("entry_mode") != "horizontal_aperture"
+                    and not region_progress_route.get("tilted_region_world_route_fallback")
                 ):
                     # Align the carried object's real XY pose at clearance height
                     # before the final descent into a tight container region.
+                    # Tilted regions already provide an explicit world-frame
+                    # entry-alignment waypoint; do not rebuild it in the near-
+                    # horizontal region-local z frame, which can produce metre-
+                    # scale coordinates when the region normal is nearly horizontal.
                     object_distance = distance_before
                     # If the actual carried-object footprint already fits through
                     # the native region aperture, centering it more precisely is
@@ -8122,6 +10765,32 @@ def _native_place_single(
                     waypoint_distance = float(np.linalg.norm(
                         target_object_world[:2, 3] - live_object_world[:2, 3]
                     ))
+                elif role == "adaptive_clearance":
+                    # Clearance is a physical carried-object waypoint too.
+                    # Measure its remaining object-space distance so the
+                    # bounded low-step controller does not truncate a long
+                    # vertical lift at the generic 128-action default.
+                    waypoint_distance = float(np.linalg.norm(
+                        target_object_world[:3, 3] - live_object_world[:3, 3]
+                    ))
+                elif role == "native_region_entry_descent":
+                    # Horizontal-aperture insertion can require a substantial
+                    # physical descent at the exterior staging pose. A fixed
+                    # 128-action cap truncated a continuously progressing mug
+                    # descent before it reached the door height; budget this
+                    # waypoint from the measured carried-object residual, while
+                    # retaining the existing per-action stagnation and episode
+                    # limits as hard stops.
+                    waypoint_distance = float(np.linalg.norm(
+                        target_object_world[:3, 3] - live_object_world[:3, 3]
+                    ))
+                elif role == "native_region_goal_alignment":
+                    # Final On alignment is a horizontal transfer above the
+                    # support. Budget it from measured XY distance; its later
+                    # vertical descent has a separate native placement gate.
+                    waypoint_distance = float(np.linalg.norm(
+                        target_object_world[:2, 3] - live_object_world[:2, 3]
+                    ))
                 else:
                     waypoint_distance = None
                 position_tolerance_m, rotation_tolerance_rad = (
@@ -8132,6 +10801,9 @@ def _native_place_single(
                         clearance_lift_delta_m=(
                             float(abs(target_object_world[2, 3] - live_object_world[2, 3]))
                             if role == "adaptive_clearance" else None
+                        ),
+                        in_transit_position_tolerance_m=(
+                            native_region_in_transit_position_tolerance_m
                         ),
                     )
                 )
@@ -8217,22 +10889,34 @@ def _native_place_single(
                 if action_budget_remaining <= 0:
                     raise RuntimeError("native_region_progress_transport_horizon_budget_exhausted")
                 waypoint_action_budget_estimate = None
+                waypoint_response_fraction = NATIVE_REGION_PROGRESS_LOW_STEP_RESPONSE_FRACTION
                 if (
-                    role in {"region_progress", "obstacle_aware_region_progress"}
+                    role in {
+                        "adaptive_clearance",
+                        "region_progress",
+                        "obstacle_aware_region_progress",
+                        "native_region_goal_alignment",
+                        "native_region_entry_descent",
+                    }
                     and waypoint_distance is not None
                     and waypoint_translation_step_limit_m > 0.0
-                    and waypoint_translation_step_limit_m < 0.008
+                    and waypoint_translation_step_limit_m <= 0.008
                 ):
-                    # A fixed 128-action cap can truncate a deliberately small
-                    # transport step even when the physical trace shows smooth
-                    # progress and a stable grasp. Scale only these low-step XY
-                    # waypoints from measured target distance and OSC setpoint
-                    # size; the episode/transport remainder remains the hard cap.
+                    # A fixed 128-action cap can truncate a small-step carried
+                    # object waypoint even when the physical trace shows smooth
+                    # progress and a stable grasp. Scale its bound from the
+                    # measured object-space distance and OSC setpoint size;
+                    # the episode/transport remainder remains the hard cap.
+                    if role == "native_region_goal_alignment":
+                        # The active L2T2 trace moved the carried object about
+                        # 1.7 mm for an 8 mm OSC target step; use a conservative
+                        # 10% response estimate for this long final transfer.
+                        waypoint_response_fraction = 0.10
                     estimated_actions = int(np.ceil(
                         max(0.0, float(waypoint_distance) - position_tolerance_m)
                         / max(
                             waypoint_translation_step_limit_m
-                            * NATIVE_REGION_PROGRESS_LOW_STEP_RESPONSE_FRACTION,
+                            * waypoint_response_fraction,
                             1e-5,
                         )
                     )) + NATIVE_REGION_PROGRESS_LOW_STEP_SETTLE_ACTIONS
@@ -8251,8 +10935,13 @@ def _native_place_single(
                         }
                         or (
                             role == "native_region_entry_alignment"
-                            and region_progress_route.get("entry_mode")
-                            == "horizontal_aperture"
+                            and (
+                                region_progress_route.get("entry_mode")
+                                == "horizontal_aperture"
+                                or region_progress_route.get(
+                                    "tilted_region_world_route_fallback"
+                                ) is True
+                            )
                         )
                     )
                     else min(
@@ -8283,7 +10972,7 @@ def _native_place_single(
                         "requested_actions": segment_steps,
                         "remaining_transport_actions": action_budget_remaining,
                         "low_step_response_fraction": (
-                            NATIVE_REGION_PROGRESS_LOW_STEP_RESPONSE_FRACTION
+                            waypoint_response_fraction
                             if waypoint_action_budget_estimate is not None else None
                         ),
                         "source": (
@@ -8305,10 +10994,6 @@ def _native_place_single(
                             and region_progress_route.get("transit_clearance_mode")
                             == "surface_slide"
                         )
-                    or (
-                        role == "reachability_descent"
-                        and region_progress_route.get("transit_clearance_mode") == "surface_slide"
-                    )
                         or (
                             role == "region_progress"
                             and region_progress_route.get(
@@ -8325,7 +11010,13 @@ def _native_place_single(
                     "max_translation_step_m": waypoint_translation_step_limit_m,
                     "max_rotation_step_rad": waypoint_rotation_step_limit_rad,
                     "minimum_vertical_translation_fraction": (
-                        0.5 if role == "obstacle_aware_region_progress" else 0.0
+                        0.5 if (
+                            role == "obstacle_aware_region_progress"
+                            or staged_horizontal_aperture_height_hold
+                        ) else 0.0
+                    ),
+                    "staged_horizontal_aperture_height_hold": (
+                        staged_horizontal_aperture_height_hold
                     ),
                     "larger_translation_step_live_grasp_check": larger_step_grasp_check,
                     "soft_keypose_reference_id": (
@@ -8374,7 +11065,10 @@ def _native_place_single(
                     max_translation_step_m=waypoint_translation_step_limit_m,
                     max_rotation_step_rad=waypoint_rotation_step_limit_rad,
                     minimum_vertical_translation_fraction=(
-                        0.5 if role == "obstacle_aware_region_progress" else 0.0
+                        0.5 if (
+                            role == "obstacle_aware_region_progress"
+                            or staged_horizontal_aperture_height_hold
+                        ) else 0.0
                     ),
                     # A Stage A surface-slide route deliberately carries the
                     # Keep the Panda gripper actively closed during every
@@ -8389,12 +11083,6 @@ def _native_place_single(
                         ),
                         track_live_object_height=(
                             role == "robot_fixture_aperture_outward_escape"
-                            or (
-                                role == "region_progress"
-                                and region_progress_route.get(
-                                    "horizontal_aperture_staged_outward_before_descent", {}
-                                ).get("enabled") is True
-                            )
                         ),
                         track_live_grasp_transform=True,
                     ),
@@ -8408,7 +11096,6 @@ def _native_place_single(
                     object_progress_horizontal_only=(
                         role == "robot_fixture_aperture_outward_escape"
                         or role == "obstacle_aware_region_progress"
-                        or support_gated_surface_descent
                         or (
                             role == "region_progress"
                             and region_progress_route.get("transit_clearance_mode")
@@ -9251,6 +11938,65 @@ def _native_place_single(
                             ),
                             "object_or_robot_state_written_directly": False,
                         })
+                    joint_reference_index = waypoint_index + 1
+                    direct_joint_reference_available = bool(
+                        native_rrt_execution_mode == "joint_space_pd"
+                        and keypose_sequence is None
+                        and route_strategy == "jointspace_rrt"
+                        and planned.get("status") == "offline_feasible"
+                        and planned.get("live_state_unchanged") is True
+                        and joint_reference_index < len(
+                            np.asarray(planned.get("qpos_path", []), dtype=np.float64)
+                        )
+                    )
+                    if direct_joint_reference_available:
+                        joint_path = np.asarray(planned["qpos_path"], dtype=np.float64)
+                        reference_path = np.asarray(
+                            planned.get("eef_reference_poses_world", []), dtype=np.float64,
+                        )
+                        joint_tracking = {
+                            "tracking_mode": "native_mass_matrix_PD_torque_tracking_of_dense_RRT_joint_path",
+                            "route_archive": planned_route_archive,
+                            "rrt_source_path_index": joint_reference_index,
+                            "rrt_reference_qpos_rad": joint_path[joint_reference_index].tolist(),
+                            "rrt_reference_eef_pose_world": (
+                                reference_path[joint_reference_index].tolist()
+                                if joint_reference_index < len(reference_path) else None
+                            ),
+                            "carried_object_geometry_included": bool(
+                                planned.get("carried_object_geometry_included", True)
+                            ),
+                            "physical_collision_response_enabled": True,
+                            "object_or_robot_state_written_directly": False,
+                            "safety_certified": False,
+                        }
+                        _record_joint_trajectory_step(
+                            bridge,
+                            joint_path[joint_reference_index],
+                            f"transport_{keypose['name']}_dense_RRT_joint_path",
+                            "native_goal_transport",
+                            counter[0],
+                            target_binding,
+                            instruction,
+                            safety_policy,
+                            monitor,
+                            records,
+                            frames,
+                            gripper_action=0.0,
+                            planning_tracking=joint_tracking,
+                            raise_on_done=False,
+                        )
+                        counter[0] += 1
+                        persist_step(records[-1], frames[-1])
+                        if records[-1].get("done") and not native_goal_satisfied():
+                            raise RuntimeError(
+                                "environment_done_during_native_jointspace_RRT_transport"
+                            )
+                        if native_goal_satisfied():
+                            break
+                        if counter[0] > transport_action_budget:
+                            raise RuntimeError("native_goal_transport_action_budget_exhausted")
+                        continue
                     _advance_pose(
                         bridge, subgoal[:3], subgoal[3:],
                         f"transport_{keypose['name']}", "native_goal_transport", counter,
@@ -9404,7 +12150,11 @@ def _native_place_single(
                 for source_path_index in range(1, len(insertion_eef_path)):
                     reference_pose = insertion_eef_path[source_path_index]
                     tracking_context = {
-                        "tracking_mode": "native_OSC_closed_loop_to_dense_collision_aware_insertion_RRT_EEF_path",
+                        "tracking_mode": (
+                            "native_mass_matrix_PD_torque_tracking_of_dense_insertion_RRT_joint_path"
+                            if native_rrt_execution_mode == "joint_space_pd"
+                            else "native_OSC_closed_loop_to_dense_collision_aware_insertion_RRT_EEF_path"
+                        ),
                         "route_archive": native_goal_insertion_rrt["route_archive"],
                         "rrt_source_path_index": source_path_index,
                         "rrt_reference_eef_pose_world": reference_pose.tolist(),
@@ -9412,21 +12162,44 @@ def _native_place_single(
                         "physical_collision_response_enabled": True,
                         "safety_certified": False,
                     }
-                    _advance_pose(
-                        bridge, reference_pose[:3], reference_pose[3:],
-                        "transport_native_goal_insertion_dense_RRT_path",
-                        "native_goal_transport", counter,
-                        max(0, transport_action_budget - counter[0]),
-                        target_binding, instruction, safety_policy, monitor,
-                        records, frames,
-                        stop_condition=native_goal_satisfied,
-                        step_callback=persist_step,
-                        stagnation_window_actions=24,
-                        position_tolerance_m=0.010,
-                        rotation_tolerance_rad=0.10,
-                        planning_tracking=tracking_context,
-                        absolute_action_limit=None,
-                    )
+                    if native_rrt_execution_mode == "joint_space_pd":
+                        _record_joint_trajectory_step(
+                            bridge,
+                            insertion_qpos_path[source_path_index],
+                            "transport_native_goal_insertion_dense_RRT_joint_path",
+                            "native_goal_transport",
+                            counter[0],
+                            target_binding,
+                            instruction,
+                            safety_policy,
+                            monitor,
+                            records,
+                            frames,
+                            planning_tracking=tracking_context,
+                            raise_on_done=False,
+                        )
+                        counter[0] += 1
+                        persist_step(records[-1], frames[-1])
+                        if records[-1].get("done") and not native_goal_satisfied():
+                            raise RuntimeError(
+                                "environment_done_during_native_goal_insertion_jointspace_RRT"
+                            )
+                    else:
+                        _advance_pose(
+                            bridge, reference_pose[:3], reference_pose[3:],
+                            "transport_native_goal_insertion_dense_RRT_path",
+                            "native_goal_transport", counter,
+                            max(0, transport_action_budget - counter[0]),
+                            target_binding, instruction, safety_policy, monitor,
+                            records, frames,
+                            stop_condition=native_goal_satisfied,
+                            step_callback=persist_step,
+                            stagnation_window_actions=24,
+                            position_tolerance_m=0.010,
+                            rotation_tolerance_rad=0.10,
+                            planning_tracking=tracking_context,
+                            absolute_action_limit=None,
+                        )
                     native_goal_insertion_rrt.setdefault(
                         "closed_loop_source_path_indices_executed", []
                     ).append(source_path_index)
@@ -10175,16 +12948,22 @@ def _native_place(
     native_region_transit_clearance_mode: str = "compiled_obstacle",
     native_region_transit_height_override_m: float | None = None,
     native_region_progress_max_step_m: float = 0.008,
+    native_region_in_transit_position_tolerance_m: float = 0.020,
     native_region_entry_mode: str = "over_rim",
     native_region_aperture_tilt_degrees: float = 0.0,
+    native_region_preserve_live_orientation: bool = False,
     native_region_entry_height_offset_m: float | None = None,
     native_region_yaw_delta_degrees: float | None = None,
     native_region_pretransport_yaw_delta_degrees: float | None = None,
+    native_region_goal_local_offset_m: tuple[float, float, float] | None = None,
     native_region_pretransport_settle_actions: int = 0,
+    native_rrt_execution_mode: str = "eef_osc",
 ) -> dict[str, Any]:
     """Search distinct native-region layouts from one exact held-object Snapshot."""
     if _STAGE_A_NEAR_GOAL_RELEASE_PROBE_ENABLED:
         controller.enable_near_goal_release_probe()
+    if native_rrt_execution_mode not in {"eef_osc", "joint_space_pd"}:
+        raise ValueError("native_rrt_execution_mode_must_be_eef_osc_or_joint_space_pd")
     output_dir.mkdir(parents=True, exist_ok=True)
     native_start = bridge.request({"op": "native_task_status"})
     values, task_success = _task_values(native_start)
@@ -10372,6 +13151,9 @@ def _native_place(
             defer_micro_violation_to_transport=(
                 transport_strategy in {"legacy_rrt", "native_region_progress_osc"}
             ),
+            allow_micro_violation_handoff=(
+                native_region_pretransport_yaw_delta_degrees is not None
+            ),
         )
         if limit_recovery.get("status") == "joint_limit_recovery_failed_without_legal_fallback":
             final_status = bridge.request({"op": "native_task_status"})
@@ -10418,10 +13200,15 @@ def _native_place(
             native_region_transit_clearance_mode=native_region_transit_clearance_mode,
             native_region_transit_height_override_m=native_region_transit_height_override_m,
             native_region_progress_max_step_m=native_region_progress_max_step_m,
+            native_region_in_transit_position_tolerance_m=(
+                native_region_in_transit_position_tolerance_m
+            ),
             native_region_entry_mode=native_region_entry_mode,
             native_region_aperture_tilt_degrees=native_region_aperture_tilt_degrees,
             native_region_entry_height_offset_m=native_region_entry_height_offset_m,
             native_region_pretransport_yaw_delta_degrees=native_region_pretransport_yaw_delta_degrees,
+            native_region_goal_local_offset_m=native_region_goal_local_offset_m,
+            native_rrt_execution_mode=native_rrt_execution_mode,
         )
         result["joint_limit_recovery"] = limit_recovery
         recovery_actions = int(
@@ -11131,13 +13918,19 @@ def _native_place(
                 native_region_transit_clearance_mode=native_region_transit_clearance_mode,
                 native_region_transit_height_override_m=native_region_transit_height_override_m,
                 native_region_progress_max_step_m=native_region_progress_max_step_m,
+                native_region_in_transit_position_tolerance_m=(
+                    native_region_in_transit_position_tolerance_m
+                ),
                 native_region_entry_mode=native_region_entry_mode,
                 native_region_aperture_tilt_degrees=native_region_aperture_tilt_degrees,
+                native_region_preserve_live_orientation=native_region_preserve_live_orientation,
                 native_region_entry_height_offset_m=native_region_entry_height_offset_m,
                 native_region_pretransport_yaw_delta_degrees=native_region_pretransport_yaw_delta_degrees,
+                native_region_goal_local_offset_m=native_region_goal_local_offset_m,
                 continue_horizontal_aperture_alignment=(
                     continue_horizontal_aperture_alignment
                 ),
+                native_rrt_execution_mode=native_rrt_execution_mode,
             )
         except Exception as exc:
             result = {
@@ -11261,7 +14054,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cold_start = bool(getattr(args, "cold_start", False) or cold_start_continuation)
     continuation_root = getattr(args, "cold_start_continuation_root", None)
     if cold_start_continuation:
-        sources = (args.resume_from_runtime_snapshot, args.resume_from_placement_report)
+        sources = (
+            args.resume_from_runtime_snapshot,
+            args.resume_from_placement_report,
+            args.resume_from_grasp_report,
+        )
         if sum(source is not None for source in sources) != 1:
             raise ValueError("cold_start_continuation_requires_exactly_one_same_run_resume_source")
         if continuation_root is None:
@@ -11274,7 +14071,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.experience_library is not None
         or args.keypose_experience
         or args.previous_search_report
-        or args.resume_from_grasp_report is not None
+        or (args.resume_from_grasp_report is not None and not args.cold_start_continuation)
         or (args.resume_from_placement_report is not None and not cold_start_continuation)
         or (args.resume_from_runtime_snapshot is not None and not cold_start_continuation)
         or args.resume_from_keypose_preflight_report is not None
@@ -11414,10 +14211,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "standard_benchmark_horizon": 1000,
             "horizon_mode": "standard_benchmark" if args.demonstration_horizon == 1000 else "demonstration_only_extension",
             "transport_strategy": args.transport_strategy,
+            "native_rrt_execution_mode": args.native_rrt_execution_mode,
             "native_region_progress_max_step_m": args.native_region_progress_max_step_m,
             "native_region_transit_height_override_m": args.native_region_transit_height_override_m,
             "native_region_entry_mode": args.native_region_entry_mode,
             "native_region_aperture_tilt_degrees": args.native_region_aperture_tilt_degrees,
+            "native_region_preserve_live_orientation": args.native_region_preserve_live_orientation,
             "native_region_entry_height_offset_m": args.native_region_entry_height_offset_m,
         },
         "segments": [],
@@ -11672,6 +14471,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
         if (
             args.stage_a_unheld_in_freefall_settle_probe
+            or args.stage_a_unheld_object_settle_probe
             or args.stage_a_near_aperture_release_probe
         ):
             if not cold_start_continuation or direct_resume is None:
@@ -11687,18 +14487,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 model_sha=model_sha,
                 safety_policy=policy,
                 controller_fields=controller_inventory["robots"][0]["fields"],
-                output_dir=output_dir / "stage_a_unheld_in_freefall_settle_probe",
+                output_dir=output_dir / (
+                    "stage_a_unheld_object_settle_probe"
+                    if args.stage_a_unheld_object_settle_probe
+                    else "stage_a_unheld_in_freefall_settle_probe"
+                ),
                 maximum_actions=(
                     args.stage_a_near_aperture_release_probe_actions
                     if args.stage_a_near_aperture_release_probe
+                    else args.stage_a_unheld_object_settle_probe_actions
+                    if args.stage_a_unheld_object_settle_probe
                     else args.stage_a_unheld_in_freefall_settle_probe_actions
                 ),
                 allow_near_aperture_release=args.stage_a_near_aperture_release_probe,
+                allow_anywhere_unheld_settle=args.stage_a_unheld_object_settle_probe,
             )
             report["segments"].append({
                 "type": (
                     "stage_a_near_aperture_native_In_release_probe"
                     if args.stage_a_near_aperture_release_probe
+                    else "stage_a_unheld_object_physics_settle_probe"
+                    if args.stage_a_unheld_object_settle_probe
                     else "stage_a_unheld_in_native_In_freefall_settle_probe"
                 ),
                 **settle_result,
@@ -11798,16 +14607,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
                 transport_strategy=args.transport_strategy,
+                native_rrt_execution_mode=args.native_rrt_execution_mode,
                 native_region_route_variant=args.native_region_route_variant,
                 native_region_candidate_offset=args.native_region_candidate_offset,
                 native_region_transit_clearance_mode=args.native_region_transit_clearance_mode,
                 native_region_transit_height_override_m=args.native_region_transit_height_override_m,
                 native_region_progress_max_step_m=args.native_region_progress_max_step_m,
+                native_region_in_transit_position_tolerance_m=(
+                    args.native_region_in_transit_position_tolerance_m
+                ),
                 native_region_entry_mode=args.native_region_entry_mode,
                 native_region_aperture_tilt_degrees=args.native_region_aperture_tilt_degrees,
+                native_region_preserve_live_orientation=args.native_region_preserve_live_orientation,
                 native_region_entry_height_offset_m=args.native_region_entry_height_offset_m,
                 native_region_yaw_delta_degrees=args.native_region_yaw_delta_degrees,
                 native_region_pretransport_yaw_delta_degrees=args.native_region_pretransport_yaw_delta_degrees,
+                native_region_goal_local_offset_m=args.native_region_goal_local_offset_m,
                 native_region_pretransport_settle_actions=args.native_region_pretransport_settle_actions,
                 expected_start_snapshot_sha256=(
                     direct_resume.get("payload_sha256") if direct_resume
@@ -11921,16 +14736,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
                 transport_strategy=args.transport_strategy,
+                native_rrt_execution_mode=args.native_rrt_execution_mode,
                 native_region_route_variant=args.native_region_route_variant,
                 native_region_candidate_offset=args.native_region_candidate_offset,
                 native_region_transit_clearance_mode=args.native_region_transit_clearance_mode,
                 native_region_transit_height_override_m=args.native_region_transit_height_override_m,
                 native_region_progress_max_step_m=args.native_region_progress_max_step_m,
+                native_region_in_transit_position_tolerance_m=(
+                    args.native_region_in_transit_position_tolerance_m
+                ),
                 native_region_entry_mode=args.native_region_entry_mode,
                 native_region_aperture_tilt_degrees=args.native_region_aperture_tilt_degrees,
+                native_region_preserve_live_orientation=args.native_region_preserve_live_orientation,
                 native_region_entry_height_offset_m=args.native_region_entry_height_offset_m,
                 native_region_yaw_delta_degrees=args.native_region_yaw_delta_degrees,
                 native_region_pretransport_yaw_delta_degrees=args.native_region_pretransport_yaw_delta_degrees,
+                native_region_goal_local_offset_m=args.native_region_goal_local_offset_m,
                 native_region_pretransport_settle_actions=args.native_region_pretransport_settle_actions,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
@@ -12008,7 +14829,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     controller_fields=controller_inventory["robots"][0]["fields"],
                     output_dir=output_dir / "expert_articulated_fixture_goal",
                     model_sha=model_sha,
+                    history_root=(
+                        args.articulated_contact_history_root
+                        or args.cold_start_continuation_root
+                    ),
+                    ik_seed_history_root=(
+                        args.articulated_ik_seed_history_root
+                        or args.cold_start_continuation_root
+                    ),
+                    dynamic_scene_hold_actions=args.stage_a_dynamic_scene_hold_actions,
+                    dynamic_scene_clearance_lift_m=(
+                        args.stage_a_dynamic_scene_clearance_lift_m
+                    ),
                     rrt_time_budget_s=args.rrt_time_budget_s,
+                    stage_a_contact_permissive_precontact=(
+                        args.stage_a_contact_permissive_articulated_precontact
+                    ),
                 )
                 report["segments"].append({"type": "expert_articulated_fixture_goal", **articulated})
                 report["status"] = articulated["status"]
@@ -12042,16 +14878,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rrt_time_budget_s=args.rrt_time_budget_s,
                 recovery_fallback_snapshot=recovery_fallback_snapshot,
                 transport_strategy=args.transport_strategy,
+                native_rrt_execution_mode=args.native_rrt_execution_mode,
                 native_region_route_variant=args.native_region_route_variant,
                 native_region_candidate_offset=args.native_region_candidate_offset,
                 native_region_transit_clearance_mode=args.native_region_transit_clearance_mode,
                 native_region_transit_height_override_m=args.native_region_transit_height_override_m,
                 native_region_progress_max_step_m=args.native_region_progress_max_step_m,
+                native_region_in_transit_position_tolerance_m=(
+                    args.native_region_in_transit_position_tolerance_m
+                ),
                 native_region_entry_mode=args.native_region_entry_mode,
                 native_region_aperture_tilt_degrees=args.native_region_aperture_tilt_degrees,
+                native_region_preserve_live_orientation=args.native_region_preserve_live_orientation,
                 native_region_entry_height_offset_m=args.native_region_entry_height_offset_m,
                 native_region_yaw_delta_degrees=args.native_region_yaw_delta_degrees,
                 native_region_pretransport_yaw_delta_degrees=args.native_region_pretransport_yaw_delta_degrees,
+                native_region_goal_local_offset_m=args.native_region_goal_local_offset_m,
                 native_region_pretransport_settle_actions=args.native_region_pretransport_settle_actions,
                 expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                 expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
@@ -12259,16 +15101,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         rrt_time_budget_s=args.rrt_time_budget_s,
                         recovery_fallback_snapshot=recovery_fallback_snapshot,
                         transport_strategy=args.transport_strategy,
+                        native_rrt_execution_mode=args.native_rrt_execution_mode,
                         native_region_route_variant=args.native_region_route_variant,
                         native_region_candidate_offset=args.native_region_candidate_offset,
                         native_region_transit_clearance_mode=args.native_region_transit_clearance_mode,
                         native_region_transit_height_override_m=args.native_region_transit_height_override_m,
                         native_region_progress_max_step_m=args.native_region_progress_max_step_m,
+                        native_region_in_transit_position_tolerance_m=(
+                            args.native_region_in_transit_position_tolerance_m
+                        ),
                         native_region_entry_mode=args.native_region_entry_mode,
                         native_region_aperture_tilt_degrees=args.native_region_aperture_tilt_degrees,
+                        native_region_preserve_live_orientation=args.native_region_preserve_live_orientation,
                         native_region_entry_height_offset_m=args.native_region_entry_height_offset_m,
                         native_region_yaw_delta_degrees=args.native_region_yaw_delta_degrees,
                         native_region_pretransport_yaw_delta_degrees=args.native_region_pretransport_yaw_delta_degrees,
+                        native_region_goal_local_offset_m=args.native_region_goal_local_offset_m,
                         native_region_pretransport_settle_actions=args.native_region_pretransport_settle_actions,
                         expected_start_snapshot_sha256=(direct_resume.get("payload_sha256") if direct_resume else None),
                         expected_bddl_sha256=str(observed.get("scene_metadata", {}).get("bddl_sha256")),
@@ -12399,6 +15247,20 @@ def _parse_args() -> argparse.Namespace:
         help="maximum real control actions in the unheld In-region freefall settle probe",
     )
     parser.add_argument(
+        "--stage-a-unheld-object-settle-probe",
+        action="store_true",
+        help=(
+            "on an exact same-episode Runtime Snapshot with no bilateral grasp, hold the live EEF pose, "
+            "physically open the gripper, and let an unheld object settle under MuJoCo gravity"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-unheld-object-settle-probe-actions",
+        type=int,
+        default=40,
+        help="maximum real control actions for an unheld-object settle away from the native region",
+    )
+    parser.add_argument(
         "--stage-a-near-aperture-release-probe",
         action="store_true",
         help=(
@@ -12428,6 +15290,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--local-replan-rrt-time-budget-s", type=float, default=2.0)
     parser.add_argument("--maximum-physical-branches", type=int, default=3)
     parser.add_argument("--branch-control-action-budget", type=int, default=440)
+    parser.add_argument("--stage-a-close-action-budget", type=int, default=18)
+    parser.add_argument(
+        "--stage-a-dynamic-scene-hold-actions", type=int, default=0,
+        help="physically hold the live arm pose for bounded MuJoCo actions before articulated-fixture planning",
+    )
+    parser.add_argument(
+        "--stage-a-dynamic-scene-clearance-lift-m", type=float, default=0.0,
+        help="physically lift the live EEF before waiting for a moving scene object to pass",
+    )
     parser.add_argument(
         "--pregrasp-route-waypoint-position-tolerance-m",
         "--pregrasp-endpoint-position-tolerance-m",
@@ -12440,13 +15311,26 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pregrasp-route-waypoint-rotation-tolerance-rad",
+        type=float,
+        default=0.045,
+        help="rotation tolerance for physical pregrasp route waypoints; grasp checks remain MuJoCo based",
+    )
+    parser.add_argument(
         "--pregrasp-route-control-mode",
-        choices=("eef_osc", "joint_space_rrt"),
+        choices=("eef_osc", "joint_space_rrt", "joint_space_ik_waypoints"),
         default="eef_osc",
         help=(
-            "execute the selected RRT pregrasp route with OSC EEF waypoints or "
-            "its dense, collision-checked joint-space qpos path"
+            "execute a selected pregrasp route with OSC, a collision-checked joint-space RRT path, "
+            "or staged IK endpoints joined by a dense physical joint trajectory"
         ),
+    )
+    parser.add_argument(
+        "--joint-space-rrt-max-tracking-error-l2-rad",
+        dest="joint_space_rrt_max_tracking_error_l2_rad",
+        type=float,
+        default=0.15,
+        help="maximum measured MuJoCo joint-qpos deviation for dense joint-space RRT tracking",
     )
     parser.add_argument(
         "--stage-a-unilateral-close-probe-position-m", type=float, default=0.010,
@@ -12454,6 +15338,14 @@ def _parse_args() -> argparse.Namespace:
             "maximum candidate-pose error for a bounded physical close probe after a real unilateral target-pad contact; "
             "the live MuJoCo grasp monitor must still verify closure"
         ),
+    )
+    parser.add_argument(
+        "--stage-a-near-pregrasp-bypass-position-m", type=float, default=0.010,
+        help="skip only pregrasp transit from a sufficiently close live EEF start; physical approach/grasp checks still run",
+    )
+    parser.add_argument(
+        "--stage-a-near-pregrasp-bypass-rotation-rad", type=float, default=0.02,
+        help="maximum measured EEF rotation error for the near-pregrasp transit bypass",
     )
     parser.add_argument(
         "--stage-a-pregrasp-staged-clearance-height-m", type=float, default=0.0,
@@ -12491,6 +15383,12 @@ def _parse_args() -> argparse.Namespace:
             "axis-aligned A* pregrasp transit; route is physical guidance only"
         ),
     )
+    parser.add_argument(
+        "--stage-a-pregrasp-high-transit-axis-tolerance-m",
+        type=float,
+        default=0.004,
+        help="endpoint tolerance for each axis-selective compiled-geometry A* high-transit correction",
+    )
     parser.add_argument("--rrt-time-budget-s", type=float, default=20.0)
     parser.add_argument(
         "--approach-route-strategy",
@@ -12506,6 +15404,15 @@ def _parse_args() -> argparse.Namespace:
         choices=("native_region_progress_osc", "legacy_rrt"),
         default="native_region_progress_osc",
         help="task-success transport route; native region progress uses live object feedback with real OSC",
+    )
+    parser.add_argument(
+        "--native-rrt-execution-mode",
+        choices=("eef_osc", "joint_space_pd"),
+        default="eef_osc",
+        help=(
+            "track a native placement RRT with OSC EEF setpoints or the planner's dense "
+            "joint-space path using measured MuJoCo mass-matrix PD torque control"
+        ),
     )
     parser.add_argument(
         "--native-region-route-variant",
@@ -12549,6 +15456,14 @@ def _parse_args() -> argparse.Namespace:
         help="tilt a carried object toward a compact tool posture for horizontal native In insertion",
     )
     parser.add_argument(
+        "--native-region-preserve-live-orientation",
+        action="store_true",
+        help=(
+            "continue a held horizontal-aperture route using the exact orientation from its "
+            "identity-verified live Runtime Snapshot"
+        ),
+    )
+    parser.add_argument(
         "--native-region-entry-height-offset-m",
         type=float,
         default=None,
@@ -12576,8 +15491,28 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--native-region-goal-local-offset-m",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "shift an In placement goal in the native region's local frame; "
+            "the original BDDL volume still decides success"
+        ),
+    )
+    parser.add_argument(
         "--native-region-progress-max-step-m", type=float, default=0.008,
         help="per-action OSC target displacement limit for native-region transport; default 8 mm",
+    )
+    parser.add_argument(
+        "--native-region-in-transit-position-tolerance-m",
+        type=float,
+        default=0.020,
+        help=(
+            "Stage A tolerance for intermediate carried-object In transit waypoints only; "
+            "native entry, final placement, and BDDL success checks remain unchanged"
+        ),
     )
     parser.add_argument(
         "--native-region-pretransport-settle-actions", type=int, default=0,
@@ -12601,6 +15536,23 @@ def _parse_args() -> argparse.Namespace:
         "--cold-start-continuation-root", type=Path, default=None,
         help="V3 output root that must contain the same-run continuation source",
     )
+    parser.add_argument(
+        "--articulated-contact-history-root", type=Path, default=None,
+        help="Optional read-only record root used to recover a prior measured fixture-contact pose.",
+    )
+    parser.add_argument(
+        "--articulated-ik-seed-history-root", type=Path, default=None,
+        help="Optional read-only report root supplying prior safe IK solutions as current-scene solver seeds.",
+    )
+    parser.add_argument(
+        "--stage-a-contact-permissive-articulated-precontact",
+        action="store_true",
+        help=(
+            "for Stage A only, allow the full-scene articulated precontact RRT to retain "
+            "measured contacts in its route diagnostics instead of rejecting those samples; "
+            "physical execution remains MuJoCo-audited and this is not safety certification"
+        ),
+    )
     args = parser.parse_args()
     if (
         not np.isfinite(args.stage_a_near_goal_release_probe_max_error_m)
@@ -12609,8 +15561,16 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--stage-a-near-goal-release-probe-max-error-m must be in 0.012..0.5")
     if not 1 <= args.stage_a_unheld_in_freefall_settle_probe_actions <= 120:
         parser.error("--stage-a-unheld-in-freefall-settle-probe-actions must be in 1..120")
+    if not 1 <= args.stage_a_unheld_object_settle_probe_actions <= 120:
+        parser.error("--stage-a-unheld-object-settle-probe-actions must be in 1..120")
     if not 1 <= args.stage_a_near_aperture_release_probe_actions <= 120:
         parser.error("--stage-a-near-aperture-release-probe-actions must be in 1..120")
+    if sum((
+        args.stage_a_unheld_in_freefall_settle_probe,
+        args.stage_a_unheld_object_settle_probe,
+        args.stage_a_near_aperture_release_probe,
+    )) > 1:
+        parser.error("choose only one Stage A unheld settle/release probe mode")
     resume_sources = [
         args.resume_from_grasp_report,
         args.resume_from_placement_report,
@@ -12635,13 +15595,17 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--candidate-start-index must select an index inside the candidate budget")
     if (
         args.geometry_candidate_pool_offset < 0
-        or args.geometry_candidate_pool_offset + args.maximum_candidates > 48
+        or args.geometry_candidate_pool_offset + args.maximum_candidates > 512
     ):
         parser.error("--geometry-candidate-pool-offset plus --maximum-candidates must fit the generated geometry pool")
     if args.candidate_id and args.candidate_start_index != 0:
         parser.error("--candidate-id requires --candidate-start-index 0")
     cold_start_mode = args.cold_start or args.cold_start_continuation
-    continuation_sources = (args.resume_from_runtime_snapshot, args.resume_from_placement_report)
+    continuation_sources = (
+        args.resume_from_runtime_snapshot,
+        args.resume_from_placement_report,
+        args.resume_from_grasp_report,
+    )
     if args.cold_start_continuation and (
         not args.cold_start
         or sum(source is not None for source in continuation_sources) != 1
@@ -12651,27 +15615,23 @@ def _parse_args() -> argparse.Namespace:
             "--cold-start-continuation requires --cold-start, exactly one resume source, "
             "and --cold-start-continuation-root"
         )
-    if args.stage_a_unheld_in_freefall_settle_probe and (
+    if (
+        args.stage_a_unheld_in_freefall_settle_probe
+        or args.stage_a_unheld_object_settle_probe
+        or args.stage_a_near_aperture_release_probe
+    ) and (
         not args.cold_start_continuation
         or args.resume_from_runtime_snapshot is None
         or args.resume_from_placement_report is not None
     ):
         parser.error(
-            "--stage-a-unheld-in-freefall-settle-probe requires an exact cold-start Runtime Snapshot continuation"
-        )
-    if args.stage_a_near_aperture_release_probe and (
-        not args.cold_start_continuation
-        or args.resume_from_runtime_snapshot is None
-        or args.resume_from_placement_report is not None
-    ):
-        parser.error(
-            "--stage-a-near-aperture-release-probe requires an exact cold-start Runtime Snapshot continuation"
+            "Stage A unheld settle/release probes require an exact cold-start Runtime Snapshot continuation"
         )
     if cold_start_mode and (
         args.experience_library is not None
         or args.keypose_experience
         or args.previous_search_report
-        or args.resume_from_grasp_report is not None
+        or (args.resume_from_grasp_report is not None and not args.cold_start_continuation)
         or (args.resume_from_placement_report is not None and not args.cold_start_continuation)
         or (args.resume_from_runtime_snapshot is not None and not args.cold_start_continuation)
         or args.resume_from_keypose_preflight_report is not None
@@ -12687,14 +15647,47 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--maximum-physical-branches must be in 1..3")
     if not 1 <= args.branch_control_action_budget <= 440:
         parser.error("--branch-control-action-budget must be in 1..440")
-    if not np.isfinite(args.pregrasp_route_waypoint_position_tolerance_m) or not (
-        0.004 <= args.pregrasp_route_waypoint_position_tolerance_m <= 0.025
+    if not 1 <= args.stage_a_close_action_budget <= 440:
+        parser.error("--stage-a-close-action-budget must be in 1..440")
+    if not 0 <= args.stage_a_dynamic_scene_hold_actions <= 200:
+        parser.error("--stage-a-dynamic-scene-hold-actions must be in 0..200")
+    if (
+        not np.isfinite(args.stage_a_dynamic_scene_clearance_lift_m)
+        or not 0.0 <= args.stage_a_dynamic_scene_clearance_lift_m <= 0.25
     ):
-        parser.error("--pregrasp-route-waypoint-position-tolerance-m must be in 0.004..0.025")
+        parser.error("--stage-a-dynamic-scene-clearance-lift-m must be in 0..0.25")
+    if not np.isfinite(args.native_region_in_transit_position_tolerance_m) or not (
+        0.020 <= args.native_region_in_transit_position_tolerance_m <= 0.060
+    ):
+        parser.error(
+            "--native-region-in-transit-position-tolerance-m must be in 0.020..0.060"
+        )
+    if not np.isfinite(args.pregrasp_route_waypoint_position_tolerance_m) or not (
+        0.004 <= args.pregrasp_route_waypoint_position_tolerance_m <= 0.030
+    ):
+        parser.error("--pregrasp-route-waypoint-position-tolerance-m must be in 0.004..0.030")
+    if not np.isfinite(args.pregrasp_route_waypoint_rotation_tolerance_rad) or not (
+        0.045 <= args.pregrasp_route_waypoint_rotation_tolerance_rad <= 0.12
+    ):
+        parser.error(
+            "--pregrasp-route-waypoint-rotation-tolerance-rad must be in 0.045..0.12"
+        )
+    if not np.isfinite(args.joint_space_rrt_max_tracking_error_l2_rad) or not (
+        0.15 <= args.joint_space_rrt_max_tracking_error_l2_rad <= 0.25
+    ):
+        parser.error("--joint-space-rrt-max-tracking-error-l2-rad must be in 0.15..0.25")
     if not np.isfinite(args.stage_a_unilateral_close_probe_position_m) or not (
         0.010 <= args.stage_a_unilateral_close_probe_position_m <= 0.080
     ):
         parser.error("--stage-a-unilateral-close-probe-position-m must be in 0.010..0.080")
+    if not np.isfinite(args.stage_a_near_pregrasp_bypass_position_m) or not (
+        0.010 <= args.stage_a_near_pregrasp_bypass_position_m <= 0.080
+    ):
+        parser.error("--stage-a-near-pregrasp-bypass-position-m must be in 0.010..0.080")
+    if not np.isfinite(args.stage_a_near_pregrasp_bypass_rotation_rad) or not (
+        0.02 <= args.stage_a_near_pregrasp_bypass_rotation_rad <= 0.10
+    ):
+        parser.error("--stage-a-near-pregrasp-bypass-rotation-rad must be in 0.02..0.10")
     if (
         not np.isfinite(args.stage_a_pregrasp_staged_clearance_height_m)
         or args.stage_a_pregrasp_staged_clearance_height_m != 0.0
@@ -12724,6 +15717,12 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             "--stage-a-pregrasp-obstacle-aware-high-transit requires staged clearance "
             "and cannot be combined with a lateral detour or axis-aligned transit"
+        )
+    if not np.isfinite(args.stage_a_pregrasp_high_transit_axis_tolerance_m) or not (
+        0.004 <= args.stage_a_pregrasp_high_transit_axis_tolerance_m <= 0.020
+    ):
+        parser.error(
+            "--stage-a-pregrasp-high-transit-axis-tolerance-m must be in 0.004..0.020"
         )
     if not 0 <= args.native_region_candidate_offset < 16:
         parser.error("--native-region-candidate-offset must be in 0..15")
@@ -12761,6 +15760,12 @@ def _parse_args() -> argparse.Namespace:
         or not -180.0 <= args.native_region_pretransport_yaw_delta_degrees <= 180.0
     ):
         parser.error("--native-region-pretransport-yaw-delta-degrees must be in -180..180")
+    if args.native_region_goal_local_offset_m is not None and (
+        not np.isfinite(args.native_region_goal_local_offset_m).all()
+        or not args.target_predicate
+        or str(args.target_predicate[0]).lower() != "in"
+    ):
+        parser.error("--native-region-goal-local-offset-m requires finite xyz values and --target-predicate in")
     if args.native_region_entry_mode != "horizontal_aperture" and args.native_region_aperture_tilt_degrees != 0.0:
         parser.error("--native-region-aperture-tilt-degrees requires --native-region-entry-mode horizontal_aperture")
     if not 1000 <= args.demonstration_horizon <= MAX_DEMONSTRATION_HORIZON:

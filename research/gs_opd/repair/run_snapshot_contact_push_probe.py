@@ -22,6 +22,7 @@ from scipy.spatial.transform import Rotation
 
 from research.gs_opd.repair import task_success_first_grasp_search as search
 from research.gs_opd.repair.trajectory_bundle_acceptance import GraspStabilityMonitor
+from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
 
 
 def sha256(data: bytes) -> str:
@@ -49,12 +50,31 @@ def main() -> int:
     parser.add_argument("--maximum-actions", type=int, default=18)
     parser.add_argument("--demonstration-horizon", type=int, default=1000)
     parser.add_argument("--approach-actions", type=int, default=18)
+    parser.add_argument("--preplanning-settle-actions", type=int, default=0,
+                        help="physically hold the restored EEF pose before deriving live waypoints")
     parser.add_argument("--approach-stagnation-window-actions", type=int, default=20)
     parser.add_argument("--approach-position-tolerance-m", type=float, default=0.008,
                         help="position tolerance for high transit waypoints; final contact remains tighter")
+    parser.add_argument("--maximum-actual-eef-displacement-m", type=float, default=0.030,
+                        help="abort if measured EEF travel in one physical action exceeds this distance")
+    parser.add_argument("--approach-lift-step-m", type=float, default=0.008,
+                        help="maximum physical translation step for lift_* waypoints")
+    parser.add_argument("--grasp-confirmation-consecutive-actions", type=int, default=4,
+                        help="require this many consecutive bilateral contact samples before lift")
+    parser.add_argument("--grasp-confirmation-wait-actions", type=int, default=24,
+                        help="hold the close pose for at most this many actions while confirming grasp")
     parser.add_argument("--approach-gripper-action", type=float, default=-1.0)
     parser.add_argument("--push-gripper-action", type=float, default=-1.0)
     parser.add_argument("--skip-contact-approach", action="store_true")
+    parser.add_argument("--skip-push-after-approach", action="store_true",
+                        help="use only explicit approach waypoints, for a held-object carry/release continuation")
+    parser.add_argument(
+        "--allow-satisfied-native-target-for-physical-waypoints", action="store_true",
+        help=(
+            "allow an exact Snapshot whose selected native goal is already true only when "
+            "the bounded physical waypoint route skips the push phase"
+        ),
+    )
     parser.add_argument("--parent-run-report", type=Path)
     parser.add_argument("--resume-approach-report", type=Path,
                         help="continue the named waypoint and remaining route from a prior probe branch")
@@ -62,6 +82,9 @@ def main() -> int:
     parser.add_argument("--approach-waypoint", nargs=4, action="append",
                         metavar=("NAME", "X_M", "Y_M", "Z_M"),
                         help="override with an explicit physical OSC waypoint; repeat in route order")
+    parser.add_argument("--approach-pose-waypoint-json", type=Path,
+                        help=("JSON list of physical OSC waypoints with position_world_m, "
+                              "quaternion_wxyz, and phase; used for exact-pose route retracing"))
     parser.add_argument("--contact-standoff-m", type=float, default=0.045)
     parser.add_argument("--contact-height-offset-m", type=float, default=0.015)
     parser.add_argument("--approach-lateral-detour-m", type=float, default=0.0,
@@ -69,6 +92,15 @@ def main() -> int:
     parser.add_argument("--approach-clearance-m", type=float, default=0.10)
     parser.add_argument("--retain-source-orientation", action="store_true",
                         help="keep the live Snapshot wrist orientation for a side-of-gripper push")
+    parser.add_argument("--preserve-source-tool-roll", action="store_true",
+                        help=("orient local tool +Z toward the push axis with the minimum swing "
+                              "from the live orientation, preserving wrist roll"))
+    parser.add_argument("--pusher-approach-axis-world", nargs=3, type=float,
+                        metavar=("X", "Y", "Z"),
+                        help=("explicit world direction for the palm approach axis; "
+                              "supports top-down or other non-horizontal physical pushes"))
+    parser.add_argument("--tool-roll-offset-degrees", type=float, default=0.0,
+                        help="apply a physical wrist roll around the live local tool +Z axis")
     parser.add_argument("--goal-world-x-offset-m", type=float, default=0.0,
                         help="shift the requested point within the native region along world X")
     parser.add_argument("--goal-region-local-offset-m", nargs=2, type=float,
@@ -76,19 +108,55 @@ def main() -> int:
     parser.add_argument("--goal-region-object-margin-m", type=float, default=0.035)
     parser.add_argument("--push-chunk-m", type=float, default=0.012)
     parser.add_argument("--push-distance-m", type=float, default=0.072)
+    parser.add_argument(
+        "--push-vertical-drift-m", type=float, default=0.0,
+        help=(
+            "signed vertical EEF displacement distributed over the full horizontal "
+            "push distance; negative values press a contacted object down while advancing"
+        ),
+    )
+    parser.add_argument(
+        "--push-direction-world-xy", nargs=2, type=float, metavar=("X", "Y"),
+        help=(
+            "override the default native-region direction with an explicit horizontal "
+            "direction; this changes only the commanded physical pusher path"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-push-object-progress-m", type=float, default=0.0015,
+        help=(
+            "minimum measured target displacement along the push axis for a chunk "
+            "to count as progress; lower this for physically constrained sliding"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.allow_satisfied_native_target_for_physical_waypoints and not args.skip_push_after_approach:
+        raise ValueError("satisfied_native_target_is_allowed_only_for_push_skipped_physical_waypoints")
 
     if (
         args.maximum_actions < 1 or args.approach_actions < 1
+        or not 0 <= args.preplanning_settle_actions <= min(50, args.maximum_actions)
         or args.approach_stagnation_window_actions < 0
         or (0 < args.approach_stagnation_window_actions < 2)
-        or not 0.002 <= args.approach_position_tolerance_m <= 0.02
+        or not 0.002 <= args.approach_position_tolerance_m <= 0.03
+        or not 0.010 <= args.maximum_actual_eef_displacement_m <= 0.10
+        or not 0.001 <= args.approach_lift_step_m <= 0.008
+        or not 1 <= args.grasp_confirmation_consecutive_actions <= 20
+        or not 1 <= args.grasp_confirmation_wait_actions <= 100
         or bool(args.resume_approach_report) != bool(args.resume_at_waypoint)
         or not 1000 <= args.demonstration_horizon <= search.MAX_DEMONSTRATION_HORIZON
         or not -1.0 <= args.approach_gripper_action <= 1.0
         or not -1.0 <= args.push_gripper_action <= 1.0
         or not 0.01 <= args.contact_standoff_m <= 0.12
         or not -0.03 <= args.contact_height_offset_m <= 0.10
+        or not np.isfinite(args.tool_roll_offset_degrees)
+        or abs(args.tool_roll_offset_degrees) > 180.0
+        or (args.pusher_approach_axis_world is not None and (
+            len(args.pusher_approach_axis_world) != 3
+            or not np.isfinite(args.pusher_approach_axis_world).all()
+            or np.linalg.norm(args.pusher_approach_axis_world) < 1e-6
+        ))
         or abs(args.approach_lateral_detour_m) > 0.25
         or not 0.04 <= args.approach_clearance_m <= 0.30
         or abs(args.goal_world_x_offset_m) > 0.20
@@ -101,7 +169,17 @@ def main() -> int:
             and (args.resume_approach_report is not None
                  or any(not np.isfinite([float(x) for x in row[1:]]).all()
                         for row in args.approach_waypoint)))
+        or (args.approach_waypoint is not None
+            and args.approach_pose_waypoint_json is not None)
         or args.push_chunk_m <= 0 or args.push_distance_m <= 0
+        or not np.isfinite(args.push_vertical_drift_m)
+        or abs(args.push_vertical_drift_m) > 0.20
+        or (args.push_direction_world_xy is not None and (
+            len(args.push_direction_world_xy) != 2
+            or not np.isfinite(args.push_direction_world_xy).all()
+            or np.linalg.norm(args.push_direction_world_xy) < 1e-6
+        ))
+        or not 0.0001 <= args.minimum_push_object_progress_m <= 0.01
     ):
         raise ValueError("push_probe_limits_must_be_positive")
     manifest = json.loads(args.t0_manifest.read_text(encoding="utf-8"))
@@ -169,6 +247,8 @@ def main() -> int:
         "configured_action_budget": args.maximum_actions,
         "demonstration_horizon": args.demonstration_horizon,
         "approach_action_budget": args.approach_actions,
+        "preplanning_settle_actions": args.preplanning_settle_actions,
+        "maximum_actual_eef_displacement_m": args.maximum_actual_eef_displacement_m,
         "approach_gripper_action": args.approach_gripper_action,
         "push_gripper_action": args.push_gripper_action,
         "actions_executed": 0,
@@ -201,7 +281,13 @@ def main() -> int:
             "op": "task_success_first_context", "expected_instruction": args.instruction,
             "target_predicate": args.target_predicate,
         })
-        if context.get("status") != "complete" or context.get("native_goal_value") is not False:
+        native_goal_already_satisfied = context.get("native_goal_value") is True
+        if (
+            context.get("status") != "complete"
+            or (context.get("native_goal_value") is not False
+                and not (native_goal_already_satisfied
+                         and args.allow_satisfied_native_target_for_physical_waypoints))
+        ):
             raise RuntimeError(f"active_target_context_invalid:{context}")
         target_binding = dict(context["target_binding"])
         if target_binding.get("root_body_id") is None:
@@ -218,6 +304,53 @@ def main() -> int:
         monitor = GraspStabilityMonitor(required_samples=3)
         policy = {}
         candidate_id = "snapshot_native_goal_region_contact_push"
+        action_counter = [0]
+        settle_start_pose = obs["snapshot_state"]["robot_states"][0]
+        settle_target_position = np.asarray(settle_start_pose["eef_pos"], dtype=np.float64)
+        settle_positions = [settle_target_position.copy()]
+        for _ in range(args.preplanning_settle_actions):
+            live = bridge.request({"op": "observe", "include_snapshot_state": True})
+            robot = live["snapshot_state"]["robot_states"][0]
+            position = np.asarray(robot["eef_pos"], dtype=np.float64)
+            quaternion = np.asarray(robot["eef_quat"], dtype=np.float64)
+            action = world_pose_tracking_action(
+                position, quaternion, position.copy(), quaternion.copy(),
+                controller["robots"][0]["fields"],
+                gripper_action=args.approach_gripper_action,
+            )
+            search._record_step(
+                bridge, action, "snapshot_contact_push_preplanning_settle",
+                candidate_id, action_counter[0], target_binding, args.instruction,
+                policy, monitor, records, frames, raise_on_done=False,
+                planning_tracking={
+                    "tracking_mode": "physical_live_pose_hold_before_waypoint_generation",
+                    "source_snapshot_is_exact": True,
+                    "hold_target_is_current_measured_pose": True,
+                    "measured_eef_pose_before_action_world": np.r_[
+                        position, quaternion,
+                    ].tolist(),
+                    "safety_certified": False,
+                },
+            )
+            action_counter[0] += 1
+            settled_robot = records[-1].get("snapshot_state", {}).get("robot_states", [{}])[0]
+            if settled_robot.get("eef_pos") is not None:
+                settle_positions.append(np.asarray(settled_robot["eef_pos"], dtype=np.float64))
+        if args.preplanning_settle_actions:
+            obs = bridge.request({"op": "observe", "include_snapshot_state": True})
+            settled_native = bridge.request({"op": "native_task_status"})
+            report["preplanning_settle"] = {
+                "status": "completed",
+                "actions": args.preplanning_settle_actions,
+                "start_eef_pose": settle_start_pose,
+                "final_eef_pose": obs["snapshot_state"]["robot_states"][0],
+                "maximum_eef_excursion_from_start_m": max(
+                    float(np.linalg.norm(position - settle_positions[0]))
+                    for position in settle_positions
+                ),
+                "native_task_status": settled_native,
+                "waypoints_derived_after_settle_from_this_live_state": True,
+            }
         status = bridge.request({"op": "native_goal_query", "predicate": args.target_predicate})
         snapshot_state = obs["snapshot_state"]
         target_object = search._object_state(snapshot_state, int(target_binding["root_body_id"]))
@@ -251,11 +384,17 @@ def main() -> int:
                     applied_goal_x_offset, -maximum_center_offset, maximum_center_offset,
                 ))
             goal_xy = region_position[:2] + np.array([applied_goal_x_offset, 0.0])
-        direction = goal_xy - target_position[:2]
-        norm = float(np.linalg.norm(direction))
+        native_goal_direction = goal_xy - target_position[:2]
+        norm = float(np.linalg.norm(native_goal_direction))
         if norm < 1e-5:
             raise RuntimeError("target_xy_already_at_region_center; contact_push_direction_undefined")
-        direction /= norm
+        native_goal_direction /= norm
+        direction = native_goal_direction.copy()
+        requested_push_direction = None
+        if args.push_direction_world_xy is not None:
+            requested_push_direction = np.asarray(args.push_direction_world_xy, dtype=np.float64)
+            requested_push_direction /= max(float(np.linalg.norm(requested_push_direction)), 1e-12)
+            direction = requested_push_direction.copy()
         lateral_axis = np.array([-direction[1], direction[0]], dtype=np.float64)
         report.update({
             "resume_native_task_status": initial_native,
@@ -264,6 +403,10 @@ def main() -> int:
             "initial_target_root_pose": target_object,
             "initial_eef_pose": snapshot_state["robot_states"][0],
             "push_direction_world_xy": direction.tolist(),
+            "native_goal_direction_world_xy": native_goal_direction.tolist(),
+            "requested_push_direction_world_xy": (
+                requested_push_direction.tolist() if requested_push_direction is not None else None
+            ),
             "requested_goal_point_world_xy": goal_xy.tolist(),
             "requested_goal_world_x_offset_m": args.goal_world_x_offset_m,
             "applied_goal_world_x_offset_m": applied_goal_x_offset,
@@ -274,19 +417,29 @@ def main() -> int:
             "approach_lateral_detour_m": args.approach_lateral_detour_m,
             "approach_clearance_m": args.approach_clearance_m,
             "retain_source_orientation": args.retain_source_orientation,
+            "tool_roll_offset_degrees": float(args.tool_roll_offset_degrees),
+            "pusher_orientation_strategy": (
+                "minimum_swing_preserving_live_tool_roll"
+                if args.preserve_source_tool_roll else "world_vertical_jaw_axis"
+            ),
             "region_xy_half_extents_m": region_half_extent[:2].tolist(),
             "initial_native_goal_query": status,
             "push_chunk_m": args.push_chunk_m,
             "push_distance_m": args.push_distance_m,
+            "push_vertical_drift_m": args.push_vertical_drift_m,
+            "minimum_push_object_progress_m": args.minimum_push_object_progress_m,
             "contact_standoff_m": args.contact_standoff_m,
             "contact_height_offset_m": args.contact_height_offset_m,
             "native_task_status_after_each_action": True,
+            "native_goal_already_satisfied_at_branch_start": native_goal_already_satisfied,
+            "satisfied_goal_physical_waypoints_only": bool(
+                args.allow_satisfied_native_target_for_physical_waypoints
+            ),
         })
         start = bridge.request({"op": "export_runtime_snapshot"})
         if start.get("status") != "complete" or not isinstance(start.get("payload"), bytes):
             raise RuntimeError("branch_start_export_failed")
         (args.output / "branch_start_runtime_snapshot.pkl").write_bytes(start["payload"])
-        action_counter = [0]
         initial_eef = snapshot_state["robot_states"][0]
         current_position = np.asarray(initial_eef["eef_pos"], dtype=np.float64)
         current_quaternion = np.asarray(initial_eef["eef_quat"], dtype=np.float64)
@@ -353,6 +506,21 @@ def main() -> int:
                             return True
             return False
 
+        def target_bilateral_grasp_confirmed() -> bool:
+            required = args.grasp_confirmation_consecutive_actions
+            if required < 1 or len(records) < required:
+                return False
+            for record in records[-required:]:
+                grasp = record.get("grasp_state", {})
+                fingers = grasp.get("finger_contacts", {})
+                if not (
+                    grasp.get("grasp_confirmed") is True
+                    and fingers.get("left") is True
+                    and fingers.get("right") is True
+                ):
+                    return False
+            return True
+
         initial_grasp = bridge.request({
             "op": "grasp_state",
             "carried_binding": target_binding,
@@ -380,19 +548,91 @@ def main() -> int:
         report["source_grasp_contacts_pending_release"] = source_grasp_contacts_pending[0]
 
         contact_quaternion = current_quaternion.copy()
-        if args.approach_lateral_detour_m and not args.retain_source_orientation:
+        if args.pusher_approach_axis_world is not None:
+            push_axis = np.asarray(args.pusher_approach_axis_world, dtype=np.float64)
+            push_axis /= max(float(np.linalg.norm(push_axis)), 1e-12)
+            source_rotation = Rotation.from_quat(current_quaternion[[1, 2, 3, 0]])
+            if args.preserve_source_tool_roll:
+                source_approach_axis = source_rotation.apply([0.0, 0.0, 1.0])
+                minimum_swing, _ = Rotation.align_vectors(
+                    [push_axis], [source_approach_axis],
+                )
+                target_rotation = minimum_swing * source_rotation
+                quat_xyzw = target_rotation.as_quat()
+                orientation_method = "minimum_swing_preserving_live_tool_roll"
+            else:
+                world_up = np.array([0.0, 0.0, 1.0])
+                reference_axis = (
+                    world_up if abs(float(np.dot(world_up, push_axis))) < 0.95
+                    else np.array([0.0, 1.0, 0.0])
+                )
+                jaw_axis = reference_axis - push_axis * float(
+                    np.dot(reference_axis, push_axis)
+                )
+                jaw_axis /= max(float(np.linalg.norm(jaw_axis)), 1e-12)
+                local_x_world = np.cross(jaw_axis, push_axis)
+                local_x_world /= max(float(np.linalg.norm(local_x_world)), 1e-12)
+                target_rotation = Rotation.from_matrix(
+                    np.column_stack((local_x_world, jaw_axis, push_axis))
+                )
+                quat_xyzw = target_rotation.as_quat()
+                orientation_method = "world_reference_jaw_axis"
+            contact_quaternion = quat_xyzw[[3, 0, 1, 2]]
+            report["pusher_orientation_selection"] = {
+                "method": orientation_method,
+                "requested_tool_local_z_world": push_axis.tolist(),
+                "source_tool_local_z_world": source_rotation.apply([0.0, 0.0, 1.0]).tolist(),
+                "selected_tool_local_z_world": target_rotation.apply([0.0, 0.0, 1.0]).tolist(),
+                "source_to_target_rotation_rad": float(
+                    (source_rotation.inv() * target_rotation).magnitude()
+                ),
+            }
+        elif args.approach_lateral_detour_m and not args.retain_source_orientation:
             # The gripper's local +Z is its approach axis. Orient it toward the
-            # push direction while keeping the open jaw axis approximately
-            # vertical, so first contact is made by the front of the tool.
+            # push direction so first contact is made by the front of the tool.
             push_axis = np.r_[direction, 0.0]
             world_up = np.array([0.0, 0.0, 1.0])
-            jaw_axis = world_up - push_axis * float(np.dot(world_up, push_axis))
-            jaw_axis /= max(float(np.linalg.norm(jaw_axis)), 1e-12)
-            local_x_world = np.cross(jaw_axis, push_axis)
-            local_x_world /= max(float(np.linalg.norm(local_x_world)), 1e-12)
-            rotation_matrix = np.column_stack((local_x_world, jaw_axis, push_axis))
-            quat_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
+            if args.preserve_source_tool_roll:
+                # Runtime Snapshot EEF quaternions use wxyz; SciPy uses xyzw.
+                source_rotation = Rotation.from_quat(current_quaternion[[1, 2, 3, 0]])
+                source_approach_axis = source_rotation.apply([0.0, 0.0, 1.0])
+                minimum_swing, _ = Rotation.align_vectors(
+                    [push_axis], [source_approach_axis],
+                )
+                target_rotation = minimum_swing * source_rotation
+                vertical_jaw_axis = world_up - push_axis * float(np.dot(world_up, push_axis))
+                vertical_jaw_axis /= max(float(np.linalg.norm(vertical_jaw_axis)), 1e-12)
+                vertical_tool_x = np.cross(vertical_jaw_axis, push_axis)
+                vertical_tool_x /= max(float(np.linalg.norm(vertical_tool_x)), 1e-12)
+                fixed_vertical_rotation = Rotation.from_matrix(
+                    np.column_stack((vertical_tool_x, vertical_jaw_axis, push_axis))
+                )
+                report["pusher_orientation_selection"] = {
+                    "method": "minimum_rotation_align_live_local_tool_z_to_push_axis",
+                    "source_local_tool_z_world": source_approach_axis.tolist(),
+                    "target_local_tool_z_world": target_rotation.apply([0.0, 0.0, 1.0]).tolist(),
+                    "source_to_target_rotation_rad": float(minimum_swing.magnitude()),
+                    "source_to_world_vertical_jaw_axis_rotation_rad": float(
+                        (source_rotation.inv() * fixed_vertical_rotation).magnitude()
+                    ),
+                }
+                quat_xyzw = target_rotation.as_quat()
+            else:
+                jaw_axis = world_up - push_axis * float(np.dot(world_up, push_axis))
+                jaw_axis /= max(float(np.linalg.norm(jaw_axis)), 1e-12)
+                local_x_world = np.cross(jaw_axis, push_axis)
+                local_x_world /= max(float(np.linalg.norm(local_x_world)), 1e-12)
+                rotation_matrix = np.column_stack((local_x_world, jaw_axis, push_axis))
+                quat_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
             contact_quaternion = quat_xyzw[[3, 0, 1, 2]]
+        if abs(args.tool_roll_offset_degrees) > 1e-9:
+            live_tool_rotation = Rotation.from_quat(
+                contact_quaternion[[1, 2, 3, 0]]
+            )
+            local_tool_roll = Rotation.from_rotvec(np.array([
+                0.0, 0.0, np.deg2rad(args.tool_roll_offset_degrees),
+            ]))
+            contact_quaternion = (live_tool_rotation * local_tool_roll).as_quat()[[3, 0, 1, 2]]
         contact_approach_ready = False
         if args.skip_contact_approach:
             report["contact_approach"] = {
@@ -487,13 +727,33 @@ def main() -> int:
                 if any(not phase or pose.shape != (3,) or not np.isfinite(pose).all()
                        for pose, _quat, phase in waypoints):
                     raise ValueError("custom_approach_waypoint_invalid")
+            if args.approach_pose_waypoint_json:
+                pose_rows = json.loads(
+                    args.approach_pose_waypoint_json.read_text(encoding="utf-8")
+                )
+                if not isinstance(pose_rows, list) or not pose_rows:
+                    raise ValueError("custom_approach_pose_waypoint_json_must_be_nonempty_list")
+                waypoints = []
+                for row in pose_rows:
+                    if not isinstance(row, dict):
+                        raise ValueError("custom_approach_pose_waypoint_must_be_object")
+                    pose = np.asarray(row.get("position_world_m"), dtype=np.float64)
+                    quat = np.asarray(row.get("quaternion_wxyz"), dtype=np.float64)
+                    phase = str(row.get("phase", ""))
+                    if (pose.shape != (3,) or quat.shape != (4,)
+                            or not np.isfinite(pose).all() or not np.isfinite(quat).all()
+                            or abs(float(np.linalg.norm(quat)) - 1.0) > 1e-3
+                            or not phase):
+                        raise ValueError("custom_approach_pose_waypoint_invalid")
+                    waypoints.append((pose, quat, phase))
             report["contact_approach"] = {
                 "status": "in_progress",
                 "action_budget": approach_budget,
                 "target_eef_position_world_m": contact_pose.tolist(),
                 "waypoints": [
-                    {"position_world_m": pose.tolist(), "phase": name}
-                    for pose, _quat, name in waypoints
+                    {"position_world_m": pose.tolist(),
+                     "quaternion_wxyz": quat.tolist(), "phase": name}
+                    for pose, quat, name in waypoints
                 ],
                 "resume_approach_report": (
                     str(args.resume_approach_report.resolve())
@@ -502,12 +762,18 @@ def main() -> int:
                 "resume_at_waypoint": args.resume_at_waypoint,
                 "stagnation_window_actions": args.approach_stagnation_window_actions,
                 "noncontact_waypoint_position_tolerance_m": args.approach_position_tolerance_m,
+                "lift_waypoint_max_translation_step_m": args.approach_lift_step_m,
+                "grasp_confirmation_consecutive_actions": (
+                    args.grasp_confirmation_consecutive_actions
+                ),
+                "grasp_confirmation_wait_actions": args.grasp_confirmation_wait_actions,
                 "native_BDDL_remains_success_oracle": True,
             }
             approach_start_actions = action_counter[0]
             approached = True
             for waypoint_position, waypoint_quaternion, waypoint_phase in waypoints:
                 final_contact_phase = waypoint_phase == "acquire_pusher_contact"
+                close_phase = waypoint_phase in {"close_on_soup", "close_on_target"}
                 if final_contact_phase and approach_contact_seen():
                     approached = False
                     break
@@ -526,10 +792,26 @@ def main() -> int:
                         else args.approach_position_tolerance_m
                     ),
                     rotation_tolerance_rad=0.06,
-                    max_translation_step_m=0.008,
-                    gripper_action=args.approach_gripper_action,
+                    max_translation_step_m=(
+                        args.approach_lift_step_m
+                        if waypoint_phase.startswith("lift_") else 0.008
+                    ),
+                    maximum_actual_eef_displacement_m=args.maximum_actual_eef_displacement_m,
+                    gripper_action=(
+                        -1.0 if waypoint_phase.startswith("open_")
+                        else args.approach_gripper_action
+                    ),
                     stop_condition=(
                         approach_contact_seen if final_contact_phase else None
+                    ),
+                    success_condition=(
+                        target_bilateral_grasp_confirmed
+                        if close_phase else None
+                    ),
+                    require_success_condition=close_phase,
+                    success_condition_wait_actions=(
+                        args.grasp_confirmation_wait_actions
+                        if close_phase else 0
                     ),
                     planning_tracking={
                         "tracking_mode": "snapshot_contact_push_lateral_detour",
@@ -587,9 +869,11 @@ def main() -> int:
         report["native_target_goal_after_approach"] = goal_after_approach
         max_chunks = (
             int(np.ceil(args.push_distance_m / args.push_chunk_m))
-            if contact_approach_ready else 0
+            if contact_approach_ready and not args.skip_push_after_approach else 0
         )
-        if not contact_approach_ready:
+        if args.skip_push_after_approach:
+            report["early_stop_reason"] = "push_skipped_by_explicit_held_object_waypoint_mode"
+        elif not contact_approach_ready:
             report["early_stop_reason"] = "push_skipped_because_contact_approach_did_not_reach_pusher_pose"
         no_progress_chunks = 0
         for chunk in range(max_chunks):
@@ -603,7 +887,10 @@ def main() -> int:
             current_position = np.asarray(live_robot["eef_pos"], dtype=np.float64)
             current_quaternion = np.asarray(live_robot["eef_quat"], dtype=np.float64)
             step_len = min(args.push_chunk_m, args.push_distance_m - chunk * args.push_chunk_m)
-            target_position = current_position + np.r_[direction * step_len, 0.0]
+            vertical_step = (
+                args.push_vertical_drift_m * step_len / args.push_distance_m
+            )
+            target_position = current_position + np.r_[direction * step_len, vertical_step]
             chunk_start_xy = np.asarray(
                 search._object_state(live["snapshot_state"], int(target_binding["root_body_id"]))["root_pos"],
                 dtype=np.float64,
@@ -621,7 +908,7 @@ def main() -> int:
                 )
                 latest_xy = np.asarray(latest_object["root_pos"], dtype=np.float64)[:2]
                 return float(np.dot(latest_xy - chunk_start_xy, direction)) >= min(
-                    0.010, step_len * 0.80,
+                    args.minimum_push_object_progress_m, step_len * 0.80,
                 )
 
             try:
@@ -631,6 +918,7 @@ def main() -> int:
                     action_counter, remaining, target_binding, args.instruction,
                     policy, monitor, records, frames,
                     max_translation_step_m=min(0.008, args.push_chunk_m),
+                    maximum_actual_eef_displacement_m=args.maximum_actual_eef_displacement_m,
                     position_tolerance_m=0.003, rotation_tolerance_rad=0.06,
                     gripper_action=args.push_gripper_action,
                     stop_condition=chunk_progress_or_success,
@@ -675,7 +963,7 @@ def main() -> int:
             object_progress = float(np.linalg.norm(after_xy - push_baseline_target_xy))
             live_contacts = records[-1].get("grasp_state", {}).get("finger_contacts", {})
             has_target_contact = target_contact_seen()
-            if chunk_progress < 0.0015:
+            if chunk_progress < args.minimum_push_object_progress_m:
                 no_progress_chunks += 1
             else:
                 no_progress_chunks = 0
@@ -701,6 +989,8 @@ def main() -> int:
         report["actions_executed"] = len(records)
         if report["final_native_task_status"].get("task_success") is True:
             report["status"] = "native_task_success"
+        elif final_goal.get("value") is True:
+            report["status"] = "native_target_goal_reached_task_incomplete"
         elif report["status"] not in {
             "native_target_goal_reached",
             "native_target_goal_reached_after_contact_approach",
@@ -724,6 +1014,20 @@ def main() -> int:
         try:
             native = bridge.request({"op": "native_task_status"})
             report["final_native_task_status"] = native
+            if native.get("task_success") is True:
+                # A native-success action also sets env.done. The pose helper
+                # reports that terminal condition as an exception after it has
+                # already recorded the successful physical step. Preserve the
+                # native result as success while retaining the exception below.
+                report["status"] = "native_task_success"
+                report["terminal_exception_after_native_success"] = report["error"]
+            else:
+                target_goal = bridge.request({
+                    "op": "native_goal_query", "predicate": args.target_predicate,
+                })
+                report["final_native_target_goal_query"] = target_goal
+                if target_goal.get("value") is True:
+                    report["status"] = "native_target_goal_reached_task_incomplete"
             snap = bridge.request({"op": "export_runtime_snapshot"})
             if snap.get("status") == "complete" and isinstance(snap.get("payload"), bytes):
                 (args.output / "terminal_runtime_snapshot.pkl").write_bytes(snap["payload"])

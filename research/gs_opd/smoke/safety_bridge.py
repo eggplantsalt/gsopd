@@ -4645,6 +4645,46 @@ def _task_success_first_articulation_context(request):
         raise ValueError("articulated_fixture_contact_approach_direction_is_degenerate")
     radial /= radial_norm
     geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(handle_geom))
+    closed_door_aperture = None
+    door_boxes = [row for row in geom_candidates if row["is_box"]]
+    region_names = [
+        name for name, region_object in getattr(env.env, "object_sites_dict", {}).items()
+        if getattr(region_object, "parent_name", None) == fixture_id
+    ]
+    interior_region_names = [name for name in region_names if "heating" in name or "contain" in name]
+    if interior_region_names:
+        region_names = interior_region_names
+    if (predicate[0].lower() == "close" and joint_type_name == "hinge"
+            and abs(float(axis_world[2])) > 0.9 and door_boxes and region_names):
+        panel = max(door_boxes, key=lambda row: float(np.prod(row["size_m"])))
+        sizes = np.asarray(panel["size_m"], dtype=np.float64)
+        thin_axis = int(np.argmin(sizes))
+        panel_id = int(panel["geom_id"])
+        normal = np.asarray(scratch.geom_xmat[panel_id], dtype=np.float64).reshape(3, 3)[:, thin_axis].copy()
+        normal[2] = 0.0
+        norm = float(np.linalg.norm(normal))
+        region_center = np.mean(np.asarray([
+            env.sim.data.get_site_xpos(name) for name in region_names
+        ], dtype=np.float64), axis=0)
+        panel_center = np.asarray(scratch.geom_xpos[panel_id], dtype=np.float64).copy()
+        if norm > 0.9 and sizes[thin_axis] < 0.25 * float(np.max(sizes)):
+            normal /= norm
+            signed_distance = float(np.dot(panel_center - region_center, normal))
+            if abs(signed_distance) > 0.01:
+                if signed_distance < 0.0:
+                    normal = -normal
+                closed_door_aperture = {
+                    "source": "scratch_closed_hinged_door_collision_plane",
+                    "door_panel_geom_id": panel_id,
+                    "door_panel_geom_name": panel["geom_name"],
+                    "door_closed_position_rad": target_position,
+                    "door_plane_center_world_m": panel_center.tolist(),
+                    "native_region_names": region_names,
+                    "native_region_center_world_m": region_center.tolist(),
+                    "outward_direction_world": normal.tolist(),
+                    "inward_direction_world": (-normal).tolist(),
+                    "live_fixture_state_changed": False,
+                }
     return {
         "operation": "task_success_first_articulation_context",
         "status": "complete", "read_only": True,
@@ -4657,6 +4697,7 @@ def _task_success_first_articulation_context(request):
         "selected_contact_geometries": selected_handle_geometries,
         "fixture_root_body_id": root,
         "fixture_root_body_name": str(fixture.root_body),
+        "closed_door_aperture": closed_door_aperture,
         "native_goal_predicate": predicate,
         "native_goal_value": bool(env.env._eval_predicate(predicate)),
         "joint": {**selected, "target_position": target_position, "close_open_range": target_ranges},
@@ -5120,6 +5161,17 @@ _VERIFIED_STATIC_INSTALLATION_CONTACTS = (
         "scene_body_id": 1,
         "scene_body_name": "study_table",
     },
+    {
+        "model_geometry_sha256": "6cc06b66c27a4645b53b53f78b42e59d523238b9071cec524bda814ecfd51b66",
+        "robot_geom_id": 19,
+        "robot_geom_name": "robot0_link0_collision",
+        "robot_body_id": 3,
+        "robot_body_name": "robot0_link0",
+        "scene_geom_id": 6,
+        "scene_geom_name": "floor",
+        "scene_body_id": 1,
+        "scene_body_name": "floor",
+    },
 )
 
 
@@ -5365,16 +5417,31 @@ def _normalize_safety_geometry_policy(raw_policy):
         robot_geoms,
         other_groups,
     )
+    support_object_ids = raw_policy.get("allowed_carried_support_object_ids", [])
+    known_support_object_ids = {
+        item["object_id"] for item in forbidden_groups + other_groups
+    }
+    if (
+        not isinstance(support_object_ids, list)
+        or any(not isinstance(value, str) or not value for value in support_object_ids)
+        or len(set(support_object_ids)) != len(support_object_ids)
+        or not set(support_object_ids).issubset(known_support_object_ids)
+    ):
+        raise ValueError("allowed_carried_support_object_ids_must_be_verified_non_target_scene_objects")
     support_geom_ids = raw_policy.get("allowed_carried_support_contact_geom_ids", [])
+    verified_support_geom_ids = (
+        set().union(*(item["geom_ids"] for item in other_groups)) if other_groups else set()
+    ) | set().union(*(
+        item["geom_ids"] for item in forbidden_groups
+        if item["object_id"] in set(support_object_ids)
+    ))
     if (
         not isinstance(support_geom_ids, list)
         or any(isinstance(value, bool) or not isinstance(value, int) for value in support_geom_ids)
         or len(set(support_geom_ids)) != len(support_geom_ids)
-        or not set(support_geom_ids).issubset(
-            set().union(*(item["geom_ids"] for item in other_groups)) if other_groups else set()
-        )
+        or not set(support_geom_ids).issubset(verified_support_geom_ids)
     ):
-        raise ValueError("allowed_carried_support_contact_geoms_must_be_verified_other_scene_geometries")
+        raise ValueError("allowed_carried_support_contact_geoms_must_be_verified_support_object_geometries")
     if not forbidden_groups:
         raise ValueError("at_least_one_forbidden_contact_object_is_required_for_takeover")
     allowed_body_ids = set().union(*(item["body_ids"] for item in target_groups)) if target_groups else set()
@@ -5451,6 +5518,7 @@ def _normalize_safety_geometry_policy(raw_policy):
 
     carried_raw = raw_policy.get("carried_object")
     carried_object = None
+    verified_grasp_contact_bindings = []
     if carried_raw is not None:
         if not isinstance(carried_raw, dict):
             raise ValueError("carried_object_must_be_an_object_or_null")
@@ -5561,6 +5629,61 @@ def _normalize_safety_geometry_policy(raw_policy):
         }
         if not carried_object["gripper_geom_ids"].issubset(robot_geoms):
             raise ValueError("carried_object_gripper_geoms_do_not_match_the_active_robot")
+        # A verified grasp can include contact from both fingertip pads and
+        # rigid finger shells. Exclude only the exact live bilateral grasp
+        # pairs from generic robot-vs-target collision checks, with a bound
+        # just below their measured penetration in this RuntimeSnapshot.
+        # The object-to-EEF transform is held fixed in the scratch planner, and
+        # every physical action remains subject to the live grasp monitor and
+        # substep contact recorder.
+        matched = grasp.get("finger_contacts", {}).get("matched_contacts", {})
+        observed_pair_distances = {}
+        for contact_index in range(int(live.ncon)):
+            contact = live.contact[contact_index]
+            pair = tuple(sorted((int(contact.geom1), int(contact.geom2))))
+            if (
+                pair[0] in expected_gripper_geoms
+                and pair[1] in carried_group["geom_ids"]
+            ) or (
+                pair[1] in expected_gripper_geoms
+                and pair[0] in carried_group["geom_ids"]
+            ):
+                observed_pair_distances.setdefault(pair, []).append(float(contact.dist))
+        for side in ("left", "right"):
+            rows = matched.get(side, [])
+            if not rows:
+                raise ValueError(f"carried_object_verified_grasp_missing_{side}_finger_contacts")
+            for row in rows:
+                finger_geom = int(row.get("finger_geom", {}).get("id", -1))
+                object_geom = int(row.get("object_geom", {}).get("id", -1))
+                pair = tuple(sorted((finger_geom, object_geom)))
+                distances = observed_pair_distances.get(pair, [])
+                if (
+                    finger_geom not in expected_gripper_geoms
+                    or object_geom not in carried_group["geom_ids"]
+                    or not distances
+                ):
+                    raise ValueError(
+                        f"carried_object_verified_grasp_contact_is_not_live:{side}:{pair}"
+                    )
+                measured_distance = min(distances)
+                if measured_distance < -0.005:
+                    raise ValueError(
+                        f"carried_object_verified_grasp_contact_penetration_exceeds_5mm:{pair}:{measured_distance}"
+                    )
+                pair_ids.add(pair)
+                allowed_pair_min_clearance[pair] = min(
+                    allowed_pair_min_clearance.get(pair, 0.0),
+                    measured_distance - 0.0001,
+                )
+                verified_grasp_contact_bindings.append({
+                    "side": side,
+                    "robot_geom_id": finger_geom,
+                    "carried_geom_id": object_geom,
+                    "measured_signed_contact_distance_m": measured_distance,
+                    "minimum_clearance_m": allowed_pair_min_clearance[pair],
+                    "source": "bridge_verified_live_bilateral_grasp_contacts",
+                })
     classified_scene_body_ids = set().union(*(item["body_ids"] for item in groups)) if groups else set()
     all_active_collision_geoms = _collision_geom_ids(range(int(model.nbody)))
     all_scene_collision_body_ids = {
@@ -5584,6 +5707,7 @@ def _normalize_safety_geometry_policy(raw_policy):
         "other_scene_objects": other_groups,
         "allowed_contact_pair_ids": pair_ids,
         "allowed_pair_minimum_clearance_m": allowed_pair_min_clearance,
+        "verified_grasp_contact_bindings": verified_grasp_contact_bindings,
         "allowed_static_installation_contact_pair_ids": static_installation_pair_ids,
         "allowed_static_installation_contact_pair_bindings": static_installation_pair_bindings,
         "allowed_target_body_ids": allowed_body_ids,
@@ -5591,6 +5715,7 @@ def _normalize_safety_geometry_policy(raw_policy):
         "forbidden_scene_body_ids": set().union(*(item["body_ids"] for item in forbidden_groups)) if forbidden_groups else set(),
         "other_scene_body_ids": set().union(*(item["body_ids"] for item in other_groups)) if other_groups else set(),
         "allowed_carried_support_contact_geom_ids": set(support_geom_ids),
+        "allowed_carried_support_object_ids": set(support_object_ids),
         "forbidden_object_pairs": normalized_forbidden_pairs,
         "measure_forbidden_object_pair_clearances": measure_pair_clearances,
         "carried_object": carried_object,
@@ -6254,6 +6379,15 @@ def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monit
         raise ValueError("active_robot_arm_joint_or_actuator_mapping_is_not_7D")
     q_start = np.asarray(data.qpos[qidx], dtype=np.float64).copy()
     q_delta = q_target - q_start
+    joint_limit_recovery_tolerance = request.get("joint_limit_recovery_tolerance_rad", 0.0)
+    if (
+        isinstance(joint_limit_recovery_tolerance, bool)
+        or not isinstance(joint_limit_recovery_tolerance, (int, float))
+        or not np.isfinite(float(joint_limit_recovery_tolerance))
+        or not 0.0 <= float(joint_limit_recovery_tolerance) <= 0.01
+    ):
+        raise ValueError("joint_limit_recovery_tolerance_rad_is_invalid")
+    joint_limit_recovery_tolerance = float(joint_limit_recovery_tolerance)
     control_dt = float(task_env.control_timestep)
     model_dt = float(task_env.model_timestep)
     substeps = int(round(control_dt / model_dt))
@@ -6269,6 +6403,11 @@ def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monit
     ], 1], dtype=np.float64)
     if np.any(q_target < lower) or np.any(q_target > upper):
         raise ValueError("joint_target_exceeds_compiled_MuJoCo_position_limits")
+    if (
+        np.any(q_start < lower - joint_limit_recovery_tolerance)
+        or np.any(q_start > upper + joint_limit_recovery_tolerance)
+    ):
+        raise ValueError("joint_start_exceeds_recovery_tolerance")
     gripper_action = request.get("gripper_action")
     if gripper_action is not None:
         if isinstance(gripper_action, bool) or not isinstance(gripper_action, (int, float)):
@@ -6348,7 +6487,10 @@ def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monit
             task_env._update_observables()
             if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
                 raise FloatingPointError("MuJoCo_state_became_nonfinite_during_joint_control")
-            if np.any(data.qpos[qidx] < lower - 1e-7) or np.any(data.qpos[qidx] > upper + 1e-7):
+            if (
+                np.any(data.qpos[qidx] < lower - joint_limit_recovery_tolerance)
+                or np.any(data.qpos[qidx] > upper + joint_limit_recovery_tolerance)
+            ):
                 raise RuntimeError("MuJoCo_arm_joint_crossed_compiled_position_limit")
         task_env.cur_time += control_dt
         reward, done, info = task_env._post_action(None)
@@ -6369,6 +6511,17 @@ def _run_joint_trajectory_step_with_contact_monitor(request, action_index, monit
         monitor["_last_control_step"] = _finish_contact_control_step(monitor, control_step)
 
     info["applied_joint_torques_nm_per_substep"] = applied_joint_torques
+    if joint_limit_recovery_tolerance > 0.0:
+        final_q = np.asarray(data.qpos[qidx], dtype=np.float64)
+        info["joint_limit_recovery"] = {
+            "tolerance_rad": joint_limit_recovery_tolerance,
+            "source_qpos_rad": q_start.tolist(),
+            "target_qpos_rad": q_target.tolist(),
+            "final_qpos_rad": final_q.tolist(),
+            "final_outside_limit_rad": np.maximum(
+                np.maximum(lower - final_q, final_q - upper), 0.0
+            ).tolist(),
+        }
     return obs, reward, done, info, substep_contacts
 
 
@@ -7783,6 +7936,7 @@ try:
                             expected_instruction=expected_instruction,
                             actual_instruction=task.language,
                             ik_seed_qpos=request.get("ik_seed_qpos"),
+                            ik_selection_seed_qpos=request.get("ik_selection_seed_qpos"),
                             planner_config=planner_config,
                         )
                         result["operation"] = "task_success_first_rrt"
@@ -7839,7 +7993,8 @@ try:
                             actual_instruction=task.language,
                             ik_seed_qpos=request.get("ik_seed_qpos"),
                             ik_selection_seed_qpos=request.get("ik_selection_seed_qpos"),
-                            goal_ik_only=True,
+                            planner_config=request.get("planner_config"),
+                            goal_ik_only=bool(request.get("goal_ik_only", True)),
                             ik_solver_max_nfev=int(request.get("ik_solver_max_nfev", 120)),
                             jointspace_reference_start_qpos=request.get(
                                 "jointspace_reference_start_qpos"

@@ -412,14 +412,30 @@ def plan_current_scene(
     if not isinstance(normalized_safety_policy, dict):
         raise ValueError("verified_safety_geometry_policy_is_required")
     planner_values = dict(planner_config or {})
+    ik_joint_limit_margin = float(planner_values.pop("ik_joint_limit_margin_rad", 1e-7))
+    if not np.isfinite(ik_joint_limit_margin) or not 1e-7 <= ik_joint_limit_margin <= 0.20:
+        raise ValueError("ik_joint_limit_margin_rad_must_be_in_1e_7_to_0_20")
     start_joint_limit_tolerance_rad = float(
         planner_values.get("start_joint_limit_tolerance_rad", 0.0)
     )
+    raw_allowed_penetration = planner_values.get("allowed_penetration_by_object", {})
     if (
         not np.isfinite(start_joint_limit_tolerance_rad)
         or start_joint_limit_tolerance_rad < 0.0
     ):
         raise ValueError("start_joint_limit_tolerance_must_be_finite_and_non_negative")
+    if not isinstance(raw_allowed_penetration, dict):
+        raise ValueError("allowed_penetration_by_object_must_be_an_object")
+    allowed_penetration_by_object: dict[str, float] = {}
+    for object_id, raw_depth in raw_allowed_penetration.items():
+        depth = float(raw_depth)
+        if (
+            not isinstance(object_id, str) or not object_id
+            or not np.isfinite(depth) or depth < 0.0 or depth > 0.20
+        ):
+            raise ValueError("allowed_penetration_by_object_entry_is_invalid")
+        allowed_penetration_by_object[object_id] = depth
+    planner_values.pop("allowed_penetration_by_object", None)
     if not isinstance(goal_configuration_preflight_only, bool):
         raise ValueError("goal_configuration_preflight_only_must_be_boolean")
     if not isinstance(goal_ik_only, bool):
@@ -528,6 +544,11 @@ def plan_current_scene(
     allowed_target_body_ids = set(normalized_safety_policy["allowed_target_body_ids"])
     other_scene_body_ids = set(normalized_safety_policy["other_scene_body_ids"])
     forbidden_object_pairs = normalized_safety_policy["forbidden_object_pairs"]
+    penetration_by_body_id = {
+        int(body_id): float(allowed_penetration_by_object.get(item["object_id"], 0.0))
+        for item in checked_objects
+        for body_id in item["body_ids"]
+    }
     lower = np.asarray(model.jnt_range[arm_joint_ids, 0], dtype=np.float64).copy()
     upper = np.asarray(model.jnt_range[arm_joint_ids, 1], dtype=np.float64).copy()
     limited = np.asarray(model.jnt_limited[arm_joint_ids], dtype=bool)
@@ -577,8 +598,8 @@ def plan_current_scene(
 
         solution = least_squares(
             residual,
-            np.clip(seed, lower + 1e-7, upper - 1e-7),
-            bounds=(lower + 1e-7, upper - 1e-7),
+            np.clip(seed, lower + ik_joint_limit_margin, upper - ik_joint_limit_margin),
+            bounds=(lower + ik_joint_limit_margin, upper - ik_joint_limit_margin),
             x_scale="jac",
             max_nfev=ik_solver_max_nfev,
             ftol=1e-11,
@@ -609,12 +630,31 @@ def plan_current_scene(
         if item["position_error_m"] <= 0.003 and item["orientation_error_rad"] <= 0.03
     ]
     if not ik_valid:
-        raise ValueError("task_goal_has_no_bounded_current_scene_inverse_kinematics_solution")
+        best = min(
+            ik_candidates,
+            key=lambda item: (
+                (item["position_error_m"] / 0.003) ** 2
+                + (item["orientation_error_rad"] / 0.03) ** 2
+            ),
+        )
+        raise ValueError(
+            "task_goal_has_no_bounded_current_scene_inverse_kinematics_solution:"
+            f"best_position_error_m={best['position_error_m']:.6f};"
+            f"best_orientation_error_rad={best['orientation_error_rad']:.6f};"
+            f"best_joint5_rad={best['qpos'][4]:.6f};"
+            f"best_seed_index={best['seed_index']}"
+        )
     selection_seed = planner_q_start
     if ik_selection_seed_qpos is not None:
         selection_seed = _unit(ik_selection_seed_qpos, 7, "ik_selection_seed_qpos")
-        if np.any(selection_seed < lower) or np.any(selection_seed > upper):
+        if (
+            np.any(selection_seed < lower - start_joint_limit_tolerance_rad)
+            or np.any(selection_seed > upper + start_joint_limit_tolerance_rad)
+        ):
             raise ValueError("ik_selection_seed_qpos_is_outside_joint_limits")
+        # Score IK seeds against the same bounded projection used for the
+        # measured real start. The live MuJoCo state is never modified.
+        selection_seed = np.clip(selection_seed, lower, upper)
     for item in ik_valid:
         item["selection_seed_distance_rad"] = float(
             np.linalg.norm(item["qpos"] - selection_seed)
@@ -633,8 +673,12 @@ def plan_current_scene(
             reference_start = _unit(
                 jointspace_reference_start_qpos, 7, "jointspace_reference_start_qpos"
             )
-            if np.any(reference_start < lower) or np.any(reference_start > upper):
+            if (
+                np.any(reference_start < lower - start_joint_limit_tolerance_rad)
+                or np.any(reference_start > upper + start_joint_limit_tolerance_rad)
+            ):
                 raise ValueError("jointspace_reference_start_qpos_is_outside_joint_limits")
+            reference_start = np.clip(reference_start, lower, upper)
             maximum_joint_delta = float(np.max(np.abs(q_goal - reference_start)))
             reference_steps = max(
                 1, int(math.ceil(maximum_joint_delta / float(jointspace_reference_max_step_rad)))
@@ -681,7 +725,16 @@ def plan_current_scene(
         clearances = {}
         clearance_pair_details = {}
         forbidden_contacts = []
+        carried = normalized_safety_policy.get("carried_object")
         for item in checked_objects:
+            # A bridge-verified carried object is rigidly propagated from the
+            # measured live grasp transform in scratch data. Its robot contact
+            # is therefore the grasp itself, not an environmental obstacle;
+            # the live grasp verifier checks bilateral fingertip contact, and
+            # the carried geometry is still checked against every scene object
+            # below. Keep robot collision checks against all other objects.
+            if carried is not None and item["object_id"] == carried["object_id"]:
+                continue
             group_allowed_pairs = {
                 pair for pair in allowed_pair_ids
                 if next(geom_id for geom_id in pair if geom_id not in set(robot_geoms))
@@ -700,11 +753,14 @@ def plan_current_scene(
                 return ConfigurationCheck("incomplete", None, {}, diagnostics={"object_id": item["object_id"]})
             clearances[item["object_id"]] = distance
             clearance_pair_details[item["object_id"]] = distance_detail.get("pair")
-            if distance < item["minimum_clearance_m"]:
+            minimum_required = float(item["minimum_clearance_m"]) - float(
+                allowed_penetration_by_object.get(item["object_id"], 0.0)
+            )
+            if distance < minimum_required:
                 forbidden_contacts.append({
                     "object_id": item["object_id"],
                     "distance_m": float(distance),
-                    "minimum_required_m": item["minimum_clearance_m"],
+                    "minimum_required_m": minimum_required,
                 })
             for pair in group_allowed_pairs:
                 pair_distance = _exact_pair_distance(mujoco, model, scratch, *pair)
@@ -722,7 +778,6 @@ def plan_current_scene(
                         "distance_m": pair_distance,
                         "minimum_allowed_distance_m": minimum_allowed,
                     })
-        carried = normalized_safety_policy.get("carried_object")
         carried_forbidden_clearances = []
         if carried is not None:
             carried_geoms = np.asarray(sorted(carried["geom_ids"]), dtype=np.int64)
@@ -777,11 +832,19 @@ def plan_current_scene(
                             "distance_m": pair_distance,
                             "minimum_allowed_distance_m": minimum_allowed,
                         })
-        minimum_forbidden = min(
-            [clearances[item["object_id"]] for item in forbidden]
-            + carried_forbidden_clearances,
-            default=10.0,
-        )
+        effective_forbidden_clearances = [
+            clearances[item["object_id"]]
+            + float(allowed_penetration_by_object.get(item["object_id"], 0.0))
+            for item in forbidden
+        ]
+        if carried is not None:
+            effective_forbidden_clearances.extend(
+                value + float(allowed_penetration_by_object.get(item["object_id"], 0.0))
+                for item in checked_objects
+                for value in [clearances.get(f"carried:{carried['object_id']}->{item['object_id']}")]
+                if value is not None and item["policy_class"] == "forbidden_objects"
+            )
+        minimum_forbidden = min(effective_forbidden_clearances, default=10.0)
         self_contacts = []
         for contact_index in range(int(scratch.ncon)):
             contact = scratch.contact[contact_index]
@@ -794,9 +857,13 @@ def plan_current_scene(
             elif body_a in robot_bodies or body_b in robot_bodies:
                 scene_body = body_b if body_a in robot_body_ids else body_a
                 if scene_body in forbidden_body_ids:
-                    forbidden_contacts.append({"geom_ids": [geom_a, geom_b], "body_ids": [body_a, body_b], "distance_m": float(contact.dist)})
+                    penetration_allowance = penetration_by_body_id.get(scene_body, 0.0)
+                    if float(contact.dist) < -penetration_allowance:
+                        forbidden_contacts.append({"geom_ids": [geom_a, geom_b], "body_ids": [body_a, body_b], "distance_m": float(contact.dist)})
                 elif scene_body in allowed_target_body_ids and tuple(sorted((geom_a, geom_b))) not in allowed_pair_ids:
-                    forbidden_contacts.append({"geom_ids": [geom_a, geom_b], "body_ids": [body_a, body_b], "distance_m": float(contact.dist)})
+                    penetration_allowance = penetration_by_body_id.get(scene_body, 0.0)
+                    if float(contact.dist) < -penetration_allowance:
+                        forbidden_contacts.append({"geom_ids": [geom_a, geom_b], "body_ids": [body_a, body_b], "distance_m": float(contact.dist)})
                 elif scene_body in other_scene_body_ids:
                     forbidden_contacts.append({
                         "unallowed_scene_contact": True,
@@ -829,6 +896,13 @@ def plan_current_scene(
             },
         )
 
+    raw_safe_goal_requirement = planner_values.pop(
+        "require_safe_goal_configurations", None,
+    )
+    if raw_safe_goal_requirement is not None and not isinstance(
+        raw_safe_goal_requirement, bool,
+    ):
+        raise ValueError("require_safe_goal_configurations_must_be_a_bool")
     configured_margin = float(
         planner_values.pop("minimum_clearance_m", normalized_safety_policy["minimum_clearance_m"])
     )
@@ -838,10 +912,15 @@ def plan_current_scene(
         **planner_values,
         minimum_clearance_m=configured_margin,
     )
+    require_safe_goal_configurations = (
+        planner_cfg.require_safe_configurations
+        if raw_safe_goal_requirement is None
+        else raw_safe_goal_requirement
+    )
     if goal_configuration_preflight_only and not planner_cfg.require_safe_configurations:
         raise ValueError("goal_configuration_preflight_requires_full_collision_checks")
     goal_ik_configuration_checks = 0
-    if planner_cfg.require_safe_configurations:
+    if require_safe_goal_configurations:
         safe_ik_candidates = []
         for item in ik_valid:
             goal_check = check_configuration(item["qpos"])
@@ -888,6 +967,10 @@ def plan_current_scene(
                     "clearance_pairs_by_object": item.get(
                         "goal_configuration_clearance_pairs_by_object", {}
                     ),
+                    "forbidden_contacts": item.get(
+                        "goal_configuration_forbidden_contacts", []
+                    ),
+                    "self_contacts": item.get("goal_configuration_self_contacts", []),
                     "forbidden_contact_count": len(
                         item.get("goal_configuration_forbidden_contacts", [])
                     ),
@@ -989,6 +1072,8 @@ def plan_current_scene(
             ],
             "route_candidates": result.candidates,
             "live_state_unchanged": unchanged,
+            "require_safe_configurations": planner_cfg.require_safe_configurations,
+            "require_safe_goal_configurations": require_safe_goal_configurations,
             "start_joint_limit_validation": {
                 "maximum_live_excess_rad": float(np.max(start_joint_limit_excess)),
                 "offline_start_projection_applied": bool(np.any(start_joint_limit_excess > 0.0)),
@@ -1059,6 +1144,8 @@ def plan_current_scene(
         ],
         "route_candidates": route_candidates,
         "live_state_unchanged": unchanged,
+        "require_safe_configurations": planner_cfg.require_safe_configurations,
+        "require_safe_goal_configurations": require_safe_goal_configurations,
         "start_joint_limit_validation": {
             "maximum_live_excess_rad": float(np.max(start_joint_limit_excess)),
             "offline_start_projection_applied": bool(np.any(start_joint_limit_excess > 0.0)),

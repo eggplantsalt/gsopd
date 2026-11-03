@@ -1,8 +1,12 @@
 # SafeTRAIL Task-Feasible Bootstrap: 30-task matrix
 
-## Current checkpoint (2026-10-30)
+## Current checkpoint (2026-11-02)
 
-当前覆盖12/30：10项Standard、2项Extended。最新新增`obstacle_avoidance_human/L1T1`在t981原生BDDL成功，完整Episode 981动作/24,525个真实接触子步，t578/t798/t904 Snapshot边界及t981终态均精确审计；详情见任务矩阵该行及成功清单。关键效率修正是当native-region路由已包含最终插入且无后续对象目标时，不再固定保留96个Stage A动作，已让t904续段以77步完成。当前下一项为`obstacle_avoidance/L1T4`：t759持物快照显示mug已到微波炉内目标XY 2.6mm范围，但末端下降OSC停滞；后续继续In放置，再执行原生Close目标，Standard剩241动作。已完成/未完成唯一状态见CSV；开发定向路线与冻结版本评测分开记录。
+原生BDDL覆盖20/30（12 Standard、8 Extended），尚缺10项。OA/L2T4 dev35由t1491快照真实执行440步至t1931，持物未失，但180°旋姿使杯远离放置区0.617m，In/Close仍false。dev36已从该精确Snapshot续跑，目标yaw约128°来自实测姿态投影。结果、连续Snapshot和失败物理记录见`GS_OPD_CURRENT_GOAL.md`与数据盘日志；唯一逐任务状态以CSV为准。
+
+## Historical checkpoint (2026-10-30)
+
+当时覆盖12/30：10项Standard、2项Extended。新增`obstacle_avoidance_human/L1T1`在t981原生BDDL成功，完整Episode 981动作/24,525个真实接触子步，t578/t798/t904 Snapshot边界及t981终态均精确审计；详情见任务矩阵该行及成功清单。关键效率修正是当native-region路由已包含最终插入且无后续对象目标时，不再固定保留96个Stage A动作，已让t904续段以77步完成。随后待办曾是`obstacle_avoidance/L1T4` t759持物快照：mug距微波炉内目标XY 2.6mm，下降OSC停滞，Standard剩241动作。已完成/未完成唯一状态见CSV；开发定向路线与冻结版本评测分开记录。
 
 ## Previous checkpoint (2026-10-29)
 

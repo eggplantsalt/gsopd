@@ -75,14 +75,17 @@ BRIDGE_AUTHKEY = b"gs-opd-local"
 EXPECTED_MUJOCO_SUBSTEPS_PER_ACTION = 25
 MAX_GEOMETRY_CANDIDATES = 16
 MAX_OFFLINE_GEOMETRY_SCREEN_BATCH = 24
-MAX_OFFLINE_GEOMETRY_GENERATION = 48
+MAX_OFFLINE_GEOMETRY_GENERATION = 512
 MAX_RRT_PREFLIGHTS = 8
 MAX_PHYSICAL_BRANCHES = 3
-MAX_BRANCH_CONTROL_ACTIONS = 440
+# Stage A Extended continuation routes may span multiple legal waypoints. The
+# active episode horizon and per-run action budget remain the operational
+# limits; this ceiling no longer truncates physically progressing routes at 440.
+MAX_BRANCH_CONTROL_ACTIONS = 5000
 MAX_PREFIX_CONTROL_ACTIONS = 320
 MAX_APPROACH_CONTROL_ACTIONS = 60
 MAX_CLOSE_CONTROL_ACTIONS = 18
-MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS = 8
+MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS = 12
 # A unilateral pad contact can occur well before the generated grasp pose is
 # reached.  Only use a pose-held close probe when that contact is already near
 # the nominal frame; otherwise finish the live object-relative surface approach.
@@ -1928,6 +1931,9 @@ def _record_joint_trajectory_step(
     records: list[dict[str, Any]],
     frames: list[dict[str, Any]],
     *,
+    gripper_action: float = 0.0,
+    planning_tracking: dict[str, Any] | None = None,
+    joint_limit_recovery_tolerance_rad: float = 0.0,
     raise_on_done: bool = True,
 ) -> None:
     """Execute and archive one measured joint-space RRT trajectory sample."""
@@ -1941,8 +1947,11 @@ def _record_joint_trajectory_step(
         "op": "joint_trajectory_step",
         "action_index": int(action_index),
         "joint_target_qpos_rad": target.tolist(),
-        "gripper_action": 0.0,
+        "gripper_action": float(gripper_action),
         "joint_position_kp": 50.0,
+        "joint_limit_recovery_tolerance_rad": float(
+            joint_limit_recovery_tolerance_rad
+        ),
         "safety_geometry_policy": (
             None if _STAGE_A_CONTACT_ONLY_SUBSTEP_AUDIT else policy
         ),
@@ -1979,6 +1988,7 @@ def _record_joint_trajectory_step(
         "joint_target_qpos_rad": target.tolist(),
         "control_mode": "joint_space_mass_matrix_PD_torque",
         "control_action_space": "7D_joint_target_qpos_rad",
+        "gripper_action_command": float(gripper_action),
         "state": reply.get("state", {}),
         "snapshot_state": snapshot_state,
         "target_body_id": int(target_binding["body_id"]),
@@ -2016,6 +2026,15 @@ def _record_joint_trajectory_step(
         "agentview_rgb": _image(reply, "agentview_image"),
         "wrist_rgb": _image(reply, "robot0_eye_in_hand_image"),
     })
+    if planning_tracking is not None:
+        tracking = dict(planning_tracking)
+        actual_joint_qpos = snapshot_state.get("robot_states", [{}])[0].get("joint_qpos")
+        if actual_joint_qpos is not None:
+            tracking["actual_joint_qpos_after_rad"] = actual_joint_qpos
+            actual_q = np.asarray(actual_joint_qpos, dtype=np.float64)
+            if actual_q.shape == target.shape:
+                tracking["joint_target_error_l2_rad"] = float(np.linalg.norm(actual_q - target))
+        records[-1]["planning_tracking"] = tracking
     if reply.get("done") and raise_on_done:
         raise RuntimeError("environment_done_during_grasp_only_joint_route")
 
@@ -2084,16 +2103,21 @@ def _advance_pose(
     frames: list[dict[str, Any]],
     *,
     stop_condition=None,
+    success_condition=None,
+    require_success_condition: bool = False,
+    success_condition_wait_actions: int = 0,
     step_callback=None,
     stagnation_window_actions: int = 0,
     position_tolerance_m: float = 0.004,
     rotation_tolerance_rad: float = 0.045,
     max_translation_step_m: float = 0.008,
     max_rotation_step_rad: float = 0.10,
+    maximum_actual_eef_displacement_m: float = 0.030,
     planning_tracking: dict[str, Any] | None = None,
     target_pose_provider: Callable[
         [dict[str, Any]], tuple[np.ndarray, np.ndarray]
     ] | None = None,
+    target_pose_provider_requires_bilateral_grasp: bool = True,
     object_progress_reached_condition: Callable[[dict[str, Any]], bool] | None = None,
     translation_axes: tuple[int, ...] | None = None,
     minimum_vertical_translation_fraction: float = 0.0,
@@ -2132,6 +2156,13 @@ def _advance_pose(
     ):
         raise ValueError("pose_tracking_max_rotation_step_rad_must_be_in_0.005_to_0.10")
     if (
+        isinstance(maximum_actual_eef_displacement_m, bool)
+        or not isinstance(maximum_actual_eef_displacement_m, (int, float))
+        or not np.isfinite(float(maximum_actual_eef_displacement_m))
+        or not 0.010 <= float(maximum_actual_eef_displacement_m) <= 0.10
+    ):
+        raise ValueError("pose_tracking_max_actual_eef_displacement_must_be_in_0.010_to_0.10")
+    if (
         isinstance(gripper_action, bool)
         or not isinstance(gripper_action, (int, float))
         or not np.isfinite(float(gripper_action))
@@ -2159,12 +2190,26 @@ def _advance_pose(
         absolute_action_limit = MAX_BRANCH_CONTROL_ACTIONS
     if object_progress_rotation_only and object_progress_target_world is None:
         raise ValueError("pose_tracking_rotation_only_requires_an_object_progress_target")
+    if not isinstance(target_pose_provider_requires_bilateral_grasp, bool):
+        raise ValueError("pose_tracking_target_pose_provider_grasp_gate_must_be_boolean")
     if object_progress_reached_condition is not None and not callable(
         object_progress_reached_condition
     ):
         raise ValueError("pose_tracking_object_progress_reached_condition_must_be_callable")
+    if success_condition is not None and not callable(success_condition):
+        raise ValueError("pose_tracking_success_condition_must_be_callable")
+    if not isinstance(require_success_condition, bool):
+        raise ValueError("pose_tracking_require_success_condition_must_be_boolean")
+    if (
+        isinstance(success_condition_wait_actions, bool)
+        or not isinstance(success_condition_wait_actions, int)
+        or success_condition_wait_actions < 0
+        or (require_success_condition and success_condition_wait_actions < 1)
+    ):
+        raise ValueError("pose_tracking_success_condition_wait_actions_invalid")
     progress_history: list[tuple[float, float]] = []
     object_progress_history: list[tuple[float, float]] = []
+    success_condition_hold_actions = 0
     object_progress_target = None
     if object_progress_target_world is not None:
         object_progress_target = np.asarray(object_progress_target_world, dtype=np.float64)
@@ -2187,9 +2232,13 @@ def _advance_pose(
             raise RuntimeError("physical_branch_control_action_budget_exhausted_before_step")
         if stop_condition is not None and stop_condition():
             return False
+        if success_condition is not None and success_condition():
+            return True
         observed = bridge.request({"op": "observe", "include_snapshot_state": True})
         bilateral_for_tracking = previous_bilateral_grasp_confirmed()
-        if target_pose_provider is not None and bilateral_for_tracking:
+        if target_pose_provider is not None and (
+            bilateral_for_tracking or not target_pose_provider_requires_bilateral_grasp
+        ):
             target_position, target_quaternion = target_pose_provider(
                 observed.get("snapshot_state", {})
             )
@@ -2250,11 +2299,22 @@ def _advance_pose(
                 ))
             ):
                 return True
-        elif object_progress_target is None and _pose_tracking_error_within_tolerance(
-            distance, rotation_norm, position_tolerance_m, rotation_tolerance_rad,
-        ):
+        pose_reached = (
+            object_progress_target is None
+            and _pose_tracking_error_within_tolerance(
+                distance, rotation_norm, position_tolerance_m, rotation_tolerance_rad,
+            )
+        )
+        waiting_for_success_condition = bool(
+            pose_reached and require_success_condition and success_condition is not None
+        )
+        if pose_reached and not waiting_for_success_condition:
             return True
-        if stagnation_window_actions:
+        if waiting_for_success_condition:
+            if success_condition_hold_actions >= success_condition_wait_actions:
+                return False
+            success_condition_hold_actions += 1
+        if stagnation_window_actions and not waiting_for_success_condition:
             if (
                 isinstance(stagnation_window_actions, bool)
                 or not isinstance(stagnation_window_actions, int)
@@ -2300,7 +2360,9 @@ def _advance_pose(
                     f"{phase}_waypoint_stagnated_for_{stagnation_window_actions}_actions"
                     f"{diagnostic}"
                 )
-        if translation_axes is None:
+        if waiting_for_success_condition:
+            delta_position = np.zeros(3, dtype=np.float64)
+        elif translation_axes is None:
             step_limit = float(max_translation_step_m)
             vertical_fraction = float(minimum_vertical_translation_fraction)
             if vertical_fraction > 0.0 and abs(float(position_error[2])) > 1e-12:
@@ -2344,8 +2406,11 @@ def _advance_pose(
             delta_position = position_error * min(
                 1.0, float(max_translation_step_m) / max(distance, 1e-12),
             )
-        delta_rotation = rotation_error * min(
-            1.0, float(max_rotation_step_rad) / max(rotation_norm, 1e-12),
+        delta_rotation = (
+            np.zeros(3, dtype=np.float64)
+            if waiting_for_success_condition else rotation_error * min(
+                1.0, float(max_rotation_step_rad) / max(rotation_norm, 1e-12),
+            )
         )
         next_quaternion_xyzw = Rotation.from_rotvec(delta_rotation).as_quat()
         next_quaternion = quaternion_multiply(
@@ -2400,8 +2465,13 @@ def _advance_pose(
         actual = np.asarray(
             records[-1]["snapshot_state"]["robot_states"][0]["eef_pos"], dtype=np.float64
         )
-        if float(np.linalg.norm(actual - current_position)) > 0.030:
-            raise RuntimeError("actual_EEF_displacement_exceeded_30mm_per_control_action")
+        actual_displacement = float(np.linalg.norm(actual - current_position))
+        if actual_displacement > float(maximum_actual_eef_displacement_m):
+            raise RuntimeError(
+                "actual_EEF_displacement_exceeded_configured_limit_per_control_action:"
+                f"actual_m={actual_displacement:.6f};"
+                f"limit_m={float(maximum_actual_eef_displacement_m):.6f}"
+            )
         if stop_condition is not None and stop_condition():
             return False
         # The monitored action record contains the exact post-step MuJoCo
@@ -2581,16 +2651,28 @@ def _run_physical_branch(
     frames: list[dict[str, Any]],
     output_dir: Path,
     local_replan_rrt_time_budget_s: float = 2.0,
+    stage_a_close_action_budget: int = MAX_CLOSE_CONTROL_ACTIONS,
     pregrasp_route_waypoint_position_tolerance_m: float = 0.004,
+    pregrasp_route_waypoint_rotation_tolerance_rad: float = 0.045,
+    surface_approach_position_tolerance_m: float = 0.004,
     pregrasp_route_control_mode: str = "eef_osc",
+    joint_space_rrt_max_tracking_error_l2_rad: float = 0.15,
     abort_target_displacement_m: float | None = None,
     force_route_before_contact_close: bool = False,
     stage_a_unilateral_close_probe_position_m: float = LIVE_UNILATERAL_CLOSE_PROBE_POSITION_M,
+    stage_a_unilateral_contact_close_probe: bool = False,
+    stage_a_unilateral_contact_route_first: bool = False,
+    stage_a_stop_pregrasp_route_on_stable_grasp: bool = False,
+    stage_a_route_grasp_intercept_stable_samples: int = 3,
+    stage_a_live_contact_lift_translation_step_m: float = LIVE_CONTACT_LIFT_TRANSLATION_STEP_M,
+    stage_a_near_pregrasp_bypass_position_m: float = PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M,
+    stage_a_near_pregrasp_bypass_rotation_rad: float = PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD,
     stage_a_pregrasp_staged_clearance_height_m: float = 0.0,
     stage_a_pregrasp_lateral_detour_m: float = 0.0,
     stage_a_pregrasp_lift_before_lateral_detour: bool = False,
     stage_a_pregrasp_axis_aligned_high_transit: bool = False,
     stage_a_pregrasp_obstacle_aware_high_transit: bool = False,
+    stage_a_pregrasp_high_transit_axis_tolerance_m: float = 0.004,
     stage_a_obstacle_components: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], bytes | None]:
     from research.gs_opd.repair.trajectory_tracking import world_pose_tracking_action
@@ -2741,9 +2823,23 @@ def _run_physical_branch(
     pregrasp_open_actions = 0
     pregrasp_open_qpos_tolerance_m = 0.0005
     pregrasp_open_qpos_start = initial_gripper_qpos.copy()
+    candidate_clamp_width_m = candidate.get("estimated_clamp_width_m")
+    measured_pad_gap_m = context.get("gripper_pad_separation_m")
+    candidate_has_sufficient_live_aperture = False
+    if candidate_clamp_width_m is not None and measured_pad_gap_m is not None:
+        candidate_clamp_width_m = float(candidate_clamp_width_m)
+        measured_pad_gap_m = float(measured_pad_gap_m)
+        if (
+            np.isfinite(candidate_clamp_width_m)
+            and candidate_clamp_width_m > 0.0
+            and np.isfinite(measured_pad_gap_m)
+            and measured_pad_gap_m >= candidate_clamp_width_m + 0.010
+        ):
+            candidate_has_sufficient_live_aperture = True
     if (
         initial_grasp_state.get("grasp_confirmed") is not True
         and not initial_live_target_contact_sides
+        and not candidate_has_sufficient_live_aperture
     ):
         while (
             pregrasp_open_actions < 16
@@ -2781,10 +2877,13 @@ def _run_physical_branch(
             else (
                 "opening_deferred_to_preserve_measured_target_finger_contact"
                 if initial_live_target_contact_sides else (
-                    "opened_to_model_joint_limits"
-                    if float(np.max(np.abs(open_gripper_qpos_target - initial_gripper_qpos)))
-                    <= pregrasp_open_qpos_tolerance_m
-                    else "open_action_budget_exhausted_before_joint_limits"
+                    "already_sufficient_for_candidate"
+                    if candidate_has_sufficient_live_aperture else (
+                        "opened_to_model_joint_limits"
+                        if float(np.max(np.abs(open_gripper_qpos_target - initial_gripper_qpos)))
+                        <= pregrasp_open_qpos_tolerance_m
+                        else "open_action_budget_exhausted_before_joint_limits"
+                    )
                 )
             )
         ),
@@ -2795,6 +2894,15 @@ def _run_physical_branch(
         "gripper_qpos_target_m": open_gripper_qpos_target.tolist(),
         "gripper_qpos_end_m": initial_gripper_qpos.tolist(),
         "joint_limit_tolerance_m": pregrasp_open_qpos_tolerance_m,
+        "candidate_clamp_width_m": candidate_clamp_width_m,
+        "measured_pad_gap_m": measured_pad_gap_m,
+        "candidate_aperture_margin_m": (
+            None if candidate_clamp_width_m is None or measured_pad_gap_m is None
+            else float(measured_pad_gap_m - candidate_clamp_width_m)
+        ),
+        "opening_skipped_because_candidate_aperture_was_sufficient": (
+            candidate_has_sufficient_live_aperture
+        ),
         "model_maximum_pad_separation_m": context.get("maximum_pad_separation_m"),
         "state_was_changed_only_by_recorded_physical_OSC_actions": True,
     }
@@ -2816,6 +2924,15 @@ def _run_physical_branch(
     initial_contact_sides = target_finger_contact_sides(initial_grasp_state)
     live_bilateral_target_contact = len(initial_contact_sides) == 2
     live_unilateral_target_contact = len(initial_contact_sides) == 1
+    stage_a_unilateral_contact_close_probe_override = bool(
+        stage_a_unilateral_contact_close_probe and live_unilateral_target_contact
+    )
+    if stage_a_unilateral_contact_close_probe_override:
+        # This branch starts from an exact, physically observed single-pad
+        # contact Snapshot.  Permit the bounded in-place closure to move the
+        # ungrasped object while the opposing pad arrives; the grasp monitor,
+        # physical lift, and native task predicate remain authoritative.
+        abort_target_displacement_m = None
     contact_free_candidate_pose_close_probe = bool(
         not initial_contact_sides
         and initial_grasp_state.get("grasp_confirmed") is not True
@@ -2847,21 +2964,24 @@ def _run_physical_branch(
         initial_grasp_rotation_error_rad <= LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD
     )
     unilateral_close_probe_position_match = bool(
-        live_unilateral_target_contact
-        # A contact alone is insufficient: the other pad may still be outside
-        # the object, as happens when a downward approach first touches a can's
-        # upper rim.  Keep the pose-held close probe local to the grasp frame.
-        # Once the active target finger itself is in MuJoCo contact, however,
-        # the candidate's nominal orientation is only a prior: the physical
-        # close probe holds the measured EEF pose and the live stability
-        # monitor decides whether this contact is actually graspable.
-        and initial_grasp_distance_m <= stage_a_unilateral_close_probe_position_m
+        stage_a_unilateral_contact_close_probe_override
+        or (
+            live_unilateral_target_contact
+            # A single finger can brush the target while the jaw frame is still
+            # substantially rotated from the generated grasp. Closing at that
+            # measured pose can push the object away before the opposing pad
+            # reaches it. Use the bounded unilateral close only once both the
+            # position and jaw orientation are locally aligned; otherwise keep
+            # the live object-relative surface approach active.
+            and initial_grasp_distance_m <= stage_a_unilateral_close_probe_position_m
+            and initial_grasp_rotation_error_rad
+            <= LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD
+        )
     )
     unilateral_surface_approach_start = bool(
         live_unilateral_target_contact
         and stage_a_unilateral_close_probe_position_m < initial_grasp_distance_m
         <= LIVE_UNILATERAL_APPROACH_CONTINUE_POSITION_M
-        and initial_grasp_rotation_error_rad <= NEAR_SURFACE_START_ROTATION_RAD
     )
     # Real bilateral pad contacts provide stronger evidence than matching the
     # nominal candidate pose. A physically obstructed surface approach can
@@ -2923,9 +3043,9 @@ def _run_physical_branch(
     near_pregrasp_start_robot_contact_count = None
     near_pregrasp_start_bypass = False
     if (
-        pregrasp_start_position_error_m <= PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M
+        pregrasp_start_position_error_m <= stage_a_near_pregrasp_bypass_position_m
         and pregrasp_start_rotation_error_rad
-        <= PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD
+        <= stage_a_near_pregrasp_bypass_rotation_rad
     ):
         near_pregrasp_start_contacts = bridge.request({"op": "inspect_contacts"})
         contact_rows = near_pregrasp_start_contacts.get("contacts", [])
@@ -2948,14 +3068,20 @@ def _run_physical_branch(
         "admitted": near_pregrasp_start_bypass,
         "eef_to_candidate_pregrasp_position_error_m": pregrasp_start_position_error_m,
         "eef_to_candidate_pregrasp_rotation_error_rad": pregrasp_start_rotation_error_rad,
-        "position_limit_m": PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M,
-        "rotation_limit_rad": PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD,
+        "position_limit_m": stage_a_near_pregrasp_bypass_position_m,
+        "rotation_limit_rad": stage_a_near_pregrasp_bypass_rotation_rad,
         "contact_inspection": near_pregrasp_start_contacts,
         "robot_scene_contact_count": near_pregrasp_start_robot_contact_count,
         "surface_approach_and_live_grasp_checks_still_required": True,
         "route_skip_only": True,
     }
     contact_based_route_skip = bool(close_from_live_contact or unilateral_surface_approach_start)
+    if stage_a_unilateral_contact_route_first and live_unilateral_target_contact:
+        # A single-pad brush near a container can trap the wrist between the
+        # target and fixture.  In that case first execute the planned
+        # pregrasp retreat/transit, then perform the candidate's physical
+        # surface approach; do not continue directly through the contact.
+        contact_based_route_skip = bool(close_from_live_contact)
     skip_pregrasp_route = bool(
         contact_based_route_skip or near_pregrasp_start_bypass
     )
@@ -2972,6 +3098,13 @@ def _run_physical_branch(
         "physical_success_still_requires_opposing_contacts_and_lift": True,
     }
     branch["live_unilateral_target_contact_observed"] = live_unilateral_target_contact
+    branch["stage_a_unilateral_contact_close_probe_override"] = {
+        "requested": bool(stage_a_unilateral_contact_close_probe),
+        "admitted_from_live_single_pad_contact": stage_a_unilateral_contact_close_probe_override,
+        "closes_at_measured_live_eef_pose": True,
+        "still_requires_bilateral_grasp_stability_and_physical_lift": True,
+        "native_BDDL_task_success_remains_final_task_criterion": True,
+    }
     branch["live_unilateral_close_probe_position_match"] = unilateral_close_probe_position_match
     branch["live_unilateral_close_probe_action_limit"] = (
         MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS
@@ -2983,9 +3116,10 @@ def _run_physical_branch(
         "position_limit_m": LIVE_UNILATERAL_APPROACH_CONTINUE_POSITION_M,
         "rotation_error_rad": initial_grasp_rotation_error_rad,
         "reason": (
-            "single_pad_contact_is_above_or_offset_from_generated_grasp_frame"
+            "single_pad_contact_is_not_aligned_with_generated_grasp_frame"
             if unilateral_surface_approach_start else None
         ),
+        "pose_held_close_requires_position_and_rotation_alignment": True,
     }
     branch["live_unilateral_close_probe_position_threshold_m"] = (
         stage_a_unilateral_close_probe_position_m
@@ -3007,9 +3141,12 @@ def _run_physical_branch(
             "verified_bilateral_target_pad_contacts_without_nominal_pose_gate"
             if live_bilateral_target_contact and close_from_live_contact else (
                 "verified_unilateral_target_contact_and_near_candidate_pose"
-                if unilateral_close_probe_position_match else (
+                if unilateral_close_probe_position_match and not stage_a_unilateral_contact_close_probe_override else (
+                    "explicit_stage_a_measured_unilateral_contact_close_probe"
+                    if stage_a_unilateral_contact_close_probe_override else (
                     "contact_free_live_EEF_near_candidate_grasp_pose"
                     if contact_free_candidate_pose_close_probe else "candidate_pose_alignment"
+                    )
                 )
             )
         )
@@ -3025,6 +3162,15 @@ def _run_physical_branch(
         "rotation_error_max_rad": LIVE_CONTACT_CLOSE_ROTATION_TOLERANCE_RAD,
     }
     branch["pregrasp_route_skipped_due_to_live_target_contact"] = contact_based_route_skip
+    branch["stage_a_unilateral_contact_route_first"] = {
+        "requested": bool(stage_a_unilateral_contact_route_first),
+        "applied_to_live_single_pad_contact": bool(
+            stage_a_unilateral_contact_route_first and live_unilateral_target_contact
+        ),
+        "pregrasp_route_must_complete_before_surface_approach": bool(
+            stage_a_unilateral_contact_route_first and live_unilateral_target_contact
+        ),
+    }
     branch["pregrasp_route_skipped_due_to_verified_near_pregrasp_start"] = (
         near_pregrasp_start_bypass
     )
@@ -3157,9 +3303,9 @@ def _run_physical_branch(
                 "status": "skipped_without_bilateral_target_contact",
             }
         live_close_action_limit = (
-            MAX_CLOSE_CONTROL_ACTIONS if live_bilateral_target_contact
+            stage_a_close_action_budget if live_bilateral_target_contact
             else (
-                MAX_CLOSE_CONTROL_ACTIONS
+                stage_a_close_action_budget
                 if contact_free_candidate_pose_close_probe
                 else MAX_LIVE_UNILATERAL_CLOSE_PROBE_ACTIONS
             )
@@ -3190,6 +3336,16 @@ def _run_physical_branch(
         )
         maximum_gripper_qpos_step_m = 0.0
         branch["live_contact_close_probe_contact_sides"] = []
+        branch["live_unilateral_bilateral_contact_pause"] = {
+            "status": "not_applicable",
+            "pause_actions": 0,
+            "pause_actions_after_first_bilateral_contact": 2,
+            "gripper_command_during_pause": 0.0,
+        }
+        unilateral_bilateral_contact_seen = False
+        unilateral_bilateral_contact_pause_remaining = 0
+        if live_unilateral_target_contact:
+            branch["live_unilateral_bilateral_contact_pause"]["status"] = "armed"
         branch["live_contact_physical_closure_settle"] = {
             "required_consecutive_stable_samples": 2,
             "maximum_per_joint_qpos_change_m": closure_position_tolerance_m,
@@ -3210,10 +3366,23 @@ def _run_physical_branch(
             if monitor.stable:
                 # The stability monitor verifies real opposing contacts and a
                 # fully issued close command, but actuator qpos can still be
-                # moving several millimeters per control step. Hold the live
-                # OSC target exactly in place while MuJoCo finishes the
-                # physical squeeze; do not begin lifting on command state.
-                close_action = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                # moving several millimeters per control step. PandaGripper
+                # interprets the last action dimension incrementally, so a
+                # zero command preserves its current actuator setpoint while
+                # MuJoCo finishes the physical squeeze; continuing to send 1
+                # advances the close target and can push an already-contacting
+                # object out of the pads. Do not begin lifting on command state.
+                close_action = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            elif unilateral_bilateral_contact_pause_remaining > 0:
+                live_eef_world = _runtime_eef_pose(live_runtime_state)
+                close_action = world_pose_tracking_action(
+                    live_eef_world[:3, 3], _wxyz(live_eef_world[:3, :3]),
+                    close_hold_eef_world[:3, 3], _wxyz(close_hold_eef_world[:3, :3]),
+                    controller_fields,
+                    gripper_action=0.0,
+                )
+                unilateral_bilateral_contact_pause_remaining -= 1
+                branch["live_unilateral_bilateral_contact_pause"]["pause_actions"] += 1
             else:
                 live_eef_world = _runtime_eef_pose(live_runtime_state)
                 close_action = world_pose_tracking_action(
@@ -3246,6 +3415,14 @@ def _run_physical_branch(
             live_close_actions += 1
             contact_sides = target_finger_contact_sides(records[-1]["grasp_state"])
             branch["live_contact_close_probe_contact_sides"].append(contact_sides)
+            if live_unilateral_target_contact and len(contact_sides) == 2:
+                if not unilateral_bilateral_contact_seen:
+                    unilateral_bilateral_contact_seen = True
+                    unilateral_bilateral_contact_pause_remaining = 2
+                    branch["live_unilateral_bilateral_contact_pause"].update({
+                        "status": "paused_incremental_close_after_first_opposing_pad_contacts",
+                        "first_bilateral_contact_action": live_close_actions,
+                    })
             current_gripper_qpos = np.asarray(
                 records[-1].get("snapshot_state", {}).get("robot_states", [{}])[0].get("gripper_qpos", []),
                 dtype=np.float64,
@@ -3332,11 +3509,13 @@ def _run_physical_branch(
         maximum_actions=MAX_PREFIX_CONTROL_ACTIONS,
     )
     joint_space_qpos_path = None
-    if pregrasp_route_control_mode == "joint_space_rrt" and not skip_pregrasp_route:
+    if pregrasp_route_control_mode in {
+        "joint_space_rrt", "joint_space_ik_waypoints",
+    } and not skip_pregrasp_route:
         raw_joint_path = rrt.get("joint_space_qpos_path_rad")
         if raw_joint_path is None:
             raise RuntimeError(
-                "joint_space_RRT_route_requested_but_selected_route_has_no_qpos_path"
+                "joint_space_pregrasp_route_requested_but_selected_route_has_no_qpos_path"
             )
         joint_space_qpos_path = np.asarray(raw_joint_path, dtype=np.float64)
         if (
@@ -3362,13 +3541,23 @@ def _run_physical_branch(
             "required_physical_actions": int(len(joint_space_qpos_path) - 1),
             "action_budget": int(route_action_budget),
             "controller": "joint_space_mass_matrix_PD_torque",
-            "path_source": "active_current_scene_jointspace_RRT_route_candidate",
-            "maximum_allowed_tracking_error_l2_rad": 0.15,
+            "path_source": (
+                "active_current_scene_jointspace_RRT_route_candidate"
+                if pregrasp_route_control_mode == "joint_space_rrt"
+                else "active_scene_staged_endpoint_IK_joint_interpolation"
+            ),
+            "maximum_allowed_tracking_error_l2_rad": float(
+                joint_space_rrt_max_tracking_error_l2_rad
+            ),
             "maximum_joint_sample_delta_rad": float(np.max(np.abs(
                 np.diff(joint_space_qpos_path, axis=0)
             ))),
             "route_was_safety_certified": False,
         }
+        if isinstance(rrt.get("joint_space_ik_waypoint_preflight"), dict):
+            branch["pregrasp_joint_space_RRT_path"]["ik_waypoint_preflight"] = (
+                rrt["joint_space_ik_waypoint_preflight"]
+            )
         candidate["_joint_space_RRT_execution"] = branch["pregrasp_joint_space_RRT_path"]
     branch["local_replans"] = []
     # Keep screen-derived IK with the candidate before crossing into this
@@ -3574,7 +3763,10 @@ def _run_physical_branch(
             branch["local_replans"][-1]["status"] = "physical_replan_segment_reached"
             candidate["_local_replans"] = list(branch["local_replans"])
 
-    if not skip_pregrasp_route and pregrasp_route_control_mode == "joint_space_rrt":
+    stable_grasp_route_intercept: dict[str, Any] | None = None
+    if not skip_pregrasp_route and pregrasp_route_control_mode in {
+        "joint_space_rrt", "joint_space_ik_waypoints",
+    }:
         if (
             stage_a_pregrasp_staged_clearance_height_m > 0.0
             or abs(stage_a_pregrasp_lateral_detour_m) > 1e-8
@@ -3584,17 +3776,152 @@ def _run_physical_branch(
             raise RuntimeError(
                 "joint_space_RRT_pregrasp_mode_cannot_combine_with_EEF_staged_route_modifiers"
             )
-        start_joint_state = records[-1].get("snapshot_state", {})
+        # The branch may begin with the gripper already at its open limit, in
+        # which case opening takes zero actions and the physical record list is
+        # still empty.  initial_runtime_state is the live observation captured
+        # for this branch and is refreshed after every real open-gripper step.
+        start_joint_state = initial_runtime_state
         start_robot = start_joint_state.get("robot_states", [{}])[0]
         actual_start_qpos = np.asarray(start_robot.get("joint_qpos", []), dtype=np.float64)
         if (
             actual_start_qpos.shape != (7,)
             or not np.isfinite(actual_start_qpos).all()
-            or float(np.max(np.abs(actual_start_qpos - joint_space_qpos_path[0]))) > 0.01
+        ):
+            raise RuntimeError("joint_space_RRT_live_arm_start_is_unavailable_after_open_gripper")
+        planned_start_deviation_linf_rad = float(np.max(np.abs(
+            actual_start_qpos - joint_space_qpos_path[0]
+        )))
+        if (
+            pregrasp_route_control_mode == "joint_space_ik_waypoints"
+            and planned_start_deviation_linf_rad > 0.01
         ):
             raise RuntimeError(
-                "joint_space_RRT_path_start_does_not_match_live_robot_after_open_gripper"
+                "joint_space_IK_waypoint_path_start_differs_from_exact_live_state:"
+                f"{planned_start_deviation_linf_rad:.6f}rad"
             )
+        if (
+            pregrasp_route_control_mode == "joint_space_rrt"
+            and planned_start_deviation_linf_rad > 0.01
+        ):
+            # Opening the Panda gripper is a physical action. Even with the
+            # EEF held in OSC, its arm qpos can drift enough to invalidate the
+            # earlier collision-checked joint route. Replan from the exact
+            # measured post-open Runtime state instead of rejecting the grasp
+            # candidate or executing a path whose start no longer matches.
+            live = bridge.request({"op": "observe", "include_snapshot_state": True})
+            live_state = live.get("snapshot_state", {})
+            live_robot = live_state.get("robot_states", [{}])[0]
+            live_qpos = np.asarray(live_robot.get("joint_qpos", []), dtype=np.float64)
+            live_state_vector = _snapshot_state_vector(live_state)
+            live_state_sha256 = _state_sha(live_state_vector)
+            reference_poses = np.asarray(
+                rrt.get("eef_reference_poses_world", []), dtype=np.float64,
+            )
+            if (
+                live_qpos.shape != (7,) or not np.isfinite(live_qpos).all()
+                or reference_poses.ndim != 2 or reference_poses.shape[1] != 7
+                or not len(reference_poses) or not np.isfinite(reference_poses).all()
+                or not np.array_equal(live_state_vector, _snapshot_state_vector(initial_runtime_state))
+            ):
+                raise RuntimeError("joint_space_RRT_post_open_replan_source_state_is_invalid")
+            live_start_deviation_linf_rad = float(np.max(np.abs(
+                live_qpos - joint_space_qpos_path[0]
+            )))
+            if live_start_deviation_linf_rad > 0.01:
+                goal_pose = reference_poses[-1]
+                post_open_plan = bridge.request({
+                    "op": "task_success_first_rrt",
+                    "expected_instruction": context["instruction"],
+                    "model_geometry_sha256": model_sha,
+                    "start_state_sha256": live_state_sha256,
+                    "goal_pose_world": {
+                        "position_world_m": goal_pose[:3].tolist(),
+                        "quaternion_wxyz": goal_pose[3:].tolist(),
+                    },
+                    "ik_seed_qpos": (
+                        [candidate_pregrasp_ik_seed_qpos.tolist()]
+                        if candidate_pregrasp_ik_seed_qpos is not None else None
+                    ),
+                    "safety_geometry_policy": policy,
+                    "planner_config": {
+                        "step_rad": 0.22,
+                        "connect_max_steps": 20,
+                        "goal_bias": 0.15,
+                        "max_iterations": 1200,
+                        "max_config_checks": 12000,
+                        "max_candidate_routes": 3,
+                        "search_time_budget_s": local_replan_rrt_time_budget_s,
+                        "shortcut_attempts": 40,
+                        "minimum_clearance_m": 0.0,
+                        "start_joint_limit_tolerance_rad": 5e-6,
+                        "require_safe_configurations": False,
+                        "seed": planner_seed(0, int(candidate["target_geom_id"]), 1),
+                    },
+                })
+                branch["pregrasp_joint_space_RRT_path"]["post_open_live_replan"] = {
+                    "status": post_open_plan.get("status"),
+                    "failure_reason": post_open_plan.get("failure_reason"),
+                    "source_state_sha256": live_state_sha256,
+                    "model_geometry_sha256": post_open_plan.get("model_geometry_sha256"),
+                    "planning_seconds": post_open_plan.get("planning_seconds"),
+                    "configuration_checks": post_open_plan.get("config_checks"),
+                    "selected_route_index": post_open_plan.get("selected_route_index"),
+                    "pre_open_path_start_deviation_linf_rad": planned_start_deviation_linf_rad,
+                    "live_post_open_path_start_deviation_linf_rad": live_start_deviation_linf_rad,
+                    "live_state_unchanged": post_open_plan.get("live_state_unchanged"),
+                    "goal_pose_world": goal_pose.tolist(),
+                    "safety_certified": False,
+                }
+                replanned_qpos_path = post_open_plan.get("qpos_path")
+                if (
+                    post_open_plan.get("status") != "offline_feasible"
+                    or post_open_plan.get("live_state_unchanged") is not True
+                    or not isinstance(replanned_qpos_path, list)
+                ):
+                    raise RuntimeError(
+                        "joint_space_RRT_post_open_live_replan_failed:"
+                        f"{post_open_plan.get('status')}:"
+                        f"{post_open_plan.get('failure_reason')}"
+                    )
+                replanned_qpos_path = np.asarray(replanned_qpos_path, dtype=np.float64)
+                if (
+                    replanned_qpos_path.ndim != 2
+                    or replanned_qpos_path.shape[1] != 7
+                    or len(replanned_qpos_path) < 2
+                    or not np.isfinite(replanned_qpos_path).all()
+                    or float(np.max(np.abs(replanned_qpos_path[0] - live_qpos))) > 0.01
+                    or len(replanned_qpos_path) - 1 > MAX_PREFIX_CONTROL_ACTIONS
+                ):
+                    raise RuntimeError("joint_space_RRT_post_open_live_replan_path_is_invalid")
+                joint_space_qpos_path = replanned_qpos_path
+                route_action_budget = max(route_action_budget, len(joint_space_qpos_path) - 1)
+                branch["pregrasp_joint_space_RRT_path"].update({
+                    "status": "replanned_from_verified_post_open_live_state",
+                    "path_source": "active_current_scene_jointspace_RRT_after_physical_gripper_open",
+                    "waypoint_count_including_start": int(len(joint_space_qpos_path)),
+                    "required_physical_actions": int(len(joint_space_qpos_path) - 1),
+                    "action_budget": int(route_action_budget),
+                    "maximum_joint_sample_delta_rad": float(np.max(np.abs(
+                        np.diff(joint_space_qpos_path, axis=0)
+                    ))),
+                    "post_open_live_replan": {
+                        "status": post_open_plan.get("status"),
+                        "source_state_sha256": live_state_sha256,
+                        "model_geometry_sha256": post_open_plan.get("model_geometry_sha256"),
+                        "planning_seconds": post_open_plan.get("planning_seconds"),
+                        "configuration_checks": post_open_plan.get("config_checks"),
+                        "selected_route_index": post_open_plan.get("selected_route_index"),
+                        "pre_open_path_start_deviation_linf_rad": planned_start_deviation_linf_rad,
+                        "live_post_open_path_start_deviation_linf_rad": live_start_deviation_linf_rad,
+                        "live_state_unchanged": post_open_plan.get("live_state_unchanged"),
+                        "safety_certified": False,
+                    },
+                })
+                candidate["_joint_space_RRT_execution"] = branch[
+                    "pregrasp_joint_space_RRT_path"
+                ]
+            initial_runtime_state = live_state
+            actual_start_qpos = live_qpos
         route_start_action_count = action_counter[0]
         target_start_position = np.asarray(initial_object["root_pos"], dtype=np.float64)
         maximum_joint_tracking_error_rad = 0.0
@@ -3605,7 +3932,11 @@ def _run_physical_branch(
             _record_joint_trajectory_step(
                 bridge,
                 joint_target,
-                "task_success_first_jointspace_rrt_pregrasp_route",
+                (
+                    "task_success_first_jointspace_rrt_pregrasp_route"
+                    if pregrasp_route_control_mode == "joint_space_rrt"
+                    else "task_success_first_jointspace_ik_waypoint_pregrasp_route"
+                ),
                 candidate_id,
                 action_counter[0],
                 target_binding,
@@ -3630,16 +3961,73 @@ def _run_physical_branch(
                 "maximum_tracking_error_l2_rad": maximum_joint_tracking_error_rad,
                 "latest_tracking_error_l2_rad": joint_error,
             })
-            if joint_error > 0.15:
+            current_grasp_sample = records[-1].get("grasp_monitor_sample", {})
+            intercept_stable_samples = int(
+                current_grasp_sample.get("consecutive_stable_samples", 0) or 0
+            )
+            if (
+                stage_a_stop_pregrasp_route_on_stable_grasp
+                and monitor.stable
+                and intercept_stable_samples >= stage_a_route_grasp_intercept_stable_samples
+            ):
+                # A real, stable bilateral grasp can appear while the planned
+                # retreat/transit is still running. Continuing to track the
+                # remaining free-space RRT path can pull the closed fingers
+                # off the object; preserve that measured grasp and proceed to
+                # the bounded closure settle and physical lift verification.
+                stable_grasp_route_intercept = {
+                    "status": "pregrasp_route_stopped_to_preserve_stable_bilateral_grasp",
+                    "timestep": records[-1].get("timestep"),
+                    "required_consecutive_stable_samples": int(
+                        stage_a_route_grasp_intercept_stable_samples
+                    ),
+                    "observed_consecutive_stable_samples": intercept_stable_samples,
+                    "physical_actions_executed": int(
+                        action_counter[0] - route_start_action_count
+                    ),
+                    "stable_grasp_monitor": monitor.diagnostics(),
+                    "joint_tracking_error_l2_rad_at_intercept": joint_error,
+                    "tracking_limit_would_fail_at_intercept": bool(
+                        joint_error > joint_space_rrt_max_tracking_error_l2_rad
+                    ),
+                    "target_root_position_world_m": _object_state(
+                        records[-1].get("snapshot_state", {}),
+                        int(target_binding["body_id"]),
+                    ).get("root_pos"),
+                    "source": "distinct_consecutive_live_MuJoCo_bilateral_pad_contact_samples",
+                    "safety_certified": False,
+                }
+                branch["stable_grasp_route_intercept"] = stable_grasp_route_intercept
+                branch["pregrasp_joint_space_RRT_path"]["status"] = (
+                    "physical_route_interrupted_to_preserve_stable_bilateral_grasp"
+                )
+                branch["pregrasp_joint_space_RRT_path"]["maximum_target_displacement_m"] = (
+                    float(np.linalg.norm(
+                        np.asarray(stable_grasp_route_intercept["target_root_position_world_m"], dtype=np.float64)
+                        - target_start_position
+                    ))
+                )
+                close_from_live_contact = True
+                close_hold_eef_world = _runtime_eef_pose(
+                    records[-1].get("snapshot_state", {})
+                )
+                checkpoint_runtime_snapshot(
+                    "stable_bilateral_grasp_intercept",
+                    records[-1].get("snapshot_state", {}),
+                )
+                break
+            if joint_error > joint_space_rrt_max_tracking_error_l2_rad:
                 branch["pregrasp_joint_space_RRT_path"]["status"] = (
                     "aborted_physical_tracking_diverged"
                 )
                 branch["pregrasp_joint_space_RRT_path"]["failure_reason"] = (
-                    f"actual_joint_target_error_l2_rad={joint_error:.6f}>0.150000"
+                    "actual_joint_target_error_l2_rad="
+                    f"{joint_error:.6f}>{joint_space_rrt_max_tracking_error_l2_rad:.6f}"
                 )
                 raise RuntimeError(
                     "joint_space_RRT_physical_tracking_diverged:"
-                    f"qpos_error_l2_rad={joint_error:.6f}>0.150000"
+                    f"qpos_error_l2_rad={joint_error:.6f}>"
+                    f"{joint_space_rrt_max_tracking_error_l2_rad:.6f}"
                 )
             after_object = _object_state(
                 records[-1].get("snapshot_state", {}), int(target_binding["body_id"])
@@ -3659,10 +4047,21 @@ def _run_physical_branch(
                     f"{target_displacement:.6f}m>{abort_target_displacement_m:.6f}m"
                 )
         branch["pregrasp_joint_space_RRT_path"].update({
-            "status": "physical_joint_route_completed",
+            "status": (
+                "physical_route_interrupted_to_preserve_stable_bilateral_grasp"
+                if stable_grasp_route_intercept is not None
+                else "physical_joint_route_completed"
+            ),
             "executed_actions": int(action_counter[0] - route_start_action_count),
             "maximum_tracking_error_l2_rad": maximum_joint_tracking_error_rad,
-            "maximum_target_displacement_m": maximum_target_displacement_m,
+            "maximum_target_displacement_m": (
+                float(np.linalg.norm(
+                    np.asarray(stable_grasp_route_intercept["target_root_position_world_m"], dtype=np.float64)
+                    - target_start_position
+                ))
+                if stable_grasp_route_intercept is not None
+                else maximum_target_displacement_m
+            ),
             "target_displacement_abort_threshold_m": abort_target_displacement_m,
         })
 
@@ -4124,7 +4523,7 @@ def _run_physical_branch(
                             before_axis_error = float(
                                 pregrasp[axis_index] - live_position[axis_index]
                             )
-                            if abs(before_axis_error) <= 0.004:
+                            if abs(before_axis_error) <= stage_a_pregrasp_high_transit_axis_tolerance_m:
                                 round_row["axis_steps"].append({
                                     "axis": axis_index,
                                     "status": "already_within_axis_tolerance",
@@ -4137,8 +4536,12 @@ def _run_physical_branch(
                                 phase,
                                 max(1, route_action_budget - action_counter[0]),
                                 max_translation_step_m=0.02,
-                                position_tolerance_m=0.004,
-                                rotation_tolerance_rad=0.045,
+                                position_tolerance_m=(
+                                    stage_a_pregrasp_high_transit_axis_tolerance_m
+                                ),
+                                rotation_tolerance_rad=(
+                                    pregrasp_route_waypoint_rotation_tolerance_rad
+                                ),
                                 stop_condition=record_robot_obstacle_contact,
                                 translation_axes=(axis_index,),
                             )
@@ -4244,19 +4647,21 @@ def _run_physical_branch(
                     if final_adaptive_endpoint
                     else 0.12
                     if adaptive_jointspace_route
-                    else 0.045
+                    else float(pregrasp_route_waypoint_rotation_tolerance_rad)
                 ),
                 stop_condition=record_robot_obstacle_contact,
                 translation_axes=waypoint_translation_axes,
             )
             if action_counter[0] > route_action_budget:
                 raise RuntimeError("RRT_OSC_pregrasp_route_action_budget_exceeded")
-    branch["pregrasp_route_reached"] = not skip_pregrasp_route
+    branch["pregrasp_route_reached"] = bool(
+        not skip_pregrasp_route and stable_grasp_route_intercept is None
+    )
     branch["pregrasp_route_skipped_due_to_live_target_contact"] = contact_based_route_skip
     branch["pregrasp_route_skipped_due_to_verified_near_pregrasp_start"] = (
         near_pregrasp_start_bypass
     )
-    if not skip_pregrasp_route:
+    if not skip_pregrasp_route and stable_grasp_route_intercept is None:
         pregrasp_observation = bridge.request({"op": "observe", "include_snapshot_state": True})
         checkpoint_runtime_snapshot("pregrasp", pregrasp_observation.get("snapshot_state", {}))
 
@@ -4431,6 +4836,10 @@ def _run_physical_branch(
             target_pose_provider=object_relative_target_provider(object_to_eef),
             step_callback=checkpoint_first_target_contact,
             stop_condition=stop_surface_approach,
+            position_tolerance_m=surface_approach_position_tolerance_m,
+            rotation_tolerance_rad=(
+                pregrasp_route_waypoint_rotation_tolerance_rad
+            ),
             # Drive long free-space grasp approaches with the controller's
             # full validated translation increment. The old 8 mm increment
             # needed >60 actions for a 75 mm reach from a legal snapshot.
@@ -4458,7 +4867,7 @@ def _run_physical_branch(
     close_actions = 0
     while (
         not preclosed_bilateral_contact
-        and close_actions < MAX_CLOSE_CONTROL_ACTIONS
+        and close_actions < stage_a_close_action_budget
         and not monitor.stable
     ):
         if branch.get("surface_approach_stopped_on_target_contact"):
@@ -4490,6 +4899,19 @@ def _run_physical_branch(
         close_actions += 1
         if action_counter[0] > MAX_BRANCH_CONTROL_ACTIONS:
             raise RuntimeError("physical_branch_control_action_budget_exceeded")
+    if stable_grasp_route_intercept is not None:
+        # This soup contact window is transient under any extra hold action.
+        # The measured grasp monitor already requires distinct live states, so
+        # proceed directly to incremental lift while the verified bilateral
+        # contacts still exist.
+        branch["stable_grasp_route_intercept_closure_settle"] = {
+            "status": "skipped_to_preserve_transient_verified_contact_before_lift",
+            "actions": 0,
+            "reason": "physical_hold_action_lost_a_pad_in_previous_same_snapshot_branch",
+            "stable_grasp_contact_samples_at_intercept": int(
+                stable_grasp_route_intercept["observed_consecutive_stable_samples"]
+            ),
+        }
     branch["close_actions"] = close_actions
     branch["grasp_before_lift"] = monitor.diagnostics()
     if not monitor.stable and not preclosed_bilateral_contact:
@@ -4506,6 +4928,16 @@ def _run_physical_branch(
     target_before = _object_state(before["snapshot_state"], int(context["target_binding"]["root_body_id"]))
     object_pose_at_grasp = _runtime_object_pose(target_before)
     eef_pose_at_grasp = _runtime_eef_pose(before["snapshot_state"])
+    # A stable bilateral contact can be intercepted during the pregrasp RRT
+    # route. In that case the branch-start grasp state is stale (often
+    # unilateral) by the time the lift begins. Query the live state here so
+    # the first lift step is gated by the actual intercept, not branch start.
+    pre_lift_grasp_state = bridge.request({
+        "op": "grasp_state",
+        "carried_binding": target_binding,
+        "expected_instruction": context["instruction"],
+    })
+    branch["pre_lift_grasp_state"] = pre_lift_grasp_state
     branch["verified_object_to_eef_at_grasp"] = (
         np.linalg.inv(object_pose_at_grasp) @ eef_pose_at_grasp
     ).tolist()
@@ -4517,7 +4949,7 @@ def _run_physical_branch(
         else MAX_LIFT_CONTROL_ACTIONS
     )
     lift_translation_step_m = (
-        LIVE_CONTACT_LIFT_TRANSLATION_STEP_M if live_contact_lift else 0.008
+        stage_a_live_contact_lift_translation_step_m if live_contact_lift else 0.008
     )
     lift_phase = (
         "task_success_first_live_contact_incremental_40mm_lift"
@@ -4555,7 +4987,25 @@ def _run_physical_branch(
             and records[-1].get("grasp_state", {}).get("grasp_confirmed") is True
         )
 
-    _advance_pose(
+    lift_record_start_index = len(records)
+
+    def stop_live_lift_when_grasp_is_lost() -> bool:
+        if len(records) > lift_record_start_index:
+            latest_grasp = records[-1].get("grasp_state", {})
+        else:
+            latest_grasp = pre_lift_grasp_state
+        latest_fingers = latest_grasp.get("finger_contacts", {})
+        latest_bilateral_confirmation = bool(
+            latest_grasp.get("grasp_confirmed") is True
+            and latest_fingers.get("left") is True
+            and latest_fingers.get("right") is True
+        )
+        return bool(
+            (live_contact_lift and not latest_bilateral_confirmation)
+            or stable_minimum_lift_reached()
+        )
+
+    lift_pose_reached = _advance_pose(
         bridge,
         eef_before + np.asarray([0.0, 0.0, LIFT_COMMAND_M]),
         orientation,
@@ -4569,8 +5019,32 @@ def _run_physical_branch(
         monitor,
         records,
         frames,
-        stop_condition=stable_minimum_lift_reached,
+        stop_condition=stop_live_lift_when_grasp_is_lost,
         max_translation_step_m=lift_translation_step_m,
+    )
+    branch["lift_pose_reached"] = bool(lift_pose_reached)
+    branch["lift_actions_recorded"] = int(len(records) - lift_record_start_index)
+    branch["lift_last_grasp_state"] = (
+        records[-1].get("grasp_state", {})
+        if len(records) > lift_record_start_index else pre_lift_grasp_state
+    )
+    branch["live_lift_diagnostics"] = {
+        "strategy": branch["lift_control_profile"]["strategy"],
+        "pose_reached": bool(lift_pose_reached),
+        "recorded_lift_actions": int(len(records) - lift_record_start_index),
+        "target_root_position_before_m": target_before.get("root_pos"),
+        "target_root_position_after_m": _object_state(
+            bridge.request({"op": "observe", "include_snapshot_state": True})["snapshot_state"],
+            int(context["target_binding"]["root_body_id"]),
+        ).get("root_pos"),
+        "pre_lift_grasp_state": pre_lift_grasp_state,
+        "last_lift_grasp_state": branch["lift_last_grasp_state"],
+        "translation_step_m": lift_translation_step_m,
+        "actions_used": int(action_counter[0]),
+    }
+    (output_dir / f"{candidate_id}__live_lift_diagnostics.json").write_text(
+        json.dumps(branch["live_lift_diagnostics"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
     after = bridge.request({"op": "observe", "include_snapshot_state": True})
     target_after = _object_state(after["snapshot_state"], int(context["target_binding"]["root_body_id"]))
@@ -5379,6 +5853,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "pregrasp_route_waypoint_position_tolerance_m": float(
                 args.pregrasp_route_waypoint_position_tolerance_m
             ),
+            "pregrasp_route_waypoint_rotation_tolerance_rad": float(
+                args.pregrasp_route_waypoint_rotation_tolerance_rad
+            ),
+            "surface_approach_position_tolerance_m": float(
+                args.surface_approach_position_tolerance_m
+            ),
             "pregrasp_route_control_mode": str(args.pregrasp_route_control_mode),
             "candidate_generation_limit": (
                 int(args.candidate_start_index + args.maximum_candidates)
@@ -5400,9 +5880,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "stage_a_pregrasp_staged_clearance_height_world_m": float(
                 args.stage_a_pregrasp_staged_clearance_height_m
             ),
+            "stage_a_pregrasp_high_transit_axis_tolerance_m": float(
+                args.stage_a_pregrasp_high_transit_axis_tolerance_m
+            ),
+            "stage_a_near_pregrasp_bypass_position_m": float(
+                args.stage_a_near_pregrasp_bypass_position_m
+            ),
+            "stage_a_near_pregrasp_bypass_rotation_rad": float(
+                args.stage_a_near_pregrasp_bypass_rotation_rad
+            ),
+            "stage_a_stop_pregrasp_route_on_stable_grasp": bool(
+                args.stage_a_stop_pregrasp_route_on_stable_grasp
+            ),
+            "stage_a_route_grasp_intercept_stable_samples": int(
+                args.stage_a_route_grasp_intercept_stable_samples
+            ),
+            "stage_a_live_contact_lift_translation_step_m": float(
+                args.stage_a_live_contact_lift_translation_step_m
+            ),
             "pregrasp_route_actions_max": MAX_PREFIX_CONTROL_ACTIONS,
             "approach_actions_max": MAX_APPROACH_CONTROL_ACTIONS,
-            "close_actions_max": MAX_CLOSE_CONTROL_ACTIONS,
+            "close_actions_max": int(args.stage_a_close_action_budget),
             "live_contact_settle_actions_max": MAX_LIVE_CONTACT_SETTLE_ACTIONS,
             "live_contact_settle_linear_speed_threshold_m_s": LIVE_CONTACT_SETTLE_LINEAR_SPEED_M_S,
             "live_contact_settle_angular_speed_threshold_rad_s": LIVE_CONTACT_SETTLE_ANGULAR_SPEED_RAD_S,
@@ -6630,7 +7128,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _pose_tracking_error_components(live_eef_transform, pregrasp_pose)
             )
             near_pregrasp_start = bool(
-                approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
+                # A requested joint-space RRT route must actually retain the
+                # planner's dense qpos path. The near-pregrasp OSC shortcut
+                # synthesizes only EEF waypoints and therefore cannot support
+                # physical mass-matrix PD tracking, even when the live EEF is
+                # already close to the endpoint.
+                args.pregrasp_route_control_mode not in {
+                    "joint_space_rrt", "joint_space_ik_waypoints",
+                }
+                and approach_reachability.get("grasp_open_gripper", {}).get("reachable") is True
                 and pregrasp_position_error <= NEAR_PREGRASP_START_POSITION_M
                 and pregrasp_rotation_error <= NEAR_PREGRASP_START_ROTATION_RAD
             )
@@ -6859,6 +7365,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for candidate_index, (candidate, summary) in enumerate(zip(candidates_to_plan, report["candidates"])):
             planner_response = summary["planner_response"]
             routes = list(planner_response.get("route_candidates", []))
+            # The planner keeps the dense, collision-checked joint path at the
+            # response level, while route_candidates currently expose only
+            # their EEF waypoint summaries.  Reattach that path to the route
+            # it belongs to so joint_space_rrt execution can physically track
+            # the same path that passed the live-scene RRT preflight.
+            selected_route_index = planner_response.get("selected_route_index")
+            selected_qpos_path = planner_response.get("qpos_path")
+            if selected_qpos_path is not None:
+                for route in routes:
+                    if (
+                        route.get("route_index") == selected_route_index
+                        and route.get("joint_space_qpos_path_rad") is None
+                    ):
+                        route["joint_space_qpos_path_rad"] = selected_qpos_path
             start_pose = np.r_[
                 context["eef_pose_world"]["position_m"],
                 _wxyz(context["eef_pose_world"]["rotation"]),
@@ -6992,6 +7512,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             route_poses = [route_start.tolist(), pregrasp_pose_7d.tolist()]
                             route_index = "explicit_geometry_direct_approach_physical_validation"
                             route_source = "explicit_active_BDDL_geometry_direct_OSC_approach"
+                        elif args.pregrasp_route_control_mode == "joint_space_ik_waypoints":
+                            start_route_pose = np.asarray(route_start, dtype=np.float64)
+                            goal_route_pose = np.asarray(pregrasp_pose_7d, dtype=np.float64)
+                            clearance_z = max(
+                                float(start_route_pose[2]), float(goal_route_pose[2])
+                            ) + 0.04
+                            start_high = start_route_pose.copy()
+                            start_high[2] = clearance_z
+                            target_high_live_orientation = goal_route_pose.copy()
+                            target_high_live_orientation[2] = clearance_z
+                            target_high_live_orientation[3:] = start_route_pose[3:]
+                            target_high_target_orientation = goal_route_pose.copy()
+                            target_high_target_orientation[2] = clearance_z
+                            route_poses = [
+                                start_route_pose.tolist(),
+                                start_high.tolist(),
+                                target_high_live_orientation.tolist(),
+                                target_high_target_orientation.tolist(),
+                                goal_route_pose.tolist(),
+                            ]
+                            route_index = "explicit_geometry_staged_joint_ik_waypoints"
+                            route_source = (
+                                "explicit_active_BDDL_geometry_staged_joint_ik_waypoints"
+                            )
                         else:
                             route_poses = high_approach_route(
                                 route_start,
@@ -7093,7 +7637,185 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         route["contact_escape_prepended"] = True
                         route["route_source"] = "MuJoCo_contact_normal_escape_then_planner_route"
                         route["joint_space_qpos_path_rad"] = None
-            elif (
+            if args.pregrasp_route_control_mode == "joint_space_ik_waypoints":
+                route_start_qpos = np.asarray(context["arm_qpos"], dtype=np.float64)
+                endpoint_ik_seed = candidate.get("_pregrasp_ik_seed_qpos")
+                endpoint_ik_seed = (
+                    np.asarray(endpoint_ik_seed, dtype=np.float64)
+                    if endpoint_ik_seed is not None else None
+                )
+                for route in routes:
+                    route_poses_array = np.asarray(
+                        route.get("eef_reference_poses_world", []), dtype=np.float64,
+                    )
+                    if (
+                        route.get("live_contact_sides")
+                        or route_start_qpos.shape != (7,)
+                        or not np.isfinite(route_start_qpos).all()
+                        or route_poses_array.ndim != 2
+                        or route_poses_array.shape[1] != 7
+                        or len(route_poses_array) < 2
+                        or not np.isfinite(route_poses_array).all()
+                    ):
+                        continue
+                    route_start_pose = route_poses_array[0].copy()
+                    route_goal_pose = route_poses_array[-1].copy()
+                    minimum_clearance_z = max(
+                        float(route_start_pose[2]), float(route_goal_pose[2]),
+                    )
+                    chosen_ik_path = None
+                    clearance_attempts = []
+                    for clearance_delta_m in (0.06, 0.04, 0.02, 0.0):
+                        clearance_z = minimum_clearance_z + clearance_delta_m
+                        start_high = route_start_pose.copy()
+                        start_high[2] = clearance_z
+                        target_high_live_orientation = route_goal_pose.copy()
+                        target_high_live_orientation[2] = clearance_z
+                        target_high_live_orientation[3:] = route_start_pose[3:]
+                        target_high_target_orientation = route_goal_pose.copy()
+                        target_high_target_orientation[2] = clearance_z
+                        staged_poses = [
+                            route_start_pose,
+                            start_high,
+                            target_high_live_orientation,
+                            target_high_target_orientation,
+                            route_goal_pose,
+                        ]
+                        q_cursor = route_start_qpos.copy()
+                        q_path = [q_cursor.copy()]
+                        waypoint_reports = []
+                        failed_waypoint = None
+                        for waypoint_index, pose in enumerate(staged_poses[1:], start=1):
+                            ik_seeds = [q_cursor.tolist()]
+                            if (
+                                endpoint_ik_seed is not None
+                                and endpoint_ik_seed.shape == (7,)
+                                and np.isfinite(endpoint_ik_seed).all()
+                                and not np.allclose(endpoint_ik_seed, q_cursor, atol=1e-8)
+                            ):
+                                ik_seeds.append(endpoint_ik_seed.tolist())
+                            try:
+                                ik_reply = bridge.request({
+                                    "op": "task_success_first_ik_preflight",
+                                    "expected_instruction": instruction,
+                                    "model_geometry_sha256": model_sha,
+                                    "start_state_sha256": state_sha,
+                                    "goal_pose_world": {
+                                        "position_world_m": pose[:3].tolist(),
+                                        "quaternion_wxyz": pose[3:].tolist(),
+                                    },
+                                    "ik_seed_qpos": ik_seeds,
+                                    "ik_selection_seed_qpos": q_cursor.tolist(),
+                                    "ik_solver_max_nfev": 120,
+                                    "safety_geometry_policy": policy,
+                                })
+                            except Exception as exc:
+                                ik_reply = {
+                                    "status": "request_exception",
+                                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                                    "live_state_unchanged": None,
+                                }
+                            goal_qpos = ik_reply.get("ik_goal_qpos")
+                            passed = bool(
+                                ik_reply.get("status") == "goal_ik_preflight_passed"
+                                and ik_reply.get("live_state_unchanged") is True
+                                and isinstance(goal_qpos, list)
+                                and len(goal_qpos) == 7
+                                and np.isfinite(np.asarray(goal_qpos, dtype=np.float64)).all()
+                            )
+                            waypoint_reports.append({
+                                "waypoint_index": waypoint_index,
+                                "pose_world": pose.tolist(),
+                                "status": "bounded_IK_passed" if passed else "bounded_IK_failed",
+                                "failure_reason": ik_reply.get("failure_reason"),
+                                "planning_seconds": ik_reply.get("planning_seconds"),
+                                "live_state_unchanged": ik_reply.get("live_state_unchanged"),
+                            })
+                            if not passed:
+                                failed_waypoint = waypoint_index
+                                break
+                            goal_qpos_array = np.asarray(goal_qpos, dtype=np.float64)
+                            joint_delta = float(np.max(np.abs(goal_qpos_array - q_cursor)))
+                            sample_count = max(1, int(math.ceil(joint_delta / 0.04)))
+                            for sample_index in range(1, sample_count + 1):
+                                alpha = float(sample_index / sample_count)
+                                q_path.append(q_cursor + alpha * (goal_qpos_array - q_cursor))
+                            q_cursor = goal_qpos_array
+                        clearance_attempts.append({
+                            "clearance_height_world_m": clearance_z,
+                            "failed_waypoint_index": failed_waypoint,
+                            "waypoints": waypoint_reports,
+                        })
+                        if failed_waypoint is None:
+                            chosen_ik_path = {
+                                "poses": staged_poses,
+                                "qpos_path": q_path,
+                                "clearance_z": clearance_z,
+                                "waypoints": waypoint_reports,
+                            }
+                            break
+                    if chosen_ik_path is None:
+                        route["joint_space_ik_waypoint_preflight"] = {
+                            "status": "no_complete_staged_endpoint_IK_route",
+                            "clearance_attempts": clearance_attempts,
+                            "physical_actions": 0,
+                            "safety_certified": False,
+                        }
+                        summary.setdefault("joint_space_ik_waypoint_preflights", []).append({
+                            "candidate_id": candidate.get("candidate_id"),
+                            "route_index": route.get("route_index"),
+                            **route["joint_space_ik_waypoint_preflight"],
+                        })
+                        continue
+                    q_path_array = np.asarray(chosen_ik_path["qpos_path"], dtype=np.float64)
+                    if (
+                        q_path_array.ndim != 2
+                        or q_path_array.shape[1] != 7
+                        or len(q_path_array) < 2
+                        or not np.isfinite(q_path_array).all()
+                        or float(np.max(np.abs(q_path_array[0] - route_start_qpos))) > 1e-6
+                        or len(q_path_array) - 1 > MAX_PREFIX_CONTROL_ACTIONS
+                    ):
+                        route["joint_space_ik_waypoint_preflight"] = {
+                            "status": "invalid_bounded_IK_joint_path",
+                            "waypoint_count_including_start": int(len(q_path_array)),
+                            "physical_actions": 0,
+                            "safety_certified": False,
+                        }
+                        summary.setdefault("joint_space_ik_waypoint_preflights", []).append({
+                            "candidate_id": candidate.get("candidate_id"),
+                            "route_index": route.get("route_index"),
+                            **route["joint_space_ik_waypoint_preflight"],
+                        })
+                        continue
+                    route["eef_reference_poses_world"] = [
+                        pose.tolist() for pose in chosen_ik_path["poses"]
+                    ]
+                    route["preserve_eef_waypoints"] = True
+                    route["joint_space_qpos_path_rad"] = q_path_array.tolist()
+                    route["joint_space_ik_waypoint_preflight"] = {
+                        "status": "complete_bounded_IK_staged_route",
+                        "planner_source": "active_scene_staged_endpoint_IK_joint_interpolation.v1",
+                        "clearance_height_world_m": chosen_ik_path["clearance_z"],
+                        "waypoints": chosen_ik_path["waypoints"],
+                        "clearance_attempts": clearance_attempts,
+                        "waypoint_count_including_start": int(len(q_path_array)),
+                        "required_physical_actions": int(len(q_path_array) - 1),
+                        "maximum_joint_sample_delta_rad": float(np.max(np.abs(
+                            np.diff(q_path_array, axis=0)
+                        ))),
+                        "source_state_sha256": state_sha,
+                        "live_state_unchanged": True,
+                        "configuration_collision_checks": 0,
+                        "physical_MuJoCo_contact_monitoring_required": True,
+                        "safety_certified": False,
+                    }
+                    summary.setdefault("joint_space_ik_waypoint_preflights", []).append({
+                        "candidate_id": candidate.get("candidate_id"),
+                        "route_index": route.get("route_index"),
+                        **route["joint_space_ik_waypoint_preflight"],
+                    })
+            if (
                 not candidate_route_preflight_admitted(
                     summary.get("rrt_status"),
                     summary.get("rrt_live_state_unchanged"),
@@ -7110,6 +7832,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for route_rank, route in enumerate(routes):
                 poses = route.get("eef_reference_poses_world")
                 if not poses:
+                    continue
+                if (
+                    args.pregrasp_route_control_mode == "joint_space_ik_waypoints"
+                    and route.get("joint_space_ik_waypoint_preflight", {}).get("status")
+                    != "complete_bounded_IK_staged_route"
+                ):
                     continue
                 if route.get("route_source") == "near_target_direct_surface_approach":
                     signature = f"near_target_direct_surface_approach:{candidate['candidate_id']}"
@@ -7223,13 +7951,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     frames=frames,
                     output_dir=output_dir,
                     local_replan_rrt_time_budget_s=args.local_replan_rrt_time_budget_s,
+                    stage_a_close_action_budget=args.stage_a_close_action_budget,
                     pregrasp_route_waypoint_position_tolerance_m=(
                         args.pregrasp_route_waypoint_position_tolerance_m
                     ),
+                    pregrasp_route_waypoint_rotation_tolerance_rad=(
+                        args.pregrasp_route_waypoint_rotation_tolerance_rad
+                    ),
+                    surface_approach_position_tolerance_m=(
+                        args.surface_approach_position_tolerance_m
+                    ),
                     pregrasp_route_control_mode=args.pregrasp_route_control_mode,
+                    joint_space_rrt_max_tracking_error_l2_rad=(
+                        args.joint_space_rrt_max_tracking_error_l2_rad
+                    ),
                     abort_target_displacement_m=(
                         0.015
-                        if cold_start and not bool(rrt.get("defer_live_contact_close_until_route_end"))
+                        if cold_start
+                        and not bool(rrt.get("defer_live_contact_close_until_route_end"))
                         else None
                     ),
                     force_route_before_contact_close=bool(
@@ -7237,6 +7976,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     stage_a_unilateral_close_probe_position_m=(
                         args.stage_a_unilateral_close_probe_position_m
+                    ),
+                    stage_a_unilateral_contact_close_probe=(
+                        args.stage_a_unilateral_contact_close_probe
+                    ),
+                    stage_a_unilateral_contact_route_first=(
+                        args.stage_a_unilateral_contact_route_first
+                    ),
+                    stage_a_stop_pregrasp_route_on_stable_grasp=(
+                        args.stage_a_stop_pregrasp_route_on_stable_grasp
+                    ),
+                    stage_a_route_grasp_intercept_stable_samples=(
+                        args.stage_a_route_grasp_intercept_stable_samples
+                    ),
+                    stage_a_live_contact_lift_translation_step_m=(
+                        args.stage_a_live_contact_lift_translation_step_m
+                    ),
+                    stage_a_near_pregrasp_bypass_position_m=(
+                        args.stage_a_near_pregrasp_bypass_position_m
+                    ),
+                    stage_a_near_pregrasp_bypass_rotation_rad=(
+                        args.stage_a_near_pregrasp_bypass_rotation_rad
                     ),
                     stage_a_pregrasp_staged_clearance_height_m=(
                         args.stage_a_pregrasp_staged_clearance_height_m
@@ -7252,6 +8012,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     stage_a_pregrasp_obstacle_aware_high_transit=(
                         args.stage_a_pregrasp_obstacle_aware_high_transit
+                    ),
+                    stage_a_pregrasp_high_transit_axis_tolerance_m=(
+                        args.stage_a_pregrasp_high_transit_axis_tolerance_m
                     ),
                     stage_a_obstacle_components=stage_a_obstacle_components,
                 )
@@ -7708,6 +8471,10 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stage-a-close-action-budget", type=int, default=MAX_CLOSE_CONTROL_ACTIONS,
+        help="maximum physical close actions used to establish a stable MuJoCo grasp",
+    )
+    parser.add_argument(
         "--pregrasp-route-waypoint-position-tolerance-m",
         "--pregrasp-endpoint-position-tolerance-m",
         dest="pregrasp_route_waypoint_position_tolerance_m",
@@ -7719,12 +8486,40 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pregrasp-route-waypoint-rotation-tolerance-rad",
+        type=float,
+        default=0.045,
+        help=(
+            "rotation tolerance for physical pregrasp route and axis-selective endpoint waypoints; "
+            "surface contact and MuJoCo grasp checks remain authoritative"
+        ),
+    )
+    parser.add_argument(
         "--pregrasp-route-control-mode",
-        choices=("eef_osc", "joint_space_rrt"),
+        choices=("eef_osc", "joint_space_rrt", "joint_space_ik_waypoints"),
         default="eef_osc",
         help=(
-            "execute the selected collision-checked pregrasp route as OSC EEF "
-            "waypoints or its dense joint-space RRT qpos path"
+            "execute a selected pregrasp route with OSC, a collision-checked joint-space RRT path, "
+            "or staged IK endpoints joined by a dense physical joint trajectory"
+        ),
+    )
+    parser.add_argument(
+        "--surface-approach-position-tolerance-m",
+        type=float,
+        default=0.004,
+        help=(
+            "position tolerance for reaching the live object-relative grasp pose; "
+            "physical pad contact, stable grasp, and lift checks remain authoritative"
+        ),
+    )
+    parser.add_argument(
+        "--joint-space-rrt-max-tracking-error-l2-rad",
+        dest="joint_space_rrt_max_tracking_error_l2_rad",
+        type=float,
+        default=0.15,
+        help=(
+            "maximum measured MuJoCo joint-qpos deviation from the selected dense RRT sample; "
+            "raises no success or safety claim"
         ),
     )
     parser.add_argument(
@@ -7733,6 +8528,59 @@ def _parse_args() -> argparse.Namespace:
             "maximum candidate-pose error for a bounded physical close probe after a real unilateral target-pad contact; "
             "the live MuJoCo grasp monitor must still verify closure"
         ),
+    )
+    parser.add_argument(
+        "--stage-a-unilateral-contact-close-probe", action="store_true",
+        help=(
+            "Stage A only: if the resumed live MuJoCo state has exactly one measured target-finger-pad contact, "
+            "close at the current measured EEF pose without candidate pose gates; real bilateral grasp stability, "
+            "physical lift, and native BDDL task success remain required"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-unilateral-contact-route-first", action="store_true",
+        help=(
+            "Stage A only: when a resumed Snapshot has one measured target-pad contact, "
+            "execute the planned pregrasp retreat/transit before the candidate surface approach, "
+            "instead of continuing directly through a potentially fixture-trapped contact"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-stop-pregrasp-route-on-stable-grasp", action="store_true",
+        help=(
+            "Stage A only: if the live grasp monitor verifies consecutive bilateral pad-contact states "
+            "during a joint-space pregrasp route, stop the route, export that exact Snapshot, and "
+            "continue with physical lift verification"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-route-grasp-intercept-stable-samples", type=int, default=3,
+        help=(
+            "minimum distinct consecutive live bilateral-grasp samples before a joint-space "
+            "pregrasp route may be interrupted by --stage-a-stop-pregrasp-route-on-stable-grasp"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-live-contact-lift-translation-step-m", type=float,
+        default=LIVE_CONTACT_LIFT_TRANSLATION_STEP_M,
+        help=(
+            "Stage A physical EEF translation increment for incremental lift from verified live bilateral contact"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-near-pregrasp-bypass-position-m",
+        type=float,
+        default=PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M,
+        help=(
+            "when starting a physical branch near its candidate pregrasp, skip only the pregrasp transit; "
+            "the real surface approach and live grasp checks still run"
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-near-pregrasp-bypass-rotation-rad",
+        type=float,
+        default=PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD,
+        help="maximum measured EEF rotation error for the near-pregrasp transit bypass",
     )
     parser.add_argument(
         "--stage-a-pregrasp-staged-clearance-height-m", type=float, default=0.0,
@@ -7769,6 +8617,12 @@ def _parse_args() -> argparse.Namespace:
             "use read-only active compiled object geometry to plan a high-plane "
             "axis-aligned A* pregrasp transit; route is physical guidance only"
         ),
+    )
+    parser.add_argument(
+        "--stage-a-pregrasp-high-transit-axis-tolerance-m",
+        type=float,
+        default=0.004,
+        help="physical endpoint tolerance for each axis-selective compiled-geometry A* high-transit correction",
     )
     parser.add_argument("--rrt-time-budget-s", type=float, default=12.0)
     parser.add_argument(
@@ -7810,10 +8664,30 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--geometry-candidate-pool-offset is available only for physical task-success search")
     if not 1 <= args.maximum_rrt_preflights <= MAX_RRT_PREFLIGHTS:
         parser.error(f"--maximum-rrt-preflights must be in 1..{MAX_RRT_PREFLIGHTS}")
+    if (
+        isinstance(args.stage_a_route_grasp_intercept_stable_samples, bool)
+        or args.stage_a_route_grasp_intercept_stable_samples < 3
+    ):
+        parser.error("--stage-a-route-grasp-intercept-stable-samples must be at least 3")
+    if (
+        not np.isfinite(args.stage_a_live_contact_lift_translation_step_m)
+        or not 0.001 <= args.stage_a_live_contact_lift_translation_step_m <= 0.008
+    ):
+        parser.error("--stage-a-live-contact-lift-translation-step-m must be in 0.001..0.008")
     if not np.isfinite(args.stage_a_unilateral_close_probe_position_m) or not (
         0.010 <= args.stage_a_unilateral_close_probe_position_m <= 0.080
     ):
         parser.error("--stage-a-unilateral-close-probe-position-m must be in 0.010..0.080")
+    if not np.isfinite(args.stage_a_near_pregrasp_bypass_position_m) or not (
+        PHYSICAL_NEAR_PREGRASP_BYPASS_POSITION_M
+        <= args.stage_a_near_pregrasp_bypass_position_m <= 0.080
+    ):
+        parser.error("--stage-a-near-pregrasp-bypass-position-m must be in 0.010..0.080")
+    if not np.isfinite(args.stage_a_near_pregrasp_bypass_rotation_rad) or not (
+        PHYSICAL_NEAR_PREGRASP_BYPASS_ROTATION_RAD
+        <= args.stage_a_near_pregrasp_bypass_rotation_rad <= 0.10
+    ):
+        parser.error("--stage-a-near-pregrasp-bypass-rotation-rad must be in 0.02..0.10")
     if (
         not np.isfinite(args.stage_a_pregrasp_staged_clearance_height_m)
         or args.stage_a_pregrasp_staged_clearance_height_m != 0.0
@@ -7843,6 +8717,12 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             "--stage-a-pregrasp-obstacle-aware-high-transit requires staged clearance "
             "and cannot be combined with a lateral detour or axis-aligned transit"
+        )
+    if not np.isfinite(args.stage_a_pregrasp_high_transit_axis_tolerance_m) or not (
+        0.004 <= args.stage_a_pregrasp_high_transit_axis_tolerance_m <= 0.020
+    ):
+        parser.error(
+            "--stage-a-pregrasp-high-transit-axis-tolerance-m must be in 0.004..0.020"
         )
     if args.strict_grasp_screen_only:
         if args.candidate_start_index < 0 or (
@@ -7907,10 +8787,28 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             f"--branch-control-action-budget must be in 1..{MAX_BRANCH_CONTROL_ACTIONS}"
         )
+    if not 1 <= args.stage_a_close_action_budget <= MAX_BRANCH_CONTROL_ACTIONS:
+        parser.error(
+            f"--stage-a-close-action-budget must be in 1..{MAX_BRANCH_CONTROL_ACTIONS}"
+        )
     if not np.isfinite(args.pregrasp_route_waypoint_position_tolerance_m) or not (
-        0.004 <= args.pregrasp_route_waypoint_position_tolerance_m <= 0.025
+        0.004 <= args.pregrasp_route_waypoint_position_tolerance_m <= 0.030
     ):
-        parser.error("--pregrasp-route-waypoint-position-tolerance-m must be in 0.004..0.025")
+        parser.error("--pregrasp-route-waypoint-position-tolerance-m must be in 0.004..0.030")
+    if not np.isfinite(args.pregrasp_route_waypoint_rotation_tolerance_rad) or not (
+        0.045 <= args.pregrasp_route_waypoint_rotation_tolerance_rad <= 0.12
+    ):
+        parser.error(
+            "--pregrasp-route-waypoint-rotation-tolerance-rad must be in 0.045..0.12"
+        )
+    if not np.isfinite(args.surface_approach_position_tolerance_m) or not (
+        0.004 <= args.surface_approach_position_tolerance_m <= 0.020
+    ):
+        parser.error("--surface-approach-position-tolerance-m must be in 0.004..0.020")
+    if not np.isfinite(args.joint_space_rrt_max_tracking_error_l2_rad) or not (
+        0.15 <= args.joint_space_rrt_max_tracking_error_l2_rad <= 0.25
+    ):
+        parser.error("--joint-space-rrt-max-tracking-error-l2-rad must be in 0.15..0.25")
     if not 0.5 <= args.rrt_time_budget_s <= 60.0:
         parser.error("--rrt-time-budget-s must be in 0.5..60")
     if not 0.5 <= args.local_replan_rrt_time_budget_s <= 60.0:

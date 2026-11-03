@@ -14,7 +14,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
-MAX_DEMONSTRATION_HORIZON = 5000
+# Stage A Extended continuations preserve the same live MuJoCo episode across
+# exact Runtime Snapshots. Keep a generous configurable ceiling; the native
+# BDDL predicates remain the only success criterion.
+MAX_DEMONSTRATION_HORIZON = 50000
 
 
 def inspect_native_goal_coverage(native_status: dict[str, Any]) -> dict[str, Any]:

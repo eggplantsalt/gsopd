@@ -1,12 +1,105 @@
-# 2026-11-01 当前Stage A总体路线与局部策略
+# SafeTRAIL Stage A 全局路线
 
-**总体终点：** OA与OAH两个Suite的30个任务均取得合法Episode、真实连续MuJoCo执行并通过原生LIBERO-Safety BDDL完整成功。当前19/30（12 Standard、7 Extended）；Stage A接受安全违规，Standard最多1000动作，Extended单独标记。
+全局验收30/30真实、连续、原生BDDL成功Episode。最新矩阵与三条Extended成功索引核实覆盖23/30（12 Standard、11 Extended）；剩余七项：OA/L0T4、L1T3、L1T4、L2T4，以及OAH/L0T3、L0T4、L2T4。
 
-**当前执行点：** OA/L1T4 dev39高位路线到达水平侧抓预抓点附近，但腕部link6压桌造成14.1mm高度残差，且轻触微波炉g17。dev40将接触中心上移13.1mm，基于MuJoCo确认清除桌面接触后再闭合与lift；根据真实接触和跟踪行为继续改变几何，不重复垂直压杯路线。
+当前物理实验：OAH/L0T4 dev403的高位link6预接近端点本身清离机器人障碍，但0/8 IK被合法杯—微波炉g7承托近接触的禁碰列表拒绝；无物理动作，父t4970状态不变。已修改articulated-fixture碰撞策略：只对原生In目标对应fixture、且实时检测到≤2mm/≥0.01N承托接触时移除该一组物体—物体pair，所有机器人碰撞检查不变。dev404从同一合法t4970 Snapshot重新预检并执行link6—g17关门；dev401的竖直长抬升路线停止，异常物理记录保存路径已修复。dev402父Snapshot SHA `f76a1a66b29ff29b4c4621a834c58011bfb2fb478ac7ad08c7a36df447cbccaf`。详细来源与连续性见`docs/GS_OPD_CURRENT_GOAL.md`及任务矩阵。
 
-**通用策略：** 以逐步MuJoCo轨迹、接触/关节与原生谓词定位失败。只有完整Episode真实`task_success=true`才增加覆盖；候选筛选、规划成功或waypoint容差不能作为任务完成。保留合法Snapshot来源，Stage A不受后续禁触约束。
+OA/L2T4 dev278曾物理到达In=true，但释放/撤手不稳定；dev291–292杯子滑出且未建立可信再抓持。暂停该释放族，后续若恢复须换承托、接触驱动或其他放置方法。
 
-**记录：** 数据盘`/opt/data/private/gs_opd/safetrail_stage_a_exploration/experiments.md`保存每轮结果与证据，`experience.md`只记录实际验证的复用经验；矩阵实时反映任务状态。
+最新成功OAH/L1T4 dev489：真实link6–g17接触驱动门铰链从−0.194789到−0.003307rad，原生In、Close与task_success均true；206动作，t4810，Extended。成功索引路径见数据盘successes目录。
+
+## 执行原则
+
+用真实物理接触、关节状态、对象运动及原生谓词判断路线；遇到已证实的停滞/滑移机制就切换控制机制。所有Snapshot续接需保持同一Episode身份；只有原生`task_success=true`算覆盖成功。
+
+---
+
+## 历史路线记录
+
+
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 历史路线记录
+
+## 2026-11-02 接管状态：OAH/L0T3 dev129将预转控制限制在+10°
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev126/127/128分别请求+75°/+45°/+30°，都从真实jaw1/roll0抓持进入pretransport旋转，并在相同t2108时刻失持，Soup In=false。动作接触显示物体只实际偏转约20°，随后pad接触面转换。
+
+dev129将真实yaw请求降至+10°，其余均不变；目标是避开t2108附近的滑脱阈值后再观察横向进展。若仍未形成可持续移动，将停止正向pretransport yaw路线。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_yawalign10_dev129/launch.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev128把预转yaw降到+30°
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev126的+75°与dev127的+45°都在第28个真实pretransport动作失去双指，失持发生在水平转运开始之前。
+
+dev128从同一合法t1842静置源重启已验证jaw1/roll0抓姿，只把pretransport yaw降为+30°；低速1mm/action和目标篮路线保持不变。若该角度能完成真实旋转，记录随后横向推进与BDDL；否则结束这条预转yaw家族并转至别的配置/物理抓姿。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_yawalign30_dev128/launch.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev127缩短预转角后续接低速转运
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev126从合法t1842静置态复用已验证抓姿，真实执行+75° pretransport yaw；连续保持双指至t2107，第28个placement动作t2108失持，原生Soup In=false。
+
+dev127只把预转yaw缩短至+45°，其余抓姿、t1842合法源、0.061m transit、1mm/action与basket路线相同。根据t2108前的真实接触变化，测试能否在不跨过失持接触面转换的情况下完成姿态调整并开始转运。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_yawalign45_dev127/launch.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev126测试预转yaw改善横向夹持负载
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev125从dev124 t2104稳定持物Snapshot续跑，低速移动6个动作后双pad抓持丢失，Soup In=false。dev124的桌面下降无法到达，dev125的当前高度运载仍未改善抓持对横向剪切的承载。
+
+dev126从dev94合法t1842静置Snapshot使用dev102验证过的jaw1/roll0双pad侧抓，在原生放置转运前执行+75°真实MuJoCo pretransport yaw，目标使夹持法线方向更贴近basket的横向运输力，再以0.061m transit和1mm/action运行。全过程保持合法Snapshot与原生BDDL验收。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_yawalign75_dev126/launch.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev125从可恢复持物态继续篮内转运
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev124从合法t1842起完成238动作抓取，并通过真实双pad grasp monitor；桌面支撑下降段执行24动作后停滞：Soup根仍在z=.05822m，目标支撑高度.03840m，EEF残差19.9mm，双指仍在抓持，原生In=false。失败Snapshot保留了可续接的稳定持物态。
+
+dev125从dev124 t2104精确Runtime Snapshot续跑，将transit高度设为当前实测Soup根高.0582m，保持1mm/action低速移动，避开无法到达的额外20mm下降；随后继续原生篮口放置并以BDDL状态验收。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_carry_from_t2104_1mm_dev125/launch.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev124表面支撑转运验证
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。dev123从t2038执行27个真实动作后，末端持续触碰tomato_sauce瓶体，EEF距目标34.0mm，未成抓持；原生Soup In=false。失败态快照可恢复。
+
+dev124回到dev94已验证合法静置t1842 Snapshot，复用dev102曾形成的geom89/jaw1/roll0双指抓持；转运目标改为根高度0.0384m、桌面支撑、每动作1mm，先沿桌面稳定移动，再按over-rim进入篮口。此分支检验支撑摩擦能否避免空中长距离承载滑脱；全过程只由真实MuJoCo动作与原生BDDL判定。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_geom89_jaw1_surface_support_1mm_dev124.sh`。
+
+---
+
+## 2026-11-02 接管状态：OAH/L0T3 dev123执行中
+
+原生BDDL覆盖仍为 **20/30（12 Standard、8 Extended）**，剩余10项。接管核验确认无旧进程运行。dev122从合法t2038 Snapshot运行27个MuJoCo动作后，因EEF误差0.0332m、姿态误差0.5185rad停滞；未形成抓持，Soup In=false。
+
+dev123从同一合法t2038 Runtime Snapshot使用曾实际获得双指接触与22.5mm抬升的geom89/jaw1/roll0抓姿，object-local Y +25mm抬高夹持中心，close预算24。放置采用compiled-obstacle transit与over-rim入口，原生BDDL task_success是唯一成功判据。启动脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261101/obstacle_avoidance_human_L0T3_geom89_jaw1_roll0_yplus25_close24_overrim_dev123.sh`。源码在`research/gs_opd/repair/task_success_first_executor.py`及`task_success_first_grasp_search.py`；未改动物体状态。
+
+---
+
+## 2026-11-01 当前局部目标：OAH/L0T3改善真实夹持法线对向
+
+`GOAL_STATUS=ACTIVE`；原生BDDL覆盖**20/30（12 Standard、8 Extended）**，剩余10项。dev121用roll−30°/object-local-Y +25mm达成三态真实双pad monitor；Soup被确认抬升7.35mm，但首个抬升动作即失去双pad。t2056实测左右接触法线点积约+0.20，夹持方向明显不对向，故只达到瞬态稳定门限。
+
+dev122从dev117 t2038合法直立Soup Snapshot续跑，保持接触高度+25mm和close budget24，只将approach roll从−30°换成+30°，争取将MuJoCo实测左右pad法线转到相反方向；随后必须通过真实稳定lift、同一Episode篮内放置和完整原生BDDL验收。脚本：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261101/obstacle_avoidance_human_L0T3_geom89_jaw1_rollplus30_yplus25_dev122.sh`。
+
+---
+## 2026-11-01 Stage A 接管状态
+
+目标仍为30项原生BDDL成功并保留连续MuJoCo Episode；当前20/30。OAH/L0T3 dev102改水平侧向jaw1后真实稳定双pad抓持并抬升22.5mm，已进入Soup原生篮内运输；t2109仅剩右指接触并观察到快速转动，等待物理结案。详见局部目标、任务矩阵和data-disk记录。
 
 ## 2026-11-01 OA/L1T4：给前门运输保留Panda wrist-roll余量
 
@@ -18,7 +111,7 @@ dev14在真实MuJoCo里将mug转到距离yaw目标约10°，根漂移约14mm、�
 
 ## 2026-11-01 OA/L1T4 route update: force zero yaw during direct horizontal entry
 
-OAH/L1T3 dev80–85 have isolated several real route bugs and physically engaged support, but the geom80/jaw1/local-Y−10mm held Soup rises off the support plane during horizontal movement and rolls out of both fingers at about 27mm regardless of 4mm vs 8mm translation step; a 1mm post-contact downward bias also failed. No native Soup In. Stop the repeated grasp/route family. Preserve every run and return only with a new grasp orientation/contact family or pusher.
+OAH/L1T3 dev85–85 have isolated several real route bugs and physically engaged support, but the geom80/jaw1/local-Y−10mm held Soup rises off the support plane during horizontal movement and rolls out of both fingers at about 27mm regardless of 4mm vs 8mm translation step; a 1mm post-contact downward bias also failed. No native Soup In. Stop the repeated grasp/route family. Preserve every run and return only with a new grasp orientation/contact family or pusher.
 
 OA/L1T4 stays on the legal t249 held-object prefix. dev10 established that .04m root-height entry avoids microwave g6 roof contact. dev11/12 showed the hand, not the mug, blocks the front aperture: the mug stays near y=.093m while `gripper0_hand_collision` loads against `microwave_1_g6`, leaving actual EEF y≈.151m against a y≈.407m target. Do not repeat same-orientation horizontal insertion. dev13 began a real 180° mug-yaw reorientation, but the 128-action posture segment stopped after 44.6° and the live-position tracker accepted 256 mm of outward object-root drift. dev14 keeps the requested object root fixed, uses a 0.05 rad bounded rotation step and remaining route budget, then measures whether the palm clears g6 during low entry; validate native In, physical Close, and task_success within the Standard horizon.
 
@@ -44,7 +137,7 @@ dev80 route明明生成了`reachability_descent`至世界z=.0364m，但tracking 
 
 ## 2026-11-01 OAH/L1T3：姿态解耦物理生效但悬空carry仍滑脱，dev80转为桌面支撑
 
-dev79已确认姿态解耦有效运行：Soup横向转运时object orientation命令接近零，route report含`preserve_live_orientation_during_over_rim_transfer_then_rotate_at_high_goal_pose`；仍无外物碰撞，但root在约+28mm竖直、+24mm水平运动后失去左pad。悬空carry负载本身仍不可靠，因此dev80从合法dev76 held Snapshot把Soup先下降到桌面并启用受支撑的surface-slide路线，在真实MuJoCo中检测台面/篮碰撞和原生In；如果滑移也失抓，再改为明确的接触推手位姿，不回到当前空中carry姿态族。
+dev80已确认姿态解耦有效运行：Soup横向转运时object orientation命令接近零，route report含`preserve_live_orientation_during_over_rim_transfer_then_rotate_at_high_goal_pose`；仍无外物碰撞，但root在约+28mm竖直、+24mm水平运动后失去左pad。悬空carry负载本身仍不可靠，因此dev80从合法dev76 held Snapshot把Soup先下降到桌面并启用受支撑的surface-slide路线，在真实MuJoCo中检测台面/篮碰撞和原生In；如果滑移也失抓，再改为明确的接触推手位姿，不回到当前空中carry姿态族。
 
 ## 2026-11-01 route-dispatch审计：dev78姿态修改未命中，dev79验证通用over-rim In路径
 
@@ -1431,3 +1524,280 @@ OA/L1T2 stage_07已审计为Extended native success，撤销对它的续跑计�
 ## dev65后调整抓姿选择
 
 OAH/L1T3 dev65实测A*平移路径无碰撞、旋腕前XY对准，但geom81/jaw1目标姿态与t2421 live wrist差167.6°，旋腕使EEF偏移57mm；保持X/Y锁定的旋转waypoint预算用尽，Soup无接触。下步不加路线预算重试，而是按当前EEF旋转代价扫描多轴几何组合；以geom81/jaw2/approach1−1/flip−1（28.6°、估算宽度75.2mm）做单支真实验证。
+
+
+## 2026-11-02 路线状态更新：覆盖基线22/30，当前OAH/L0T4
+
+本节覆盖数与任务优先级覆盖同文档较早的19/30历史记录：最新原生报告审计为22/30，剩余8项为OA/L0T4、L1T3、L1T4、L2T4及OAH/L0T3、L0T4、L1T4、L2T4。当前选择OAH/L0T4继续，因为它已从合法连续链达到In=true，任务仅差Close。dev295–299显示：单纯沿-X撤手会拖杯，前沿余量充足时原生In可保持；最新dev300尝试沿-Z剥离残留指垫。未有本轮任务成功，不改变矩阵或覆盖数。若本链无法安全续接关门，转向剩余任务中有原生部分目标Snapshot且已验证抓放姿态的任务；完整优先级按最新矩阵和合法Snapshot调整。
+
+
+### OAH/L0T4 dev300结果与dev301执行器续接（2026-11-02）
+
+dev300沿-Z实际移动EEF约8.4mm，3个动作/75物理子步完整；原生In维持true，连续3条物理记录无指垫接触且杯速较低。dev301从dev300 t3482合法Runtime Snapshot运行原生close microwave_1规划与执行，尚待结果。覆盖保持22/30。
+
+
+### OAH/L0T4 dev301规划失败与dev302物理清障（2026-11-02）
+
+dev301从dev300 t3482合法终态启动原生Close执行器，初始谓词In=true、Close=false。precontact RRT在0物理动作拒绝起点：scratch配置中指部/杯最小间隙=-0.246mm，robot/microwave clearance=1.126mm，均未满足规划所需10mm；native状态不变。这说明真实pad接触消失尚不足以让完整机器人/夹爪几何进入规划安全起点。没有放宽碰撞容差。dev302当前从未被dev301改变的dev300 Snapshot沿-X做12mm直接IK关节轨迹，尝试建立真实几何净空；完整执行与原生谓词待查。覆盖仍22/30。
+原始dev301碰撞报告位于数据盘 obstacle_avoidance_human_L0T4_native_close_after_vertical_peel_dev301 下；dev302物理记录位于 obstacle_avoidance_human_L0T4_collision_clearance_step_dev302/run/。
+
+
+### OAH/L0T4 dev302接触法线与dev303（2026-11-02）
+
+dev302从dev300终态沿-X真实移动12mm，5动作至t3487，杯子root变化约[-8.0,-6.3,+0.1]mm，原生In仍true、Close=false，125/125子步完整；末端出现finger2—杯g14与手掌—开门板g17接触。结合dev301的规划失败，排除继续盲目沿-X或放宽RRT净空。dev303当前依据两对接触实际法线沿+X移动12mm，尝试同时离开杯体与门板。覆盖仍22/30。
+
+
+### OAH/L0T4 dev303接触法线外撤结果与dev304垂直逃逸（2026-11-02）
+
+dev303从dev302 t3487合法终态沿+X移动12mm，5动作至t3492，所有125物理子步完整，In仍true。前3步无机器人/杯接触，末2步重新出现pad和finger2碰杯；杯root总位移约[+2.8,-4.2,-7.8]mm，现距BDDL前沿仅约0.4mm、下沿仍有余量。停止水平外撤。末端两对接触法线在+Z方向均可分离，dev304现尝试开爪+Z10mm物理逃逸。覆盖仍22/30。
+
+
+### OAH/L0T4 dev304前沿越界与dev305对角撤离分支（2026-11-02）
+
+dev304从dev303 t3492沿+Z移动约8.6mm，3真实动作/75子步完整；杯root y从.26687降至.26447m，于t3494使原生In变false，z仍在区域中。失败来自门口侧向滑动而非垂直越界。退回更早且合法的dev300 t3482 Snapshot（In=true、无pad接触、前沿余量约10.9mm），dev305尝试按接触法线将EEF同时+X/+Z各6mm，使机器人离开杯与开门板；当前物理执行待审计。覆盖仍22/30。
+
+
+### OAH/L0T4 dev305与dev306（2026-11-02）
+
+dev305从dev300 t3482合法Snapshot执行+X/+Z对角短撤离，3动作至t3485；实际EEF移动约(+5.1,0,+2.4)mm，225物理子步连续记录中最后3态无robot contacts。杯root仅向-Y移动约1.4mm，In=true。dev306从该终态续接原生Close规划和真实执行，报告待审计。覆盖仍22/30。
+
+
+### OAH/L0T4 dev306净空差值与dev307（2026-11-02）
+
+dev306原生Close执行器在0物理动作再次拒绝起点。与dev301相比，dev305终态已物理清除接触，scratch最小杯间隙从-0.246mm增至+0.312mm，微波炉间隙从1.126mm增至1.355mm，但仍低于原生执行器10mm预接触门槛；task_success未变。dev307当前从合法dev305 t3485 Snapshot朝实测接触法线共同分离方向执行+X/+Y/+Z，尝试获得更大净空并保持In。覆盖22/30。
+
+
+### OAH/L0T4 dev307结果与dev308 Close执行（2026-11-02）
+
+dev307从dev305 t3485合法Snapshot沿法线方向+X/+Y/+Z真实移动5动作至t3490，全部125物理子步完整。末3态无robot contacts，原生In=true；杯子root变化约[+5.1,-6.8,-7.4]mm，前沿余量约2.8mm。dev308当前从此连续终态运行原生Close RRT/物理执行；覆盖仍22/30。
+
+
+## 2026-11-02 局部任务切换：暂停OAH/L0T4直撤，转OAH/L0T3抓放
+
+dev308的原生Close起点RRT仍在0动作拒绝，杯净空+0.011mm、微波炉+1.019mm，与dev301相比无有效改善。停止同方向直撤，保留dev305/dev307合法In=true终态供后续不同腕姿/接触机制复用。转到OAH/L0T3 dev150精确t2372 Snapshot：cheese In=true、Soup In=false，Soup已沿旧pusher路线真实推进约52mm但仍静置于篮外；机器人末态邻近hairbrush。dev309准备从此Snapshot以以前对Soup物理验证过的geom81/jaw1/approach2抓姿候选重新抓放，只调用新物理控制，不重放历史动作。Extended分支，覆盖仍22/30。
+原始源报告、终态Snapshot与接触子步记录在 /opt/data/private/gs_opd/overnight/safetrail_stage_a_20261102/obstacle_avoidance_human_L0T3_t2231_palm_detour_dev150/contact_push_probe/。
+
+
+### OAH/L0T3 dev309候选过滤诊断与dev310（2026-11-02）
+
+dev309从dev150 t2372合法Snapshot恢复正确，初始Soup In=false、cream-cheese In=true；但固定dev56候选ID未出现在当前倾斜Soup的生成列表，原始run_report中candidates=0、RRT/IK筛选=0、物理动作=0。此前顶层错误no_stage_a_grasp_candidate_with_pregrasp_and_grasp_endpoint_ik不应解释为候选的IK失败。dev310改为按当前编译碰撞几何筛候选池，最多16候选、8个RRT预检、一个物理分支。覆盖22/30。
+
+
+### 2026-11-02 OAH/L0T3分支决策
+
+dev310在合法t2372现态对活动Soup几何筛选24个候选，17个预抓IK无解、7个全几何/自碰撞；单个向下倾斜物理分支被robot link6—tomato_sauce接触挡住，57动作后EEF误差47.3mm、无有效物体转运。保留源Snapshot与动作记录。dev311首个命令在参数校验阶段因冷启动禁止非零candidate-start-index退出，0动作；改为精确指定活动几何重新生成的geom87候选ID，测试斜向抓姿，最多一个RRT预检/一个物理分支；若同样因机器人链路碰撞或端点不可达失败，停止该抓取候选族，切换到其他未覆盖任务或单独设计避障接触路线。
+
+
+### 2026-11-02 OAH/L0T3抓姿搜索止损
+
+dev311受支持地精确指定活动geom87候选后，仍在和dev310相同的法线逃逸/低位路线停滞，原生目标未进展。此抓姿ID搜索族停止。dev312改用分段物理OSC掌面推送：低位离开hairbrush，向南侧移后高位抬升和转腕，绕过tomato_sauce，再从Soup后方接触并分块朝basket推进。每段均保留原生In/task_success与接触子步记录；若链路接触继续阻塞则转到其他开放任务。
+
+
+### 2026-11-02 OAH/L0T3接触推送路径调整
+
+dev312验证了向下初始逃逸可清hairbrush，但继续负Y侧移使robot0_link6触tomato_sauce，80动作内未到达Soup接触位。dev313改变退让象限为正X/正Y，在Soup北侧先清障再升高，后续高位转腕和push；所有接触与native谓词继续逐步审计。
+
+
+### 2026-11-02 OAH/L0T3 brush脱离验证
+
+dev313从dev312终态仅横移+X，54动作仍保持hairbrush g5接触，故不可从该中间Snapshot直接做高位转运。dev314回到t2372原始合法Snapshot，先执行已实证的向下脱离，再低位向+X/+Y退让；只有确认实际离开brush及sauce后才继续高位绕行。
+
+
+### 2026-11-02 OAH/L0T3绕行象限决策
+
+dev314低位+X/+Y方向使link6撞hairbrush；dev312负Y方向使link6撞tomato_sauce。dev315仅测试西/南低位绕行，使用dev312已验证的低位脱离起始段；若西侧仍受限，则停止重复同一接触推送机制并切换到另一个未覆盖任务。
+
+
+### 2026-11-02 改用关节空间RRT绕开OAH/L0T3碰撞
+
+dev312/314显示低位直线退让会让link6分别碰tomato_sauce与hairbrush。dev315生成实测无接触的向下逃逸Snapshot；dev316用现有关节空间RRT‑Connect，0m最小净空且不允许穿透，通过真实关节控制执行到西南高位和目标后方。此为规划/控制机制切换，不是容差放宽。
+
+
+### 2026-11-02 OAH/L0T3工作空间筛查
+
+dev316的[.13,-.08,.25] endpoint没有有界IK，未产生物理动作。dev317改用多个贴近实测EEF的高位候选做只读IK+RRT，拒绝所有碰撞/无解端点，只执行首个完全可行的真实路径。
+
+
+### 2026-11-02 OAH/L0T3腕部姿态筛查止损
+
+dev317的高位EEF端点被gripper手掌—hairbrush g10碰撞拒绝。dev318只改变腕部姿态、保持局部高位目标，使用活动几何+零净空RRT筛查；若无法找到无碰解，则离开OAH/L0T3并转到其他开放任务。
+
+
+## 2026-11-02 dev318止损与OAH/L0T4门外撤离dev319
+
+dev318七种腕姿均无法绕开hairbrush g10，0动作；结束OAH/L0T3当前推手路线。转到OAH/L0T4现有合法In=true分支。选择dev305 t3485而不是更晚dev307 t3490，因前者杯子保留较大原生区域余量且末态只有轻微finger2—杯接触。dev319尝试活动几何关节RRT沿门外−Y约97mm撤手，最小净空0mm、无penetration allowance，物理执行只接收完全可行轨迹。
+
+
+### OAH/L0T4 dev320接触约束原因及dev321精确豁免
+
+dev319控制流早退0动作；修复runner后dev320 endpoint IK解存在，但RRT把mug与其真实native In区域父对象microwave_1之间约0.916mm的支撑接触当作禁止的object pair，0物理动作。dev321仅豁免已通过native predicate/region-parent核验的这个目标支撑对象对；机器人和fixture、mug间的所有全几何碰撞检查仍启用，最小净空0mm，无穿透allowance。只在无碰路线可行时真实撤手，随后沿用Close原10mm门槛。
+
+
+### OAH/L0T4 dev321 RRT超时后分段dev322
+
+dev321使用精确目标支撑对象对例外后，97mm−Y目标的robot geometry端点安全，但RRT 15s内无路，0动作。dev322保持相同scene policy与方向，不增加单次RRT预算，将路径拆为22–25mm连续端点；每段成功后以新物理状态重新规划，In=false时停止。
+
+
+### OAH/L0T4 dev322低位撤离受杯体阻挡
+
+dev322短段首个端点仍让finger2与杯g16重叠11.42mm；0动作，停止低位水平分段。dev323筛选−Y/+Z斜上路线端点，完整机器人/环境碰撞和RRT校验后最多执行一个分支。
+
+
+### OAH/L0T4 dev323规划轨迹与动作cap不匹配
+
+dev323第二斜上候选存在0碰撞RRT路（50样本、min clearance 0.3116mm、0 unsafe samples），144个动作参考因当轮cap=120未执行。dev324从同一精确源重规划单一候选，cap=180，以完整执行并审计状态。
+
+
+### OAH/L0T4 dev324物理拖杯证据与dev325接触法线脱离
+
+dev324 144动作连续有效，但finger-pad与杯geom接触拖动杯体，t3493 In=false；t3629 mug落桌root[-.0233,.2389,.9321]m，Close=false。接触到杯的方向robot→cup为[.920,.107,.377]；之前沿外撤路线仍与法线有压入分量。dev325回到合法dev305 t3485 Snapshot，先按负法线做短位移真实卸载，再核验In/接触，不再复用高位长撤。
+
+
+## 2026-11-02 OAH/L0T4止损，转OA/L1T3篮壁接触试验
+
+dev325负实测finger—mug法线20/30/40mm端点均与开门g17穿透约10–28mm，全部0动作，暂停纯负法线退出。转OA/L1T3：保留dev243 t7393失败分支；从更近的合法dev80 t5976 Snapshot继续（Cheese根在basket g5接触、Soup远离篮）。优先复用OAH/L1T3 dev136真实开爪/退手19动作native success机制；OA dev80旧命令因将当前EEF固定为错误contact pose且仅5步无目标接触，不重复。新一轮重新计算当前原生site指向并物理建立接触。
+
+
+## 2026-11-03 OA/L1T3 route pause; OAH/L0T4 next
+
+OA/L1T3 dev337–346 produced no native predicate success. Carried Cheese lost bilateral contact before reaching the opening; rim contact and a real finger push moved the loose basket and tilted its native region, so high-edge pushing is paused. Keep the exact legal branches and do not resume the old local-x descent or fixed-world push direction.
+
+Next work: OAH/L0T4 from dev305 t3485 (native Mug In=true, microwave Close=false). Prior evidence rules out the old long diagonal withdrawal (dragged mug out of region) and pure negative contact-normal translation (collides with open-door g17). Recompute the live contact geometry and test a short combined upward/outward retreat with wrist reorientation that clears g17; retain only a physical branch where native In stays true. Then approach an external point on the door panel/handle with a measured contact normal and close it through MuJoCo, checking native Close/task_success after each short action segment. No direct door/object state changes. Coverage remains 22/30 until full BDDL task_success.
+
+
+## 2026-11-03 OAH/L0T4 dev350–361：杯子前沿漂移、分段进场与g17阻挡
+
+dev350的真实上抬使EEF到z=1.192m，但杯子仍有较大角速度；dev352高位移动并未碰杯，却在t3494观察到杯跨出heating region边界，native In=false。后续dev356–360建立了避开开门门板的高位—前上方—窄通道分段姿态：dev359下降末端实际碰cap约3步；dev360左移20mm清掉cap接触，末态净空门框约1.72mm。dev361确认继续从杯前方推进会使gripper与开门g17重叠约8mm。杯前直推路线暂停。
+
+改走任务耦合的物理门操作：从dev357 t4132高位Snapshot，沿dev347实测microwave g15九点轨迹，在门把手处建立可审计接触并逐段沿闭门弧推动。门扫掠可能将杯从前沿推回原生In region；每段后依据实时铰链qpos、杯位姿和原生In/Close决定。无论局部谓词如何，只有task_success=true才能增加覆盖。
+
+
+## OAH/L0T4 dev362–372：真实门面切向推门确认
+
+dev362–364沿高位及把手外侧RRT路由到g15外20mm处。dev366闭爪实际接触g15，却把门从−1.817推向−1.920；contact audit显示finger1 pad接g15、finger2 pad接g17，因接触在门外侧而拉开。dev369基于实时g15点、夹爪接触偏移和+0.10rad闭门切向规划，32步使hinge q从−1.915到−1.811。dev370/372改用实时g17面板接触点，每段约+0.20rad，分别推进至−1.601和−1.396；g17双pad接触连续。dev372末端cap轻触约1步，物体移动约0.7mm；杯子仍在前沿，In=false、Close=false。
+
+当前从合法t4836 Snapshot继续（dev372）。复用live panel contact rebase，分段继续沿+hinge-angle切向推进；每段核对杯子区域谓词、门角和cap位姿。预期门扫掠靠近开口时可能推动杯体向内，但尚未观察到，需要以实际MuJoCo及BDDL查询验证。
+
+
+## 2026-11-03 实验接管：OA/L0T4 dev406与OAH/L1T4 dev407–415
+
+OA/L0T4从合法t698分支做roll90低接触姿态，30动作停在q2≈1.684rad、EEF目标残差65.7mm，杯未推进；停止该姿态族。OAH/L1T4原t1181合法双pad持杯分支仍可用。dev407–409的四元数顺序/负夹爪命令问题已查明并隔离；dev410以WXYZ重做5°前倾后双pad保持，dev411用RRT+关节PD真实后撤50mm清开g6，dev412再物理增倾10°，两段各48动作、抓持保持。dev413/414的持杯入腔候选被手指—g6约31mm几何重叠拒绝；dev415 OSC尝试向前70mm/上20mm，真实20动作后EEF仍差46.97mm，杯仅向+Y约24.8mm并停在g6前，t1307 In/Close/task_success=false。
+
+从dev415合法Snapshot以闭爪下降到桌面并实测支撑接触；稳定后再开爪，改为侧向物理推送进入微波炉。每段只按MuJoCo接触、实测位姿和BDDL谓词决定续接。归档根：`/opt/data/private/gs_opd/overnight/safetrail_stage_a_20261103/`。覆盖维持22/30。
+
+
+## OAH/L1T4 dev417：垂直下放被g6接触限制
+
+dev416从dev415合法终态闭爪下放10动作/250子步至t1317，杯根z .96369→.95480m，双pad保持；前两步手—g6接触，未触台。dev417再下降6真实动作至t1323，杯根z .95480→.94672m，双pad保持；g6与手部三步发生接触（signed distance约+1mm，最大合力约46N），杯—台面仍无接触，native In/Close/task_success=false。dev417终态合法Snapshot payload 89f29153c38b3f000d0a0d8055c0f570e6972daea306940d319aef063f0236ae。下一步先保持夹持向−Y撤离g6，再继续下降。 下一动作改为闭爪−Y短撤，清开微波炉g6后再下降；只有记录到杯—台面接触并确认速度稳定后才开爪。
+
+
+## OAH/L1T4 dev418：物理撤退清开g6
+
+dev418从合法dev417 t1323源闭爪向−Y退20mm；10真实动作到t1333，EEF y .19661→.18010m，杯根y .18957→.17285m，双pad保持，g6手部接触清零，native In/Close/task_success=false。杯根z稳定在.94679m，无杯—台面接触。合法Snapshot payload e824159eb5ac0aaf56daf6a2aa08b8e861edd5811d6d50602fbc82da46233fbe。 下一段继续短距离向下，直到实测杯—台面承托；检查杯根速度并稳定后才开爪。
+
+
+## OAH/L1T4 dev419：接近counter支撑高度
+
+dev419从dev418 t1333合法终态以闭爪向下15mm；6真实动作至t1339，杯根z .94679→.93554m，EEF z 1.03577→1.02449m，双pad持续，所有动作均无g6或台面接触，native In/Close/task_success=false。当前距既往实测台面静置根高约3.4mm，向下速度约.033m/s；合法Snapshot SHA256 6eeeee825965bdea65b6e7c5e13e154caddb82d8ee679c8907037e5372250f51。 下一段只下降约4mm且不超过4真实动作，查首次承托接触和垂直速度。
+
+
+## OAH/L1T4 dev420：台面上方约2mm
+
+dev420从dev419 t1339合法终态保持闭爪下放4mm目标；1真实动作到t1340，杯根z .93554→.93410m（−1.44mm），双pad保持、无微波炉/台面接触，native In/Close/task_success=false。距离历史实测台面支撑高度约2mm，合法Snapshot SHA256 ddcf3e6319970037d14e8db3e1e9e4c1811696fca89e024223ed2ba58235c5ae。 下一段最多3个物理动作微量下放，核验杯—台面support contact和垂直速度。
+
+
+## 2026-11-03 OAH/L1T4支撑高度校准更正（覆盖dev419/420的早期估计）
+
+此前把另一支dev324中侧倒杯子根z=.93212m当成直立杯的台面支撑高度，导致dev419/420“距台面3.4/2mm”的估计错误。核对合法t0 preflight的`actual_object_layout`：直立初始杯根为[.00453,-.23555,.900094]m，且t0原生状态明确为On kitchen_table。dev324杯子四元数[.727,.651,.108,-.191]、倾倒姿态下确实通过table_collision接触，但其根高不可作为当前直立姿态参照。dev421在t1343根z=.930685m、除双pad外没有任何MuJoCo接触，故当前仍约高于桌面30.6mm。继续从合法dev421闭爪短段下放；只在真实`table_collision`—mug接触和速度稳定后释放。
+
+
+## OAH/L1T4 dev421–422物理下降与支撑高度校准
+
+校准：t0原生preflight的直立杯根z=.900094m、On kitchen_table；dev324根z=.93212m时杯已侧倒且table_collision接触，不能作为直立杯高度基准。 dev421的3真实动作至t1343使杯根z .934095→.930685m，无table/microwave接触；从该合法末态dev422闭爪再下放4真实动作至t1347，杯根z .930685→.923308m，双pad保持、g6净空，除手指—杯外无接触，native In/Close/task_success=false。dev422 Snapshot SHA256 1e8e62209b72917da7f88ecee7e04ab6a604e737cb3b4604790ea640fa2986c8；到直立支撑高度仍约23.2mm。 dev421动作预算完成前3步已完整记录；dev422续接成功。下一段闭爪下降约12mm，然后约.911m处缩短步长，直到确认真实桌面接触。
+
+
+## OAH/L1T4 dev423下放结果
+
+dev423由dev422 t1347闭爪下放12mm目标，4真实动作至t1351；杯根z .923308→.915290m，双pad保持，g6净空，全部物理接触仅双pad—杯，没有table_collision。native In/Close/task_success=false；合法Snapshot SHA256 bb4004a6fef2930998b9539a85d4d417bdc2ec17d1feffd8a7ff982ad361d643。按t0直立支撑根z=.900094m，仍高约15.2mm。 下一段闭爪下放8–10mm后检查台面接触，再缩短步长。
+
+
+## OAH/L1T4 dev424：接近直立台面支撑
+
+dev424从dev423 t1351闭爪下降10mm目标，5真实动作到t1356；杯根z .915290→.907001m，双pad保持，g6净空，只有双pad—杯接触，没有table_collision。垂直速度降至约−.0166m/s，native In/Close/task_success=false。距t0直立支撑根z=.900094m约6.9mm；Snapshot SHA256 e90604db9a6120a625f9f99ccca49ffe163e13807091b6244b5a6066de574273。 下一段最多6步下降约8mm，并查首次table_collision接触。
+
+
+## OAH/L1T4 dev425真实台面支撑已证实
+
+dev425从dev424合法源以闭爪向下8mm目标，6真实动作至t1362；t1358开始，MuJoCo连续记录table_collision—white_yellow_mug_1_g24/g25/g26/g37/g39真实接触至t1362。杯根z .905509→.903956m，末端竖直速度约2.3e-5m/s，双pad仍保持。BDDL In/Close/task_success=false。目标末端因接触提前停滞并报告Timeout，但6动作/150子步完整，t1362终态Snapshot合法（SHA256 364144e2018faac01590ff9e2b417c3230667d6a69534482964c82d212f184af）。已确认实物由台面承托，可物理开爪。 只有完整原生task_success计覆盖。下一步用Panda负夹爪action物理释放并上撤，核对杯保持table_collision支撑，再开展微波炉入口+Y推送。
+
+
+## OAH/L1T4 dev426：释放成功，杯留在台面
+
+dev426从dev425 t1362台面支撑Snapshot以负夹爪action开爪并上撤。10真实动作至t1372，夹爪已打开、左右pad均无杯接触；杯根从约[.00023,.17134,.90396]m沉降至[-.00125,.17085,.900091]m，table_collision—杯接触持续，末态速度近零。原生In/Close/task_success=false。开爪目标25mm上撤尚差约5.8mm并触发Timeout，但物理动作及250子步完整，Snapshot合法SHA256 b70e5fde9b2fa99721ebdeaf3f54ddb7122afd7ec604a0e9bf0ec0aaa561122b。 下一段保持开爪清净手部，之后从可达侧向推手接触沿+Y表面推动。
+
+
+## OAH/L1T4 dev427：外侧开爪撤手与微波炉底板台阶
+
+dev427从dev426终态保持开爪向上撤20mm，8真实动作至t1380；EEF z 1.01137→1.02748m，夹爪保持张开；杯根[-.001250,.170848,.900091]m及table_collision接触/低速不变，未与机器人接触。native In/Close/task_success=false；Snapshot SHA256 1f4417755097413fd75f3660eae8539031256c37ec5702856c613578a2bd9f80。微波炉几何：fixture root z=.920m，底板中心z=.012m、半高.012m，内底顶约z=.944m，约高于桌面44mm。下一步从杯−Y侧用开爪手掌朝+Y推入，同时升高约44mm；逐段读杯移动、接触及BDDL。 在dev427终态执行开爪手掌沿+Y方向接触；以0.16m路径上抬44mm的真实坡推作物理验证。
+
+
+## OAH/L1T4 dev428：续接高位推手绕行
+
+dev428尝试自动高位绕行至杯子−Y侧，最大接近预算170动作。真实动作分布：lift_above_scene 86、align_open_tool_to_push_axis 72、lateral_high_detour 12，随后因剩余接近预算不足而Timeout。前两段完成，EEF腕姿已对齐tool local +Z→world +Y（四元数距目标约0.004rad），末态仅距侧移目标约21mm；未接触杯子，杯根和table_collision支撑不变，原生In/Close/task_success=false。170/170动作与4250/4250子步均完整。合法末态Snapshot SHA256 b3e7e62eb9e8fa25416eea3887435e44af9a5fff75b8666fe1dd490bedebe76f。 下一分支从dev428终态按原报告在`lateral_high_detour`处继续，并将approach预算增至150；不重做姿态对齐。
+
+
+## OAH/L1T4 dev429：杯后下降持续可达
+
+dev429从dev428 t1550按lateral_high_detour续跑，150真实动作/3750子步至t1700；侧绕8步、后方高位转运56步、姿态复核19步，进入descend_behind_target 67步。EEF由约z=1.204降至1.0698m，单步实降约2.1mm，当前与目标z=.9401m仍差129.7mm；x/y已约[-.0106,.0770]m，对应后方目标[-.00679,.07601]m。无robot—杯接触/碰撞，杯仍根[-.00125,.17085,.90009]m稳定桌面，原生false。终态Snapshot SHA256 a6ce6cf410b199a0234c30b86f2c1dae22589948d48d3fdfccbd9d0febc69edd，记录完整。 下一步从t1700续接descend_behind_target，保留余量完成剩余垂降和推手触杯。
+
+
+## OA/L2T4 dev252: +90° clears robot hand; mug catches right-front lip
+
+From the exact dev251 t1812 held Snapshot (SHA `9714c63dd9c99bb3d9377e129b10693cb454d6b6f52e23b4bcc141a397294be4`), dev252 physically rotated to the geometry-fit +90° orientation, lifted to 1.18m, descended outside the microwave, and entered horizontally. Across 303 continuous actions to t2115, all 7575/7575 contact substeps were captured. The gripper hand moved from y≈.189m to y≈.077m and no longer touched microwave g3. The mug then advanced about 85mm, but its g1 hit microwave g4 at the opening's right-front corner: max penetration 1.51mm and force about 8.8N. It brushed g6; bilateral grasp was lost at t2115. Native In/Close/task_success remained false.
+
+Keep the +90° hand-clearing orientation and use the exact t2115 terminal Snapshot (SHA `1210e3fe20dee9248e09f68643852a8a9d16f971db19be919d856da5e22a5d90`) for dev253. The observed g4 normal has a strong +X component, so shift the local-X target 30mm left, physically reacquire the mug, and test the right-front clearance. Do not increase collision allowances.
+
+
+## OA/L2T4 dev253: a bilateral regrasp, but pregrasp tracking stalls
+
+The exact dev252 t2115 state was regrasped through a constrained RRT candidate. The active geometry screen rejected 24 poses (22 fixture collisions, 2 IK unreachable), but the first physical branch achieved real left/right pad contacts. It ran 34 actions/850 complete substeps to t2149, then the pregrasp OSC waypoint stopped with 12.18mm EEF position error (12-action stagnation window). Mug g1/g2 still touched microwave g4; grasp monitoring passed, while no lift was verified. Preserve its legal terminal Snapshot SHA `302abafe6cca23d54226187fd94aec0928d563178c2ac9be919d856da5e22a5d90`. dev254 resumes this exact held state and tests a −30mm local-X placement offset while keeping the hand-clearing +90° yaw.
+
+
+## OA/L2T4 dev254: do not reorient while the mug is against the front lip
+
+From dev253 t2149, the route immediately tried `native_region_aperture_posture` while the mug still contacted g4. Over 43 actions/1075 fully monitored substeps, the root moved right by about 13mm; the gripper then hit mug geoms g4/g5/g22 and lost its bilateral grasp at t2192. The planned left-shifted entry was never reached. Native In/Close remained false. Exact terminal Snapshot SHA `4ddf7e7a768d1b1242776758f3cbfaccfbe5b25ad7edd9efe07a1720194cc9ae`. dev255 starts from the earlier exact t1812 held Snapshot, reorients outside the aperture first, and approaches with the region-local X shift in effect before the mug reaches g4.
+
+
+## OA/L2T4 dev255: the right lip cleared; the upper interior lip became the blocker
+
+From exact t1812, dev255 performed the +90° hand-clearing posture outside, then carried at 1.18m and entered at root z≈.990m with local-X −30mm. Over 305 actions/7625 fully monitored contact substeps it advanced the mug to y≈.235m at world x≈−.011m. The earlier g4 right-front contact was absent. Instead, mug geoms g1/g3 touched microwave g6 at [.026,.252,1.088]m with normal approximately `[0,.92,.39]` and 2–4N force; bilateral grasp was lost at t2117. Native In/Close remained false. This is an upper-inner-lip contact: reduce entry height to about .970m (+20mm above the support pose) while preserving the X shift and exterior yaw.
+
+
+## OA/L2T4 dev256: lower the object through; compact the tool for g6 clearance
+
+The +20mm entry root (≈.972m actual) removed mug-to-g6 contact observed at +40mm. However, gripper0_hand_collision remained against microwave g6 with 0.947mm clearance and ≈19–26N force. The EEF stagnated at y≈.182m while alignment target is y≈.375m (object residual≈119mm); the mug itself no longer touched g6 and bilateral grasp stayed pass. Run stopped at t2148 after 336 actions/8400 complete contact substeps. Exact held Snapshot SHA `824601c339513a4dfb68084c52ad5e164a0b76a74522d1aeb44d70e8dd4747b4`. Next test a 20° aperture compact tilt outside the appliance, retaining +90° fit yaw, local-X −30mm, and +20mm entry.
+
+
+## OA/L2T4 dev257: compact tilt clears the hand; continue from the low exterior pose
+
+A 20° aperture compact tilt applied outside moved the EEF to y≈.074m and removed the g6 hand contact seen in dev256. The robot physically lowered the held mug outside the microwave to root [.03646,.16079,.99768]m, about 15mm from the descent waypoint, with no fixture contact and bilateral grasp intact. The 301-action/7525-substep branch stopped when the object residual was .01508m against a .015m waypoint tolerance; native In/Close remained false. Exact t2113 held Snapshot SHA `6c276984dfb06a30abb5a31da2e72959d292b7c90c742fd15e72f7971085e0da`. Continue this same physical state through the horizontal aperture continuation path and inspect that the planner skips the effectively reached descent waypoint before entering.
+
+
+## OA/L2T4 dev258后路线调整：保持已验证的紧凑持姿
+
+dev258证明其重定向并非微波炉主动接触触发，而是精确t2113 Snapshot中的link6—桌上sake瓶接触；自动先重定向再撤离，造成杯体g6碰撞。dev257的+90°/20°姿态此前已从干净t1812真实执行至低位入口外侧。dev259新增并使用`--native-region-preserve-live-orientation`，避免续接重复选默认姿态；以MuJoCo实测接触法线外撤，重算倾斜包络支撑根位，然后执行高位过渡与入口。若实际姿态的native区域拟合/OSC路线不可行，根据原始物理接触改换入口方向或先处理剩余任务。
+
+
+## dev259参数传递修复
+
+dev259实际恢复路径属于`live_target_grasp_verified`，此前新开关只传入另一个`_native_place`分支，导致报告命令开关为true但执行路线仍重定向约1.57rad。主物理段t2115–2170、56条动作记录，杯g1与g6穿入约1.7mm后失抓；另有1个限位恢复动作记录。所有放置调用现在统一传递该开关。dev260以dev257 t2113干净双pad父Snapshot复跑，并在确认路线姿态与live姿态一致后继续。
+
+
+## dev260：从清障后的持物快照继续
+
+dev260保留了t2113紧凑朝向并沿sake接触径向真实移动，但到t2185时link6/手部已清开sake，关节7贴近下限导致侧逃逸航点剩35.5mm而停滞。t2185 Snapshot仍双pad持杯；dev261从该父末态跳过已清掉的径向逃逸目标，直接做自适应竖直清障和剩余入口路线，并保持同一朝向。
+
+
+## dev261后：水平入口改为高位通过
+
+dev261高位清障至杯根z=1.160m成功且无场景碰撞；同姿态下低位门外下降在joint7下限附近停滞36.7mm。dev262不重复该下降：从合法t2341持物态以入口+200mm偏置，在高位横向穿门，再在内部垂直降至原生支撑姿态。
